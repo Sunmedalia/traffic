@@ -1,0 +1,2 @@
+# Unified diffs contain context prefixes followed by the original indentation.
+*.patch -whitespace

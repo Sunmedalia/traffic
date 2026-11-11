@@ -1,0 +1,530 @@
+diff --git a/internal/probe/base/handlers/publisher_handler.go b/internal/probe/base/handlers/publisher_handler.go
+index 8d11371..e7cb877 100644
+--- a/internal/probe/base/handlers/publisher_handler.go
++++ b/internal/probe/base/handlers/publisher_handler.go
+@@ -125,6 +125,9 @@ func (h *PublisherHandler) envelope(event domain.Event, sequence uint64) domain.
+ 		envelope.DestinationIP = packet.GetDstIP()
+ 		envelope.DestinationPort = uint32(packet.GetDstPort())
+ 	}
++	if value, ok := event.(interface{ GetStreamID() string }); ok {
++		envelope.StreamID = value.GetStreamID()
++	}
+ 	if value, ok := event.(interface{ GetSrcIP() string }); ok {
+ 		envelope.SourceIP = value.GetSrcIP()
+ 	}
+@@ -144,6 +147,12 @@ func (h *PublisherHandler) envelope(event domain.Event, sequence uint64) domain.
+ 			envelope.Direction = "write"
+ 		}
+ 	}
++	if value, ok := event.(interface {
++		GetDataLen() uint32
++		IsRead() bool
++	}); ok && value.IsRead() && value.GetDataLen() == 0 {
++		return envelope
++	}
+ 	if len(envelope.Payload) == 0 {
+ 		if h.useHex && h.format == domain.CaptureFormatText {
+ 			envelope.Payload = []byte(event.StringHex())
+diff --git a/internal/probe/openssl/connection_cache.go b/internal/probe/openssl/connection_cache.go
+index b84e3a9..7a7e167 100644
+--- a/internal/probe/openssl/connection_cache.go
++++ b/internal/probe/openssl/connection_cache.go
+@@ -37,6 +37,7 @@ type connectionInfo struct {
+ 	sourcePort      uint16
+ 	destinationPort uint16
+ 	generation      uint64
++	created         uint64
+ }
+ 
+ // connectionCache joins OpenSSL connection records with TLS data records.
+@@ -46,6 +47,7 @@ type connectionCache struct {
+ 	byPID          map[uint32]map[uint32]connectionInfo
+ 	bySock         map[uint64]connectionKey
+ 	nextGeneration uint64
++	history        map[connectionKey][]connectionInfo
+ }
+ 
+ func (c *connectionCache) observe(event *ConnDataEvent) {
+@@ -77,13 +79,20 @@ func (c *connectionCache) observe(event *ConnDataEvent) {
+ 		c.byPID[event.Pid] = make(map[uint32]connectionInfo)
+ 	}
+ 	if previous, ok := c.byPID[event.Pid][event.Fd]; ok {
++		if previous.sock == event.Sock && previous.tuple == event.Tuple {
++			return
++		}
+ 		delete(c.bySock, previous.sock)
+ 	}
+ 	if previousKey, ok := c.bySock[event.Sock]; ok {
+ 		c.removeLocked(previousKey, event.Sock)
+ 	}
++	if c.byPID[event.Pid] == nil {
++		c.byPID[event.Pid] = make(map[uint32]connectionInfo)
++	}
+ 	c.nextGeneration++
+-	c.byPID[event.Pid][event.Fd] = connectionInfo{
++	info := connectionInfo{
++		created:         event.TimestampNs,
+ 		tuple:           event.Tuple,
+ 		sock:            event.Sock,
+ 		sourceIP:        source.String(),
+@@ -92,7 +101,20 @@ func (c *connectionCache) observe(event *ConnDataEvent) {
+ 		destinationPort: event.Dport,
+ 		generation:      c.nextGeneration,
+ 	}
+-	c.bySock[event.Sock] = connectionKey{pid: event.Pid, fd: event.Fd}
++	c.byPID[event.Pid][event.Fd] = info
++	if c.history == nil {
++		c.history = make(map[connectionKey][]connectionInfo)
++	}
++	if len(c.history) > 4096 {
++		c.history = make(map[connectionKey][]connectionInfo)
++	}
++	key := connectionKey{event.Pid, event.Fd}
++	items := append(c.history[key], info)
++	if len(items) > 128 {
++		items = items[len(items)-128:]
++	}
++	c.history[key] = items
++	c.bySock[event.Sock] = key
+ }
+ 
+ func (c *connectionCache) lookup(pid, fd uint32) (connectionInfo, bool) {
+@@ -137,3 +159,16 @@ func (c *connectionCache) removeLocked(key connectionKey, sock uint64) {
+ 		delete(c.byPID, key.pid)
+ 	}
+ }
++
++// lookupAt prevents a later reuse of the same FD from changing earlier TLS events.
++func (c *connectionCache) lookupAt(pid, fd uint32, stamp uint64) (connectionInfo, bool) {
++	c.mu.RLock()
++	defer c.mu.RUnlock()
++	items := c.history[connectionKey{pid, fd}]
++	for i := len(items) - 1; i >= 0; i-- {
++		if items[i].created <= stamp {
++			return items[i], true
++		}
++	}
++	return connectionInfo{}, false
++}
+diff --git a/internal/probe/openssl/event.go b/internal/probe/openssl/event.go
+index b8aebea..d534549 100644
+--- a/internal/probe/openssl/event.go
++++ b/internal/probe/openssl/event.go
+@@ -18,6 +18,7 @@ import (
+ 	"bytes"
+ 	"encoding/binary"
+ 	"fmt"
++	"io"
+ 	"time"
+ 
+ 	"golang.org/x/sys/unix"
+@@ -109,6 +110,7 @@ type Event struct {
+ 	Version         int32             `json:"version"` // TLS version (e.g., 771 for TLS 1.2)
+ 	Tuple           string
+ 	BioType         uint32
++	connectionID    string
+ 	Sock            uint64
+ 	sourceIP        string
+ 	destinationIP   string
+@@ -132,7 +134,7 @@ func (e *Event) DecodeFromBytes(data []byte) error {
+ 	if err := binary.Read(buf, binary.LittleEndian, &e.Tid); err != nil {
+ 		return errors.NewEventDecodeError("openssl.Tid", err)
+ 	}
+-	if err := binary.Read(buf, binary.LittleEndian, &e.Data); err != nil {
++	if _, err := io.ReadFull(buf, e.Data[:]); err != nil {
+ 		return errors.NewEventDecodeError("openssl.Data", err)
+ 	}
+ 	if err := binary.Read(buf, binary.LittleEndian, &e.DataLen); err != nil {
+@@ -151,6 +153,25 @@ func (e *Event) DecodeFromBytes(data []byte) error {
+ 		return errors.NewEventDecodeError("openssl.BioType", err)
+ 	}
+ 
++	metadataSize := binary.Size(connDataEvent{})
++	if buf.Len() >= 8 && binary.LittleEndian.Uint64(buf.Bytes()[:8]) == 0x54524146434f4e31 {
++		if buf.Len() < 8+metadataSize {
++			return errors.NewEventDecodeError("openssl.Connection", io.ErrUnexpectedEOF)
++		}
++		buf.Next(8)
++		metadata := &ConnDataEvent{}
++		if err := metadata.DecodeFromBytes(buf.Next(metadataSize)); err == nil && metadata.Inode != 0 && metadata.Pid == e.Pid && metadata.Fd == e.Fd && (metadata.Family == unix.AF_INET || metadata.Family == unix.AF_INET6) {
++			e.Tuple = metadata.Tuple
++			e.Sock = metadata.Sock
++			source, destination := metadata.endpoints()
++			e.sourceIP = source
++			e.destinationIP = destination
++			e.sourcePort = metadata.Sport
++			e.destinationPort = metadata.Dport
++			e.connectionID = fmt.Sprintf("%d_inode_%d", e.Pid, metadata.Inode)
++		}
++	}
++
+ 	return nil
+ }
+ 
+@@ -404,3 +425,10 @@ func getClockOffset() (int64, error) {
+ 
+ 	return realNs - monoNs, nil
+ }
++
++func (e *Event) GetStreamID() string {
++	if e.connectionID != "" {
++		return e.connectionID
++	}
++	return fmt.Sprintf("unknown_%d_%d", e.Pid, e.Fd)
++}
+diff --git a/internal/probe/openssl/event_connect.go b/internal/probe/openssl/event_connect.go
+index db9350b..c8a033b 100644
+--- a/internal/probe/openssl/event_connect.go
++++ b/internal/probe/openssl/event_connect.go
+@@ -34,6 +34,8 @@ type connDataEvent struct {
+ 	Dport       uint16   `json:"dport"`
+ 	IsDestroy   uint8    `json:"isDestroy"`
+ 	Pad         [7]byte  `json:"-"`
++	IdentityPad [6]byte  `json:"-"`
++	Inode       uint64   `json:"inode"`
+ 
+ 	// NOTE: do not leave padding hole in this struct.
+ }
+@@ -87,6 +89,20 @@ func (e *ConnDataEvent) DecodeFromBytes(payload []byte) (err error) {
+ 		return errors.NewEventDecodeError("openssl.ConnDataEvent.IsDestroy", err)
+ 	}
+ 
++	if buf.Len() >= 7 {
++		if err := binary.Read(buf, binary.LittleEndian, &e.Pad); err != nil {
++			return err
++		}
++	}
++	if buf.Len() >= 14 {
++		if err := binary.Read(buf, binary.LittleEndian, &e.IdentityPad); err != nil {
++			return err
++		}
++		if err := binary.Read(buf, binary.LittleEndian, &e.Inode); err != nil {
++			return err
++		}
++	}
++
+ 	if e.Family == unix.AF_INET {
+ 		saddr, daddr := netip.AddrFrom4([4]byte(e.Saddr[:4])), netip.AddrFrom4([4]byte(e.Daddr[:4]))
+ 		e.Tuple = fmt.Sprintf("[%s]:%d->[%s]:%d", saddr, e.Sport, daddr, e.Dport)
+@@ -199,3 +215,10 @@ func (ce *ConnDataEvent) Payload() []byte {
+ func (ce *ConnDataEvent) PayloadLen() int {
+ 	return len(ce.Tuple)
+ }
++
++func (e *ConnDataEvent) endpoints() (string, string) {
++	if e.Family == unix.AF_INET {
++		return netip.AddrFrom4([4]byte(e.Saddr[:4])).String(), netip.AddrFrom4([4]byte(e.Daddr[:4])).String()
++	}
++	return netip.AddrFrom16(e.Saddr).String(), netip.AddrFrom16(e.Daddr).String()
++}
+diff --git a/internal/probe/openssl/event_connect_test.go b/internal/probe/openssl/event_connect_test.go
+index 11b31b3..0e77a63 100644
+--- a/internal/probe/openssl/event_connect_test.go
++++ b/internal/probe/openssl/event_connect_test.go
+@@ -236,7 +236,7 @@ func TestConnectionMetadataEnrichesTLSOutput(t *testing.T) {
+ 	copy(comm[:], "curl")
+ 	connect := &connectDecoder{probe: probe}
+ 	decoded, err := connect.Decode(nil, buildConnPayload(t,
+-		source, destination, comm, 123, 0xdeadbeef,
++		source, destination, comm, 0, 0xdeadbeef,
+ 		1000, 1001, 7, unix.AF_INET, 54321, 443, 0,
+ 	))
+ 	if err != nil {
+diff --git a/internal/probe/openssl/openssl_probe.go b/internal/probe/openssl/openssl_probe.go
+index d78dd0a..86ef872 100644
+--- a/internal/probe/openssl/openssl_probe.go
++++ b/internal/probe/openssl/openssl_probe.go
+@@ -21,6 +21,7 @@ import (
+ 	"io"
+ 	"math"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/cilium/ebpf"
+ 	manager "github.com/gojue/ebpfmanager"
+@@ -783,8 +784,10 @@ func (d *tlsEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, error)
+ 	if err := event.Validate(); err != nil {
+ 		return nil, err
+ 	}
+-	if d.probe != nil {
+-		if conn, ok := d.probe.connections.lookup(event.Pid, event.Fd); ok {
++	if d.probe != nil && event.connectionID == "" {
++		time.Sleep(time.Millisecond)
++		if conn, ok := d.probe.connections.lookupAt(event.Pid, event.Fd, event.Timestamp); ok {
++			event.connectionID = fmt.Sprintf("%d_%d_%d", event.Pid, conn.sock, conn.generation)
+ 			event.Tuple = conn.tuple
+ 			event.Sock = conn.sock
+ 			event.sourceIP = conn.sourceIP
+diff --git a/internal/probe/openssl/traffic_cache_test.go b/internal/probe/openssl/traffic_cache_test.go
+new file mode 100644
+index 0000000..a15a9a8
+--- /dev/null
++++ b/internal/probe/openssl/traffic_cache_test.go
+@@ -0,0 +1,83 @@
++package openssl
++
++import (
++	"encoding/binary"
++	"golang.org/x/sys/unix"
++	"testing"
++)
++
++func TestTrafficReusedSocketCache(t *testing.T) {
++	c := &connectionCache{}
++	event := &ConnDataEvent{}
++	event.Pid = 123
++	event.Fd = 4
++	event.Sock = 9
++	event.Family = unix.AF_INET
++	event.TimestampNs = 100
++	c.observe(event)
++	event.Fd = 5
++	event.TimestampNs = 200
++	c.observe(event)
++	event.Sock = 10
++	event.TimestampNs = 300
++	c.observe(event)
++	old, ok := c.lookupAt(123, 5, 250)
++	if !ok || old.sock != 9 {
++		t.Fatalf("old socket mismatch %+v", old)
++	}
++	current, ok := c.lookupAt(123, 5, 350)
++	if !ok || current.sock != 10 {
++		t.Fatalf("new socket mismatch %+v", current)
++	}
++	if _, ok = c.lookupAt(123, 5, 99); ok {
++		t.Fatal("future connection attributed to earlier TLS event")
++	}
++}
++
++func TestTrafficInlineMetadataIgnoresStaleFDCache(t *testing.T) {
++	probe, err := NewProbe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	var oldSource, oldDestination, source, destination, comm [16]byte
++	copy(oldSource[:], []byte{192, 0, 2, 10})
++	copy(oldDestination[:], []byte{192, 0, 2, 20})
++	copy(source[:], []byte{192, 0, 2, 1})
++	copy(destination[:], []byte{192, 0, 2, 2})
++	copy(comm[:], "nginx")
++	stale := &ConnDataEvent{}
++	if err = stale.DecodeFromBytes(buildConnPayload(t, oldSource, oldDestination, comm, 0, 111, 1000, 1001, 7, unix.AF_INET, 1111, 443, 0)); err != nil {
++		t.Fatal(err)
++	}
++	probe.connections.observe(stale)
++	metadata := buildConnPayload(t, source, destination, comm, 0, 222, 1000, 1001, 7, unix.AF_INET, 54321, 443, 0)
++	metadata = append(metadata, make([]byte, 6)...)
++	inode := make([]byte, 8)
++	binary.LittleEndian.PutUint64(inode, 4321)
++	metadata = append(metadata, inode...)
++	magic := make([]byte, 8)
++	binary.LittleEndian.PutUint64(magic, 0x54524146434f4e31)
++	sample := append(append(benchmarkTLSDataSample(t), magic...), metadata...)
++	output, err := (&tlsEventDecoder{probe: probe}).Decode(nil, sample)
++	if err != nil {
++		t.Fatal(err)
++	}
++	event := output.(*Event)
++	if event.GetStreamID() != "1000_inode_4321" || event.GetSrcIP() != "192.0.2.1" || event.GetSrcPort() != 54321 || event.GetDstIP() != "192.0.2.2" {
++		t.Fatalf("stale connection won: %+v", event)
++	}
++	clone := event.Clone().(*Event)
++	if clone.GetStreamID() != event.GetStreamID() {
++		t.Fatal("snapshot identity lost during clone")
++	}
++	for size := 0; size < len(metadata); size++ {
++		short := append(append(benchmarkTLSDataSample(t), magic...), metadata[:size]...)
++		if _, err = (&tlsEventDecoder{}).Decode(nil, short); err == nil {
++			t.Fatalf("accepted short metadata %d", size)
++		}
++	}
++	padded := append(sample, make([]byte, 8)...)
++	if _, err = (&tlsEventDecoder{}).Decode(nil, padded); err != nil {
++		t.Fatalf("padding rejected: %v", err)
++	}
++}
+diff --git a/kern/openssl.h b/kern/openssl.h
+index 9a8fb26..7d22fc1 100644
+--- a/kern/openssl.h
++++ b/kern/openssl.h
+@@ -25,19 +25,6 @@ enum ssl_data_event_type { kSSLRead, kSSLWrite };
+ #define INVALID_FD 0
+ #define DEFAULT_BIO_TYPE 0
+ 
+-struct ssl_data_event_t {
+-    enum ssl_data_event_type type;
+-    u64 timestamp_ns;
+-    u32 pid;
+-    u32 tid;
+-    char data[MAX_DATA_SIZE_OPENSSL];
+-    s32 data_len;
+-    char comm[TASK_COMM_LEN];
+-    u32 fd;
+-    s32 version;
+-    u32 bio_type;
+-};
+-
+ struct connect_event_t {
+     unsigned __int128 saddr;
+     unsigned __int128 daddr;
+@@ -52,9 +39,27 @@ struct connect_event_t {
+     u16 dport;
+     u8 is_destroy;
+     u8 pad[7];
++    u8 identity_pad[6];
++    u64 inode;
+ } __attribute__((packed)); // NOTE: do not leave padding hole in this struct.
+ 
++struct ssl_data_event_t {
++    enum ssl_data_event_type type;
++    u64 timestamp_ns;
++    u32 pid;
++    u32 tid;
++    char data[MAX_DATA_SIZE_OPENSSL];
++    s32 data_len;
++    char comm[TASK_COMM_LEN];
++    u32 fd;
++    s32 version;
++    u32 bio_type;
++    u64 connection_magic;
++    struct connect_event_t connection;
++};
++
+ struct active_ssl_buf {
++    int server;
+     /*
+      * protocol version (one of SSL2_VERSION, SSL3_VERSION, TLS1_VERSION,
+      * DTLS1_VERSION)
+@@ -138,6 +143,8 @@ struct {
+  * General helper functions
+  ***********************************************************/
+ 
++static __always_inline void traffic_socket_metadata(u32 fd, int server, struct connect_event_t *conn);
++
+ static __always_inline struct ssl_data_event_t* create_ssl_data_event(
+     u64 current_pid_tgid) {
+     u32 zero = 0;
+@@ -160,9 +167,9 @@ static __always_inline struct ssl_data_event_t* create_ssl_data_event(
+  * BPF syscall processing functions
+  ***********************************************************/
+ 
+-static int process_SSL_data(struct pt_regs* ctx, u64 id,
++static __always_inline int process_SSL_data(struct pt_regs* ctx, u64 id,
+                             enum ssl_data_event_type type, const char* buf,
+-                            u32 fd, s32 version, u32 bio_type) {
++                            u32 fd, s32 version, u32 bio_type, int server) {
+     int len = (int)PT_REGS_RC(ctx);
+     if (len < 0) {
+         return 0;
+@@ -174,6 +181,9 @@ static int process_SSL_data(struct pt_regs* ctx, u64 id,
+     }
+ 
+     event->type = type;
++    event->connection_magic = 0x54524146434f4e31ULL;
++    __builtin_memset(&event->connection, 0, sizeof(event->connection));
++    traffic_socket_metadata(fd, server, &event->connection);
+     event->fd = fd;
+     event->bio_type = bio_type;
+     event->version = version;
+@@ -268,6 +278,76 @@ static int process_SSL_bio(void *ssl, int bio_offset, u32 *fd, u32 *bio_type) {
+     return 0;
+ }
+ 
++// Copy descriptor identity and tuple into the plaintext event at its source.
++static __always_inline void traffic_socket_metadata(u32 fd, int server, struct connect_event_t *conn) {
++#ifdef SSL_CONNECTION_ST_SERVER
++    if (server < 0 || fd == 0 || fd > 1048576) return;
++    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
++    struct files_struct *files = 0;
++    struct fdtable *table = 0;
++    struct file **entries = 0;
++    struct file *file = 0;
++    struct inode *inode = 0;
++    struct socket *socket = 0;
++    struct sock *sk = 0;
++    unsigned short mode = 0;
++    bpf_probe_read_kernel(&files, sizeof(files), &task->files);
++    if (!files) return;
++    bpf_probe_read_kernel(&table, sizeof(table), &files->fdt);
++    if (!table) return;
++    bpf_probe_read_kernel(&entries, sizeof(entries), &table->fd);
++    if (!entries) return;
++    bpf_probe_read_kernel(&file, sizeof(file), &entries[fd]);
++    if (!file) return;
++    bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
++    if (!inode) return;
++    bpf_probe_read_kernel(&mode, sizeof(mode), &inode->i_mode);
++    if ((mode & 0170000) != 0140000) return;
++    bpf_probe_read_kernel(&socket, sizeof(socket), &file->private_data);
++    if (!socket) return;
++    bpf_probe_read_kernel(&sk, sizeof(sk), &socket->sk);
++    if (!sk) return;
++    u16 family = 0;
++    unsigned __int128 source = 0, destination = 0;
++    u32 ports = 0;
++    bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
++    if (family == AF_INET) {
++        u64 addresses = 0;
++        bpf_probe_read_kernel(&addresses, sizeof(addresses), &sk->__sk_common.skc_addrpair);
++        source = (__be32)(addresses >> 32);
++        destination = (__be32)addresses;
++    } else if (family == AF_INET6) {
++        bpf_probe_read_kernel(&source, sizeof(source), &sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
++        bpf_probe_read_kernel(&destination, sizeof(destination), &sk->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
++    } else return;
++    bpf_probe_read_kernel(&ports, sizeof(ports), &sk->__sk_common.skc_portpair);
++    if (ports == 0) return;
++    u64 identity = 0;
++    bpf_probe_read_kernel(&identity, sizeof(identity), &inode->i_ino);
++    if (!identity) return;
++    u64 pid_tgid = bpf_get_current_pid_tgid();
++    conn->timestamp_ns = bpf_ktime_get_ns();
++    conn->pid = pid_tgid >> 32;
++    conn->tid = pid_tgid;
++    conn->fd = fd;
++    conn->family = family;
++    conn->sock = (u64)sk;
++    conn->inode = identity;
++    if (server == 0) {
++        conn->sport = ports >> 16;
++        conn->dport = bpf_ntohs((u16)ports);
++        conn->saddr = source;
++        conn->daddr = destination;
++    } else {
++        conn->sport = bpf_ntohs((u16)ports);
++        conn->dport = ports >> 16;
++        conn->saddr = destination;
++        conn->daddr = source;
++    }
++    bpf_get_current_comm(&conn->comm, sizeof(conn->comm));
++#endif
++}
++
+ static __always_inline int probe_entry_SSL(struct pt_regs* ctx, void *map, int bio_offset) {
+     if (!passes_filter(ctx)) {
+         return 0;
+@@ -293,9 +373,14 @@ static __always_inline int probe_entry_SSL(struct pt_regs* ctx, void *map, int b
+         debug_bpf_printk("openssl uprobe/SSL entry fd: %d, version: %d\n", fd, ssl_version);
+     }
+ 
++    
+     const char *buf = openssl_untag_user_pointer((const void *)PT_REGS_PARM2(ctx));
+     struct active_ssl_buf active_ssl_buf_t;
+     __builtin_memset(&active_ssl_buf_t, 0, sizeof(active_ssl_buf_t));
++    active_ssl_buf_t.server = -1;
++#ifdef SSL_CONNECTION_ST_SERVER
++    openssl_probe_read_user(&active_ssl_buf_t.server, sizeof(active_ssl_buf_t.server), ssl + SSL_CONNECTION_ST_SERVER);
++#endif
+     active_ssl_buf_t.fd = fd;
+     active_ssl_buf_t.version = ssl_version;
+     active_ssl_buf_t.buf = buf;
+@@ -318,7 +403,7 @@ static __always_inline int probe_ret_SSL(struct pt_regs* ctx, void *map, enum ss
+         u32 bio_type = active_ssl_buf_t->bio_type;
+         s32 version = active_ssl_buf_t->version;
+         bpf_probe_read(&buf, sizeof(const char*), &active_ssl_buf_t->buf);
+-        process_SSL_data(ctx, current_pid_tgid, type, buf, fd, version, bio_type);
++        process_SSL_data(ctx, current_pid_tgid, type, buf, fd, version, bio_type, active_ssl_buf_t->server);
+     }
+     bpf_map_delete_elem(map, &current_pid_tgid);
+     return 0;
