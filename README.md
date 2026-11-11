@@ -1,8 +1,19 @@
 # traffic
 
-面向 Linux 网站应急响应的流量分析命令行工具。在攻击仍持续时启动采集，将 HTTP 请求、响应、检测依据和网络证据放到同一个会话中查询。
+面向 Linux 网站应急响应的流量采集与分析工具。使用独立的采集程序记录现场数据，再通过 TUI 分析程序实时查看或回看会话。HTTP 请求、响应、检测依据和网络证据保存在同一个会话目录。
 
 当前为 **Linux ARM64 实验版本**，已在 Debian 13、Linux 6.12、Nginx 1.26、OpenSSL 3.5 环境验证。运行中采集使用网卡抓包和 eBPF TLS 探针，采集过程无需重启或重载网站、修改网站配置。兼容性和性能验收状态见 [验证记录](VALIDATION.md)。
+
+## 程序职责
+
+| 程序 | 源码入口 | 功能 |
+| --- | --- | --- |
+| `traffic` | `cmd/traffic` | `doctor` 检查采集环境，`capture` 实时采集，`import` 将已有 PCAP 转为会话，`rules check` 校验采集规则 |
+| `traffic-tui` | `cmd/traffic-tui` | 默认打开中文 TUI，分析会话中的请求、响应和告警，提供 `status`、`requests`、`events`、`show`、`export` 查询及证据导出命令 |
+
+采集程序负责网卡抓包、TLS 探针、协议还原、规则初筛、会话写入和资源管理。分析程序读取会话索引及证据，提供筛选、详情浏览和导出。两者通过版本化的 SQLite、JSON 和 PCAP 会话文件交换数据，可分别启动和部署。`internal/session` 定义共享的数据结构、数据库布局和正文解码逻辑。
+
+升级时将原来的 `traffic tui` 改为 `traffic-tui`，将 `traffic status/requests/events/show/export` 的程序名改为 `traffic-tui`。原来的 `traffic analyze` 改名为 `traffic import`，用于把离线 PCAP 还原并写入新会话。
 
 ## 能力
 
@@ -15,7 +26,7 @@
 
 ## 构建
 
-主程序需要 Linux、Go 1.26+、CGO 和 libpcap。以下以 Debian/Ubuntu 为例。
+构建需要 Go 1.26.7+ 和 CGO。采集程序需要 Linux 和 libpcap，分析程序通过 Go 读取 PCAP，依赖 SQLite 驱动。以下以 Debian/Ubuntu 为例。
 
 ```bash
 sudo apt-get update
@@ -27,7 +38,16 @@ cd traffic
 ./bin/traffic doctor
 ```
 
-构建脚本执行竞态测试、`go vet`，随后生成 `bin/traffic` 和校验文件。普通 HTTP 采集可通过 `--no-tls` 使用主程序。
+构建脚本执行竞态测试、`go vet`，生成独立的 `bin/traffic`、`bin/traffic-tui` 和校验文件。普通 HTTP 采集可通过 `--no-tls` 启动。
+
+也可以分别构建两个程序。
+
+```bash
+go build -o bin/traffic ./cmd/traffic
+go build -o bin/traffic-tui ./cmd/traffic-tui
+```
+
+单独构建分析程序需要 C 编译器，可在 Linux 或 macOS 上执行。
 
 ### HTTPS 采集依赖
 
@@ -64,15 +84,15 @@ sudo ./bin/traffic capture \
 
 ```bash
 # 采集过程中也可查询
-./bin/traffic status --session ./sessions/incident-001
-./bin/traffic events --session ./sessions/incident-001
-./bin/traffic requests --client 192.0.2.10 --session ./sessions/incident-001
+./bin/traffic-tui status --session ./sessions/incident-001
+./bin/traffic-tui events --session ./sessions/incident-001
+./bin/traffic-tui requests --client 192.0.2.10 --session ./sessions/incident-001
 
 # 查看完整记录，EVENT_ID 来自列表结果
-./bin/traffic show EVENT_ID --session ./sessions/incident-001
+./bin/traffic-tui show EVENT_ID --session ./sessions/incident-001
 
 # 停止采集后导出，目标文件必须不存在
-./bin/traffic export EVENT_ID \
+./bin/traffic-tui export EVENT_ID \
   --session ./sessions/incident-001 \
   --out ./evidence.zip
 ```
@@ -83,12 +103,44 @@ sudo ./bin/traffic capture \
 # 60 秒普通抓包与 HTTP 分析
 sudo ./bin/traffic capture --no-tls --duration 60s --output ./sessions/http-001
 
-# 离线分析明文 HTTP 流量
-./bin/traffic analyze capture.pcap --ports 80,8080 --output ./sessions/offline-001
+# 将已有明文 HTTP PCAP 导入会话
+./bin/traffic import capture.pcap --ports 80,8080 --output ./sessions/offline-001
 
 # 查看所有选项
 ./bin/traffic capture --help
 ```
+
+## 终端交互界面
+
+使用独立的分析程序，在交互式终端打开正在采集或已经结束的会话。
+
+```bash
+./bin/traffic-tui --session ./sessions/incident-001
+
+# 每两秒刷新，并预设筛选条件
+./bin/traffic-tui --session ./sessions/incident-001 \
+  --refresh 2s --client 192.0.2.10 --severity high
+```
+
+中文界面提供采集概览、请求列表和告警列表。概览显示累计请求和告警命中、网络包、各类丢弃、TLS 状态、资源限制及采集错误。列表每页 100 条，支持按客户端、规则、严重程度、起始时间和 Host/URL 关键词组合筛选。起始时间使用 RFC3339，例如 `2026-11-11T10:00:00+08:00`。规则和严重程度组合筛选要求同一条告警同时匹配。
+
+| 按键 | 操作 |
+| --- | --- |
+| `1` / `2` / `3` | 切换概览、请求、告警 |
+| `↑` / `↓` 或 `j` / `k` | 选择请求或滚动详情 |
+| `g` / `G` | 列表首尾 |
+| `n` / `p`、`←` / `→`、`PgDn` / `PgUp` | 列表翻页 |
+| `Enter` | 打开请求详情 |
+| `Tab` / `Shift+Tab` | 切换请求、响应、解码正文、检测依据 |
+| `/` | 打开筛选面板，`Tab` 切换字段，`Enter` 应用，`Ctrl+R` 清空字段 |
+| 空格 / `r` | 暂停或恢复自动刷新 / 手动刷新 |
+| `Esc` | 返回列表或取消筛选 |
+| `?` | 打开快捷键帮助 |
+| `q` / `Ctrl+C` | 退出 TUI |
+
+默认每秒自动刷新，历史页保持当前浏览位置，打开的详情会更新后续到达的响应。暂停刷新后仍可手动刷新和查询。宽度达到 120 列时详情与列表分栏，窄终端使用独立详情页。建议至少 80 列、24 行，时间按界面标注的本地时区显示。
+
+详情显示保存的请求响应文本、可用的 gzip 请求正文解码结果，以及规则版本、命中片段和解码来源。不完整及截断记录在列表和详情中标注。采集心跳超过五秒未更新时提示心跳过期，状态文件缺失时仍可浏览 SQLite 中的请求。分析程序以只读方式打开现有 SQLite 索引，证据导出写入指定的新 ZIP 文件。运行用户需要会话目录和文件的读取权限，普通查询和界面浏览无需管理员权限。
 
 ## 检测规则
 
@@ -149,10 +201,10 @@ python3 scripts/verify.py /tmp/traffic-functional --host 127.0.0.1
 python3 scripts/benchmark.py --output /tmp/traffic-performance --host 127.0.0.1
 ```
 
-脚本支持 `--binary` 和 `--config` 指定工具与 Nginx 配置。功能脚本检查 126 条请求及响应、已有 HTTPS 连接、TLS 版本、中文正文、五类规则、网站配置和 PID、证据校验。性能脚本默认 20/100 请求每秒、每组五分钟、重复三轮。
+脚本支持 `--binary` 和 `--config` 指定采集程序与 Nginx 配置。功能脚本另通过 `--analysis-binary` 指定证据导出所用的 `traffic-tui`，默认路径为 `/opt/traffic/bin/traffic-tui`。功能脚本检查 126 条请求及响应、已有 HTTPS 连接、TLS 版本、中文正文、五类规则、网站配置和 PID、证据校验。性能脚本默认 20/100 请求每秒、每组五分钟、重复三轮。
 
 HTTP/2、HTTP/3、WebSocket 内容解析、Java/Go TLS、Windows 及 x86_64 的完整采集验收待实现。HTTP/1.1 流中途缺失消息开头时，可见内容受限。代理后的来源地址默认取连接对端，经过 CDN 或负载均衡时需结合可信代理信息分析。
 
 ## 第三方组件
 
-主程序依赖及版本见 `go.mod`、`go.sum`。eCapture 以独立子进程运行，固定源码、补丁和构建方式随仓库提供。第三方版权与许可证说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+两个程序的依赖及版本见 `go.mod`、`go.sum`。eCapture 以独立子进程运行，固定源码、补丁和构建方式随仓库提供。第三方版权与许可证说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -81,27 +80,6 @@ func TestResponsePairing(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatal(count)
-	}
-}
-func TestExport(t *testing.T) {
-	loadRules("")
-	s, e := openStore(t.TempDir(), true)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer s.db.Close()
-	os.WriteFile(filepath.Join(s.dir, "capture.lock"), nil, 0600)
-	out := filepath.Join(t.TempDir(), "event.zip")
-	x := Transaction{ID: "example", Time: time.Now(), Request: []byte("example")}
-	b, _ := json.Marshal(x)
-	if e = exportEvidence(s, x, b, out); e != nil {
-		t.Fatal(e)
-	}
-	if _, e = os.Stat(out); e != nil {
-		t.Fatal(e)
-	}
-	if e = exportEvidence(s, x, b, out); e == nil {
-		t.Fatal("overwrote export")
 	}
 }
 func TestProtobufMalformed(t *testing.T) {

@@ -25,6 +25,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("output", type=Path)
 parser.add_argument("--host", default="127.0.0.1")
 parser.add_argument("--binary", default="/opt/traffic/bin/traffic")
+parser.add_argument("--analysis-binary", default="/opt/traffic/bin/traffic-tui")
 parser.add_argument(
     "--config", type=Path, default=Path("/etc/nginx/sites-available/traffic-lab")
 )
@@ -122,7 +123,7 @@ assert not any(row.get("alerts") for row in rows if row["method"] == "POST"), (
 event = next(row for row in rows if row.get("alerts"))
 archive = output.parent / (output.name + "-evidence.zip")
 subprocess.run(
-    [binary, "export", event["id"], "--session", str(output), "--out", str(archive)],
+    [args.analysis_binary, "export", event["id"], "--session", str(output), "--out", str(archive)],
     check=True,
 )
 with zipfile.ZipFile(archive) as evidence:

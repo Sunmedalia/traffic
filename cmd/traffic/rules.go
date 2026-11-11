@@ -1,13 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
-	"compress/gzip"
 	"fmt"
-	"io"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -17,6 +13,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/Sunmedalia/traffic/internal/session"
 )
 
 type Rule struct {
@@ -126,32 +124,7 @@ func decodePercent(text string) string {
 	})
 }
 
-func safeText(b []byte) string { return strings.ToValidUTF8(string(b), "�") }
-
-func decodedBody(raw []byte) (string, string) {
-	request, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
-	if err != nil {
-		return "", ""
-	}
-	defer request.Body.Close()
-	if !strings.EqualFold(request.Header.Get("Content-Encoding"), "gzip") {
-		return "", ""
-	}
-	reader, err := gzip.NewReader(request.Body)
-	if err != nil {
-		return "", ""
-	}
-	defer reader.Close()
-	body, err := io.ReadAll(io.LimitReader(reader, int64(requestLimit)+1))
-	view := "gzip-body"
-	if len(body) > requestLimit {
-		body = body[:requestLimit]
-		view = "gzip-body-truncated"
-	} else if err != nil {
-		view = "gzip-body-incomplete"
-	}
-	return string(body), view
-}
+func decodedBody(raw []byte) (string, string) { return session.DecodedBody(raw, requestLimit) }
 
 type scanPath struct {
 	when   time.Time
