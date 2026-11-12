@@ -301,6 +301,8 @@ func tuiState(s string) string {
 		return "已停止"
 	case "complete":
 		return "已完成"
+	case "failed":
+		return "采集失败"
 	case "stale":
 		return "心跳过期"
 	case "":

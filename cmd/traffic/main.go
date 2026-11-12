@@ -37,7 +37,7 @@ func main() {
 		os.Exit(1)
 	}
 }
-func run(args []string) error {
+func run(args []string) (runErr error) {
 	syscall.Umask(0077)
 	if len(args) == 0 {
 		return errors.New("usage: traffic doctor|capture|import|rules")
@@ -66,7 +66,9 @@ func run(args []string) error {
 		return nil
 	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
-	output := fs.String("output", "", "capture output directory")
+	output := fs.String("output", "", "exact session directory; default is auto-created under --data-dir")
+	dataDir := fs.String("data-dir", "./sessions", "root directory for automatically named sessions")
+	name := fs.String("name", "", "session name; default capture or import")
 	ports := fs.String("ports", "80,443", "TCP ports")
 	interfaces := fs.String("interfaces", "", "comma-separated interfaces")
 	pid := fs.Int("pid", 0, "Nginx worker PID; default auto-discovered worker UID")
@@ -110,16 +112,58 @@ func run(args []string) error {
 		return nil
 	}
 	if cmd == "capture" || cmd == "import" {
-		if *output == "" {
-			return errors.New("--output required")
-		}
 		if cmd == "import" && id == "" {
 			return errors.New("PCAP path required")
 		}
-		debug.SetMemoryLimit(220 << 20)
-		if e := os.MkdirAll(*output, 0700); e != nil {
-			return e
+		// Validate inputs before reserving a session directory.
+		filterParts := []string{}
+		for _, port := range strings.Split(*ports, ",") {
+			number, err := strconv.Atoi(port)
+			if err != nil || number < 1 || number > 65535 {
+				return fmt.Errorf("invalid port %q", port)
+			}
+			filterParts = append(filterParts, fmt.Sprintf("port %d", number))
 		}
+		filter := "tcp and (" + strings.Join(filterParts, " or ") + ")"
+		names := []string{"any"}
+		if *interfaces != "" {
+			names = strings.Split(*interfaces, ",")
+		}
+		for _, iface := range names {
+			if strings.TrimSpace(iface) != iface || iface == "" || strings.ContainsAny(iface, "/\\") {
+				return fmt.Errorf("invalid interface %q", iface)
+			}
+		}
+		if cmd == "import" {
+			handle, err := pcap.OpenOffline(id)
+			if err != nil {
+				return err
+			}
+			handle.Close()
+		}
+		dataDirSet := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "data-dir" {
+				dataDirSet = true
+			}
+		})
+		if *output != "" && dataDirSet {
+			return errors.New("use either --output or --data-dir")
+		}
+		if *name == "" {
+			*name = cmd
+		}
+		host, err := os.Hostname()
+		if err != nil {
+			return err
+		}
+		started := time.Now()
+		directory, err := prepareOutputDir(*output, *dataDir, *name, host, started)
+		if err != nil {
+			return err
+		}
+		*output = directory
+		debug.SetMemoryLimit(220 << 20)
 		lock, e := os.OpenFile(filepath.Join(*output, "capture.lock"), os.O_CREATE|os.O_RDWR, 0600)
 		if e != nil {
 			return e
@@ -137,6 +181,21 @@ func run(args []string) error {
 			return e
 		}
 		defer s.db.Close()
+		defer func() {
+			if runErr != nil {
+				s.mu.Lock()
+				alreadyReported := s.fatal != nil
+				s.stats.State = "failed"
+				s.mu.Unlock()
+				if !alreadyReported {
+					s.problem(runErr)
+				}
+				s.report()
+			}
+		}()
+		s.stats.Started = started.UTC()
+		fmt.Fprintf(os.Stderr, "会话目录 %s\n", s.dir)
+		s.report()
 		p := newHTTP(s)
 		if cmd == "capture" {
 			cleanup, e := limitResources()
@@ -155,39 +214,49 @@ func run(args []string) error {
 			ctx, stop = context.WithTimeout(ctx, *duration)
 			defer stop()
 		}
-		filterParts := []string{}
-		for _, port := range strings.Split(*ports, ",") {
-			n, e := strconv.Atoi(port)
-			if e != nil || n < 1 || n > 65535 {
-				return fmt.Errorf("invalid port %q", port)
-			}
-			filterParts = append(filterParts, fmt.Sprintf("port %d", n))
+		manifest := map[string]any{
+			"schema_version": 1,
+			"layout_version": 2,
+			"hostname":       host,
+			"name":           *name,
+			"mode":           cmd,
+			"started":        s.stats.Started,
+			"filter":         filter,
+			"tls_enabled":    cmd == "capture" && !*noTLS,
+			"rules":          rules,
+			"header_limit":   32768,
+			"request_limit":  requestLimit,
+			"response_limit": responseLimit,
 		}
-		filter := "tcp and (" + strings.Join(filterParts, " or ") + ")"
 		if cmd == "import" {
-			e = capturePackets(ctx, s, p, "offline", filter, id)
-			p.wg.Wait()
-			s.mu.Lock()
-			s.stats.State = "complete"
-			s.mu.Unlock()
-			s.report()
-			return e
+			manifest["input_pcap"] = id
 		}
-		manifest := map[string]any{"schema_version": 1, "started": time.Now().UTC(), "filter": filter, "ecapture_version": "v2.9.1+traffic.1", "rules": rules, "header_limit": 32768, "request_limit": requestLimit, "response_limit": responseLimit}
-		if file, e := os.Open(*ecapture); e == nil {
-			hash := sha256.New()
-			if _, e = io.Copy(hash, file); e == nil {
-				manifest["ecapture_sha256"] = hex.EncodeToString(hash.Sum(nil))
+		if cmd == "capture" && !*noTLS {
+			manifest["ecapture_version"] = "v2.9.1+traffic.1"
+			if file, e := os.Open(*ecapture); e == nil {
+				hash := sha256.New()
+				if _, e = io.Copy(hash, file); e == nil {
+					manifest["ecapture_sha256"] = hex.EncodeToString(hash.Sum(nil))
+				}
+				file.Close()
 			}
-			file.Close()
 		}
 		b, _ := json.MarshalIndent(manifest, "", "  ")
 		if err := os.WriteFile(filepath.Join(s.dir, "manifest.json"), b, 0600); err != nil {
 			return err
 		}
-		names := strings.Split(*interfaces, ",")
-		if *interfaces == "" {
-			names = []string{"any"}
+		s.report()
+		if cmd == "import" {
+			e = capturePackets(ctx, s, p, "offline", filter, id)
+			p.wg.Wait()
+			if e != nil {
+				return e
+			}
+			s.mu.Lock()
+			s.stats.State = "complete"
+			s.mu.Unlock()
+			s.report()
+			return nil
 		}
 		var wg sync.WaitGroup
 		for _, name := range names {
@@ -254,6 +323,9 @@ func run(args []string) error {
 		p.wg.Wait()
 		s.mu.Lock()
 		s.stats.State = "stopped"
+		if s.fatal != nil {
+			s.stats.State = "failed"
+		}
 		s.mu.Unlock()
 		s.report()
 		emit(s.stats)

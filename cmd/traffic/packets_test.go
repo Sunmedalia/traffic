@@ -63,6 +63,9 @@ func TestOfflineReassemblyOutOfOrderAndRetransmission(t *testing.T) {
 		t.Fatal(e)
 	}
 	p.wg.Wait()
+	if _, err := os.Stat(filepath.Join(s.dir, "packets", "offline-01.pcap")); err != nil {
+		t.Fatalf("packet evidence not organized: %v", err)
+	}
 	var bts []byte
 	if e = s.db.QueryRow("SELECT data FROM requests").Scan(&bts); e != nil {
 		t.Fatal(e)

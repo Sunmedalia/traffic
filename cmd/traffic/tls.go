@@ -69,7 +69,12 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 		}
 		args = append(args, "-u", strconv.Itoa(uid))
 	}
-	log, e := os.OpenFile(filepath.Join(s.dir, "tls.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	for _, name := range []string{"logs", "tls"} {
+		if err := os.MkdirAll(filepath.Join(s.dir, name), 0700); err != nil {
+			return err
+		}
+	}
+	log, e := os.OpenFile(filepath.Join(s.dir, "logs", "tls.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if e != nil {
 		return e
 	}
@@ -125,7 +130,7 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 	s.mu.Lock()
 	s.stats.TLS = "attached"
 	s.mu.Unlock()
-	events, err := os.OpenFile(filepath.Join(s.dir, "tls-events.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	events, err := os.OpenFile(filepath.Join(s.dir, "tls", "events.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return err
 	}

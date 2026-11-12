@@ -110,6 +110,38 @@ sudo ./bin/traffic capture --no-tls --duration 60s --output ./sessions/http-001
 ./bin/traffic capture --help
 ```
 
+## 会话目录
+
+省略 `--output` 时，采集和 PCAP 导入会自动按主机、日期和本地开始时间创建会话。使用 `--name` 标注网站或事件，默认名称分别为 `capture` 和 `import`。
+
+```bash
+sudo ./bin/traffic capture --name nginx
+sudo ./bin/traffic capture --data-dir /var/lib/traffic/sessions --name incident-001
+./bin/traffic import capture.pcap --name offline-review
+```
+
+例如在主机 `web-01` 上执行第一条命令，将生成以下目录。
+
+```text
+sessions/web-01/2026-11-11/15-04-05-nginx/
+├── manifest.json
+├── status.json
+├── index.sqlite
+├── capture.lock
+├── packets/
+│   └── any-01.pcap
+├── tls/
+│   └── events.jsonl
+└── logs/
+    └── tls.log
+```
+
+`packets/` 保存循环 PCAP，`tls/` 保存 TLS 原始明文事件，`logs/` 保存探针诊断。TLS 相关目录按需创建。SQLite 运行期间还可能产生 `index.sqlite-wal` 和 `index.sqlite-shm`。复制会话时应完整复制整个目录。
+
+启动时程序在 stderr 输出会话绝对路径，可将此路径传给 `traffic-tui --session`。`manifest.json` 记录主机、会话名称、采集或导入模式、开始时间、过滤条件和目录布局版本。新目录使用布局版本 2，HTTP 数据结构继续使用 schema version 1，分析程序支持原有平铺目录和新目录的读取及证据导出。
+
+同一秒内启动同名会话时，目录自动添加 `-02`、`-03` 等后缀。`--name` 支持中文、字母、数字、连字符、下划线和点，最大 80 字节。`--output` 继续表示精确的会话路径，适用于已有脚本。它与显式设置的 `--data-dir` 互斥。
+
 ## 终端交互界面
 
 使用独立的分析程序，在交互式终端打开正在采集或已经结束的会话。

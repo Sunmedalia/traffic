@@ -86,7 +86,7 @@ func (r *packetRing) write(ci gopacket.CaptureInfo, b []byte) error {
 			r.file.Close()
 		}
 		r.index = (r.index + 1) % 16
-		name := filepath.Join(r.dir, fmt.Sprintf("packets-%s-%02d.pcap", r.iface, r.index))
+		name := filepath.Join(r.dir, fmt.Sprintf("%s-%02d.pcap", r.iface, r.index))
 		f, e := os.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 		if e != nil {
 			return e
@@ -129,7 +129,11 @@ func capturePackets(ctx context.Context, s *Store, p *HTTPProcessor, iface, filt
 	a.MaxBufferedPagesTotal = 4096
 	a.MaxBufferedPagesPerConnection = 64
 	defer a.FlushAll()
-	ring := packetRing{dir: s.dir, iface: iface, link: h.LinkType()}
+	packetDir := filepath.Join(s.dir, "packets")
+	if err := os.MkdirAll(packetDir, 0700); err != nil {
+		return err
+	}
+	ring := packetRing{dir: packetDir, iface: iface, link: h.LinkType()}
 	defer func() {
 		if ring.file != nil {
 			ring.file.Close()

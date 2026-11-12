@@ -92,92 +92,103 @@ func TestEvidenceEndpointMatching(t *testing.T) {
 	}
 }
 func TestExportPacketScopeAndHashes(t *testing.T) {
-	s := tuiTestStore(t)
-	if err := os.WriteFile(filepath.Join(s.dir, "capture.lock"), nil, 0600); err != nil {
-		t.Fatal(err)
-	}
-	packets, err := os.Create(filepath.Join(s.dir, "packets-test.pcap"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer := pcapgo.NewWriter(packets)
-	if err = writer.WriteFileHeader(65535, layers.LinkTypeEthernet); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC().Truncate(time.Second)
-	samples := []struct {
-		port  layers.TCPPort
-		stamp time.Time
-	}{{12345, now}, {9999, now}, {12345, now.Add(-61 * time.Second)}, {12345, now.Add(61 * time.Second)}}
-	for _, sample := range samples {
-		data := evidencePacket(t, false, sample.port)
-		if err = writer.WritePacket(gopacket.CaptureInfo{Timestamp: sample.stamp, CaptureLength: len(data), Length: len(data)}, data); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err = packets.Close(); err != nil {
-		t.Fatal(err)
-	}
-	transaction := Transaction{ID: "packet-scope", Time: now, Client: "192.0.2.1:12345"}
-	raw, err := json.Marshal(transaction)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out := filepath.Join(t.TempDir(), "evidence.zip")
-	if err = exportEvidence(s, transaction, raw, out); err != nil {
-		t.Fatal(err)
-	}
-	archive, err := zip.OpenReader(out)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer archive.Close()
-	contents := map[string][]byte{}
-	for _, entry := range archive.File {
-		stream, err := entry.Open()
-		if err != nil {
-			t.Fatal(err)
-		}
-		contents[entry.Name], err = io.ReadAll(stream)
-		stream.Close()
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	var hashes map[string]string
-	if err = json.Unmarshal(contents["sha256.json"], &hashes); err != nil {
-		t.Fatal(err)
-	}
-	for name, digest := range hashes {
-		sum := sha256.Sum256(contents[name])
-		if hex.EncodeToString(sum[:]) != digest {
-			t.Fatalf("hash mismatch %s", name)
-		}
-	}
-	reader, err := pcapgo.NewReader(bytes.NewReader(contents["packets-test.pcap"]))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err = reader.ReadPacketData(); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err = reader.ReadPacketData(); err != io.EOF {
-		t.Fatalf("unexpected extra packet: %v", err)
-	}
-	lock, err := os.OpenFile(filepath.Join(s.dir, "capture.lock"), os.O_RDWR, 0600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lock.Close()
-	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		t.Fatal(err)
-	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-	blocked := filepath.Join(t.TempDir(), "blocked.zip")
-	if err = exportEvidence(s, transaction, raw, blocked); err == nil {
-		t.Fatal("export permitted during capture")
-	}
-	if _, err = os.Stat(blocked); !os.IsNotExist(err) {
-		t.Fatal("failed export left a partial archive")
+	for _, folder := range []string{"legacy", "organized"} {
+		t.Run(folder, func(t *testing.T) {
+			s := tuiTestStore(t)
+			if err := os.WriteFile(filepath.Join(s.dir, "capture.lock"), nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			entry := "packets-test.pcap"
+			if folder == "organized" {
+				if err := os.MkdirAll(filepath.Join(s.dir, "packets"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				entry = "packets/any-01.pcap"
+			}
+			packets, err := os.Create(filepath.Join(s.dir, filepath.FromSlash(entry)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			writer := pcapgo.NewWriter(packets)
+			if err = writer.WriteFileHeader(65535, layers.LinkTypeEthernet); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC().Truncate(time.Second)
+			samples := []struct {
+				port  layers.TCPPort
+				stamp time.Time
+			}{{12345, now}, {9999, now}, {12345, now.Add(-61 * time.Second)}, {12345, now.Add(61 * time.Second)}}
+			for _, sample := range samples {
+				data := evidencePacket(t, false, sample.port)
+				if err = writer.WritePacket(gopacket.CaptureInfo{Timestamp: sample.stamp, CaptureLength: len(data), Length: len(data)}, data); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err = packets.Close(); err != nil {
+				t.Fatal(err)
+			}
+			transaction := Transaction{ID: "packet-scope", Time: now, Client: "192.0.2.1:12345"}
+			raw, err := json.Marshal(transaction)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := filepath.Join(t.TempDir(), "evidence.zip")
+			if err = exportEvidence(s, transaction, raw, out); err != nil {
+				t.Fatal(err)
+			}
+			archive, err := zip.OpenReader(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer archive.Close()
+			contents := map[string][]byte{}
+			for _, fileEntry := range archive.File {
+				stream, err := fileEntry.Open()
+				if err != nil {
+					t.Fatal(err)
+				}
+				contents[fileEntry.Name], err = io.ReadAll(stream)
+				stream.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			var hashes map[string]string
+			if err = json.Unmarshal(contents["sha256.json"], &hashes); err != nil {
+				t.Fatal(err)
+			}
+			for name, digest := range hashes {
+				sum := sha256.Sum256(contents[name])
+				if hex.EncodeToString(sum[:]) != digest {
+					t.Fatalf("hash mismatch %s", name)
+				}
+			}
+			reader, err := pcapgo.NewReader(bytes.NewReader(contents[entry]))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err = reader.ReadPacketData(); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err = reader.ReadPacketData(); err != io.EOF {
+				t.Fatalf("unexpected extra packet: %v", err)
+			}
+			lock, err := os.OpenFile(filepath.Join(s.dir, "capture.lock"), os.O_RDWR, 0600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Close()
+			if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+				t.Fatal(err)
+			}
+			defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+			blocked := filepath.Join(t.TempDir(), "blocked.zip")
+			if err = exportEvidence(s, transaction, raw, blocked); err == nil {
+				t.Fatal("export permitted during capture")
+			}
+			if _, err = os.Stat(blocked); !os.IsNotExist(err) {
+				t.Fatal("failed export left a partial archive")
+			}
+		})
 	}
 }

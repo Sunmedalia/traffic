@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Sunmedalia/traffic/internal/session"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
@@ -66,7 +67,10 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	host, port, e := net.SplitHostPort(t.Client)
 	if e == nil {
-		files, _ := filepath.Glob(filepath.Join(s.dir, "packets-*.pcap"))
+		files, err := session.PacketFiles(s.dir)
+		if err != nil {
+			return err
+		}
 		for _, name := range files {
 			file, e := os.Open(name)
 			if e != nil {
@@ -77,7 +81,12 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 				file.Close()
 				return e
 			}
-			entry := filepath.Base(name)
+			entry, err := filepath.Rel(s.dir, name)
+			if err != nil {
+				file.Close()
+				return err
+			}
+			entry = filepath.ToSlash(entry)
 			w, e := z.Create(entry)
 			if e != nil {
 				file.Close()
