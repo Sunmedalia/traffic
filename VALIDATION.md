@@ -1,5 +1,25 @@
 # 验证记录
 
+## 2026-11-12 Windows Nginx / Apache 开发验证
+
+在同一台 Windows 10 LTSC 17763 x64 测试机上新增独立的 Nginx 1.28.0 官方 x86 二进制和 Apache Lounge 2.4.71 x64 实例。Nginx 测试端口为 18080/18443，Apache 为 18081/18444，Python HTTP/1.1 回显后端为 18090，验收通过回环地址访问。服务在附加前启动，测试过程保持工作进程身份和两份站点配置哈希。
+
+Nginx 静态 OpenSSL 的函数入口由内置二进制 profile 解析，文件 SHA-256 为 `53530836391897ea218d8040acdd467cd4832efab597e534d7c670e0e6c94b3c`，先校验整个文件与函数入口再拦截。Apache 使用导出的 `libssl-3-x64.dll` API，mod_ssl 自定义 BIO 的套接字通过 `SSL_get_ex_data`、`ap_get_conn_socket` 和 `apr_os_sock_get` 取得。
+
+最终 62 条 HTTP/1.1 请求及响应全部比对通过，包括 12 条 HTTP 和 50 条 HTTPS / TLS 1.2、1.3。覆盖保持活跃的附加前既有连接、中文 POST、分块响应、HEAD、404、四路并发、大响应截断后的下一条请求及 SQLI-001 告警。另发出 29 条保持原连接活跃的附加预热请求，其中 10 条被记录，最终会话共 72 条记录、1163 个网络包、6 次告警，网卡、队列和 TLS 已观测丢弃计数均为零。预热包含探针尚未就绪时的流量，不能据此声称无启动缺口。
+
+两个 helper 均报告 `hooks_removed=true`、`script_unloaded=true`、`transport_detached=true`。测试前后 Nginx worker 身份为 `8972:134389675973912963`，Apache worker 为 `8880:134389676868048643`，配置哈希保持一致。最终二进制在同一批工作进程上完成重复附加与采集，验收中保持服务运行。期间一次网络连接中断后已重新连接并取回成功报告，主机启动时间及服务进程保持一致。
+
+HTTP 联测发现并修复三个共享解析问题。收发方向并行时，HEAD 响应需要先取得请求方法。正文超过保存上限时，需要排空剩余正文并继续处理同连接后续消息。回环小分片突发可能用尽单流 16 个槽位，现调整为 256 个槽位，全局正文队列仍限制为 32 MiB。新增请求方法通知和有界等待、截断后续响应和 OpenSSL 丢失边界回归测试。
+
+指定 Python ctypes 测试进程 PID，外部调用 `SSL_read_ex` / `SSL_write_ex`，TLS 1.2、1.3 两条请求均还原为 backend `openssl`、状态码 200，丢弃计数为零。OpenSSL `s_server -www` 的内部 BIO 路径另外测试为未取得明文，不能将 DLL 导出 API 的验收推广到所有 OpenSSL 调用路径。静态 profile 缺失的故障注入通过，目标状态为 `unavailable`，同一 Nginx 的 HTTP 请求仍完整采集为 backend `pcap`。
+
+本地全仓库 `go test -race ./...`、macOS 与 Windows `go vet ./...`、Windows x64 交叉构建通过。Windows 实机的进程身份、监听端口所有权、Nginx/Apache 名称识别、通用 PID 发现、既有 IIS assembler、OpenSSL 丢失边界、HEAD 并行解析及截断后续响应测试通过。分析程序的服务及规则筛选、HTTPS 请求导出和 ZIP 内 SHA-256 清单核验通过。
+
+完整成功报告和会话在测试机 `C:\traffic-lab\validation\middleware-final`、`middleware-generic-api` 和 `middleware-fallback`，本地证据在 `validation/windows-middleware/`，主会话另保存到 `sessions/192.168.1.11/2026-11-12/windows-middleware-final/`。证据、二进制和测试私钥在 Git 忽略目录中。测试站点保留运行，测试采集器及辅助进程在验收结束后退出。
+
+当前限制包括动态附加前已进入的调用和半截消息、其他静态 Nginx 版本、其他自定义 BIO、HTTP/2、HTTP/3、Windows Go TLS/JSSE、模块热替换和长期性能。启动预热用于保持原连接并等待附加。其他中间件需要各自实机验证。
+
 ## 2026-11-12 Windows x64 开发验证
 
 测试机为用户指定的 `192.168.1.11`，Windows 10 企业版 LTSC、版本 `10.0.17763`、x64，已有 Npcap。Windows 时钟显示 `2026-01-14` 附近，与开发机日期不同，采集时间保留测试机原值。

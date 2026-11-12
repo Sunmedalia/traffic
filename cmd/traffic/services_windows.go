@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/xml"
 	"fmt"
 	"os"
@@ -46,10 +47,79 @@ func processTarget(root string, pid int) (session.Target, error) {
 	if err := windows.QueryFullProcessImageName(handle, 0, &buffer[0], &size); err != nil {
 		return target, err
 	}
-	if strings.EqualFold(filepath.Base(windows.UTF16ToString(buffer[:size])), "w3wp.exe") {
-		target.Service = "iis"
-	}
+	target.Service = windowsServiceName(filepath.Base(windows.UTF16ToString(buffer[:size])))
 	return target, nil
+}
+
+func windowsServiceName(name string) string {
+	switch strings.ToLower(name) {
+	case "w3wp.exe":
+		return "iis"
+	case "nginx.exe":
+		return "nginx"
+	case "httpd.exe", "apache.exe", "apache2.exe":
+		return "apache"
+	default:
+		return "unknown"
+	}
+}
+
+// Query ownership from the TCP stack rather than guessing service ports.
+func windowsListeningPorts() map[int][]int {
+	result := make(map[int][]int)
+	proc := windows.NewLazySystemDLL("iphlpapi.dll").NewProc("GetExtendedTcpTable")
+	for _, family := range []uint32{windows.AF_INET, windows.AF_INET6} {
+		var size uint32
+		proc.Call(0, uintptr(unsafe.Pointer(&size)), 0, uintptr(family), 3, 0)
+		if size < 4 || size > 16<<20 {
+			continue
+		}
+		buffer := make([]byte, size)
+		status, _, _ := proc.Call(uintptr(unsafe.Pointer(&buffer[0])), uintptr(unsafe.Pointer(&size)), 0, uintptr(family), 3, 0)
+		if status != 0 {
+			continue
+		}
+		rowSize, portOffset, pidOffset := 24, 8, 20
+		if family == windows.AF_INET6 {
+			rowSize, portOffset, pidOffset = 56, 20, 52
+		}
+		count := int(binary.LittleEndian.Uint32(buffer))
+		for index := 0; index < count && 4+(index+1)*rowSize <= len(buffer); index++ {
+			row := buffer[4+index*rowSize : 4+(index+1)*rowSize]
+			pid := int(binary.LittleEndian.Uint32(row[pidOffset:]))
+			port := int(binary.BigEndian.Uint16(row[portOffset:]))
+			exists := false
+			for _, previous := range result[pid] {
+				if previous == port {
+					exists = true
+				}
+			}
+			if !exists {
+				result[pid] = append(result[pid], port)
+			}
+		}
+	}
+	for _, ports := range result {
+		sort.Ints(ports)
+	}
+	return result
+}
+
+func windowsTLSLibrary(pid int) string {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPMODULE|windows.TH32CS_SNAPMODULE32, uint32(pid))
+	if err != nil {
+		return ""
+	}
+	defer windows.CloseHandle(snapshot)
+	entry := windows.ModuleEntry32{Size: uint32(unsafe.Sizeof(windows.ModuleEntry32{}))}
+	for err = windows.Module32First(snapshot, &entry); err == nil; err = windows.Module32Next(snapshot, &entry) {
+		name := windows.UTF16ToString(entry.Module[:])
+		lower := strings.ToLower(name)
+		if strings.Contains(lower, "libssl") || lower == "ssleay32.dll" {
+			return name
+		}
+	}
+	return ""
 }
 
 // IIS listeners belong to HTTP.sys, not to the individual worker process.
@@ -91,7 +161,7 @@ func iisPorts() []int {
 	return ports
 }
 
-func discoverTargets(root, service string, selectedPID int, _ string) []session.Target {
+func discoverTargets(root, service string, selectedPID int, library string) []session.Target {
 	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
 		return nil
@@ -100,36 +170,74 @@ func discoverTargets(root, service string, selectedPID int, _ string) []session.
 	entry := windows.ProcessEntry32{Size: uint32(unsafe.Sizeof(windows.ProcessEntry32{}))}
 	var targets []session.Target
 	ports := iisPorts()
+	listeners := windowsListeningPorts()
+	parents := make(map[int]int)
 	for err = windows.Process32First(snapshot, &entry); err == nil; err = windows.Process32Next(snapshot, &entry) {
 		if selectedPID > 0 && int(entry.ProcessID) != selectedPID {
 			continue
 		}
-		if selectedPID == 0 && !strings.EqualFold(windows.UTF16ToString(entry.ExeFile[:]), "w3wp.exe") {
+		if selectedPID == 0 && windowsServiceName(windows.UTF16ToString(entry.ExeFile[:])) == "unknown" {
 			continue
 		}
 		target, err := processTarget(root, int(entry.ProcessID))
+		if service == "openssl" && selectedPID > 0 {
+			target.Service = "openssl"
+		}
 		if err != nil || (service != "auto" && target.Service != service) {
 			continue
+		}
+		parents[target.PID] = int(entry.ParentProcessID)
+		target.Ports = listeners[target.PID]
+		target.Library = library
+		if target.Library == "" {
+			target.Library = windowsTLSLibrary(target.PID)
+		}
+		if target.Library != "" {
+			target.State = "discovered"
 		}
 		if target.Service == "iis" {
 			target.Ports = ports
 		}
 		targets = append(targets, target)
 	}
+	for index := range targets {
+		if len(targets[index].Ports) == 0 {
+			targets[index].Ports = listeners[parents[targets[index].PID]]
+		}
+	}
+	if selectedPID == 0 {
+		// Windows Nginx and Apache masters delegate requests to child processes.
+		// Keep the parent's listener ports above, but instrument the workers.
+		masters := make(map[int]bool)
+		for _, child := range targets {
+			for _, parent := range targets {
+				if parents[child.PID] == parent.PID && child.Service == parent.Service && (child.Service == "nginx" || child.Service == "apache") {
+					masters[parent.PID] = true
+				}
+			}
+		}
+		workers := targets[:0]
+		for _, target := range targets {
+			if !masters[target.PID] {
+				workers = append(workers, target)
+			}
+		}
+		targets = workers
+	}
 	sort.Slice(targets, func(i, j int) bool { return targets[i].PID < targets[j].PID })
 	return targets
 }
 
-func captureServices(ctx context.Context, s *Store, _ *HTTPProcessor, _, _, service string, pid int, _ bool, _, _ string, _ int) {
-	if iisProbe != "" {
-		captureWindowsIIS(ctx, s, service, pid)
+func captureServices(ctx context.Context, s *Store, p *HTTPProcessor, _, library, service string, pid int, _ bool, _, _ string, _ int) {
+	if iisProbe != "" || opensslProbe != "" {
+		captureWindowsServices(ctx, s, p, service, pid, library)
 		return
 	}
-	s.problem(fmt.Errorf("Windows IIS HTTPS plaintext is unverified; use scripts/windows/probe-iis.py for the dynamic API experiment"))
+	s.problem(fmt.Errorf("Windows HTTPS probes are disabled; enable --iis-probe or --openssl-probe for plaintext capture"))
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
-		targets := discoverTargets("", service, pid, "")
+		targets := discoverTargets("", service, pid, library)
 		s.mu.Lock()
 		s.stats.TLS = "unavailable"
 		s.stats.Targets = targets

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -39,5 +41,33 @@ func TestIISBindingPorts(t *testing.T) {
 	}
 	if ports := iisPorts(); !reflect.DeepEqual(ports, []int{8080, 8443}) {
 		t.Fatalf("IIS binding ports %v", ports)
+	}
+}
+
+func TestWindowsMiddlewareDiscovery(t *testing.T) {
+	for name, expected := range map[string]string{"NGINX.EXE": "nginx", "httpd.exe": "apache", "apache2.exe": "apache", "w3wp.exe": "iis", "java.exe": "unknown"} {
+		if got := windowsServiceName(name); got != expected {
+			t.Fatalf("%s: %s", name, got)
+		}
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	_, text, _ := net.SplitHostPort(listener.Addr().String())
+	port, _ := strconv.Atoi(text)
+	found := false
+	for _, got := range windowsListeningPorts()[os.Getpid()] {
+		if got == port {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("listener %d missing from TCP ownership table", port)
+	}
+	targets := discoverTargets("", "openssl", os.Getpid(), "custom-ssl.dll")
+	if len(targets) != 1 || targets[0].Service != "openssl" || targets[0].Library != "custom-ssl.dll" {
+		t.Fatalf("generic OpenSSL discovery: %+v", targets)
 	}
 }

@@ -34,7 +34,7 @@ type streamFactory struct {
 }
 
 func (f *streamFactory) New(n, t gopacket.Flow) tcpassembly.Stream {
-	r := queuedStream{chunks: make(chan []byte, 16), store: f.p.s}
+	r := queuedStream{chunks: make(chan []byte, 256), store: f.p.s}
 	ends := []string{net.JoinHostPort(n.Src().String(), t.Src().String()), net.JoinHostPort(n.Dst().String(), t.Dst().String())}
 	client := ends[0]
 	r.server = ends[1]

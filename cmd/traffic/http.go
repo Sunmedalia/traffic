@@ -13,14 +13,16 @@ import (
 )
 
 type HTTPProcessor struct {
-	s             *Store
-	mu            sync.Mutex
-	pending       map[string][]Transaction
-	responses     map[string][]responseData
-	responseBytes int64
-	responseCount int
-	wg            sync.WaitGroup
-	slots         chan struct{}
+	s              *Store
+	mu             sync.Mutex
+	pending        map[string][]Transaction
+	responses      map[string][]responseData
+	responseBytes  int64
+	requestMethods map[string][]string
+	requestReady   chan struct{}
+	responseCount  int
+	wg             sync.WaitGroup
+	slots          chan struct{}
 }
 
 type responseData struct {
@@ -31,7 +33,7 @@ type responseData struct {
 }
 
 func newHTTP(s *Store) *HTTPProcessor {
-	return &HTTPProcessor{s: s, pending: map[string][]Transaction{}, responses: map[string][]responseData{}, slots: make(chan struct{}, 2000)}
+	return &HTTPProcessor{s: s, requestMethods: map[string][]string{}, requestReady: make(chan struct{}), pending: map[string][]Transaction{}, responses: map[string][]responseData{}, slots: make(chan struct{}, 2000)}
 }
 func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int, incomplete bool) {
 	br := bufio.NewReaderSize(r, 32768)
@@ -47,12 +49,7 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			return
 		}
 		if strings.HasPrefix(string(prefix), "HTTP/") {
-			p.mu.Lock()
-			var request *http.Request
-			if q := p.pending[key]; len(q) > 0 {
-				request = &http.Request{Method: q[0].Method}
-			}
-			p.mu.Unlock()
+			request := p.responseRequest(key)
 			resp, e := http.ReadResponse(br, request)
 			if e != nil {
 				return
@@ -60,8 +57,17 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			if resp.StatusCode >= 100 && resp.StatusCode < 200 && resp.StatusCode != 101 {
 				continue
 			}
+			p.mu.Lock()
+			if methods := p.requestMethods[key]; len(methods) > 1 {
+				p.requestMethods[key] = methods[1:]
+			} else {
+				delete(p.requestMethods, key)
+			}
+			p.mu.Unlock()
 			body, e := io.ReadAll(io.LimitReader(resp.Body, int64(responseLimit)+1))
-			resp.Body.Close()
+			if closeErr := resp.Body.Close(); e == nil {
+				e = closeErr
+			}
 			truncated := len(body) > responseLimit
 			if truncated {
 				body = body[:responseLimit]
@@ -109,9 +115,6 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				}
 			}
 			p.mu.Unlock()
-			if truncated {
-				return
-			}
 		} else {
 			req, e := http.ReadRequest(br)
 			if e != nil {
@@ -121,8 +124,26 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				p.s.problem(fmt.Errorf("unsupported HTTP protocol %s", req.Proto))
 				return
 			}
+			// Publish the method before reading the request body. Responses can
+			// run on another packet stream, and HEAD framing needs this method.
+			p.mu.Lock()
+			if len(p.requestMethods) >= 2000 {
+				p.requestMethods = map[string][]string{}
+			}
+			methods := p.requestMethods[key]
+			if len(methods) >= 100 {
+				methods = methods[1:]
+			}
+			if len(p.responses[key]) == 0 {
+				p.requestMethods[key] = append(methods, req.Method)
+				close(p.requestReady)
+				p.requestReady = make(chan struct{})
+			}
+			p.mu.Unlock()
 			body, e := io.ReadAll(io.LimitReader(req.Body, int64(requestLimit)+1))
-			req.Body.Close()
+			if closeErr := req.Body.Close(); e == nil {
+				e = closeErr
+			}
 			truncated := len(body) > requestLimit
 			if truncated {
 				body = body[:requestLimit]
@@ -150,6 +171,7 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			for k, items := range p.pending {
 				if len(items) > 0 && captured.Sub(items[len(items)-1].Time) > time.Minute {
 					delete(p.pending, k)
+					delete(p.requestMethods, k)
 					for _, orphan := range p.responses[k] {
 						p.responseBytes -= int64(len(orphan.raw))
 						p.responseCount--
@@ -185,9 +207,6 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				p.s.fail(err)
 			}
 			p.mu.Unlock()
-			if truncated {
-				return
-			}
 		}
 	}
 }
@@ -204,6 +223,27 @@ func boundedHeader(br *bufio.Reader) bool {
 		}
 		if _, e := br.Peek(br.Buffered() + 1); e != nil {
 			return false
+		}
+	}
+}
+
+// Packet directions are parsed concurrently. Allow the request header to arrive
+// before choosing response body framing, while bounding waits for orphan data.
+func (p *HTTPProcessor) responseRequest(key string) *http.Request {
+	deadline := time.NewTimer(100 * time.Millisecond)
+	defer deadline.Stop()
+	for {
+		p.mu.Lock()
+		methods := p.requestMethods[key]
+		ready := p.requestReady
+		p.mu.Unlock()
+		if len(methods) > 0 {
+			return &http.Request{Method: methods[0]}
+		}
+		select {
+		case <-ready:
+		case <-deadline.C:
+			return nil
 		}
 	}
 }

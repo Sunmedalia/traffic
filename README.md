@@ -1,10 +1,26 @@
 # traffic
 
-面向 Linux 网站应急响应的流量采集与分析工具。使用独立的采集程序记录现场数据，再通过 TUI 分析程序实时查看或回看会话。HTTP 请求、响应、检测依据和网络证据保存在同一个会话目录。
+面向网站应急响应的流量采集与分析工具，提供 Linux ARM64 / x86_64 和 Windows x64 实验版本。独立采集程序保存 HTTP 请求、响应、检测依据和网络证据，分析程序通过中文 TUI、Web 界面或 JSON 命令实时查看及回看会话。
 
-当前为 **Linux ARM64 / x86_64 实验版本**。ARM64 已在 Debian 13、Linux 6.12、Nginx 1.26、OpenSSL 3.5 环境验证，x86_64 已在 Ubuntu 26.04、Linux 7.0、Nginx 1.28、OpenSSL 3.5 环境验证。运行中采集使用网卡抓包和 eBPF TLS 探针，采集过程无需重启或重载网站、修改网站配置。兼容性和性能验收状态见 [验证记录](VALIDATION.md)。
+Linux 使用 libpcap、eCapture/eBPF 和可选 Java Agent。Windows 使用 Npcap 和可选 IIS / OpenSSL 动态探针。已验证环境中的探针可附加到运行中的服务，采集期间保持服务进程和网站配置。各后端的启动缺口、依赖及退出行为见下表和对应使用说明。
 
-另提供 **Windows x64 HTTP 实验版本**，已在 Windows 10 LTSC 17763 上完成 Npcap 抓包、HTTP 请求响应还原和证据导出测试。IIS / TLS 1.2 已完成显式启用的动态 HTTP Server API 明文采集验收。启动前已投递的接收调用存在漏采窗口，完整边界见验证记录。
+## 当前能力与验收范围
+
+| 平台或服务 | 已实现能力 | 实机验证与边界 |
+| --- | --- | --- |
+| Linux ARM64 / x86_64 普通 HTTP | 按网卡、TCP 端口抓包，HTTP/1.1 请求响应重组，循环 PCAP | 支持 TCP 分段、乱序、重传、长连接、中文和分块正文 |
+| Linux Nginx / OpenSSL | 运行中采集 HTTPS 明文、客户端端点和进程身份 | ARM64、x86_64 的 TLS 1.2/1.3 和采集前已建立连接通过 |
+| Linux Apache | 自动发现 apache2/httpd，采集 OpenSSL HTTPS 明文 | ARM64 的 event、worker、prefork 已测，worker/prefork 已有阻塞读取存在首次漏采边界 |
+| Linux Tomcat / JSSE | 显式动态附加 Java Agent，采集 HTTPS 明文 | ARM64 的 Tomcat 9/JDK 17、10.1/JDK 21 NIO Connector 已测，支持重复附加 |
+| Linux 通用 OpenSSL | 指定 PID 采集 OpenSSL API 明文 | ARM64 的 HAProxy、外部 `SSL_read_ex` / `SSL_write_ex` 调用已测，其他程序及库版本需验证 |
+| Windows x64 / IIS 10 | Npcap HTTP 采集，显式启用 IIS 动态 HTTPS 明文后端 | Windows 10 LTSC 17763、HTTP/1.1、TLS 1.2 已测，存在启动漏采窗口和 Frida 运行时卸载限制 |
+| Windows Nginx / Apache | 自动发现工作进程、Npcap HTTP、显式启用 OpenSSL HTTPS 明文采集 | Nginx 官方 1.28.0 x86、Apache 2.4.71 x64 的 TLS 1.2/1.3 正文比对通过，静态 Nginx 按二进制哈希适配 |
+| Windows 通用 OpenSSL | 指定 PID，支持导出的 SSL_read/write 及 _ex API | 外部 _ex 调用的 TLS 1.2/1.3 已测，s_server 内置 BIO 路径未取得明文，自定义 BIO 目前适配 Apache |
+| Linux / macOS / Windows 分析程序 | 中文 TUI、Web、JSON 查询，读取统一会话格式 | 支持会话选择、筛选、详情、状态查看和证据导出，可在分析机打开其他平台采集的完整会话 |
+
+检测覆盖疑似 SQL 注入、命令注入、路径穿越、敏感文件探测和扫描，支持附加 YAML 规则、URL 多轮解码与有界 gzip 正文解码。记录包含命中片段、规则版本及解码来源，保留不完整和截断标记。
+
+最新 IIS 验收在 24 次启动预热之后，完成 53 次 HTTP、54 次 HTTPS 请求响应正文比对，覆盖中文、分块、文件响应、四路并发、长连接、大正文截断和五类规则。预热请求记录到 14 次，漏采 10 次。随后 107 次请求均通过，已有 HTTPS 连接继续复用，配置哈希和工作进程身份检查通过。全部 121 条记录和导出证据可用，启动漏采需要单独评估。各平台测试环境和完整验收数据见 [验证记录](VALIDATION.md)。
 
 ## 程序职责
 
@@ -21,14 +37,15 @@
 
 - 捕获选定网卡和 TCP 端口的原始流量，以循环 PCAP 保留证据。
 - 还原 HTTP/1.1 请求与响应，处理 TCP 分段、乱序、重传、长连接和分片正文。
-- 从运行中的 Nginx/OpenSSL 获取 HTTPS 明文，支持 TLS 1.2/1.3 和采集启动前已建立的连接。
+- 获取 HTTPS 明文，Linux 支持 Nginx、Apache、通用 OpenSSL 和显式启用的 Tomcat JSSE 后端，Windows 支持显式启用的 IIS HTTP Server API 和 OpenSSL 后端。TLS 版本和已有连接覆盖以各平台验收结果为准。
 - 检测疑似 SQL 注入、命令注入、路径穿越、敏感文件探测和扫描行为，显示匹配片段及解码来源。
-- 使用 SQLite 查询全部请求或告警，导出请求、响应、关联 PCAP 和 SHA-256 校验清单。
-- 提供正文大小、队列、磁盘和 cgroup 资源限制，报告截断、数据缺口与采集失败。
+- 通过中文 TUI、Web 和 JSON 命令查询全部请求或告警，按客户端、规则、级别、服务和时间筛选，TUI/Web 另支持 Host/URL 关键词。
+- 导出请求、响应、关联 PCAP 和 SHA-256 校验清单，支持采集结束后的证据核对。
+- 提供正文大小、队列、磁盘及保留期限制，Linux 使用 cgroup v2、Windows 使用 Job Object，状态中报告资源约束、丢弃、截断和采集问题。
 
 ## 构建
 
-构建需要 Go 1.26.7+ 和 CGO。采集程序需要 Linux 和 libpcap，分析程序通过 Go 读取 PCAP，依赖 SQLite 驱动。以下以 Debian/Ubuntu 为例。
+构建需要 Go 1.26.7+、CGO 和 C 编译器。Linux 采集程序依赖 libpcap，Windows 采集程序依赖 Npcap。分析程序使用 Go 读取 PCAP、通过 CGO SQLite 驱动读取会话索引。以下为 Linux 的 Debian/Ubuntu 构建流程。
 
 ```bash
 sudo apt-get update
@@ -49,9 +66,9 @@ go build -o bin/traffic ./cmd/traffic
 go build -o bin/traffic-tui ./cmd/traffic-tui
 ```
 
-单独构建分析程序需要 C 编译器，可在 Linux 或 macOS 上执行。
+分析程序可在 Linux、macOS 或 Windows 上构建。macOS 主要用于分析已有会话，Linux eBPF 和 Windows IIS 采集后端分别运行在对应目标系统。Windows 构建命令见下文。
 
-### HTTPS 采集依赖
+### Linux HTTPS 采集依赖
 
 HTTPS 路径使用固定版本 eCapture 加本项目补丁。当前构建脚本按 Linux 主机架构生成 **ARM64 或 x86_64 / OpenSSL 3.0、3.5 / CO-RE** 探针，并包含自定义 BIO 的 socket 关联以及 `SSL_read_ex`、`SSL_write_ex` 支持。其他版本需要单独验证。
 
@@ -65,7 +82,7 @@ sudo apt-get install -y clang llvm bpftool libelf-dev libssl-dev flex bison make
 
 补丁修复实机发现的连接缓存崩溃和 FD 复用时的元数据竞争，并减少解码复制。socket 地址及 inode 身份与对应明文一起进入事件。多核机器上的 TLS 事件使用 100 毫秒时间排序窗口，空闲时也会刷新末批事件。补丁扩展了内部 eBPF ABI，需要配套构建探针字节码与用户态解码器。[补丁文件](patches/ecapture-v2.9.1-connection-cache.patch)
 
-### Windows 构建与测试站点
+### Windows 构建与 HTTP 采集
 
 Windows x64 构建需要 Go 1.26.7+、x64 MinGW GCC，以及用于运行采集和抓包测试的 [Npcap](https://npcap.com/)。在 PowerShell 中执行以下命令。
 
@@ -78,13 +95,16 @@ powershell -ExecutionPolicy Bypass -File scripts/windows/build.ps1
 
 默认枚举具有地址的可用适配器及回环接口，跳过标记为断开的设备。也可使用 `doctor` 返回的完整 Npcap 设备名，例如 `--interfaces '\Device\NPF_Loopback'`。Windows 抓包快照上限为 256 KiB，避免回环帧超过 65,535 字节导致尾部丢失。PCAP 文件名使用设备名的 SHA-256，原始设备名保留在请求来源中。证据目录使用继承 ACL，授权当前用户、SYSTEM 和 Administrators。采集器使用 Job Object 限制合计 256 MiB 内存及单核 50% CPU，生效情况写入状态文件。
 
+### Windows IIS HTTPS 与测试站点
+
 以下脚本为专用实验机安装 IIS、ASP.NET，并创建独立的 `TrafficLab` 站点、应用池、自签证书和防火墙规则，监听 HTTP 8080、HTTPS 8443。已有目录、同名站点或端口冲突会报错。安装组件可能要求首次重启，脚本会保留安装记录，重启后通过 `-Resume` 继续。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/windows/setup-iis.ps1
 # 仅在首次安装要求重启且已完成重启后执行
 powershell -ExecutionPolicy Bypass -File scripts/windows/setup-iis.ps1 -Resume
-python scripts/windows/verify-iis.py --binary C:\traffic\bin\windows\traffic.exe --analysis-binary C:\traffic\bin\windows\traffic-tui.exe --output C:\traffic-iis-verification
+# 先验证 HTTP 采集与站点 HTTPS 访问，完整 HTTPS 明文验证见下方 --iis-probe 示例
+python scripts/windows/verify-iis.py --binary .\bin\windows\traffic.exe --analysis-binary .\bin\windows\traffic-tui.exe --output C:\traffic-iis-verification
 ```
 
 验收脚本发送 HTTP/1.1 请求，检查中文正文、分块、长连接、并发、大小限制、规则、配置哈希、工作进程身份及导出校验。报告记录 HTTPS 明文、启动预热漏采、卸载确认和已有连接复用。未显式启用 IIS 探针时，Windows TLS 状态报告 `unavailable`，HTTPS 网络包保存为密文。`--service iis` 根据 IIS 配置关联候选服务端口，HTTP.sys 监听端口不能直接确定具体站点或应用池。
@@ -93,13 +113,25 @@ IIS HTTPS 探针通过固定版本 Frida 17.5.1 动态附加运行中的 x64 `w3
 
 ```powershell
 python -m pip install frida==17.5.1
-.\bin\windows\traffic.exe capture --service iis --ports 8080,8443 --iis-probe C:\traffic-lab\scripts\windows\probe-iis.py --iis-runtime-dir C:\traffic-lab\probe-runtime --duration 60s
-python scripts/windows/verify-iis.py --binary C:\traffic-lab\bin\traffic.exe --analysis-binary C:\traffic-lab\bin\traffic-tui.exe --iis-probe C:\traffic-lab\scripts\windows\probe-iis.py --output C:\traffic-iis-https-verification
+.\bin\windows\traffic.exe capture --service iis --ports 8080,8443 --iis-probe .\scripts\windows\probe-iis.py --iis-runtime-dir C:\traffic-lab\probe-runtime --duration 60s
+python scripts/windows/verify-iis.py --binary .\bin\windows\traffic.exe --analysis-binary .\bin\windows\traffic-tui.exe --iis-probe .\scripts\windows\probe-iis.py --output C:\traffic-iis-https-verification
 ```
 
 辅助脚本、`iis-plaintext.js` 和 `probe-iis.js` 应放在同一目录，`--iis-python` 可指定装有 Frida 的 Python。原始 API 事件保存在会话 `tls/iis-*.jsonl`，诊断在 `logs/iis-*.log`，请求记录的 backend 为 `iis-httpapi`。正文和头部按 HTTP/1.1 重建，原始 API 事件及 PCAP 保留供复核。内存队列、正文复制和磁盘均有边界，丢弃及不完整记录显式报告。
 
-后附加无法恢复附加前已投递的异步接收调用，`attached` 表示拦截安装成功，首批请求仍可能漏采。验收将 24 次预热请求单独统计，随后检查 107 次 HTTP/HTTPS 请求。本机启动预热漏采 10 条，不能把预热后的成功视为首个请求无损。Windows 10 17763 本次验证 TLS 1.2、HTTP/1.1 和同一个 IIS 工作进程，TLS 1.3、内核缓存直接命中、HTTP/2、进程替换和长期性能尚未验收。缓存片段等无法复制的实体类型标记缺口。默认仍需显式启用动态探针。停止时逐个核对拦截位置原指令已恢复，但未完成 I/O 可能使 Frida 脚本卸载或传输断开停滞。辅助进程有界退出，Frida 运行时可能仍留在工作进程，报告单独记录 `hooks_removed`、`script_unloaded` 和 `transport_detached`，完整运行时卸载尚未验收。
+Windows 10 17763 的已测范围为 HTTP/1.1、TLS 1.2 及同一个 IIS 工作进程。启动窗口、其他协议、内核缓存和进程替换的边界见下文。缓存片段等无法复制的实体类型会标记缺口。
+
+停止时逐个核对拦截位置原指令已恢复，报告中 `hooks_removed` 表示该检查结果。未完成 I/O 可能使 Frida 脚本卸载或传输断开等待，辅助进程会有界退出，Frida 运行时可能仍留在工作进程。完整运行时卸载尚未验收，报告另外记录 `script_unloaded` 和 `transport_detached`。
+
+#### IIS 启动提示与完整性判断
+
+```text
+IIS dynamic attach cannot recover receive calls posted before attachment; startup requests may be missed
+```
+
+当前实现每次收到探针 `ready` 事件后，都会将这条能力限制写入 `status.json` 的 `errors`，TUI/Web 的问题列表会展示它。IIS 已提前投递的异步接收调用没有经过新附加探针的入口，探针无法恢复这些调用的缓冲区参数，因此采集启动后到达的首批请求可能漏采。随后新投递的接收调用可以正常关联。
+
+`tls=attached` 表示探针安装成功，完整性仍需结合客户端请求数、保存记录、`incomplete`、`truncated` 和各类丢弃计数判断。启动漏采不会自动体现在 `tls_dropped` 中，提示也不会统计本次实际漏采数。10 条为当前测试机的实测值，预热次数需要结合环境验证。
 
 仅观察调用元数据时可运行以下命令。
 
@@ -109,7 +141,39 @@ python scripts/windows/probe-iis.py --pid 1234 --duration 30 --runtime-dir C:\tr
 
 `scripts/windows/restore-iis.ps1` 移除实验站点、应用池、证书和防火墙规则，保留文件与安装记录。需要同时卸载本次新增的 IIS 组件时使用 `-RemoveInstalledFeatures`，Windows 可能再次要求重启。恢复脚本应在测试结束后运行。
 
-## 快速使用
+## Windows Nginx、Apache 与通用 OpenSSL
+
+Windows 采集器识别 `nginx.exe`、`httpd.exe`、`apache.exe` 和 `apache2.exe`，从 Windows TCP 表读取监听端口，关联 master/worker 并选择工作进程。普通 HTTP 使用 Npcap，HTTPS 明文通过 Frida 17.5.1 动态附加 OpenSSL 调用。支持 `SSL_read`、`SSL_write`、`SSL_read_ex` 和 `SSL_write_ex`，以实际成功读写长度复制有界数据。Apache mod_ssl 的自定义 BIO 通过 OpenSSL app_data、Apache 和 APR 公共 API 取得套接字端点。
+
+```powershell
+# 在管理员终端运行，端口按已有站点设置
+python -m pip install frida==17.5.1
+.\bin\windows\traffic.exe doctor --service auto
+.\bin\windows\traffic.exe capture --service nginx --ports 80,443 --openssl-probe .\scripts\windows\probe-openssl.py --probe-runtime-dir C:\traffic-lab\probe-runtime --duration 60s
+.\bin\windows\traffic.exe capture --service apache --ports 80,443 --openssl-probe .\scripts\windows\probe-openssl.py --probe-runtime-dir C:\traffic-lab\probe-runtime --duration 60s
+
+# 同一会话采集已运行的 IIS、Nginx、Apache
+.\bin\windows\traffic.exe capture --service auto --ports 80,443,8080,8443 --iis-probe .\scripts\windows\probe-iis.py --openssl-probe .\scripts\windows\probe-openssl.py --probe-runtime-dir C:\traffic-lab\probe-runtime
+
+# 其他使用 OpenSSL DLL 的进程，必要时指定模块名
+.\bin\windows\traffic.exe capture --service openssl --pid 1234 --ports 9443 --libssl libssl-3-x64.dll --openssl-probe .\scripts\windows\probe-openssl.py --probe-runtime-dir C:\traffic-lab\probe-runtime
+```
+
+`--probe-python` 指定安装了 Frida 的 Python，兼容原有 `--iis-python`。`--probe-runtime-dir` 与 `--iis-runtime-dir` 等价，该目录需预先存在并允许目标进程身份读取。辅助脚本目录中需同时保留 `probe-openssl.py`、`probe-iis.py`、`openssl-plaintext.js` 和 `openssl-profiles.json`。OpenSSL 原始事件写入 `tls/openssl-*.jsonl`，诊断写入 `logs/openssl-*.log`，统一请求记录的 backend 为 `openssl`。进程启动时间参与身份校验，发现进程替换后为新身份建立采集后端。
+
+OpenSSL DLL 优先按导出函数解析。官方 Windows Nginx 静态链接 OpenSSL，内置 profile 对应 nginx.org 的 `nginx-1.28.0.zip` 中 x86 `nginx.exe`，先校验整个文件的 SHA-256，再校验函数入口字节和 RVA。其他静态版本需通过 `--openssl-profile FILE.json` 提供匹配 profile，格式见内置文件。无匹配后端时目标报告 `unavailable`，网卡采集继续运行。不能把一个版本的函数位置套用于另一二进制。
+
+动态附加只覆盖附加后进入的调用，附加前已进入的阻塞读取及半截消息可能漏采。首次仅观察到的响应会被丢弃，避免配给后续长连接请求。队列丢失后切断请求响应关联，并为后续记录保留不完整标记。停止时核对原始指令恢复结果，另记录脚本卸载和传输断开状态。Nginx / Apache 的本次运行中两项卸载均成功，IIS 的未完成 I/O 卸载边界仍见上文。
+
+实机测试使用独立站点并通过回环地址访问，Nginx 端口为 18080/18443，Apache 为 18081/18444，反向代理到 `middleware-fixture.py` 的 18090。`verify-middleware.py` 在保持已有连接活跃的预热后，检查 HTTP/1.1、TLS 1.2/1.3、中文 POST、分块、HEAD、404、并发、大正文截断、规则告警、工作进程身份、配置哈希及卸载报告。
+
+```powershell
+python scripts/windows/verify-middleware.py --binary .\bin\windows\traffic.exe --probe .\scripts\windows\probe-openssl.py --config C:\path\to\nginx.conf --config C:\path\to\httpd.conf --output C:\traffic-middleware-verification
+```
+
+最终 62 条验收请求全部通过，包括 12 条 HTTP 和 50 条 HTTPS，覆盖 TLS 1.2/1.3。会话另包含 10 条预热记录，共 72 条记录、1163 个包和 6 次告警，三类已观测丢弃计数均为零。两个服务的工作进程身份及配置哈希检查通过，探针原始指令、脚本卸载和传输断开均确认成功。外部 `SSL_read_ex` / `SSL_write_ex` 的通用 PID 采集另外通过 TLS 1.2/1.3 两条请求。OpenSSL `s_server -www` 的内部 BIO 路径本次未取得明文，其他中间件仍需单独验证。HTTP/2、HTTP/3、Go TLS、Windows JSSE、其他自定义 BIO、其他静态 Nginx 版本及长期性能尚未验收。
+
+## Linux 快速使用
 
 在目标 Linux 主机执行，使用 `doctor` 确认接口、权限、内核 BTF 和各服务加载的 TLS 库。
 
@@ -158,7 +222,7 @@ sudo ./bin/traffic capture --no-tls --duration 60s --output ./sessions/http-001
 ./bin/traffic capture --help
 ```
 
-## Apache、Tomcat 和其他 OpenSSL 服务
+## Linux Apache、Tomcat 和其他 OpenSSL 服务
 
 `--service` 默认 `auto`，发现 Nginx worker、Apache 的 `apache2/httpd` 及独立 Tomcat。`--pid` 限定进程探针，`--ports` 默认仍为 `80,443`。网卡抓包始终按接口和端口过滤，明文 HTTP 的服务归属根据本机监听端口推断。服务发现每两秒更新，工作进程变化与新探针挂载之间可能存在采集窗口。`doctor` 的 `tls_verified: false` 表示环境检查尚未证明能取得明文，真实请求验证结果见验证记录。
 
@@ -288,7 +352,13 @@ sessions/web-01/2026-11-11/15-04-05-nginx/
 ./bin/traffic-tui web --session ./sessions/incident-001 --listen 127.0.0.1:9000 --refresh 2s
 ```
 
-启动后在 stderr 输出带一次性访问令牌的地址，例如 `http://127.0.0.1:8080/#token=…`，在浏览器打开即可。令牌位于 URL 片段，浏览器不会把它发送给服务端，页面将其保存在当前标签页并通过 `Authorization` 头访问接口。新标签页需要重新输入令牌。每次启动生成新令牌，也可通过环境变量 `TRAFFIC_WEB_TOKEN` 指定至少 16 个字符的固定令牌。
+启动后在 stderr 输出带本次运行访问令牌的地址，例如 `http://127.0.0.1:8080/#token=…`，在浏览器打开即可。令牌位于 URL 片段，浏览器不会把它发送给服务端，页面将其保存在当前标签页的 sessionStorage，并通过 `Authorization` 头向接口发送令牌。新标签页可再次打开完整启动地址或输入令牌。每次启动生成新令牌，也可通过环境变量 `TRAFFIC_WEB_TOKEN` 指定至少 16 个字符的固定令牌。
+
+Windows 在 PowerShell 中也可以启动 Web 界面，默认端口为 8080。与同机 IIS 测试站点同时运行时，可将分析界面设为 9000。
+
+```powershell
+.\bin\windows\traffic-tui.exe web --data-dir C:\traffic-lab\validation --listen 127.0.0.1:9000
+```
 
 默认只监听回环地址，连接为明文 HTTP。分析远程主机上的会话时建议使用 SSH 端口转发。
 
@@ -336,10 +406,10 @@ sudo ./bin/traffic capture --rules rules.yaml --no-tls --output ./sessions/custo
 | 会话磁盘预算 | 2 GiB，`--disk-limit-mib` 调整，达到上限停止采集 |
 | 低磁盘空间 | 可用空间不足 512 MiB 时停止采集 |
 | 索引保留期 | 24 小时，`--retention` 调整，删除后数据库空间可供后续写入复用 |
-| 进程资源 | 可用时创建独立 cgroup，工具及子进程合计 256 MiB 内存、单核 50% CPU |
-| 文件权限 | 会话目录 `0700`，证据文件 `0600` |
+| 进程资源 | Linux cgroup v2 / Windows Job Object，可用时限制工具及子进程合计 256 MiB 内存、单核 50% CPU。目标服务内的探针开销由目标进程承担 |
+| 文件权限 | Linux/macOS 会话目录 `0700`、证据文件 `0600`。Windows 通过继承 ACL 授权当前用户、SYSTEM 和 Administrators |
 
-队列有界。`status.json` 记录网卡丢包、用户态队列丢弃、TLS 丢失、错误和资源限制是否生效。探针失败后最多重试一次，保留网卡采集。未完成的 TLS 消息在连接关闭、空闲超时或停止时保存为不完整证据。
+队列有界。`status.json` 记录网卡丢包、用户态队列丢弃、TLS 丢失、错误和资源限制是否生效。Linux OpenSSL 探针失败后最多重试一次。Java/IIS/Windows OpenSSL 后端失败时报告不可用并保留网卡采集，进程探针的队列缺口和未完成消息保留完整性标记。IIS 后端在采集结束时保存尚未完成的已识别请求。
 
 原始 TLS 事件与探针诊断也保存在会话内，受会话总磁盘预算约束。它们可能包含请求正文、Cookie 和认证信息，分享证据前需检查具体内容。
 
@@ -363,7 +433,13 @@ python3 scripts/benchmark.py --output /tmp/traffic-performance --host 127.0.0.1
 
 脚本支持 `--binary` 和 `--config` 指定采集程序与 Nginx 配置。功能脚本另通过 `--analysis-binary` 指定证据导出所用的 `traffic-tui`，默认路径为 `/opt/traffic/bin/traffic-tui`。可用 `--ecapture` 指定探针路径、`--pid` 将 TLS 探针限定到实验进程。功能脚本检查 126 条请求及响应、已有 HTTPS 连接、TLS 版本、中文正文、五类规则、网站配置和 PID、证据校验。性能脚本默认 20/100 请求每秒、每组五分钟、重复三轮。
 
-HTTP/2、HTTP/3、WebSocket 内容解析、通用 JSSE/Go TLS、Tomcat NIO2、Windows 的完整采集验收待实现。x86_64 的 Apache、Tomcat、通用 OpenSSL 服务及长期性能仍待单独验收。HTTP/1.1 流中途缺失消息开头时，可见内容受限。代理后的来源地址默认取连接对端，经过 CDN 或负载均衡时需结合可信代理信息分析。
+### 已知限制与待验收能力
+
+- HTTP/2、HTTP/3、WebSocket 内容解析、通用 JSSE/Go TLS 和 Tomcat NIO2 尚未支持。HTTP/1.1 流缺失消息开头时，可恢复内容受限。
+- Windows 已完成 Npcap HTTP、IIS / TLS 1.2 及 Nginx、Apache / TLS 1.2、1.3 的实验验收。其他 Windows Web 服务、IIS TLS 1.3、IIS 内核缓存直接命中、应用池进程替换、长期性能和 Frida 运行时完整卸载尚未验收。IIS 附加启动窗口仍可能漏采。
+- Linux x86_64 的实机 HTTPS 验收覆盖 Nginx / OpenSSL 3.5。Apache、Tomcat、通用 OpenSSL 服务及长期性能仍待该架构单独验收。Linux ARM64 的多服务结果见验证记录。
+- 代理后的来源地址取连接对端，经过 CDN 或负载均衡时需结合可信代理信息分析。
+- Web 已覆盖令牌鉴权、静态资源、筛选、详情及导出测试，并完成真实 IIS 历史会话的接口读取检查。采集中会话的浏览器交互和持续刷新尚未完成实机验收。
 
 ## 第三方组件
 

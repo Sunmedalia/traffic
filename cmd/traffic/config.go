@@ -13,3 +13,5 @@ var capturePorts = map[int]bool{80: true, 443: true}
 
 var iisProbe, iisRuntime string
 var iisPython = "python"
+
+var opensslProbe, opensslProfile string

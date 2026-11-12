@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,7 +69,7 @@ func (s *Store) save(t Transaction) error {
 							break
 						}
 					}
-					if !serverLocal {
+					if !serverLocal && runtime.GOOS != "windows" {
 						t.LocalEndpoint = t.Client
 					}
 					t.Service = selected.Service

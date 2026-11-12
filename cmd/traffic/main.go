@@ -73,7 +73,11 @@ func run(args []string) (runErr error) {
 	interfaces := fs.String("interfaces", "", "comma-separated interfaces")
 	fs.StringVar(&iisProbe, "iis-probe", "", "Windows IIS plaintext helper script; explicit opt-in")
 	fs.StringVar(&iisPython, "iis-python", "python", "Python executable with Frida installed")
-	fs.StringVar(&iisRuntime, "iis-runtime-dir", "", "probe runtime directory readable by the IIS worker identity")
+	fs.StringVar(&iisRuntime, "iis-runtime-dir", "", "probe runtime directory readable by the target process identity")
+	fs.StringVar(&iisPython, "probe-python", "python", "Python executable for Windows plaintext helpers (alias of --iis-python)")
+	fs.StringVar(&iisRuntime, "probe-runtime-dir", "", "temporary directory readable by Windows probe targets (alias of --iis-runtime-dir)")
+	fs.StringVar(&opensslProbe, "openssl-probe", "", "Windows OpenSSL plaintext helper script; explicit opt-in")
+	fs.StringVar(&opensslProfile, "openssl-profile", "", "Windows static OpenSSL binary profile JSON; default bundled profiles")
 	javaAttach := fs.Bool("java-attach", false, "explicitly attach Java agent to --pid")
 	javaPID := fs.Int("java-pid", 0, "explicit JVM PID for Java attach while auto-discovering other services")
 	javaHelper := fs.String("java-helper", "", "Java executable with jdk.attach; default target executable")
@@ -81,7 +85,7 @@ func run(args []string) (runErr error) {
 	service := fs.String("service", "auto", "service: auto, iis (Windows), nginx, apache, tomcat, openssl")
 	pid := fs.Int("pid", 0, "target process PID; default discover service processes")
 	ecapture := fs.String("ecapture", "/opt/traffic/bin/ecapture", "eCapture v2.9.1 binary")
-	lib := fs.String("libssl", "", "TLS library override; default discover from process maps")
+	lib := fs.String("libssl", "", "TLS library override; Windows module name or Linux library path")
 	ruleFile := fs.String("rules", "", "additional YAML rules")
 	noTLS := fs.Bool("no-tls", false, "disable TLS probes")
 	duration := fs.Duration("duration", 0, "optional capture duration")
@@ -120,14 +124,20 @@ func run(args []string) (runErr error) {
 	if *service != "auto" && *service != "nginx" && *service != "apache" && *service != "tomcat" && *service != "openssl" && *service != "iis" {
 		return errors.New("invalid service")
 	}
-	if runtime.GOOS == "windows" && (*javaAttach || (*service != "auto" && *service != "iis")) {
-		return errors.New("Windows currently supports auto or iis discovery; Java attach is unavailable")
+	if runtime.GOOS == "windows" && (*javaAttach || *service == "tomcat") {
+		return errors.New("Windows Java attach is unavailable")
 	}
-	if runtime.GOOS != "windows" && iisProbe != "" {
-		return errors.New("--iis-probe requires Windows")
+	if runtime.GOOS != "windows" && (iisProbe != "" || opensslProbe != "" || opensslProfile != "") {
+		return errors.New("Windows probe flags require Windows")
 	}
 	if iisProbe != "" && (iisRuntime == "" || *noTLS) {
 		return errors.New("--iis-probe requires --iis-runtime-dir and conflicts with --no-tls")
+	}
+	if opensslProbe != "" && (iisRuntime == "" || *noTLS) {
+		return errors.New("--openssl-probe requires --probe-runtime-dir and conflicts with --no-tls")
+	}
+	if opensslProfile != "" && opensslProbe == "" {
+		return errors.New("--openssl-profile requires --openssl-probe")
 	}
 	if runtime.GOOS != "windows" && *service == "iis" {
 		return errors.New("iis service requires Windows")

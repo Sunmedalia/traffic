@@ -1,7 +1,7 @@
-"""Attach a bounded HTTP Server API feasibility probe to a running IIS worker.
+"""Host bounded Windows IIS or OpenSSL plaintext probes in a running process.
 
-Install the experiment dependency with `python -m pip install frida==17.5.1`.
-Run elevated. The --plaintext experiment also emits bounded HTTP entity bytes.
+Install the dependency with `python -m pip install frida==17.5.1` and run elevated.
+The default IIS mode uses HTTP Server API. probe-openssl.py selects OpenSSL.
 """
 
 import argparse
@@ -18,6 +18,9 @@ from pathlib import Path
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backend", choices=("iis", "openssl"), default="iis")
+    parser.add_argument("--profile", type=Path)
+    parser.add_argument("--library", default="")
     parser.add_argument("--pid", required=True, type=int)
     parser.add_argument("--duration", type=float, default=30)
     parser.add_argument("--out", required=True, type=Path)
@@ -87,10 +90,14 @@ def main():
         reported_drops = 0
         try:
             session.on("detached", lambda *_: detached.set())
-            source_path = Path(__file__).with_name("iis-plaintext.js") if args.plaintext else Path(__file__).with_suffix(".js")
+            source_path = Path(__file__).with_name("openssl-plaintext.js") if args.backend == "openssl" else (Path(__file__).with_name("iis-plaintext.js") if args.plaintext else Path(__file__).with_suffix(".js"))
             source = source_path.read_text(encoding="utf-8")
-            if args.plaintext:
+            if args.plaintext or args.backend == "openssl":
                 source = source.replace("__REQUEST_LIMIT__", str(args.request_limit)).replace("__RESPONSE_LIMIT__", str(args.response_limit)).replace("__PORTS__", json.dumps(ports))
+            if args.backend == "openssl":
+                profile_path = args.profile or Path(__file__).with_name("openssl-profiles.json")
+                profiles = json.loads(profile_path.read_text(encoding="utf-8"))
+                source = source.replace("__PROFILES__", json.dumps(profiles)).replace("__LIBRARY__", json.dumps(args.library))
             script = session.create_script(source)
             script.on("message", receive)
             script.load()
