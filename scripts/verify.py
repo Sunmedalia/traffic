@@ -26,6 +26,8 @@ parser.add_argument("output", type=Path)
 parser.add_argument("--host", default="127.0.0.1")
 parser.add_argument("--binary", default="/opt/traffic/bin/traffic")
 parser.add_argument("--analysis-binary", default="/opt/traffic/bin/traffic-tui")
+parser.add_argument("--ecapture", help="path to the TLS probe executable")
+parser.add_argument("--pid", type=int, help="restrict TLS probes to this lab process")
 parser.add_argument(
     "--config", type=Path, default=Path("/etc/nginx/sites-available/traffic-lab")
 )
@@ -41,10 +43,12 @@ existing = http.client.HTTPSConnection(
 existing.request("GET", "/api/health")
 existing.getresponse().read()
 existing_endpoint = existing.sock.getsockname()
-process = subprocess.Popen(
-    [binary, "capture", "--output", str(output), "--interfaces", "lo"],
-    stdout=subprocess.DEVNULL,
-)
+command = [binary, "capture", "--output", str(output), "--interfaces", "lo"]
+if args.ecapture:
+    command += ["--ecapture", args.ecapture]
+if args.pid:
+    command += ["--pid", str(args.pid)]
+process = subprocess.Popen(command, stdout=subprocess.DEVNULL)
 time.sleep(4)
 
 
@@ -97,6 +101,9 @@ assert before_pids == subprocess.check_output(["pgrep", "-x", "nginx"]).split()
 connection = sqlite3.connect(output / "index.sqlite")
 rows = [json.loads(row[0]) for row in connection.execute("SELECT data FROM requests")]
 assert len(rows) == 126, f"captured {len(rows)} of 126"
+assert all(not row["incomplete"] and not row["truncated"] for row in rows), (
+    "incomplete or truncated request/response"
+)
 previous = next(row for row in rows if row["url"] == "/search?q=preexisting-verify")
 assert previous["client"] == f"{existing_endpoint[0]}:{existing_endpoint[1]}", (
     "preexisting connection attribution"
@@ -132,6 +139,8 @@ with zipfile.ZipFile(archive) as evidence:
         hashlib.sha256(evidence.read(name)).hexdigest() == digest
         for name, digest in hashes.items()
     )
+status = json.loads((output / "status.json").read_text())
+assert status["tls_dropped"] == status["queue_dropped"] == status["dropped"] == 0, status
 report = {
     "requests": len(rows),
     "paired_responses": len(rows),
@@ -139,6 +148,7 @@ report = {
     "site_configuration_unchanged": True,
     "site_pids_unchanged": True,
     "evidence_hashes_verified": True,
+    "status": status,
 }
 (output / "verification.json").write_text(json.dumps(report, indent=2))
 print(json.dumps(report, indent=2))

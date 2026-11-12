@@ -77,6 +77,11 @@ try:
             connection.close()
         time.sleep(0.25)
     time.sleep(2)
+    with sqlite3.connect(args.output / "index.sqlite") as db:
+        live_rows = [json.loads(r[0]) for r in db.execute("SELECT data FROM requests")]
+    for path, method, status, secure, body in expected:
+        matches = [r for r in live_rows if r["url"] == path]
+        assert len(matches) == 1 and matches[0].get("response"), ("live capture", path, matches)
 finally:
     existing.close()
     process.send_signal(signal.SIGINT)

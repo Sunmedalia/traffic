@@ -1,5 +1,22 @@
 # 验证记录
 
+## 2026-11-12 Linux x86_64 验证
+
+在用户指定的 `192.168.1.10` 原生构建并测试，环境为 Ubuntu 26.04 LTS、Linux 7.0.0-29-generic、x86_64、Nginx 1.28.3、OpenSSL 3.5.5，内核 BTF 可用。构建源码与独立实验站位于 `/opt/traffic-x64`，实验站仅监听回环地址。采集和分析程序使用 Go 1.26.11，eCapture 使用 Go 1.26.0、Clang 21 构建，固定上游提交与 ARM64 相同。
+
+- `go test -race ./...`、`go vet ./...` 和两个程序的构建通过。
+- eCapture 的 OpenSSL 3.0.0、3.0.12、3.5.0 CO-RE 字节码及 x86_64 可执行文件构建通过。OpenSSL、基础探针、事件发布处理器和 eCaptureQ 定向竞态测试通过，完整补丁在干净的固定上游源码上通过应用检查。
+- `scripts/verify.py` 完整验收通过，126 条请求及响应全部配对，均无不完整或截断标记，覆盖 HTTP、TLS 1.2/1.3、中文 POST、并发、长连接与采集前已建立的 HTTPS 连接。
+- 五类规则触发，正常 POST 无告警，导出 ZIP 的 SHA-256 清单核对通过。实验 Nginx 配置哈希及原有进程身份检查通过。
+- `scripts/verify-services.py` 的 Nginx 六条串行访问通过，包含已有 HTTPS 连接、UTF-8 中文正文和采集运行中的响应查询，验证空闲时末批 TLS 数据及时写入。
+- 两组最终会话的网卡、用户态队列及 TLS 丢弃计数均为零，cgroup v2 的 256 MiB 内存和单核 50% CPU 约束生效。
+
+首轮实测发现多核 perf 事件乱序，一条请求的正文先于请求头送达，形成额外的不完整记录。采集器现启用 100 毫秒排序窗口，eCapture 补丁增加读取超时后的末批刷新，修复后完整验收与运行中查询均通过。排序带来约一个窗口的事件缓冲时间。首轮失败证据保留在测试机 `/opt/traffic-x64/validation/functional`。
+
+最终二进制位于测试机 `/opt/traffic-x64/bin/` 和本地 `bin/linux-amd64/`，附带 `SHA256SUMS`。本地完整会话位于 `sessions/192.168.1.10/2026-11-12/functional-final` 与 `nginx-live`，日志及证据 ZIP 位于 `validation/linux-amd64-2026-11-12/`。文件均在 Git 忽略目录中。验收结束后已停止实验 Nginx 和后端、退出采集探针，并禁用新安装 Nginx 的系统服务自启动。构建依赖和验证文件保留以便复核。
+
+本次 x86_64 运行验收覆盖 Nginx / OpenSSL 3.5。OpenSSL 3.0 探针已编译，Apache 自定义 BIO、Tomcat Java Agent、通用 OpenSSL API、其他发行版及长期性能尚未在 x86_64 实机验收。采集器与分析程序动态依赖构建环境的 glibc，采集器还依赖 libpcap，其他发行版建议在目标环境重新构建。
+
 ## 2026-11-12 多服务验证
 
 在同一台 Debian 13 ARM64 / Linux 6.12 主机上使用独立实验实例，按普通 Web 访问验证本次多服务改动。每组主要验收发送六次串行 GET/中文 JSON POST，包含 HTTP 和 HTTPS。各组成功样本的请求、响应完整，已观测网卡、队列和 TLS 丢弃均为零。新增 Java Agent 的 JVM 内开销尚未形成性能验收结论。

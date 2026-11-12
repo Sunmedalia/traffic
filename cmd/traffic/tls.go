@@ -60,7 +60,7 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 	}
 	addr := listener.Addr().String()
 	listener.Close()
-	args := []string{"tls", "--libssl", lib, "--mapsize", "1024", "--ecaptureq", "ws://" + addr + "/"}
+	args := []string{"tls", "--libssl", lib, "--mapsize", "1024", "--perf-reorder", "--perf-reorder-lag-ms", "100", "--ecaptureq", "ws://" + addr + "/"}
 	if pid > 0 {
 		args = append(args, "-p", strconv.Itoa(pid))
 	} else {

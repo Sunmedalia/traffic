@@ -2,7 +2,7 @@
 
 面向 Linux 网站应急响应的流量采集与分析工具。使用独立的采集程序记录现场数据，再通过 TUI 分析程序实时查看或回看会话。HTTP 请求、响应、检测依据和网络证据保存在同一个会话目录。
 
-当前为 **Linux ARM64 实验版本**，已在 Debian 13、Linux 6.12、Nginx 1.26、OpenSSL 3.5 环境验证。运行中采集使用网卡抓包和 eBPF TLS 探针，采集过程无需重启或重载网站、修改网站配置。兼容性和性能验收状态见 [验证记录](VALIDATION.md)。
+当前为 **Linux ARM64 / x86_64 实验版本**。ARM64 已在 Debian 13、Linux 6.12、Nginx 1.26、OpenSSL 3.5 环境验证，x86_64 已在 Ubuntu 26.04、Linux 7.0、Nginx 1.28、OpenSSL 3.5 环境验证。运行中采集使用网卡抓包和 eBPF TLS 探针，采集过程无需重启或重载网站、修改网站配置。兼容性和性能验收状态见 [验证记录](VALIDATION.md)。
 
 ## 程序职责
 
@@ -51,7 +51,7 @@ go build -o bin/traffic-tui ./cmd/traffic-tui
 
 ### HTTPS 采集依赖
 
-HTTPS 路径使用固定版本 eCapture 加本项目补丁。当前构建脚本生成 **ARM64 / OpenSSL 3.0、3.5 / CO-RE** 探针，并包含自定义 BIO 的 socket 关联以及 `SSL_read_ex`、`SSL_write_ex` 支持。其他版本需要单独验证。
+HTTPS 路径使用固定版本 eCapture 加本项目补丁。当前构建脚本按 Linux 主机架构生成 **ARM64 或 x86_64 / OpenSSL 3.0、3.5 / CO-RE** 探针，并包含自定义 BIO 的 socket 关联以及 `SSL_read_ex`、`SSL_write_ex` 支持。其他版本需要单独验证。
 
 ```bash
 # 另外需要 Go 1.26+，以及上游 eCapture 所需构建环境
@@ -61,7 +61,7 @@ sudo apt-get install -y clang llvm bpftool libelf-dev libssl-dev flex bison make
 
 构建目录必须不存在。脚本检出上游提交 `143e771cf2b4919aedc27fd7b4b24ff87b8725b9`，应用补丁并生成 `bin/ecapture`、许可证和校验文件。构建细节见 [eCapture 构建文档](https://github.com/gojue/ecapture/blob/v2.9.1/docs/agent/build-test.md)。
 
-补丁修复实机发现的连接缓存崩溃和 FD 复用时的元数据竞争，并减少解码复制。socket 地址及 inode 身份与对应明文一起进入事件。补丁扩展了内部 eBPF ABI，需要配套构建探针字节码与用户态解码器。[补丁文件](patches/ecapture-v2.9.1-connection-cache.patch)
+补丁修复实机发现的连接缓存崩溃和 FD 复用时的元数据竞争，并减少解码复制。socket 地址及 inode 身份与对应明文一起进入事件。多核机器上的 TLS 事件使用 100 毫秒时间排序窗口，空闲时也会刷新末批事件。补丁扩展了内部 eBPF ABI，需要配套构建探针字节码与用户态解码器。[补丁文件](patches/ecapture-v2.9.1-connection-cache.patch)
 
 ## 快速使用
 
@@ -77,6 +77,8 @@ sudo ./bin/traffic capture \
   --libssl /lib/aarch64-linux-gnu/libssl.so.3 \
   --output ./sessions/incident-001
 ```
+
+x86_64 主机可将示例中的库路径改为 `/usr/lib/x86_64-linux-gnu/libssl.so.3`，或省略 `--libssl` 自动发现。构建得到的三个可执行文件须使用同一目标架构。
 
 将 `eth0` 替换为目标主机的实际接口。`--libssl` 可省略，程序从目标进程映射发现动态库。默认接口为 Linux `any`，包含回环接口。`--ports` 限定抓包和 TLS 明文事件的本地端口。探针按动态库和 UID 分组，随后按选定进程及启动时间过滤，root 目标使用 PID 限定。多站点共用进程和端口时，采集包含这些站点的请求。
 
@@ -277,7 +279,7 @@ go test -race ./...
 go vet ./...
 ```
 
-GitHub Actions 在 ARM64 Linux 上执行格式检查、竞态测试、静态检查和构建。单元与回归测试覆盖规则正反例、解码、分片、请求响应配对、部分正文、队列缺口、TCP 重传乱序、离线重放和证据导出。
+GitHub Actions 在 ARM64 和 x86_64 Linux 上执行格式检查、竞态测试、静态检查和构建。单元与回归测试覆盖规则正反例、解码、分片、请求响应配对、部分正文、队列缺口、TCP 重传乱序、离线重放和证据导出。
 
 以下实机脚本需要与本项目测试站接口兼容的既有站点，包括 `/api/health`、`/api/echo`、`/search` 及未知路径返回 404。它们会发送测试请求，串行运行，输出目录需为新目录。
 
@@ -286,9 +288,9 @@ python3 scripts/verify.py /tmp/traffic-functional --host 127.0.0.1
 python3 scripts/benchmark.py --output /tmp/traffic-performance --host 127.0.0.1
 ```
 
-脚本支持 `--binary` 和 `--config` 指定采集程序与 Nginx 配置。功能脚本另通过 `--analysis-binary` 指定证据导出所用的 `traffic-tui`，默认路径为 `/opt/traffic/bin/traffic-tui`。功能脚本检查 126 条请求及响应、已有 HTTPS 连接、TLS 版本、中文正文、五类规则、网站配置和 PID、证据校验。性能脚本默认 20/100 请求每秒、每组五分钟、重复三轮。
+脚本支持 `--binary` 和 `--config` 指定采集程序与 Nginx 配置。功能脚本另通过 `--analysis-binary` 指定证据导出所用的 `traffic-tui`，默认路径为 `/opt/traffic/bin/traffic-tui`。可用 `--ecapture` 指定探针路径、`--pid` 将 TLS 探针限定到实验进程。功能脚本检查 126 条请求及响应、已有 HTTPS 连接、TLS 版本、中文正文、五类规则、网站配置和 PID、证据校验。性能脚本默认 20/100 请求每秒、每组五分钟、重复三轮。
 
-HTTP/2、HTTP/3、WebSocket 内容解析、通用 JSSE/Go TLS、Tomcat NIO2、Windows 及 x86_64 的完整采集验收待实现。HTTP/1.1 流中途缺失消息开头时，可见内容受限。代理后的来源地址默认取连接对端，经过 CDN 或负载均衡时需结合可信代理信息分析。
+HTTP/2、HTTP/3、WebSocket 内容解析、通用 JSSE/Go TLS、Tomcat NIO2、Windows 的完整采集验收待实现。x86_64 的 Apache、Tomcat、通用 OpenSSL 服务及长期性能仍待单独验收。HTTP/1.1 流中途缺失消息开头时，可见内容受限。代理后的来源地址默认取连接对端，经过 CDN 或负载均衡时需结合可信代理信息分析。
 
 ## 第三方组件
 

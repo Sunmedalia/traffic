@@ -728,3 +728,49 @@ index 9a8fb26..8bc88bc 100644
 +    bpf_map_update_elem(&traffic_ssl_sockets,&key,conn,BPF_ANY);
 +#endif
 +}
+diff --git a/internal/probe/base/base_probe.go b/internal/probe/base/base_probe.go
+index 3142cd4..76daae4 100644
+--- a/internal/probe/base/base_probe.go
++++ b/internal/probe/base/base_probe.go
+@@ -22,6 +22,7 @@ import (
+ 	"os"
+ 	"sync"
+ 	"sync/atomic"
++	"time"
+ 
+ 	"github.com/cilium/ebpf"
+ 	"github.com/cilium/ebpf/perf"
+@@ -452,7 +453,7 @@ func (p *BaseProbe) preprocessEvent(decoder domain.EventDecoder, event domain.Ev
+ 
+ func (p *BaseProbe) perfEventLoopOrdered(rd *perf.Reader, em *ebpf.Map, decoder domain.EventDecoder, lagNs uint64) {
+ 	reorder := newPerfLagReorder(lagNs)
+-	defer func() {
++	flush := func() {
+ 		for _, ev := range reorder.flushAll() {
+ 			if mn, ok := domain.AsMonoNsEvent(ev); ok {
+ 				p.logPerfDispatchDebug("after reorder", mn)
+@@ -461,7 +462,8 @@ func (p *BaseProbe) perfEventLoopOrdered(rd *perf.Reader, em *ebpf.Map, decoder
+ 				p.logger.Warn().Err(err).Msg("Failed to dispatch reordered event")
+ 			}
+ 		}
+-	}()
++	}
++	defer flush()
+ 
+ 	for {
+ 		select {
+@@ -471,8 +473,14 @@ func (p *BaseProbe) perfEventLoopOrdered(rd *perf.Reader, em *ebpf.Map, decoder
+ 		default:
+ 		}
+ 
++		// Flush the final batch while the service is idle, including a lone event.
++		rd.SetDeadline(time.Now().Add(time.Duration(lagNs)))
+ 		record, err := rd.Read()
+ 		if err != nil {
++			if stderrors.Is(err, os.ErrDeadlineExceeded) {
++				flush()
++				continue
++			}
+ 			if stderrors.Is(err, perf.ErrClosed) {
+ 				return
+ 			}
