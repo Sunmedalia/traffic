@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Traffic 流量分析</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/">TRAFFIC</a>
+  <div class="crumb" id="crumb"></div>
+  <div class="spacer"></div>
+  <span class="zone" id="zone"></span>
+  <span class="live" id="live" hidden></span>
+  <button type="button" id="pause" hidden>暂停刷新</button>
+</header>
+<div class="notice" id="notice" role="status" hidden></div>
+
+<main>
+  <section id="view-gate" class="gate" hidden>
+    <form id="gate-form">
+      <h1>输入访问令牌</h1>
+      <p>令牌在启动 <code>traffic-tui web</code> 时输出到终端，也可以直接打开终端里带令牌的完整地址。</p>
+      <input id="gate-token" type="password" autocomplete="off" spellcheck="false" placeholder="访问令牌" aria-label="访问令牌">
+      <button type="submit" class="primary">进入</button>
+    </form>
+  </section>
+
+  <section id="view-sessions" class="sessions" hidden>
+    <div class="section-head">
+      <div>
+        <h1>选择会话</h1>
+        <p class="muted" id="sessions-meta"></p>
+      </div>
+      <button type="button" id="rescan">重新扫描</button>
+    </div>
+    <div class="table-wrap">
+      <table class="data sessions-table">
+        <thead><tr><th>开始时间</th><th>名称</th><th>主机</th><th>状态</th><th class="num">请求</th><th class="num">告警</th><th>目录</th></tr></thead>
+        <tbody id="sessions-body"></tbody>
+      </table>
+      <p class="empty" id="sessions-empty" hidden>暂无会话。使用 <code>--data-dir</code> 指定采集根目录，或用 <code>--session</code> 指定会话目录后重新启动。</p>
+    </div>
+  </section>
+
+  <section id="view-session" class="session" hidden>
+    <nav class="tabs" role="tablist">
+      <button type="button" role="tab" data-tab="overview">概览</button>
+      <button type="button" role="tab" data-tab="requests">请求 <span class="badge" id="count-requests"></span></button>
+      <button type="button" role="tab" data-tab="alerts">告警 <span class="badge alert" id="count-alerts"></span></button>
+    </nav>
+
+    <div id="tab-overview" class="overview" hidden>
+      <div class="tiles" id="tiles"></div>
+      <dl class="facts" id="facts"></dl>
+      <h2>服务探针</h2>
+      <div class="table-wrap flat">
+        <table class="data">
+          <thead><tr><th>服务</th><th class="num">PID</th><th class="num">UID</th><th>端口</th><th>TLS 库</th><th>状态</th></tr></thead>
+          <tbody id="targets-body"></tbody>
+        </table>
+        <p class="empty" id="targets-empty" hidden>暂无服务探针记录</p>
+      </div>
+      <h2>采集错误</h2>
+      <ul class="errors" id="errors"></ul>
+    </div>
+
+    <div id="tab-list" class="list" hidden>
+      <form class="filters" id="filters">
+        <label>客户端<input name="client" placeholder="IP 或 IP:端口" spellcheck="false"></label>
+        <label>关键词<input name="keyword" placeholder="Host / URL" spellcheck="false"></label>
+        <label>规则<input name="rule" placeholder="规则 ID" spellcheck="false"></label>
+        <label>级别<select name="severity"><option value="">全部</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option></select></label>
+        <label>服务<input name="service" placeholder="nginx / apache / tomcat" spellcheck="false"></label>
+        <label>起始时间<input name="since" type="datetime-local" step="1"></label>
+        <div class="filter-actions">
+          <button type="submit" class="primary">筛选</button>
+          <button type="button" id="filters-clear">清空</button>
+        </div>
+      </form>
+      <div class="split" id="split">
+        <div class="pane rows">
+          <div class="table-wrap">
+            <table class="data rows-table">
+              <thead><tr><th>时间</th><th>方法</th><th class="num">状态</th><th>级别</th><th>客户端</th><th>Host</th><th class="wide">URL</th></tr></thead>
+              <tbody id="rows-body"></tbody>
+            </table>
+            <p class="empty" id="rows-empty" hidden>暂无匹配请求</p>
+          </div>
+          <div class="pager">
+            <span id="pager-info"></span>
+            <div class="spacer"></div>
+            <button type="button" id="page-first">首页</button>
+            <button type="button" id="page-prev">上一页</button>
+            <button type="button" id="page-next">下一页</button>
+          </div>
+        </div>
+        <aside class="pane detail" id="detail" hidden>
+          <div class="detail-head">
+            <div class="detail-title" id="detail-title"></div>
+            <button type="button" id="detail-export">导出证据</button>
+            <button type="button" id="detail-close" aria-label="关闭详情">关闭</button>
+          </div>
+          <dl class="facts compact" id="detail-facts"></dl>
+          <nav class="tabs small" role="tablist">
+            <button type="button" role="tab" data-detail="request">请求</button>
+            <button type="button" role="tab" data-detail="response">响应</button>
+            <button type="button" role="tab" data-detail="decoded">解码正文</button>
+            <button type="button" role="tab" data-detail="alerts">检测依据 <span class="badge alert" id="detail-alert-count"></span></button>
+          </nav>
+          <div class="detail-body" id="detail-body"></div>
+        </aside>
+      </div>
+    </div>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

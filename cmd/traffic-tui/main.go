@@ -34,7 +34,7 @@ func run(args []string) error {
 		cmd, args = args[0], args[1:]
 	}
 	switch cmd {
-	case "view", "status", "requests", "events", "show", "export":
+	case "view", "web", "status", "requests", "events", "show", "export":
 	default:
 		return fmt.Errorf("unknown analysis command %q; use traffic for collection", cmd)
 	}
@@ -44,13 +44,15 @@ func run(args []string) error {
 	}
 	fs := flag.NewFlagSet("traffic-tui "+cmd, flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "traffic-tui [--data-dir ROOT | --session DIR]\ntraffic-tui <status|requests|events|show ID|export ID> --session DIR")
+		fmt.Fprintln(fs.Output(), "traffic-tui [--data-dir ROOT | --session DIR]\ntraffic-tui web [--listen ADDR] [--data-dir ROOT | --session DIR]\ntraffic-tui <status|requests|events|show ID|export ID> --session DIR")
 		fmt.Fprintln(fs.Output(), "默认打开中文会话选择界面，查询命令输出 JSON。")
 		fs.PrintDefaults()
 	}
 	dir := fs.String("session", "", "existing session directory")
 	dataDir := fs.String("data-dir", "", "session browser search directory")
-	refresh := fs.Duration("refresh", time.Second, "TUI refresh interval")
+	refresh := fs.Duration("refresh", time.Second, "TUI or web refresh interval")
+	listen := fs.String("listen", "127.0.0.1:8080", "web listen address")
+	allowRemote := fs.Bool("allow-remote", false, "allow web to listen on a non-loopback address over plain HTTP")
 	out := fs.String("out", "", "export archive (must not exist)")
 	limit := fs.Int("limit", 100, "maximum query results")
 	service := fs.String("service", "", "service filter")
@@ -83,6 +85,9 @@ func run(args []string) error {
 			return fmt.Errorf("--since: %w", err)
 		}
 		*since = stamp.UTC().Format(indexTimeFormat)
+	}
+	if cmd == "web" {
+		return runWeb(*dir, *dataDir, *listen, *allowRemote, *refresh)
 	}
 	if cmd == "view" {
 		return runSessionBrowser(*dir, *dataDir, *refresh, tuiFilter{Client: *client, Rule: *rule, Severity: *severity, Since: *since, Service: *service})
