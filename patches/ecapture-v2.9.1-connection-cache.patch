@@ -107,7 +107,7 @@ index b84e3a9..7a7e167 100644
 +	return connectionInfo{}, false
 +}
 diff --git a/internal/probe/openssl/event.go b/internal/probe/openssl/event.go
-index b8aebea..d534549 100644
+index b8aebea..d0d2e89 100644
 --- a/internal/probe/openssl/event.go
 +++ b/internal/probe/openssl/event.go
 @@ -18,6 +18,7 @@ import (
@@ -135,7 +135,7 @@ index b8aebea..d534549 100644
  		return errors.NewEventDecodeError("openssl.Data", err)
  	}
  	if err := binary.Read(buf, binary.LittleEndian, &e.DataLen); err != nil {
-@@ -151,6 +153,25 @@ func (e *Event) DecodeFromBytes(data []byte) error {
+@@ -151,6 +153,31 @@ func (e *Event) DecodeFromBytes(data []byte) error {
  		return errors.NewEventDecodeError("openssl.BioType", err)
  	}
  
@@ -146,7 +146,7 @@ index b8aebea..d534549 100644
 +		}
 +		buf.Next(8)
 +		metadata := &ConnDataEvent{}
-+		if err := metadata.DecodeFromBytes(buf.Next(metadataSize)); err == nil && metadata.Inode != 0 && metadata.Pid == e.Pid && metadata.Fd == e.Fd && (metadata.Family == unix.AF_INET || metadata.Family == unix.AF_INET6) {
++		if err := metadata.DecodeFromBytes(buf.Next(metadataSize)); err == nil && (metadata.Inode != 0 || metadata.Fd == 0xffffffff) && metadata.Pid == e.Pid && metadata.Fd == e.Fd && (metadata.Family == unix.AF_INET || metadata.Family == unix.AF_INET6) {
 +			e.Tuple = metadata.Tuple
 +			e.Sock = metadata.Sock
 +			source, destination := metadata.endpoints()
@@ -155,13 +155,19 @@ index b8aebea..d534549 100644
 +			e.sourcePort = metadata.Sport
 +			e.destinationPort = metadata.Dport
 +			e.connectionID = fmt.Sprintf("%d_inode_%d", e.Pid, metadata.Inode)
++			if metadata.Fd == 0xffffffff {
++				e.connectionID = fmt.Sprintf("%d_apache_%d", e.Pid, metadata.Sock)
++			}
++		}
++		if e.connectionID == "" && metadata.Pid == e.Pid && metadata.Sock != 0 {
++			e.connectionID = fmt.Sprintf("%d_ssl_%d", e.Pid, metadata.Sock)
 +		}
 +	}
 +
  	return nil
  }
  
-@@ -404,3 +425,10 @@ func getClockOffset() (int64, error) {
+@@ -404,3 +431,10 @@ func getClockOffset() (int64, error) {
  
  	return realNs - monoNs, nil
  }
@@ -231,7 +237,7 @@ index 11b31b3..0e77a63 100644
  	))
  	if err != nil {
 diff --git a/internal/probe/openssl/openssl_probe.go b/internal/probe/openssl/openssl_probe.go
-index d78dd0a..86ef872 100644
+index d78dd0a..678459f 100644
 --- a/internal/probe/openssl/openssl_probe.go
 +++ b/internal/probe/openssl/openssl_probe.go
 @@ -21,6 +21,7 @@ import (
@@ -242,7 +248,20 @@ index d78dd0a..86ef872 100644
  
  	"github.com/cilium/ebpf"
  	manager "github.com/gojue/ebpfmanager"
-@@ -783,8 +784,10 @@ func (d *tlsEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, error)
+@@ -251,6 +252,12 @@ func (p *Probe) setupManagerText() error {
+ 
+ 	// TEXT mode: Only SSL_read/SSL_write probes for data capture
+ 	probes = []*manager.Probe{
++		{Section: "uprobe/SSL_read_ex", EbpfFuncName: "traffic_read_ex", AttachToFuncName: "SSL_read_ex", BinaryPath: opensslPath},
++		{Section: "uretprobe/SSL_read_ex", EbpfFuncName: "traffic_read_ex_ret", AttachToFuncName: "SSL_read_ex", BinaryPath: opensslPath},
++		{Section: "uprobe/SSL_write_ex", EbpfFuncName: "traffic_write_ex", AttachToFuncName: "SSL_write_ex", BinaryPath: opensslPath},
++		{Section: "uretprobe/SSL_write_ex", EbpfFuncName: "traffic_write_ex_ret", AttachToFuncName: "SSL_write_ex", BinaryPath: opensslPath},
++		{Section: "kprobe/tcp_recvmsg", EbpfFuncName: "traffic_tcp_recvmsg", AttachToFuncName: "tcp_recvmsg"},
++		{Section: "uprobe/SSL_free", EbpfFuncName: "traffic_ssl_free", AttachToFuncName: "SSL_free", BinaryPath: opensslPath},
+ 		{
+ 			Section:          "uprobe/SSL_write",
+ 			EbpfFuncName:     "probe_entry_SSL_write",
+@@ -783,8 +790,10 @@ func (d *tlsEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, error)
  	if err := event.Validate(); err != nil {
  		return nil, err
  	}
@@ -257,10 +276,10 @@ index d78dd0a..86ef872 100644
  			event.sourceIP = conn.sourceIP
 diff --git a/internal/probe/openssl/traffic_cache_test.go b/internal/probe/openssl/traffic_cache_test.go
 new file mode 100644
-index 0000000..a15a9a8
+index 0000000..fe35e26
 --- /dev/null
 +++ b/internal/probe/openssl/traffic_cache_test.go
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,105 @@
 +package openssl
 +
 +import (
@@ -344,8 +363,30 @@ index 0000000..a15a9a8
 +		t.Fatalf("padding rejected: %v", err)
 +	}
 +}
++
++func TestTrafficApacheMetadataUsesGenerationIdentity(t *testing.T) {
++	var source, destination, comm [16]byte
++	copy(source[:], []byte{127, 0, 0, 1})
++	copy(destination[:], []byte{127, 0, 0, 1})
++	copy(comm[:], "apache2")
++	metadata := buildConnPayload(t, source, destination, comm, 100, 987654, 1000, 1001, 0xffffffff, unix.AF_INET, 54321, 8444, 0)
++	metadata = append(metadata, make([]byte, 14)...)
++	magic := make([]byte, 8)
++	binary.LittleEndian.PutUint64(magic, 0x54524146434f4e31)
++	sample := benchmarkTLSDataSample(t)
++	binary.LittleEndian.PutUint32(sample[24+MaxDataSize+4+TaskCommLen:], 0xffffffff)
++	sample = append(append(sample, magic...), metadata...)
++	output, err := (&tlsEventDecoder{}).Decode(nil, sample)
++	if err != nil {
++		t.Fatal(err)
++	}
++	event := output.(*Event)
++	if event.GetStreamID() != "1000_apache_987654" || event.GetSrcPort() != 54321 || event.GetDstPort() != 8444 || event.GetSrcIP() != "127.0.0.1" {
++		t.Fatalf("bad Apache identity: %+v", event)
++	}
++}
 diff --git a/kern/openssl.h b/kern/openssl.h
-index 9a8fb26..7d22fc1 100644
+index 9a8fb26..8bc88bc 100644
 --- a/kern/openssl.h
 +++ b/kern/openssl.h
 @@ -25,19 +25,6 @@ enum ssl_data_event_type { kSSLRead, kSSLWrite };
@@ -368,7 +409,7 @@ index 9a8fb26..7d22fc1 100644
  struct connect_event_t {
      unsigned __int128 saddr;
      unsigned __int128 daddr;
-@@ -52,9 +39,27 @@ struct connect_event_t {
+@@ -52,9 +39,29 @@ struct connect_event_t {
      u16 dport;
      u8 is_destroy;
      u8 pad[7];
@@ -392,11 +433,28 @@ index 9a8fb26..7d22fc1 100644
 +};
 +
  struct active_ssl_buf {
++    const void *result_len;
++    u64 ssl;
 +    int server;
      /*
       * protocol version (one of SSL2_VERSION, SSL3_VERSION, TLS1_VERSION,
       * DTLS1_VERSION)
-@@ -138,6 +143,8 @@ struct {
+@@ -108,6 +115,14 @@ struct {
+     __uint(max_entries, 1024);
+ } active_ssl_write_args_map SEC(".maps");
+ 
++struct traffic_ssl_key { u64 pid; u64 ssl; };
++struct {
++    __uint(type, BPF_MAP_TYPE_LRU_HASH);
++    __type(key, struct traffic_ssl_key);
++    __type(value, struct connect_event_t);
++    __uint(max_entries, 4096);
++} traffic_ssl_sockets SEC(".maps");
++
+ // BPF programs are limited to a 512-byte stack. We store this value per CPU
+ // and use it as a heap allocated value.
+ struct {
+@@ -138,6 +153,8 @@ struct {
   * General helper functions
   ***********************************************************/
  
@@ -405,35 +463,105 @@ index 9a8fb26..7d22fc1 100644
  static __always_inline struct ssl_data_event_t* create_ssl_data_event(
      u64 current_pid_tgid) {
      u32 zero = 0;
-@@ -160,9 +167,9 @@ static __always_inline struct ssl_data_event_t* create_ssl_data_event(
+@@ -160,10 +177,19 @@ static __always_inline struct ssl_data_event_t* create_ssl_data_event(
   * BPF syscall processing functions
   ***********************************************************/
  
 -static int process_SSL_data(struct pt_regs* ctx, u64 id,
++static __always_inline void traffic_apache_metadata(u64 ssl,struct connect_event_t *conn);
++static __always_inline u64 traffic_process_key(void) {
++    struct task_struct *task=(struct task_struct *)bpf_get_current_task();
++    struct task_struct *leader=0;
++    u64 started=0;
++    bpf_probe_read_kernel(&leader,sizeof(leader),&task->group_leader);
++    if(leader) bpf_probe_read_kernel(&started,sizeof(started),&leader->start_boottime);
++    return started ^ (bpf_get_current_pid_tgid() >> 32);
++}
++
 +static __always_inline int process_SSL_data(struct pt_regs* ctx, u64 id,
                              enum ssl_data_event_type type, const char* buf,
 -                            u32 fd, s32 version, u32 bio_type) {
-+                            u32 fd, s32 version, u32 bio_type, int server) {
-     int len = (int)PT_REGS_RC(ctx);
+-    int len = (int)PT_REGS_RC(ctx);
++                            u32 fd, s32 version, u32 bio_type, int server, u64 ssl, int len) {
      if (len < 0) {
          return 0;
-@@ -174,6 +181,9 @@ static int process_SSL_data(struct pt_regs* ctx, u64 id,
+     }
+@@ -174,7 +200,17 @@ static int process_SSL_data(struct pt_regs* ctx, u64 id,
      }
  
      event->type = type;
+-    event->fd = fd;
 +    event->connection_magic = 0x54524146434f4e31ULL;
 +    __builtin_memset(&event->connection, 0, sizeof(event->connection));
 +    traffic_socket_metadata(fd, server, &event->connection);
-     event->fd = fd;
++    if (!event->connection.inode) traffic_apache_metadata(ssl,&event->connection);
++    if (!event->connection.inode && event->connection.fd != 0xffffffff) {
++        struct traffic_ssl_key key = {.pid = traffic_process_key(), .ssl = ssl};
++        struct connect_event_t *cached = bpf_map_lookup_elem(&traffic_ssl_sockets, &key);
++        if (cached) __builtin_memcpy(&event->connection, cached, sizeof(*cached));
++        else {event->connection.sock=ssl;event->connection.pid=id >> 32;}
++    }
++    event->fd = (event->connection.inode || event->connection.fd==0xffffffff) ? event->connection.fd : fd;
      event->bio_type = bio_type;
      event->version = version;
-@@ -268,6 +278,76 @@ static int process_SSL_bio(void *ssl, int bio_offset, u32 *fd, u32 *bio_type) {
+     // This is a max function, but it is written in such a way to keep older BPF
+@@ -268,6 +304,90 @@ static int process_SSL_bio(void *ssl, int bio_offset, u32 *fd, u32 *bio_type) {
      return 0;
  }
  
 +// Copy descriptor identity and tuple into the plaintext event at its source.
++static __always_inline void traffic_sock_metadata(struct sock *sk, int server, struct connect_event_t *conn) {
++    u16 family = 0;
++    unsigned __int128 source = 0, destination = 0;
++    u32 ports = 0;
++    bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
++    if (family == AF_INET) {
++        u64 addresses = 0;
++        bpf_probe_read_kernel(&addresses, sizeof(addresses), &sk->__sk_common.skc_addrpair);
++        source = (__be32)(addresses >> 32);
++        destination = (__be32)addresses;
++    } else if (family == AF_INET6) {
++        bpf_probe_read_kernel(&source, sizeof(source), &sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
++        bpf_probe_read_kernel(&destination, sizeof(destination), &sk->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
++    } else return;
++    bpf_probe_read_kernel(&ports, sizeof(ports), &sk->__sk_common.skc_portpair);
++    if (ports == 0) return;
++    struct socket *socket = 0;
++    struct file *file = 0;
++    struct inode *inode = 0;
++    u64 identity = 0;
++    bpf_probe_read_kernel(&socket, sizeof(socket), &sk->sk_socket);
++    if (!socket) return;
++    bpf_probe_read_kernel(&file, sizeof(file), &socket->file);
++    if (!file) return;
++    bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
++    if (!inode) return;
++    bpf_probe_read_kernel(&identity, sizeof(identity), &inode->i_ino);
++    if (!identity) return;
++    u64 pid_tgid = bpf_get_current_pid_tgid();
++    conn->timestamp_ns = bpf_ktime_get_ns();
++    conn->pid = pid_tgid >> 32;
++    conn->tid = pid_tgid;
++    conn->fd = 0;
++    conn->family = family;
++    conn->sock = (u64)sk;
++    conn->inode = identity;
++    if (server == 0) {
++        conn->sport = ports >> 16;
++        conn->dport = bpf_ntohs((u16)ports);
++        conn->saddr = source;
++        conn->daddr = destination;
++    } else {
++        conn->sport = bpf_ntohs((u16)ports);
++        conn->dport = ports >> 16;
++        conn->saddr = destination;
++        conn->daddr = source;
++    }
++    bpf_get_current_comm(&conn->comm, sizeof(conn->comm));
++}
++
 +static __always_inline void traffic_socket_metadata(u32 fd, int server, struct connect_event_t *conn) {
-+#ifdef SSL_CONNECTION_ST_SERVER
++#if defined(SSL_CONNECTION_ST_SERVER) || defined(SSL_ST_SERVER)
 +    if (server < 0 || fd == 0 || fd > 1048576) return;
 +    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 +    struct files_struct *files = 0;
@@ -460,51 +588,15 @@ index 9a8fb26..7d22fc1 100644
 +    if (!socket) return;
 +    bpf_probe_read_kernel(&sk, sizeof(sk), &socket->sk);
 +    if (!sk) return;
-+    u16 family = 0;
-+    unsigned __int128 source = 0, destination = 0;
-+    u32 ports = 0;
-+    bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
-+    if (family == AF_INET) {
-+        u64 addresses = 0;
-+        bpf_probe_read_kernel(&addresses, sizeof(addresses), &sk->__sk_common.skc_addrpair);
-+        source = (__be32)(addresses >> 32);
-+        destination = (__be32)addresses;
-+    } else if (family == AF_INET6) {
-+        bpf_probe_read_kernel(&source, sizeof(source), &sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
-+        bpf_probe_read_kernel(&destination, sizeof(destination), &sk->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
-+    } else return;
-+    bpf_probe_read_kernel(&ports, sizeof(ports), &sk->__sk_common.skc_portpair);
-+    if (ports == 0) return;
-+    u64 identity = 0;
-+    bpf_probe_read_kernel(&identity, sizeof(identity), &inode->i_ino);
-+    if (!identity) return;
-+    u64 pid_tgid = bpf_get_current_pid_tgid();
-+    conn->timestamp_ns = bpf_ktime_get_ns();
-+    conn->pid = pid_tgid >> 32;
-+    conn->tid = pid_tgid;
++    traffic_sock_metadata(sk, server, conn);
 +    conn->fd = fd;
-+    conn->family = family;
-+    conn->sock = (u64)sk;
-+    conn->inode = identity;
-+    if (server == 0) {
-+        conn->sport = ports >> 16;
-+        conn->dport = bpf_ntohs((u16)ports);
-+        conn->saddr = source;
-+        conn->daddr = destination;
-+    } else {
-+        conn->sport = bpf_ntohs((u16)ports);
-+        conn->dport = ports >> 16;
-+        conn->saddr = destination;
-+        conn->daddr = source;
-+    }
-+    bpf_get_current_comm(&conn->comm, sizeof(conn->comm));
 +#endif
 +}
 +
  static __always_inline int probe_entry_SSL(struct pt_regs* ctx, void *map, int bio_offset) {
      if (!passes_filter(ctx)) {
          return 0;
-@@ -293,9 +373,14 @@ static __always_inline int probe_entry_SSL(struct pt_regs* ctx, void *map, int b
+@@ -293,9 +413,17 @@ static __always_inline int probe_entry_SSL(struct pt_regs* ctx, void *map, int b
          debug_bpf_printk("openssl uprobe/SSL entry fd: %d, version: %d\n", fd, ssl_version);
      }
  
@@ -512,19 +604,127 @@ index 9a8fb26..7d22fc1 100644
      const char *buf = openssl_untag_user_pointer((const void *)PT_REGS_PARM2(ctx));
      struct active_ssl_buf active_ssl_buf_t;
      __builtin_memset(&active_ssl_buf_t, 0, sizeof(active_ssl_buf_t));
++    active_ssl_buf_t.ssl = (u64)ssl;
 +    active_ssl_buf_t.server = -1;
 +#ifdef SSL_CONNECTION_ST_SERVER
 +    openssl_probe_read_user(&active_ssl_buf_t.server, sizeof(active_ssl_buf_t.server), ssl + SSL_CONNECTION_ST_SERVER);
++#elif defined(SSL_ST_SERVER)
++    openssl_probe_read_user(&active_ssl_buf_t.server, sizeof(active_ssl_buf_t.server), ssl + SSL_ST_SERVER);
 +#endif
      active_ssl_buf_t.fd = fd;
      active_ssl_buf_t.version = ssl_version;
      active_ssl_buf_t.buf = buf;
-@@ -318,7 +403,7 @@ static __always_inline int probe_ret_SSL(struct pt_regs* ctx, void *map, enum ss
+@@ -318,7 +446,13 @@ static __always_inline int probe_ret_SSL(struct pt_regs* ctx, void *map, enum ss
          u32 bio_type = active_ssl_buf_t->bio_type;
          s32 version = active_ssl_buf_t->version;
          bpf_probe_read(&buf, sizeof(const char*), &active_ssl_buf_t->buf);
 -        process_SSL_data(ctx, current_pid_tgid, type, buf, fd, version, bio_type);
-+        process_SSL_data(ctx, current_pid_tgid, type, buf, fd, version, bio_type, active_ssl_buf_t->server);
++        int len=(int)PT_REGS_RC(ctx);
++        if (active_ssl_buf_t->result_len) {
++            u64 length=0;
++            if (len==1) openssl_probe_read_user(&length,sizeof(length),active_ssl_buf_t->result_len);
++            len=length > 0x7fffffff ? 0 : (int)length;
++        }
++        process_SSL_data(ctx, current_pid_tgid, type, buf, fd, version, bio_type, active_ssl_buf_t->server, active_ssl_buf_t->ssl, len);
      }
      bpf_map_delete_elem(map, &current_pid_tgid);
      return 0;
+@@ -537,3 +671,98 @@ int probe_SSL_set_fd(struct pt_regs* ctx) {
+     debug_bpf_printk("SSL_set_fd hook!!, ssl_addr: %d, fd: %d\n", ssl_addr, fd);
+     return 0;
+ }
++
++// Apache uses custom BIOs. Observe the socket only while SSL_read is active.
++SEC("kprobe/tcp_recvmsg")
++int traffic_tcp_recvmsg(struct pt_regs *ctx) {
++    if (!passes_filter(ctx)) return 0;
++    u64 id=bpf_get_current_pid_tgid();
++    struct active_ssl_buf *active=bpf_map_lookup_elem(&active_ssl_read_args_map,&id);
++    if (!active) return 0;
++    struct connect_event_t metadata={};
++    traffic_sock_metadata((struct sock *)PT_REGS_PARM1(ctx), active->server, &metadata);
++    if (metadata.inode) {
++        struct traffic_ssl_key key={.pid=traffic_process_key(),.ssl=active->ssl};
++        struct connect_event_t *previous=bpf_map_lookup_elem(&traffic_ssl_sockets,&key);
++        if(!previous || previous->fd!=0xffffffff) bpf_map_update_elem(&traffic_ssl_sockets,&key,&metadata,BPF_ANY);
++    }
++    return 0;
++}
++SEC("uprobe/SSL_free")
++int traffic_ssl_free(struct pt_regs *ctx) {
++    if (!passes_filter(ctx)) return 0;
++    struct traffic_ssl_key key={.pid=traffic_process_key(),.ssl=(u64)PT_REGS_PARM1(ctx)};
++    bpf_map_delete_elem(&traffic_ssl_sockets,&key);
++    return 0;
++}
++
++static __always_inline int traffic_ssl_ex_entry(struct pt_regs *ctx,void *map,int offset) {
++    probe_entry_SSL(ctx,map,offset);
++    u64 id=bpf_get_current_pid_tgid();
++    struct active_ssl_buf *active=bpf_map_lookup_elem(map,&id);
++    if(active) active->result_len=(const void *)PT_REGS_PARM4(ctx);
++    return 0;
++}
++SEC("uprobe/SSL_read_ex")
++int traffic_read_ex(struct pt_regs *ctx) {return traffic_ssl_ex_entry(ctx,&active_ssl_read_args_map,SSL_ST_RBIO);}
++SEC("uretprobe/SSL_read_ex")
++int traffic_read_ex_ret(struct pt_regs *ctx) {return probe_ret_SSL(ctx,&active_ssl_read_args_map,kSSLRead);}
++SEC("uprobe/SSL_write_ex")
++int traffic_write_ex(struct pt_regs *ctx) {return traffic_ssl_ex_entry(ctx,&active_ssl_write_args_map,SSL_ST_WBIO);}
++SEC("uretprobe/SSL_write_ex")
++int traffic_write_ex_ret(struct pt_regs *ctx) {return probe_ret_SSL(ctx,&active_ssl_write_args_map,kSSLWrite);}
++
++// Apache 2.4 / APR 1.7 / OpenSSL 3.5 ARM64. Validate the BIO method name
++// before interpreting Apache's output-filter context and public conn_rec prefix.
++static __always_inline void traffic_apache_metadata(u64 ssl,struct connect_event_t *conn) {
++#ifdef SSL_CONNECTION_ST_SERVER
++    char comm[16]={};
++    bpf_get_current_comm(comm,sizeof(comm));
++    if(!((comm[0]=='a' && comm[1]=='p' && comm[2]=='a') || (comm[0]=='h' && comm[1]=='t' && comm[2]=='t'))) return;
++    struct traffic_ssl_key key={.pid=traffic_process_key(),.ssl=ssl};
++    struct connect_event_t *cached=bpf_map_lookup_elem(&traffic_ssl_sockets,&key);
++    if(cached && cached->fd==0xffffffff) {__builtin_memcpy(conn,cached,sizeof(*conn));return;}
++    u64 bio=0,method=0,name=0,context=0,connection=0,local=0,client=0;
++    char method_name[18]={};
++    openssl_probe_read_user(&bio,8,(void *)(ssl+SSL_ST_WBIO));
++    if(!bio) return;
++    openssl_probe_read_user(&method,8,(void *)(bio+BIO_ST_METHOD));
++    if(!method) return;
++    openssl_probe_read_user(&name,8,(void *)(method+8));
++    if(!name) return;
++    openssl_probe_read_user(method_name,sizeof(method_name),(void *)name);
++    if(__builtin_memcmp(method_name,"APR output filter",18)!=0) return;
++    openssl_probe_read_user(&context,8,(void *)(bio+0x40));
++    if(!context) return;
++    openssl_probe_read_user(&connection,8,(void *)(context+8));
++    if(!connection) return;
++    openssl_probe_read_user(&local,8,(void *)(connection+24));
++    openssl_probe_read_user(&client,8,(void *)(connection+32));
++    if(!local || !client) return;
++    int local_family=0,client_family=0;
++    openssl_probe_read_user(&local_family,4,(void *)(local+28));
++    openssl_probe_read_user(&client_family,4,(void *)(client+28));
++    if(local_family!=client_family || (local_family!=AF_INET && local_family!=AF_INET6)) return;
++    u64 local_ip=0,client_ip=0;
++    openssl_probe_read_user(&local_ip,8,(void *)(local+48));
++    openssl_probe_read_user(&client_ip,8,(void *)(client+48));
++    if(!local_ip || !client_ip) return;
++    openssl_probe_read_user(&conn->sport,2,(void *)(client+24));
++    openssl_probe_read_user(&conn->dport,2,(void *)(local+24));
++    if(!conn->sport || !conn->dport) {__builtin_memset(conn,0,sizeof(*conn));return;}
++    if(local_family==AF_INET) {
++        openssl_probe_read_user(&conn->saddr,4,(void *)client_ip);
++        openssl_probe_read_user(&conn->daddr,4,(void *)local_ip);
++    } else {
++        openssl_probe_read_user(&conn->saddr,16,(void *)client_ip);
++        openssl_probe_read_user(&conn->daddr,16,(void *)local_ip);
++    }
++    conn->family=local_family;
++    conn->pid=bpf_get_current_pid_tgid() >> 32;
++    conn->tid=bpf_get_current_pid_tgid();
++    conn->fd=0xffffffff;
++    conn->sock=bpf_ktime_get_ns();
++    conn->timestamp_ns=conn->sock;
++    bpf_map_update_elem(&traffic_ssl_sockets,&key,conn,BPF_ANY);
++#endif
++}

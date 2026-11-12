@@ -143,6 +143,9 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				}
 			}
 			t := Transaction{ID: fmt.Sprintf("%x-%x", time.Now().UnixNano(), serial.Add(1)), Time: captured, Source: source, Host: req.Host, Client: client, Connection: key, Method: req.Method, URL: req.RequestURI, Request: raw, Incomplete: incomplete || e != nil, Truncated: truncated, PID: pid}
+			if endpoint, ok := r.(interface{ LocalEndpoint() string }); ok {
+				t.LocalEndpoint = endpoint.LocalEndpoint()
+			}
 			p.mu.Lock()
 			for k, items := range p.pending {
 				if len(items) > 0 && captured.Sub(items[len(items)-1].Time) > time.Minute {

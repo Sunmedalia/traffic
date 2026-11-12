@@ -54,6 +54,7 @@ func run(args []string) error {
 	refresh := fs.Duration("refresh", time.Second, "TUI refresh interval")
 	out := fs.String("out", "", "export archive (must not exist)")
 	limit := fs.Int("limit", 100, "maximum query results")
+	service := fs.String("service", "", "service filter")
 	client := fs.String("client", "", "source address filter")
 	rule := fs.String("rule", "", "rule ID filter")
 	severity := fs.String("severity", "", "severity filter: low, medium, high")
@@ -85,7 +86,7 @@ func run(args []string) error {
 		*since = stamp.UTC().Format(indexTimeFormat)
 	}
 	if cmd == "view" {
-		return runSessionBrowser(*dir, *dataDir, *refresh, tuiFilter{Client: *client, Rule: *rule, Severity: *severity, Since: *since})
+		return runSessionBrowser(*dir, *dataDir, *refresh, tuiFilter{Client: *client, Rule: *rule, Severity: *severity, Since: *since, Service: *service})
 	}
 	if *dir == "" {
 		return errors.New("--session required")
@@ -157,6 +158,9 @@ func run(args []string) error {
 		var t Transaction
 		if e = json.Unmarshal(b, &t); e != nil {
 			return e
+		}
+		if *service != "" && t.Service != *service {
+			continue
 		}
 		if cmd == "events" && len(t.Alerts) == 0 {
 			continue

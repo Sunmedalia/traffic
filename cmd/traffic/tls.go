@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -52,7 +53,7 @@ func protoFields(b []byte) (map[int][]byte, map[int]uint64, error) {
 	}
 	return s, v, nil
 }
-func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string, pid int) error {
+func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string, pid, uid int, accepts func(int) bool, attached func()) error {
 	listener, e := net.Listen("tcp", "127.0.0.1:0")
 	if e != nil {
 		return e
@@ -63,10 +64,7 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 	if pid > 0 {
 		args = append(args, "-p", strconv.Itoa(pid))
 	} else {
-		uid, err := nginxUID()
-		if err != nil {
-			return err
-		}
+
 		args = append(args, "-u", strconv.Itoa(uid))
 	}
 	for _, name := range []string{"logs", "tls"} {
@@ -130,12 +128,16 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 	s.mu.Lock()
 	s.stats.TLS = "attached"
 	s.mu.Unlock()
+	attached()
 	events, err := os.OpenFile(filepath.Join(s.dir, "tls", "events.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return err
 	}
 	defer events.Close()
 	enc := json.NewEncoder(events)
+	epoch := serial.Add(1)
+	identityWarning := false
+	portWarning := false
 	frames := &Frames{}
 	stopExpiry := frames.startExpiry(ctx, p)
 	defer stopExpiry()
@@ -158,7 +160,17 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 		if e != nil {
 			return e
 		}
-		if string(fields[8]) != "nginx" {
+		if (nums[6] != 0 && !capturePorts[int(nums[6])]) || !accepts(int(nums[7])) {
+			continue
+		}
+		if nums[6] == 0 {
+			s.mu.Lock()
+			s.stats.TLSDropped++
+			s.mu.Unlock()
+			if !portWarning {
+				s.problem(fmt.Errorf("TLS event lacks socket endpoints; cannot apply port filter"))
+				portWarning = true
+			}
 			continue
 		}
 		if err := enc.Encode(map[string]any{"fields": fields, "numbers": nums}); err != nil {
@@ -174,6 +186,17 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 		if len(fields[16]) > 0 {
 			key = string(fields[16])
 		}
+		if strings.HasPrefix(key, "unknown_") {
+			s.mu.Lock()
+			s.stats.TLSDropped++
+			s.mu.Unlock()
+			if !identityWarning {
+				s.problem(fmt.Errorf("TLS probe lacks connection identity; rebuild the bundled eCapture probe"))
+				identityWarning = true
+			}
+			continue
+		}
+		key = fmt.Sprintf("probe-%d/%s", epoch, key)
 		client := "unknown"
 		if len(fields[3]) > 0 {
 			client = net.JoinHostPort(string(fields[3]), strconv.Itoa(int(nums[4])))
@@ -188,7 +211,7 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 		queue := p.pending["tls:"+key]
 		head := len(queue) > 0 && queue[0].Method == "HEAD"
 		p.mu.Unlock()
-		frames.ingest(key+string(fields[14]), payload, frameContext{connection: key, client: client, pid: int(nums[7])}, head, p)
+		frames.ingest(key+string(fields[14]), payload, frameContext{connection: key, client: client, pid: int(nums[7]), local: net.JoinHostPort(string(fields[5]), strconv.Itoa(int(nums[6])))}, head, p)
 	}
 }
 

@@ -16,3 +16,5 @@ __pycache__/
 .DS_Store
 
 .ruff_cache/
+
+/java-agent/target/

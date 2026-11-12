@@ -8,6 +8,8 @@ import (
 )
 
 type frameContext struct {
+	incomplete bool
+	local      string
 	connection string
 	client     string
 	pid        int
@@ -18,6 +20,7 @@ type frameContext struct {
 type capturedReader struct {
 	*bytes.Reader
 	captured time.Time
+	local    string
 }
 
 func (r capturedReader) CaptureTime() time.Time { return r.captured }
@@ -37,6 +40,7 @@ func (f *Frames) ingest(key string, payload []byte, meta frameContext, head bool
 	}
 	meta.updated = now
 	chunks, gap := f.feed(key, payload, head)
+	gap = gap || meta.incomplete
 	if len(f.buffers[key]) > 0 {
 		f.contexts[key] = meta
 	} else {
@@ -54,7 +58,7 @@ func (f *Frames) ingest(key string, payload []byte, meta frameContext, head bool
 		p.s.mu.Unlock()
 	}
 	for _, chunk := range chunks {
-		p.process(capturedReader{bytes.NewReader(chunk), meta.first}, "tls:"+meta.connection, meta.client, "tls-hook", meta.pid, gap)
+		p.process(capturedReader{bytes.NewReader(chunk), meta.first, meta.local}, "tls:"+meta.connection, meta.client, "tls-hook", meta.pid, gap)
 	}
 }
 
@@ -78,13 +82,13 @@ func (f *Frames) expire(now time.Time, all bool, p *HTTPProcessor, connection st
 			continue
 		}
 		if !bytes.Contains(item.data, []byte("\r\n\r\n")) && !bytes.Contains(item.data, []byte("\n\n")) {
-			record := Transaction{Time: item.meta.first, Source: "tls-hook-fragment", Client: item.meta.client, Connection: "tls:" + item.meta.connection, PID: item.meta.pid, Request: item.data, Incomplete: true}
+			record := Transaction{LocalEndpoint: item.meta.local, Time: item.meta.first, Source: "tls-hook-fragment", Client: item.meta.client, Connection: "tls:" + item.meta.connection, PID: item.meta.pid, Request: item.data, Incomplete: true}
 			if err := p.s.save(record); err != nil {
 				p.s.fail(err)
 			}
 			continue
 		}
-		p.process(capturedReader{bytes.NewReader(item.data), item.meta.first}, "tls:"+item.meta.connection, item.meta.client, "tls-hook", item.meta.pid, true)
+		p.process(capturedReader{bytes.NewReader(item.data), item.meta.first, item.meta.local}, "tls:"+item.meta.connection, item.meta.client, "tls-hook", item.meta.pid, true)
 	}
 }
 
@@ -107,3 +111,5 @@ func (f *Frames) startExpiry(ctx context.Context, p *HTTPProcessor) func() {
 	}()
 	return func() { cancel(); worker.Wait(); f.expire(time.Now(), true, p, "") }
 }
+
+func (r capturedReader) LocalEndpoint() string { return r.local }

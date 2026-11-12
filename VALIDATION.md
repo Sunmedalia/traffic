@@ -1,5 +1,38 @@
 # 验证记录
 
+## 2026-11-12 多服务验证
+
+在同一台 Debian 13 ARM64 / Linux 6.12 主机上使用独立实验实例，按普通 Web 访问验证本次多服务改动。每组主要验收发送六次串行 GET/中文 JSON POST，包含 HTTP 和 HTTPS。各组成功样本的请求、响应完整，已观测网卡、队列和 TLS 丢弃均为零。新增 Java Agent 的 JVM 内开销尚未形成性能验收结论。
+
+| 服务 | 实测环境 | 验收结果 |
+| --- | --- | --- |
+| Nginx | 原有 1.26 / OpenSSL 3.5.7 | 6 条，已有连接通过，原配置和进程身份保持一致 |
+| Apache event | 2.4.69 / APR 1.7.5 / OpenSSL 3.5.7 | 6 条，已有连接通过 |
+| Apache worker | 同上 | 新连接 6 条通过，已有阻塞读取存在首次漏采 |
+| Apache prefork | 同上 | 新连接 6 条通过，已有阻塞读取的完整性尚未验收 |
+| Tomcat 9 | 9.0.123 / Temurin 17.0.21 / JSSE NIO | 6 条，已有连接与重复附加通过 |
+| Tomcat 10.1 | 10.1.61 / Temurin 21.0.13 / JSSE NIO | 6 条，已有连接通过 |
+| 非 root Tomcat | 10.1.61 / JDK 21 / UID、GID 33 | 6 条，凭据切换、临时 JAR 和令牌路径通过 |
+| HAProxy | Debian 13 软件包 / OpenSSL 3.5.7 | 指定 PID 的通用 OpenSSL 采集 6 条通过 |
+| 外部 OpenSSL API | OpenSSL 3.0.20 / C 测试服务 | `SSL_read_ex`、`SSL_write_ex` 的 TLS 1.2/1.3 两条 GET 通过 |
+| 同会话多服务 | Nginx + Apache prefork + Tomcat 9 | HTTP、HTTPS 各一条，共 6 条，后端和服务归属正确 |
+
+TLS 探针不存在、Java 附加助手失败两种实机故障注入通过，目标状态报告不可用并继续保存正常 HTTP 请求。
+
+`go test -race ./...`、`go vet ./...` 在 Linux ARM64 和 Mac ARM64 上通过。Java Agent 的测试覆盖直接缓冲区、多缓冲区、实际消费/产生字节、加密输出缓冲区排除、队列溢出和线程标记清理。eCapture 补丁通过定向竞态测试，包含 Apache 自定义 BIO 元数据与连接代次解码。三组 OpenSSL CO-RE 字节码构建并完成实际内核挂载。
+
+本地完整会话位于 `sessions/192.168.1.7/2026-11-12/`，包括 `14-19-02-multi-services-final`、`14-20-38-tomcat-nonroot-ready`、两组 Apache 新连接样本及 OpenSSL 3.0 样本，可直接使用无参数 TUI 选择。多服务会话的服务筛选、Java 请求详情和证据导出已验证，ZIP 内 SHA-256 清单核对通过。原始证据保存在 Git 忽略目录中。
+
+### 当前边界
+
+- Apache worker/prefork 在采集前已经进入阻塞 `SSL_read` 的调用，入口参数无法由后附加的 uprobe 回溯，首次返回可能漏采。worker 实测丢失该请求并记录 TLS 元数据缺口，新连接测试使用显式 `--new-connections-only`，报告记录已有连接未测试。
+- Apache 自定义 BIO 的结构读取针对 Apache 2.4 / APR 1.7 / OpenSSL 3.5 ARM64，并核对 BIO 方法名。其他组合需要验收。
+- OpenSSL 3.0 的 `s_server -www` 内置 BIO 路径未取得明文，尚未完成原因定位。外部导出的 SSL API 调用已通过，不能据此认定所有使用 OpenSSL 的程序均可采集。
+- Tomcat 支持独立部署的 NIO Connector。NIO2、其他 Java 服务、HTTP/2、HTTP/3 和 WebSocket 内容解析继续待适配。Agent 停用和重复附加已测，类本身保留在 JVM 内，暂不支持 Agent 热升级。
+- 新服务的队列与资源限制已有代码约束，过载、所有 JVM 禁止附加组合、容器网络及所有异常退出路径尚未完成实机验收。
+
+## 2026-11-11 Nginx 历史验证
+
 验证环境为 Debian 13 ARM64、Linux 6.12、Nginx 1.26、OpenSSL 3.5，内存约 2 GiB。记录日期为 2026-11-11。
 
 ## 已执行
@@ -14,7 +47,7 @@
 
 ## 性能状态
 
-完整的五分钟、三轮、四种模式对比仍在运行，尚未作出最终性能验收结论。
+此前五分钟、三轮、四种模式对比尚未形成最终性能验收结论。
 
 已完成的最终候选版本三轮完整检测与三轮 TLS 采集的 100 请求/秒结果如下。每组持续 300 秒。
 

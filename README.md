@@ -51,7 +51,7 @@ go build -o bin/traffic-tui ./cmd/traffic-tui
 
 ### HTTPS 采集依赖
 
-HTTPS 路径使用固定版本 eCapture 加本项目补丁。当前构建脚本生成 **ARM64 / OpenSSL 3.5 / CO-RE** 探针，其他 TLS 实现需要单独适配和验证。
+HTTPS 路径使用固定版本 eCapture 加本项目补丁。当前构建脚本生成 **ARM64 / OpenSSL 3.0、3.5 / CO-RE** 探针，并包含自定义 BIO 的 socket 关联以及 `SSL_read_ex`、`SSL_write_ex` 支持。其他版本需要单独验证。
 
 ```bash
 # 另外需要 Go 1.26+，以及上游 eCapture 所需构建环境
@@ -65,7 +65,7 @@ sudo apt-get install -y clang llvm bpftool libelf-dev libssl-dev flex bison make
 
 ## 快速使用
 
-在目标 Linux 主机执行，使用 `doctor` 确认接口、权限、内核 BTF 和 Nginx 加载的 TLS 库。
+在目标 Linux 主机执行，使用 `doctor` 确认接口、权限、内核 BTF 和各服务加载的 TLS 库。
 
 ```bash
 ./bin/traffic doctor
@@ -78,7 +78,7 @@ sudo ./bin/traffic capture \
   --output ./sessions/incident-001
 ```
 
-将 `eth0` 与 `--libssl` 替换为目标主机的实际值。默认接口为 Linux `any`，包含回环接口。`--ports` 限定网卡抓包范围，TLS 探针按自动发现的 Nginx worker UID 过滤，再接收 Nginx 事件。指定 `--pid` 可以限定单个 worker。多站点共用进程时，TLS 事件可能包含其他站点的请求。
+将 `eth0` 替换为目标主机的实际接口。`--libssl` 可省略，程序从目标进程映射发现动态库。默认接口为 Linux `any`，包含回环接口。`--ports` 限定抓包和 TLS 明文事件的本地端口。探针按动态库和 UID 分组，随后按选定进程及启动时间过滤，root 目标使用 PID 限定。多站点共用进程和端口时，采集包含这些站点的请求。
 
 采集时输出 JSON 告警。`Ctrl+C` 停止采集、卸载探针并保存摘要。每次采集使用新的会话目录。
 
@@ -109,6 +109,47 @@ sudo ./bin/traffic capture --no-tls --duration 60s --output ./sessions/http-001
 # 查看所有选项
 ./bin/traffic capture --help
 ```
+
+## Apache、Tomcat 和其他 OpenSSL 服务
+
+`--service` 默认 `auto`，发现 Nginx worker、Apache 的 `apache2/httpd` 及独立 Tomcat。`--pid` 限定进程探针，`--ports` 默认仍为 `80,443`。网卡抓包始终按接口和端口过滤，明文 HTTP 的服务归属根据本机监听端口推断。服务发现每两秒更新，工作进程变化与新探针挂载之间可能存在采集窗口。`doctor` 的 `tls_verified: false` 表示环境检查尚未证明能取得明文，真实请求验证结果见验证记录。
+
+```bash
+sudo ./bin/traffic capture --service apache --ports 8081,8444
+sudo ./bin/traffic capture --service tomcat --ports 8080 --no-tls
+sudo ./bin/traffic capture --service openssl --pid 1234 --ports 9443
+```
+
+通用 OpenSSL 服务需要指定 PID，已使用 HAProxy 验证。采集记录包含服务、目标标识、后端和本地端点。目标标识使用 PID 与进程启动时间，明文 HTTP 的服务归属根据本地监听端口确定，多个进程共享端口时保留服务类型。代理链路按每一跳分别记录。
+
+Tomcat JSSE HTTPS 通过显式启用 Java Agent 采集，首批支持 Tomcat 9/JDK 17、Tomcat 10.1/JDK 21 的 NIO Connector。OpenSSL 后端优先使用外部探针。
+
+```bash
+# 使用 JDK 17+ 和 Maven 构建，JAR 包含固定版本且重定位的 Byte Buddy
+./scripts/build-java-agent.sh
+
+sudo ./bin/traffic capture --service tomcat --pid 1234 \
+  --ports 8080,8443 --java-attach \
+  --java-agent "$PWD/bin/traffic-java-agent.jar"
+
+# 同一会话采集多个服务，仅对指定 JVM 启用 Java Agent
+sudo ./bin/traffic capture --service auto --ports 80,443,8081,8444,8083,8446 \
+  --java-attach --java-pid 1234 --java-agent "$PWD/bin/traffic-java-agent.jar"
+```
+
+目标 JVM 需要支持动态附加。附加助手默认使用目标 Java，可通过 `--java-helper /path/to/jdk/bin/java` 指定具有 `jdk.attach` 模块的匹配 JDK。工具以目标 UID/GID 运行附加助手，通过带随机令牌和版本校验的回环通道传输数据，临时文件在结束后清理。JDK 21 可能输出动态加载 Agent 的提示。禁止附加的 JVM 会报告失败，采集器继续保留网络包。
+
+Java 探针使用一条发送线程和 128 个分片槽位，单片上限 64 KiB，队列正文最多 8 MiB。业务线程只进行有界复制和非阻塞入队，溢出后标记数据缺口。JVM 内探针开销由业务 JVM 承担，采集程序的 cgroup 约束覆盖采集器与附加助手。停止后通道关闭，Agent 停用并恢复字节码，已加载的类随 JVM 保留，同一 JVM 可再次附加；Agent 本身暂不支持在同一 JVM 内热升级。
+
+TUI 概览显示各服务的探针状态，详情展示服务、目标、后端与本地端点。筛选面板支持服务条件，也可使用以下查询。
+
+```bash
+./bin/traffic-tui requests --session SESSION --service apache
+```
+
+Apache worker/prefork 在启动采集前已经阻塞于 `SSL_read` 的调用，其首次返回可能漏采，后续调用和新连接可采集。OpenSSL 3.0 内置 `s_server -www` 的 BIO 路径实测尚未取得明文，外部 `SSL_read_ex`/`SSL_write_ex` 调用已验证。
+
+普通访问验收脚本 `scripts/verify-services.py` 针对已经运行的实验服务发送六次串行请求，检查已有 HTTPS 连接、中文 POST、响应关联、配置哈希、原有进程身份及丢弃计数。脚本需要显式指定实验配置路径、端口和探针路径。`--new-connections-only` 显式跳过已有连接测试，并在报告中记录。
 
 ## 会话目录
 
@@ -247,7 +288,7 @@ python3 scripts/benchmark.py --output /tmp/traffic-performance --host 127.0.0.1
 
 脚本支持 `--binary` 和 `--config` 指定采集程序与 Nginx 配置。功能脚本另通过 `--analysis-binary` 指定证据导出所用的 `traffic-tui`，默认路径为 `/opt/traffic/bin/traffic-tui`。功能脚本检查 126 条请求及响应、已有 HTTPS 连接、TLS 版本、中文正文、五类规则、网站配置和 PID、证据校验。性能脚本默认 20/100 请求每秒、每组五分钟、重复三轮。
 
-HTTP/2、HTTP/3、WebSocket 内容解析、Java/Go TLS、Windows 及 x86_64 的完整采集验收待实现。HTTP/1.1 流中途缺失消息开头时，可见内容受限。代理后的来源地址默认取连接对端，经过 CDN 或负载均衡时需结合可信代理信息分析。
+HTTP/2、HTTP/3、WebSocket 内容解析、通用 JSSE/Go TLS、Tomcat NIO2、Windows 及 x86_64 的完整采集验收待实现。HTTP/1.1 流中途缺失消息开头时，可见内容受限。代理后的来源地址默认取连接对端，经过 CDN 或负载均衡时需结合可信代理信息分析。
 
 ## 第三方组件
 

@@ -14,7 +14,7 @@ import (
 
 // tuiFilter applies to persisted transactions, including records written by v1.
 type tuiFilter struct {
-	Client, Rule, Severity, Since, Keyword string
+	Client, Rule, Severity, Since, Keyword, Service string
 }
 
 type tuiRow struct {
@@ -51,6 +51,10 @@ func (f tuiFilter) where(alertsOnly bool) (string, []any) {
 	if f.Rule != "" || f.Severity != "" {
 		clauses = append(clauses, `EXISTS (SELECT 1 FROM json_each(CAST(requests.data AS TEXT), '$.alerts') a WHERE (?='' OR json_extract(a.value,'$.rule')=?) AND (?='' OR json_extract(a.value,'$.severity')=?))`)
 		args = append(args, f.Rule, f.Rule, f.Severity, f.Severity)
+	}
+	if f.Service != "" {
+		clauses = append(clauses, "json_extract(CAST(data AS TEXT),'$.service')=?")
+		args = append(args, f.Service)
 	}
 	if f.Keyword != "" {
 		clauses = append(clauses, `(json_extract(CAST(data AS TEXT),'$.host') LIKE ? ESCAPE '\' OR json_extract(CAST(data AS TEXT),'$.url') LIKE ? ESCAPE '\')`)

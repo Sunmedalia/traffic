@@ -71,9 +71,14 @@ func run(args []string) (runErr error) {
 	name := fs.String("name", "", "session name; default capture or import")
 	ports := fs.String("ports", "80,443", "TCP ports")
 	interfaces := fs.String("interfaces", "", "comma-separated interfaces")
-	pid := fs.Int("pid", 0, "Nginx worker PID; default auto-discovered worker UID")
+	javaAttach := fs.Bool("java-attach", false, "explicitly attach Java agent to --pid")
+	javaPID := fs.Int("java-pid", 0, "explicit JVM PID for Java attach while auto-discovering other services")
+	javaHelper := fs.String("java-helper", "", "Java executable with jdk.attach; default target executable")
+	javaAgent := fs.String("java-agent", "/opt/traffic/bin/traffic-java-agent.jar", "Java agent archive")
+	service := fs.String("service", "auto", "service: auto, nginx, apache, tomcat, openssl")
+	pid := fs.Int("pid", 0, "target process PID; default discover service processes")
 	ecapture := fs.String("ecapture", "/opt/traffic/bin/ecapture", "eCapture v2.9.1 binary")
-	lib := fs.String("libssl", "/lib/aarch64-linux-gnu/libssl.so.3", "TLS library")
+	lib := fs.String("libssl", "", "TLS library override; default discover from process maps")
 	ruleFile := fs.String("rules", "", "additional YAML rules")
 	noTLS := fs.Bool("no-tls", false, "disable TLS probes")
 	duration := fs.Duration("duration", 0, "optional capture duration")
@@ -94,6 +99,40 @@ func run(args []string) (runErr error) {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
 	}
+	if *pid < 0 || *javaPID < 0 {
+		return errors.New("PID must not be negative")
+	}
+	if *javaAttach && *service != "auto" && *service != "tomcat" {
+		return errors.New("--java-attach requires auto or tomcat service")
+	}
+	if *javaAttach && *pid <= 0 && *javaPID <= 0 {
+		return errors.New("--java-attach requires --pid or --java-pid")
+	}
+	if *javaPID > 0 && (!*javaAttach || (*pid > 0 && *pid != *javaPID)) {
+		return errors.New("--java-pid requires --java-attach and must agree with --pid when both are set")
+	}
+	if *javaAttach && *noTLS {
+		return errors.New("--java-attach conflicts with --no-tls")
+	}
+	if *service != "auto" && *service != "nginx" && *service != "apache" && *service != "tomcat" && *service != "openssl" {
+		return errors.New("invalid service")
+	}
+	if *javaAttach {
+		selectedJavaPID := *javaPID
+		if selectedJavaPID == 0 {
+			selectedJavaPID = *pid
+		}
+		target, err := processTarget("/proc", selectedJavaPID)
+		if err != nil {
+			return fmt.Errorf("Java target: %w", err)
+		}
+		if target.Service != "tomcat" {
+			return errors.New("Java probe currently supports standalone Tomcat targets")
+		}
+	}
+	if *service == "openssl" && *pid <= 0 {
+		return errors.New("openssl service requires --pid")
+	}
 	if requestLimit < 1 || requestLimit > 1<<20 || responseLimit < 1 || responseLimit > 1<<20 || diskLimitMiB < 64 || retention <= 0 || scanWindow <= 0 || scanThreshold < 1 {
 		return errors.New("invalid resource or result limits")
 	}
@@ -108,7 +147,7 @@ func run(args []string) (runErr error) {
 		maps, _ := exec.Command("sh", "-c", "for p in $(pgrep -x nginx); do echo PID=$p; grep libssl /proc/$p/maps | head -1; done").Output()
 		_, btf := os.Stat("/sys/kernel/btf/vmlinux")
 		_, probe := os.Stat(*ecapture)
-		emit(map[string]any{"os": runtime.GOOS, "arch": runtime.GOARCH, "root": os.Geteuid() == 0, "btf": btf == nil, "ecapture_installed": probe == nil, "nginx": string(maps), "interfaces": devices, "tls_verified": false})
+		emit(map[string]any{"os": runtime.GOOS, "arch": runtime.GOARCH, "root": os.Geteuid() == 0, "btf": btf == nil, "ecapture_installed": probe == nil, "nginx": string(maps), "interfaces": devices, "targets": discoverTargets("/proc", *service, *pid, *lib), "tls_verified": false})
 		return nil
 	}
 	if cmd == "capture" || cmd == "import" {
@@ -117,11 +156,13 @@ func run(args []string) (runErr error) {
 		}
 		// Validate inputs before reserving a session directory.
 		filterParts := []string{}
+		capturePorts = map[int]bool{}
 		for _, port := range strings.Split(*ports, ",") {
 			number, err := strconv.Atoi(port)
 			if err != nil || number < 1 || number > 65535 {
 				return fmt.Errorf("invalid port %q", port)
 			}
+			capturePorts[number] = true
 			filterParts = append(filterParts, fmt.Sprintf("port %d", number))
 		}
 		filter := "tcp and (" + strings.Join(filterParts, " or ") + ")"
@@ -196,6 +237,7 @@ func run(args []string) (runErr error) {
 		s.stats.Started = started.UTC()
 		fmt.Fprintf(os.Stderr, "会话目录 %s\n", s.dir)
 		s.report()
+		s.stats.Targets = discoverTargets("/proc", *service, *pid, *lib)
 		p := newHTTP(s)
 		if cmd == "capture" {
 			cleanup, e := limitResources()
@@ -222,6 +264,8 @@ func run(args []string) (runErr error) {
 			"mode":           cmd,
 			"started":        s.stats.Started,
 			"filter":         filter,
+			"service":        *service,
+			"targets":        discoverTargets("/proc", *service, *pid, *lib),
 			"tls_enabled":    cmd == "capture" && !*noTLS,
 			"rules":          rules,
 			"header_limit":   32768,
@@ -232,7 +276,7 @@ func run(args []string) (runErr error) {
 			manifest["input_pcap"] = id
 		}
 		if cmd == "capture" && !*noTLS {
-			manifest["ecapture_version"] = "v2.9.1+traffic.1"
+			manifest["ecapture_version"] = "external; identified by ecapture_sha256"
 			if file, e := os.Open(*ecapture); e == nil {
 				hash := sha256.New()
 				if _, e = io.Copy(hash, file); e == nil {
@@ -273,28 +317,7 @@ func run(args []string) (runErr error) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for attempt := 0; attempt < 2; attempt++ {
-					err := captureTLS(ctx, s, p, *ecapture, *lib, *pid)
-					if err == nil || ctx.Err() != nil {
-						return
-					}
-					s.problem(err)
-					s.mu.Lock()
-					s.stats.TLS = "unavailable"
-					s.mu.Unlock()
-					p.mu.Lock()
-					for key := range p.pending {
-						if strings.HasPrefix(key, "tls:") {
-							delete(p.pending, key)
-						}
-					}
-					for key := range p.responses {
-						if strings.HasPrefix(key, "tls:") {
-							delete(p.responses, key)
-						}
-					}
-					p.mu.Unlock()
-				}
+				captureServices(ctx, s, p, *ecapture, *lib, *service, *pid, *javaAttach, *javaAgent, *javaHelper, *javaPID)
 			}()
 		}
 		ticker := time.NewTicker(time.Second)
@@ -305,6 +328,15 @@ func run(args []string) (runErr error) {
 			case <-ctx.Done():
 				break loop
 			case <-ticker.C:
+				if *noTLS {
+					targets := discoverTargets("/proc", *service, *pid, *lib)
+					for i := range targets {
+						targets[i].State = "http-only"
+					}
+					s.mu.Lock()
+					s.stats.Targets = targets
+					s.mu.Unlock()
+				}
 				s.report()
 				s.mu.Lock()
 				fatal := s.fatal

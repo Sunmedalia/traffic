@@ -298,6 +298,9 @@ func (m tuiModel) overview() string {
 		"TLS   " + tuiLine(s.TLS),
 		"资源  " + tuiLine(s.ResourceLimits), "",
 	}
+	for _, target := range s.Targets {
+		lines = append(lines, fmt.Sprintf("服务 %s · PID %d · %s", tuiLine(target.Service), target.PID, tuiLine(target.State)))
+	}
 	if m.snapshot.StatusWarning != "" {
 		lines = append(lines, tuiDanger.Render(m.snapshot.StatusWarning), "")
 	}
@@ -321,6 +324,7 @@ func (m tuiModel) detailContent() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n%s  %s  %s\n客户端 %s\nHost %s\n来源 %s  PID %d\n连接 %s\n响应 %d  不完整 %t  截断 %t\n\n",
 		tuiLine(t.ID), tuiTime(t.Time.Format(time.RFC3339Nano)), tuiLine(t.Method), tuiLine(t.URL), tuiLine(t.Client), tuiLine(t.Host), tuiLine(t.Source), t.PID, tuiLine(t.Connection), t.Status, t.Incomplete, t.Truncated)
+	fmt.Fprintf(&b, "服务 %s  目标 %s\n后端 %s  本地 %s\n\n", tuiLine(t.Service), tuiLine(t.TargetID), tuiLine(t.Backend), tuiLine(t.LocalEndpoint))
 	labels := []string{"请求", "响应", "解码正文", "检测依据"}
 	for i, label := range labels {
 		if i == m.detailTab {
@@ -396,8 +400,8 @@ func (m tuiModel) listView(width, height int) string {
 }
 func (m tuiModel) filterLabel() string {
 	parts := []string{}
-	values := []string{m.filter.Client, m.filter.Rule, m.filter.Severity, m.filter.Since, m.filter.Keyword}
-	names := []string{"客户端", "规则", "级别", "起始时间", "关键词"}
+	values := []string{m.filter.Client, m.filter.Rule, m.filter.Severity, m.filter.Since, m.filter.Keyword, m.filter.Service}
+	names := []string{"客户端", "规则", "级别", "起始时间", "关键词", "服务"}
 	for i, value := range values {
 		if value != "" {
 			parts = append(parts, names[i]+"="+tuiLine(value))
@@ -460,7 +464,7 @@ func (m *tuiModel) openForm() tea.Cmd {
 	m.filtering = true
 	m.inputIndex = 0
 	m.formError = ""
-	values := []string{m.filter.Client, m.filter.Rule, m.filter.Severity, m.filter.Since, m.filter.Keyword}
+	values := []string{m.filter.Client, m.filter.Rule, m.filter.Severity, m.filter.Since, m.filter.Keyword, m.filter.Service}
 	m.inputs = make([]textinput.Model, len(values))
 	for i, value := range values {
 		input := textinput.New()
@@ -473,7 +477,7 @@ func (m *tuiModel) openForm() tea.Cmd {
 	return m.inputs[0].Focus()
 }
 func (m tuiModel) formView() string {
-	labels := []string{"客户端 IP / 端点", "规则 ID", "级别 low/medium/high", "起始时间 RFC3339", "Host / URL 关键词"}
+	labels := []string{"客户端 IP / 端点", "规则 ID", "级别 low/medium/high", "起始时间 RFC3339", "Host / URL 关键词", "服务 nginx/apache/tomcat/openssl"}
 	lines := []string{tuiAccent.Render("筛选"), ""}
 	for i, label := range labels {
 		if m.height < 25 && i != m.inputIndex {
@@ -511,7 +515,7 @@ func (m *tuiModel) updateForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		for i := range m.inputs {
 			values[i] = strings.TrimSpace(m.inputs[i].Value())
 		}
-		filter := tuiFilter{Client: values[0], Rule: values[1], Severity: values[2], Since: values[3], Keyword: values[4]}
+		filter := tuiFilter{Client: values[0], Rule: values[1], Severity: values[2], Since: values[3], Keyword: values[4], Service: values[5]}
 		if filter.Severity != "" && filter.Severity != "low" && filter.Severity != "medium" && filter.Severity != "high" {
 			m.formError = "级别请输入 low、medium 或 high"
 			return m, nil

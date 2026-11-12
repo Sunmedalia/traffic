@@ -11,6 +11,7 @@ import (
 var queuedBytes atomic.Int64
 
 type queuedStream struct {
+	server   string
 	chunks   chan []byte
 	current  []byte
 	failed   atomic.Bool
@@ -84,3 +85,5 @@ func (s *queuedStream) CaptureTime() time.Time {
 	}
 	return time.Unix(0, stamp).UTC()
 }
+
+func (s *queuedStream) LocalEndpoint() string { return s.server }

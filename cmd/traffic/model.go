@@ -6,8 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,12 +27,13 @@ const indexTimeFormat = session.IndexTimeFormat
 var serial atomic.Uint64
 
 type Store struct {
-	packetDrops map[string]uint64
-	fatal       error
-	db          *sql.DB
-	dir         string
-	mu          sync.Mutex
-	stats       Stats
+	localAddresses map[string]bool
+	packetDrops    map[string]uint64
+	fatal          error
+	db             *sql.DB
+	dir            string
+	mu             sync.Mutex
+	stats          Stats
 }
 
 func openStore(dir string, write bool) (*Store, error) {
@@ -37,9 +41,68 @@ func openStore(dir string, write bool) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Store{db: db, dir: dir, stats: Stats{Started: time.Now().UTC(), State: "running", TLS: "disabled"}}, nil
+	addresses := map[string]bool{}
+	interfaces, _ := net.InterfaceAddrs()
+	for _, address := range interfaces {
+		ip, _, err := net.ParseCIDR(address.String())
+		if err == nil {
+			addresses[ip.String()] = true
+		}
+	}
+	return &Store{db: db, dir: dir, localAddresses: addresses, stats: Stats{Started: time.Now().UTC(), State: "running", TLS: "disabled"}}, nil
 }
 func (s *Store) save(t Transaction) error {
+	if t.PID > 0 {
+		if target, err := processTarget("/proc", t.PID); err == nil {
+			t.Service = target.Service
+			t.TargetID = target.ID
+			s.mu.Lock()
+			for _, selected := range s.stats.Targets {
+				if selected.ID == target.ID {
+					_, portText, _ := net.SplitHostPort(t.LocalEndpoint)
+					port, _ := strconv.Atoi(portText)
+					serverLocal := false
+					for _, listeningPort := range selected.Ports {
+						if port == listeningPort {
+							serverLocal = true
+							break
+						}
+					}
+					if !serverLocal {
+						t.LocalEndpoint = t.Client
+					}
+					t.Service = selected.Service
+					break
+				}
+			}
+			s.mu.Unlock()
+		}
+	}
+	if t.PID > 0 {
+		t.Backend = "openssl"
+		if strings.Contains(t.Connection, "tls:java:") {
+			t.Backend = "java-agent"
+		}
+	} else {
+		t.Backend = "pcap"
+		host, portText, _ := net.SplitHostPort(t.LocalEndpoint)
+		port, _ := strconv.Atoi(portText)
+		ip := net.ParseIP(host)
+		local := ip != nil && (ip.IsLoopback() || s.localAddresses[ip.String()])
+		s.mu.Lock()
+		for _, target := range s.stats.Targets {
+			for _, localPort := range target.Ports {
+				if local && localPort == port {
+					if t.Service != "" && t.Service != target.Service {
+						t.Service = "unknown"
+					} else if t.Service == "" {
+						t.Service = target.Service
+					}
+				}
+			}
+		}
+		s.mu.Unlock()
+	}
 	t.SchemaVersion = 1
 	if t.ID == "" {
 		h := sha256.Sum256([]byte(fmt.Sprintf("%s/%s/%d/%s", t.Connection, t.Source, time.Now().UnixNano(), t.URL)))

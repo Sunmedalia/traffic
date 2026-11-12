@@ -2,7 +2,22 @@ package session
 
 import "time"
 
+type Target struct {
+	GID     int    `json:"gid"`
+	Ports   []int  `json:"ports,omitempty"`
+	ID      string `json:"id"`
+	PID     int    `json:"pid"`
+	UID     int    `json:"uid"`
+	Service string `json:"service"`
+	Library string `json:"library,omitempty"`
+	State   string `json:"state"`
+}
+
 type Transaction struct {
+	Backend       string    `json:"backend,omitempty"`
+	LocalEndpoint string    `json:"local_endpoint,omitempty"`
+	Service       string    `json:"service,omitempty"`
+	TargetID      string    `json:"target_id,omitempty"`
 	Host          string    `json:"host,omitempty"`
 	SchemaVersion int       `json:"schema_version"`
 	ID            string    `json:"id"`
@@ -30,6 +45,7 @@ type Alert struct {
 	Decoding int    `json:"decoding"`
 }
 type Stats struct {
+	Targets        []Target  `json:"targets,omitempty"`
 	ResourceLimits string    `json:"resource_limits"`
 	TLSDropped     uint64    `json:"tls_dropped"`
 	QueueDropped   uint64    `json:"queue_dropped"`
