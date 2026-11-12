@@ -294,7 +294,10 @@ func (m tuiModel) overview() string {
 		"开始  " + started, "",
 		fmt.Sprintf("累计请求  %d    累计告警命中  %d", s.Transactions, s.Alerts),
 		fmt.Sprintf("网络包    %d", s.Packets), "",
-		fmt.Sprintf("网卡丢包  %d    用户态队列丢弃  %d    TLS 丢失  %d", s.Dropped, s.QueueDropped, s.TLSDropped),
+		fmt.Sprintf("网卡丢包  %d    用户态队列丢弃  %d    TLS 已知丢弃  %d", s.Dropped, s.QueueDropped, s.TLSDropped),
+		session.CoverageWarning,
+		fmt.Sprintf("网卡 TLS 外层记录  %d    TLS 明文请求  %d", s.TLSWireRecords, s.TLSRequests),
+		fmt.Sprintf("Webhook 已送达  %d    失败  %d    队列丢弃  %d", s.AlertDelivered, s.AlertDeliveryFailed, s.AlertDeliveryDropped),
 		"TLS   " + tuiLine(s.TLS),
 		"资源  " + tuiLine(s.ResourceLimits), "",
 	}
@@ -325,6 +328,9 @@ func (m tuiModel) detailContent() string {
 	fmt.Fprintf(&b, "%s\n%s  %s  %s\n客户端 %s\nHost %s\n来源 %s  PID %d\n连接 %s\n响应 %d  不完整 %t  截断 %t\n\n",
 		tuiLine(t.ID), tuiTime(t.Time.Format(time.RFC3339Nano)), tuiLine(t.Method), tuiLine(t.URL), tuiLine(t.Client), tuiLine(t.Host), tuiLine(t.Source), t.PID, tuiLine(t.Connection), t.Status, t.Incomplete, t.Truncated)
 	fmt.Fprintf(&b, "服务 %s  目标 %s\n后端 %s  本地 %s\n\n", tuiLine(t.Service), tuiLine(t.TargetID), tuiLine(t.Backend), tuiLine(t.LocalEndpoint))
+	if t.PeerClient != "" {
+		fmt.Fprintf(&b, "直连对端 %s  来源地址依据 %s\n\n", tuiLine(t.PeerClient), tuiLine(t.ClientSource))
+	}
 	labels := []string{"请求", "响应", "解码正文", "检测依据"}
 	for i, label := range labels {
 		if i == m.detailTab {

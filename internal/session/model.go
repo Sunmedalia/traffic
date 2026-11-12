@@ -24,6 +24,8 @@ type Transaction struct {
 	Time          time.Time `json:"time"`
 	Source        string    `json:"source"`
 	Client        string    `json:"client"`
+	PeerClient    string    `json:"peer_client,omitempty"`
+	ClientSource  string    `json:"client_source,omitempty"`
 	Connection    string    `json:"connection"`
 	Method        string    `json:"method"`
 	URL           string    `json:"url"`
@@ -45,18 +47,25 @@ type Alert struct {
 	Decoding int    `json:"decoding"`
 }
 type Stats struct {
-	Targets        []Target  `json:"targets,omitempty"`
-	ResourceLimits string    `json:"resource_limits"`
-	TLSDropped     uint64    `json:"tls_dropped"`
-	QueueDropped   uint64    `json:"queue_dropped"`
-	Started        time.Time `json:"started"`
-	State          string    `json:"state"`
-	Packets        uint64    `json:"packets"`
-	Transactions   uint64    `json:"transactions"`
-	Alerts         uint64    `json:"alerts"`
-	Dropped        uint64    `json:"dropped"`
-	TLS            string    `json:"tls"`
-	Errors         []string  `json:"errors,omitempty"`
+	AlertDelivered       uint64    `json:"alert_delivered"`
+	AlertDeliveryFailed  uint64    `json:"alert_delivery_failed"`
+	AlertDeliveryDropped uint64    `json:"alert_delivery_dropped"`
+	TLSWireRecords       uint64    `json:"tls_wire_records"`
+	TLSRequests          uint64    `json:"tls_requests"`
+	TLSCoverage          string    `json:"tls_coverage,omitempty"`
+	TLSMissingEstimate   *uint64   `json:"tls_missing_estimate"`
+	Targets              []Target  `json:"targets,omitempty"`
+	ResourceLimits       string    `json:"resource_limits"`
+	TLSDropped           uint64    `json:"tls_dropped"`
+	QueueDropped         uint64    `json:"queue_dropped"`
+	Started              time.Time `json:"started"`
+	State                string    `json:"state"`
+	Packets              uint64    `json:"packets"`
+	Transactions         uint64    `json:"transactions"`
+	Alerts               uint64    `json:"alerts"`
+	Dropped              uint64    `json:"dropped"`
+	TLS                  string    `json:"tls"`
+	Errors               []string  `json:"errors,omitempty"`
 }
 
 const IndexTimeFormat = "2006-01-02T15:04:05.000000000Z"

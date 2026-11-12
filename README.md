@@ -131,7 +131,7 @@ IIS dynamic attach cannot recover receive calls posted before attachment; startu
 
 当前实现每次收到探针 `ready` 事件后，都会将这条能力限制写入 `status.json` 的 `errors`，TUI/Web 的问题列表会展示它。IIS 已提前投递的异步接收调用没有经过新附加探针的入口，探针无法恢复这些调用的缓冲区参数，因此采集启动后到达的首批请求可能漏采。随后新投递的接收调用可以正常关联。
 
-`tls=attached` 表示探针安装成功，完整性仍需结合客户端请求数、保存记录、`incomplete`、`truncated` 和各类丢弃计数判断。启动漏采不会自动体现在 `tls_dropped` 中，提示也不会统计本次实际漏采数。10 条为当前测试机的实测值，预热次数需要结合环境验证。
+`tls=attached` 表示探针安装成功，完整性仍需结合客户端请求数、保存记录、`incomplete`、`truncated` 和各类丢弃计数判断。启动及其他探针盲区的实际漏采数仍为未知，`tls_dropped` 仅记录已观测丢弃下限。状态显式保留 `tls_coverage=unverified` 和 `tls_missing_estimate=null`，TUI、Web 与导出证据均提示完整性未验证。10 条为当前测试机的实测值，预热次数需要结合环境验证。
 
 仅观察调用元数据时可运行以下命令。
 
@@ -393,7 +393,21 @@ Web 服务以只读方式打开 SQLite 索引，会话标识只能解析到启�
 sudo ./bin/traffic capture --rules rules.yaml --no-tls --output ./sessions/custom-001
 ```
 
-`field` 支持 `url`、`request`，`severity` 支持 `low`、`medium`、`high`。`--no-detect` 适合只采集和还原流量。
+`field` 支持 `url`、`request`、`response`、`request.headers`、`response.headers`、`request.body`、`response.body`。单个头部使用 `request.header.User-Agent`、`response.header.Set-Cookie` 等字段名，HTTP 头部名大小写不敏感，重复头部值以换行连接。头部和正文选择器按各自字段匹配，gzip 正文在有界解压后追加检测，响应到达时重新检测并输出新增告警。`severity` 支持 `low`、`medium`、`high`，`--no-detect` 关闭攻击检测。
+
+内置规则新增 XSS、SSRF、XXE、SSTI、JNDI、常见序列化载荷、Webshell 上传及访问路径，以及响应中的 passwd / 命令输出特征。这些规则覆盖常见特征，混淆变体和业务语境仍需结合原始流量判断。响应特征作为疑似成功证据保留，接口合法返回同类文本也可能命中。
+
+### 可信代理与来源地址
+
+使用 `--trusted-proxies 10.0.0.0/8,192.0.2.10,2001:db8::/32` 指定可信代理的 IP 或 CIDR。直连对端在列表中时，解析 `X-Forwarded-For`，从右向左寻找第一个非可信地址。缺少该头部时使用单值 `X-Real-IP`。非法或空链保留直连身份。默认列表为空。
+
+索引、告警和扫描聚合使用解析后的 `client`，`peer_client` 保留实际直连端点，`client_source` 记录所用头部。代理转发头不含原始端口，解析后的端口记为 `0`。TUI / Web 详情显示地址依据，PCAP 导出按直连端点筛选。
+
+### 告警外送
+
+`--alert-webhook https://siem.example/traffic` 将每条新增告警的 JSON 异步 POST 至接收端。可通过环境变量 `TRAFFIC_WEBHOOK_TOKEN` 发送 Bearer 令牌，正文包含记录 ID、时间、URL、来源地址、直连端点和检测依据。接收端可使用 `Idempotency-Key` 去重。
+
+单次请求超时 3 秒，网络失败、HTTP 429 和 5xx 最多尝试三次，重定向计为失败。有界队列最多 128 条、4 MiB，退出时等待最多 5 秒，然后取消剩余请求。`status.json`、TUI 和 Web 分别显示 `alert_delivered`、`alert_delivery_failed`、`alert_delivery_dropped`。队列位于内存，失败和溢出后的告警仍可从会话索引读取，重启后需由外部集成补送。
 
 ## 证据与资源
 
@@ -409,7 +423,10 @@ sudo ./bin/traffic capture --rules rules.yaml --no-tls --output ./sessions/custo
 | 进程资源 | Linux cgroup v2 / Windows Job Object，可用时限制工具及子进程合计 256 MiB 内存、单核 50% CPU。目标服务内的探针开销由目标进程承担 |
 | 文件权限 | Linux/macOS 会话目录 `0700`、证据文件 `0600`。Windows 通过继承 ACL 授权当前用户、SYSTEM 和 Administrators |
 
-队列有界。`status.json` 记录网卡丢包、用户态队列丢弃、TLS 丢失、错误和资源限制是否生效。Linux OpenSSL 探针失败后最多重试一次。Java/IIS/Windows OpenSSL 后端失败时报告不可用并保留网卡采集，进程探针的队列缺口和未完成消息保留完整性标记。IIS 后端在采集结束时保存尚未完成的已识别请求。
+队列有界。`status.json` 记录网卡丢包、用户态队列丢弃、TLS 已知丢弃、错误和资源限制是否生效。Linux OpenSSL 探针失败后最多重试一次。Java/IIS/Windows OpenSSL 后端失败时报告不可用并保留网卡采集，进程探针的队列缺口和未完成消息保留完整性标记。IIS 后端在采集结束时保存尚未完成的已识别请求。
+
+
+`tls_wire_records` 统计 TCP 重组后完整可读的 TLS 外层记录，`tls_requests` 统计已保存的 TLS 明文请求。两者用于排查覆盖差异。TLS 1.3 外层记录包含加密握手，一条 HTTP 请求可跨多个 TLS 记录，同一连接也可承载多条请求，多网卡重复观察还可能重复统计。两项计数无法直接相减得到漏采请求数。捕获从记录中途开始、队列缺口和超出连接上限的流也可能无法计入记录数。漏采估计保持未知，已知丢弃为零仍需外部请求计数核对。
 
 原始 TLS 事件与探针诊断也保存在会话内，受会话总磁盘预算约束。它们可能包含请求正文、Cookie 和认证信息，分享证据前需检查具体内容。
 
@@ -422,7 +439,7 @@ go test -race ./...
 go vet ./...
 ```
 
-GitHub Actions 在 ARM64 和 x86_64 Linux 上执行格式检查、竞态测试、静态检查和构建。单元与回归测试覆盖规则正反例、解码、分片、请求响应配对、部分正文、队列缺口、TCP 重传乱序、离线重放和证据导出。
+GitHub Actions 在 ARM64 和 x86_64 Linux 上执行格式检查、竞态测试、静态检查和构建。新增 Windows x64 原生竞态测试、静态检查及两个程序的构建，以及 Java 17/21 Maven 测试与打包。Windows 托管 runner 缺少 Npcap，两个依赖 libpcap DLL 的离线导入集成测试在 Linux 任务中运行，Windows 任务显式跳过这两项。新增 CI 任务尚待远端运行验证。单元与回归测试覆盖规则正反例、解码、分片、请求响应配对、部分正文、队列缺口、TCP 重传乱序、离线重放和证据导出。
 
 以下实机脚本需要与本项目测试站接口兼容的既有站点，包括 `/api/health`、`/api/echo`、`/search` 及未知路径返回 404。它们会发送测试请求，串行运行，输出目录需为新目录。
 
@@ -438,8 +455,8 @@ python3 scripts/benchmark.py --output /tmp/traffic-performance --host 127.0.0.1
 - HTTP/2、HTTP/3、WebSocket 内容解析、通用 JSSE/Go TLS 和 Tomcat NIO2 尚未支持。HTTP/1.1 流缺失消息开头时，可恢复内容受限。
 - Windows 已完成 Npcap HTTP、IIS / TLS 1.2 及 Nginx、Apache / TLS 1.2、1.3 的实验验收。其他 Windows Web 服务、IIS TLS 1.3、IIS 内核缓存直接命中、应用池进程替换、长期性能和 Frida 运行时完整卸载尚未验收。IIS 附加启动窗口仍可能漏采。
 - Linux x86_64 的实机 HTTPS 验收覆盖 Nginx / OpenSSL 3.5。Apache、Tomcat、通用 OpenSSL 服务及长期性能仍待该架构单独验收。Linux ARM64 的多服务结果见验证记录。
-- 代理后的来源地址取连接对端，经过 CDN 或负载均衡时需结合可信代理信息分析。
-- Web 已覆盖令牌鉴权、静态资源、筛选、详情及导出测试，并完成真实 IIS 历史会话的接口读取检查。采集中会话的浏览器交互和持续刷新尚未完成实机验收。
+- 代理后的来源地址依赖可信代理配置及代理正确维护转发头，默认使用连接对端。
+- Web 已覆盖令牌鉴权、静态资源、筛选、详情及导出测试，并完成真实 IIS 历史会话的接口读取检查。已用持续写入的测试会话验证浏览器新增请求刷新、待响应详情补全和告警计数更新。当前账户缺少 BPF 采集权限，真实网卡采集至浏览器的完整链路仍待实机验收。
 
 ## 第三方组件
 

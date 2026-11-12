@@ -87,6 +87,8 @@ func run(args []string) (runErr error) {
 	ecapture := fs.String("ecapture", "/opt/traffic/bin/ecapture", "eCapture v2.9.1 binary")
 	lib := fs.String("libssl", "", "TLS library override; Windows module name or Linux library path")
 	ruleFile := fs.String("rules", "", "additional YAML rules")
+	proxyList := fs.String("trusted-proxies", "", "comma-separated trusted proxy IPs or CIDRs for X-Forwarded-For / X-Real-IP")
+	webhookURL := fs.String("alert-webhook", "", "POST alert JSON to HTTP(S) endpoint; optional TRAFFIC_WEBHOOK_TOKEN bearer token")
 	noTLS := fs.Bool("no-tls", false, "disable TLS probes")
 	duration := fs.Duration("duration", 0, "optional capture duration")
 	fs.IntVar(&requestLimit, "request-limit", requestLimit, "maximum saved request body bytes")
@@ -105,6 +107,14 @@ func run(args []string) (runErr error) {
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	var proxyErr error
+	trustedProxies, proxyErr = parseTrustedProxies(*proxyList)
+	if proxyErr != nil {
+		return proxyErr
+	}
+	if err := validateWebhook(*webhookURL); err != nil {
+		return err
 	}
 	if *pid < 0 || *javaPID < 0 {
 		return errors.New("PID must not be negative")
@@ -240,6 +250,10 @@ func run(args []string) (runErr error) {
 			return e
 		}
 		defer s.db.Close()
+		if *webhookURL != "" {
+			s.webhook = newAlertWebhook(s, *webhookURL, os.Getenv("TRAFFIC_WEBHOOK_TOKEN"))
+			defer func() { s.webhook.close(); s.report() }()
+		}
 		defer func() {
 			if runErr != nil {
 				s.mu.Lock()
@@ -253,6 +267,8 @@ func run(args []string) (runErr error) {
 			}
 		}()
 		s.stats.Started = started.UTC()
+		s.stats.TLSCoverage = "unverified"
+		s.problem(errors.New(session.CoverageWarning))
 		fmt.Fprintf(os.Stderr, "会话目录 %s\n", s.dir)
 		s.report()
 		s.stats.Targets = discoverTargets("/proc", *service, *pid, *lib)
@@ -275,23 +291,26 @@ func run(args []string) (runErr error) {
 			defer stop()
 		}
 		manifest := map[string]any{
-			"schema_version": 1,
-			"layout_version": 2,
-			"hostname":       host,
-			"os":             runtime.GOOS,
-			"arch":           runtime.GOARCH,
-			"name":           *name,
-			"mode":           cmd,
-			"started":        s.stats.Started,
-			"filter":         filter,
-			"interfaces":     names,
-			"service":        *service,
-			"targets":        discoverTargets("/proc", *service, *pid, *lib),
-			"tls_enabled":    cmd == "capture" && !*noTLS,
-			"rules":          rules,
-			"header_limit":   32768,
-			"request_limit":  requestLimit,
-			"response_limit": responseLimit,
+			"schema_version":       1,
+			"layout_version":       2,
+			"hostname":             host,
+			"os":                   runtime.GOOS,
+			"arch":                 runtime.GOARCH,
+			"name":                 *name,
+			"mode":                 cmd,
+			"started":              s.stats.Started,
+			"filter":               filter,
+			"interfaces":           names,
+			"service":              *service,
+			"targets":              discoverTargets("/proc", *service, *pid, *lib),
+			"tls_enabled":          cmd == "capture" && !*noTLS,
+			"rules":                rules,
+			"trusted_proxies":      trustedProxies,
+			"tls_coverage":         "unverified",
+			"tls_missing_estimate": nil,
+			"header_limit":         32768,
+			"request_limit":        requestLimit,
+			"response_limit":       responseLimit,
 		}
 		if cmd == "import" {
 			manifest["input_pcap"] = id
@@ -320,6 +339,9 @@ func run(args []string) (runErr error) {
 			s.mu.Lock()
 			s.stats.State = "complete"
 			s.mu.Unlock()
+			if s.webhook != nil {
+				s.webhook.close()
+			}
 			s.report()
 			return nil
 		}
@@ -380,6 +402,9 @@ func run(args []string) (runErr error) {
 			s.stats.State = "failed"
 		}
 		s.mu.Unlock()
+		if s.webhook != nil {
+			s.webhook.close()
+		}
 		s.report()
 		emit(s.stats)
 		return s.fatal

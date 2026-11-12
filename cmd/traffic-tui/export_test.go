@@ -134,7 +134,7 @@ func TestExportPacketScopeAndHashes(t *testing.T) {
 			if err = packets.Close(); err != nil {
 				t.Fatal(err)
 			}
-			transaction := Transaction{ID: "packet-scope", Time: now, Client: "192.0.2.1:12345"}
+			transaction := Transaction{ID: "packet-scope", Time: now, Client: "198.51.100.1:0", PeerClient: "192.0.2.1:12345", ClientSource: "x-forwarded-for"}
 			raw, err := json.Marshal(transaction)
 			if err != nil {
 				t.Fatal(err)

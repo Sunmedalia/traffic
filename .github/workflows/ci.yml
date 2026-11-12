@@ -1,4 +1,4 @@
-name: Linux checks
+name: Checks
 on:
   push:
   pull_request:
@@ -32,3 +32,50 @@ jobs:
         run: |
           python3 -m py_compile scripts/*.py
           bash -n scripts/*.sh
+
+  java-agent:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        java: ['17', '21']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - name: Test and package Java Agent
+        run: mvn -B -f java-agent/pom.xml verify
+
+  windows:
+    runs-on: windows-2022
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+      - name: Configure CGO
+        shell: pwsh
+        run: |
+          "CC=C:\msys64\mingw64\bin\gcc.exe" >> $env:GITHUB_ENV
+          "C:\msys64\mingw64\bin" >> $env:GITHUB_PATH
+      # Hosted runners have no Npcap driver or DLL. The two offline libpcap
+      # integration tests run in Linux jobs. All other tests run natively here.
+      - name: Windows native race tests
+        run: go test -race ./... -skip '^(TestOfflineReassemblyOutOfOrderAndRetransmission|TestImportCreatesOrganizedSession)$'
+      - name: Windows static checks
+        run: go vet ./...
+      - name: Windows builds
+        run: |
+          go build -o bin/traffic.exe ./cmd/traffic
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          go build -o bin/traffic-tui.exe ./cmd/traffic-tui
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

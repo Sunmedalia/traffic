@@ -42,6 +42,10 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 		if e != nil {
 			return
 		}
+		if prefix[0] >= 20 && prefix[0] <= 23 && prefix[1] == 3 && prefix[2] <= 3 {
+			p.observeTLSRecords(br)
+			return
+		}
 		if prefix[0] < 65 || prefix[0] > 90 {
 			return
 		}
@@ -208,6 +212,27 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			}
 			p.mu.Unlock()
 		}
+	}
+}
+
+// Count complete outer records after TCP reassembly so retransmissions and
+// segmentation within an interface do not inflate the diagnostic counter.
+func (p *HTTPProcessor) observeTLSRecords(reader io.Reader) {
+	var header [5]byte
+	for {
+		if _, err := io.ReadFull(reader, header[:]); err != nil {
+			return
+		}
+		length := int64(header[3])<<8 | int64(header[4])
+		if header[0] < 20 || header[0] > 23 || header[1] != 3 || header[2] > 3 || length > (1<<14)+2048 {
+			return
+		}
+		if _, err := io.CopyN(io.Discard, reader, length); err != nil {
+			return
+		}
+		p.s.mu.Lock()
+		p.s.stats.TLSWireRecords++
+		p.s.mu.Unlock()
 	}
 }
 

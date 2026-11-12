@@ -196,9 +196,12 @@ function renderOverview() {
     h('div', { class: 'label' }, label), h('div', { class: 'value' }, number(value)));
   $('tiles').replaceChildren(
     tile('累计请求', s.transactions), tile('累计告警命中', s.alerts), tile('网络包', s.packets),
-    tile('网卡丢包', s.dropped, true), tile('用户态队列丢弃', s.queue_dropped, true), tile('TLS 丢失', s.tls_dropped, true));
+    tile('网卡丢包', s.dropped, true), tile('用户态队列丢弃', s.queue_dropped, true), tile('TLS 已知丢弃', s.tls_dropped, true));
   const session = currentSession();
   const facts = [['会话目录', state.dir || (session && session.dir) || '—'], ['状态', stateLabel(s.state)], ['开始时间', formatTime(s.started)], ['TLS', s.tls || '—'], ['资源限制', s.resource_limits || '—']];
+  facts.push(['采集完整性', '未验证，启动及探针盲区漏采数未知。TLS 已知丢弃计数为已观测下限，0 不代表采全。']);
+  facts.push(['网卡 TLS 外层记录', number(s.tls_wire_records)], ['TLS 明文请求', number(s.tls_requests)]);
+  facts.push(['Webhook 已送达 / 失败 / 队列丢弃', [s.alert_delivered, s.alert_delivery_failed, s.alert_delivery_dropped].map(number).join(' / ')]);
   $('facts').replaceChildren(...facts.flatMap(([name, value]) => [h('dt', {}, name), h('dd', {}, value)]));
   const targets = s.targets || [];
   $('targets-body').replaceChildren(...targets.map((t) => h('tr', {},
@@ -319,6 +322,8 @@ function renderDetail() {
   const facts = [
     ['时间', formatTime(t.time, true)],
     ['客户端', t.client],
+    ['直连对端', t.peer_client],
+    ['来源地址依据', t.client_source],
     ['Host', t.host],
     ['响应', (t.status ? String(t.status) : '待响应') + (flags ? ' · ' + flags : '')],
     ['服务', [t.service, t.target_id].filter(Boolean).join(' · ')],

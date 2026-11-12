@@ -50,7 +50,7 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 			return e
 		}
 	}
-	note := map[string]any{"schema_version": 1, "source": t.Source, "incomplete": t.Incomplete, "truncated": t.Truncated, "packet_scope": "client endpoint and 120-second window; may include other requests on the same connection; original packets may have rotated", "tls_plaintext_source": "process hook; network PCAP remains encrypted"}
+	note := map[string]any{"schema_version": 1, "source": t.Source, "incomplete": t.Incomplete, "truncated": t.Truncated, "capture_coverage": session.CoverageWarning, "packet_scope": "transport peer endpoint and 120-second window; may include other requests on the same connection; original packets may have rotated", "tls_plaintext_source": "process hook; network PCAP remains encrypted"}
 	info, _ := json.MarshalIndent(note, "", "  ")
 	if e = add("evidence.json", info); e != nil {
 		return e
@@ -64,7 +64,11 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 		return fmt.Errorf("stop capture before exporting evidence: %w", e)
 	}
 	defer session.UnlockFile(lock)
-	host, port, e := net.SplitHostPort(t.Client)
+	peer := t.Client
+	if t.PeerClient != "" {
+		peer = t.PeerClient
+	}
+	host, port, e := net.SplitHostPort(peer)
 	if e == nil {
 		files, err := session.PacketFiles(s.dir)
 		if err != nil {

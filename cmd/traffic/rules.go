@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -31,6 +34,16 @@ var rules = []Rule{
 	{ID: "CMD-001", Version: 1, Severity: "high", Field: "request", Pattern: "(?i)([;|&]\\s*(id|whoami|cat|curl|wget|bash|sh)\\b|\\$\\([^)]*\\)|`[^`]+`)"},
 	{ID: "PATH-001", Version: 1, Severity: "high", Field: "request", Pattern: `(?i)(\.\.[/\\]){2,}`},
 	{ID: "FILE-001", Version: 1, Severity: "medium", Field: "url", Pattern: `(?i)(/\.env([?/#]|$)|/\.git/|/wp-config\.php|/etc/passwd|/WEB-INF/web\.xml)`},
+	{ID: "XSS-001", Version: 1, Severity: "high", Field: "request", Pattern: `(?i)(<\s*script\b|<[^>]+\bon[a-z]+\s*=|javascript\s*:)`},
+	{ID: "SSRF-001", Version: 1, Severity: "high", Field: "request", Pattern: `(?i)(https?://(localhost|127\.[0-9.]+|\[::1\]|169\.254\.169\.254|metadata\.google\.internal)([:/\s?]|$)|\b(gopher|dict|file)://)`},
+	{ID: "XXE-001", Version: 1, Severity: "high", Field: "request", Pattern: `(?i)<!ENTITY\s+[^>]+\b(SYSTEM|PUBLIC)\s+`},
+	{ID: "SSTI-001", Version: 1, Severity: "high", Field: "request", Pattern: `(?i)(\{\{[^}]{0,200}(__class__|__globals__|config\b|[0-9]+\s*\*\s*[0-9]+)|\$\{[^}]{0,200}(Runtime|ProcessBuilder|[0-9]+\s*\*\s*[0-9]+)|<%=?[^%]{0,200}(Runtime|system|exec)\b)`},
+	{ID: "JNDI-001", Version: 1, Severity: "high", Field: "request", Pattern: `(?i)\$\{\s*jndi\s*:\s*(ldap|ldaps|rmi|dns|iiop|http)\s*:`},
+	{ID: "DESERIAL-001", Version: 1, Severity: "high", Field: "request.body", Pattern: `(?i)(rO0AB|<java\b[^>]*\bclass=["']java\.beans\.XMLDecoder|O:[0-9]+:"[^"\r\n]+":[0-9]+:\{)`},
+	{ID: "WEBSHELL-UPLOAD-001", Version: 1, Severity: "high", Field: "request.body", Pattern: `(?i)(filename\s*=\s*"?[^"\r\n;]*\.(php[0-9]?|phtml|jsp[x]?|asp[x]?)([";\s]|$)|<\?php[^\r\n]{0,300}\b(eval|assert|system|passthru|shell_exec)\s*\()`},
+	{ID: "WEBSHELL-ACCESS-001", Version: 1, Severity: "medium", Field: "url", Pattern: `(?i)/(shell|webshell|cmd|c99|r57|antsword|behinder)\.(php[0-9]?|phtml|jsp[x]?|asp[x]?)([?/#]|$)`},
+	{ID: "RESPONSE-PASSWD-001", Version: 1, Severity: "high", Field: "response.body", Pattern: `\broot:[^:\r\n]*:0:0:`},
+	{ID: "RESPONSE-CMD-001", Version: 1, Severity: "high", Field: "response.body", Pattern: `\buid=[0-9]+\([^)]*\)\s+gid=[0-9]+\(`},
 }
 
 func compileRules(rs []Rule) error {
@@ -41,7 +54,7 @@ func compileRules(rs []Rule) error {
 			return fmt.Errorf("invalid or duplicate rule %q", r.ID)
 		}
 		seen[r.ID] = true
-		if r.Field != "url" && r.Field != "request" {
+		if !validRuleField(r.Field) {
 			return fmt.Errorf("unsupported field %s", r.Field)
 		}
 		if r.Severity != "low" && r.Severity != "medium" && r.Severity != "high" {
@@ -79,17 +92,20 @@ func detect(t Transaction) []Alert {
 		return nil
 	}
 	var out []Alert
-	decoded, decodedView := decodedBody(t.Request)
+	request := detectionMessage(t.Request, false, requestLimit)
+	response := detectionMessage(t.Response, true, responseLimit)
 	for _, rule := range rules {
-		text := string(t.Request)
-		view := "request"
+		message := request
+		if strings.HasPrefix(rule.Field, "response") {
+			message = response
+		}
+		text, view := message.content(rule.Field)
 		if rule.Field == "url" {
-			text = t.URL
-			view = "url"
+			text, view = t.URL, "url"
 		}
 		alert := matchView(rule, text, view)
-		if alert == nil && rule.Field == "request" && decoded != "" {
-			alert = matchView(rule, decoded, decodedView)
+		if alert == nil && (rule.Field == "request" || rule.Field == "response" || rule.Field == "request.body" || rule.Field == "response.body") && message.decoded != "" {
+			alert = matchView(rule, message.decoded, message.decodedView)
 		}
 		if alert != nil {
 			out = append(out, *alert)
@@ -97,6 +113,82 @@ func detect(t Transaction) []Alert {
 	}
 	return out
 }
+
+// Header selectors use an HTTP field name, for example request.header.User-Agent.
+func validRuleField(field string) bool {
+	for _, side := range []string{"request", "response"} {
+		if field == side || field == side+".headers" || field == side+".body" {
+			return true
+		}
+		if name, ok := strings.CutPrefix(field, side+".header."); ok {
+			if name == "" {
+				return false
+			}
+			for _, c := range name {
+				if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("!#$%&'*+-.^_`|~", c)) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return field == "url"
+}
+
+type detectionHTTP struct {
+	raw, headers, body, decoded, decodedView string
+	fields                                   http.Header
+}
+
+func detectionMessage(raw []byte, response bool, limit int) detectionHTTP {
+	message := detectionHTTP{raw: string(raw)}
+	// Keep bounded partial bodies searchable even when the saved message is truncated.
+	head, payload, found := bytes.Cut(raw, []byte("\r\n\r\n"))
+	if !found {
+		head, payload, found = bytes.Cut(raw, []byte("\n\n"))
+	}
+	if found {
+		_, headers, _ := bytes.Cut(head, []byte("\n"))
+		message.headers, message.body = string(headers), string(payload)
+	}
+	reader := bufio.NewReader(bytes.NewReader(raw))
+	var body io.ReadCloser
+	if response {
+		parsed, err := http.ReadResponse(reader, nil)
+		if err == nil {
+			message.fields, body = parsed.Header, parsed.Body
+		}
+	} else {
+		parsed, err := http.ReadRequest(reader)
+		if err == nil {
+			message.fields, body = parsed.Header, parsed.Body
+			if parsed.Host != "" {
+				message.fields.Set("Host", parsed.Host)
+			}
+		}
+	}
+	if body != nil {
+		data, _ := io.ReadAll(io.LimitReader(body, int64(limit)))
+		body.Close()
+		message.body = string(data)
+	}
+	message.decoded, message.decodedView = session.DecodedBody(raw, limit)
+	return message
+}
+
+func (m detectionHTTP) content(field string) (string, string) {
+	if _, name, ok := strings.Cut(field, ".header."); ok {
+		return strings.Join(m.fields.Values(name), "\n"), field
+	}
+	if strings.HasSuffix(field, ".headers") {
+		return m.headers, field
+	}
+	if strings.HasSuffix(field, ".body") {
+		return m.body, field
+	}
+	return m.raw, field
+}
+
 func matchView(rule Rule, text, view string) *Alert {
 	for round := 0; round <= 2; round++ {
 		if match := rule.rx.FindString(text); match != "" {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ const indexTimeFormat = session.IndexTimeFormat
 var serial atomic.Uint64
 
 type Store struct {
+	webhook        *alertWebhook
 	localAddresses map[string]bool
 	packetDrops    map[string]uint64
 	fatal          error
@@ -71,6 +73,9 @@ func (s *Store) save(t Transaction) error {
 					}
 					if !serverLocal && runtime.GOOS != "windows" {
 						t.LocalEndpoint = t.Client
+						if t.PeerClient != "" {
+							t.LocalEndpoint = t.PeerClient
+						}
 					}
 					t.Service = selected.Service
 					break
@@ -107,6 +112,7 @@ func (s *Store) save(t Transaction) error {
 	if strings.HasPrefix(t.Connection, "tls:iis:") {
 		t.Backend = "iis-httpapi"
 	}
+	resolveClient(&t)
 	t.SchemaVersion = 1
 	if t.ID == "" {
 		h := sha256.Sum256([]byte(fmt.Sprintf("%s/%s/%d/%s", t.Connection, t.Source, time.Now().UnixNano(), t.URL)))
@@ -116,15 +122,38 @@ func (s *Store) save(t Transaction) error {
 	if a := scan(t); a != nil {
 		t.Alerts = append(t.Alerts, *a)
 	}
-	b, err := json.Marshal(t)
-	if err != nil {
-		return err
-	}
-	var previous int
-	e := s.db.QueryRow("SELECT alert FROM requests WHERE id=?", t.ID).Scan(&previous)
+	var previousData []byte
+	e := s.db.QueryRow("SELECT data FROM requests WHERE id=?", t.ID).Scan(&previousData)
 	fresh := e == sql.ErrNoRows
 	if e != nil && !fresh {
 		return e
+	}
+	previous := Transaction{}
+	if !fresh {
+		if err := json.Unmarshal(previousData, &previous); err != nil {
+			return err
+		}
+	}
+	known := make(map[Alert]bool, len(previous.Alerts))
+	for _, alert := range previous.Alerts {
+		known[alert] = true
+	}
+	var newAlerts []Alert
+	for _, alert := range t.Alerts {
+		if !known[alert] {
+			newAlerts = append(newAlerts, alert)
+		}
+	}
+	// Scan aggregation is emitted once per window. Keep its evidence on later
+	// response/body updates, where scan() may suppress a repeated emission.
+	for _, alert := range previous.Alerts {
+		if alert.Rule == "SCAN-001" && !slices.Contains(t.Alerts, alert) {
+			t.Alerts = append(t.Alerts, alert)
+		}
+	}
+	b, err := json.Marshal(t)
+	if err != nil {
+		return err
 	}
 	_, err = s.db.Exec("INSERT OR REPLACE INTO requests VALUES(?,?,?,?,?)", t.ID, t.Time.UTC().Format(indexTimeFormat), t.Client, len(t.Alerts), b)
 	if err != nil {
@@ -133,17 +162,18 @@ func (s *Store) save(t Transaction) error {
 	s.mu.Lock()
 	if fresh {
 		s.stats.Transactions++
-	}
-	if len(t.Alerts) > previous {
-		s.stats.Alerts += uint64(len(t.Alerts) - previous)
-	}
-	s.mu.Unlock()
-	for i, a := range t.Alerts {
-		if i < previous {
-			continue
+		if t.Backend != "pcap" && t.Method != "" {
+			s.stats.TLSRequests++
 		}
-		out, _ := json.Marshal(map[string]any{"id": t.ID, "url": t.URL, "client": t.Client, "alert": a})
+	}
+	s.stats.Alerts += uint64(len(newAlerts))
+	s.mu.Unlock()
+	for _, a := range newAlerts {
+		out, _ := json.Marshal(map[string]any{"id": t.ID, "url": t.URL, "client": t.Client, "peer_client": t.PeerClient, "client_source": t.ClientSource, "time": t.Time, "alert": a})
 		fmt.Println(string(out))
+		if s.webhook != nil {
+			s.webhook.enqueue(out)
+		}
 	}
 	return nil
 }
