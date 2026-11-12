@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 	"unicode"
@@ -13,7 +12,6 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	termansi "github.com/charmbracelet/x/ansi"
-	"github.com/charmbracelet/x/term"
 
 	"github.com/Sunmedalia/traffic/internal/session"
 )
@@ -44,33 +42,6 @@ var tuiAccent = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#5FD7D
 var tuiMuted = lipgloss.NewStyle().Foreground(lipgloss.Color("#999999"))
 var tuiSelected = lipgloss.NewStyle().Reverse(true)
 var tuiDanger = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF7777"))
-
-func runTUI(dir string, refresh time.Duration, filter tuiFilter) error {
-	if refresh <= 0 {
-		return fmt.Errorf("--refresh 必须大于 0")
-	}
-	if !term.IsTerminal(os.Stdin.Fd()) || !term.IsTerminal(os.Stdout.Fd()) {
-		return fmt.Errorf("TUI 需要交互式终端，请在终端运行 traffic-tui --session <目录>")
-	}
-	s, err := openStore(dir)
-	if err != nil {
-		return fmt.Errorf("无法打开会话: %w", err)
-	}
-	defer s.db.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	// Fail before entering raw mode when the database is not a traffic session.
-	checkCtx, stop := context.WithTimeout(ctx, 3*time.Second)
-	initial, err := loadTUISnapshot(checkCtx, s, filter, false, 0, "", nil)
-	stop()
-	if err != nil {
-		return fmt.Errorf("无法读取会话: %w", err)
-	}
-	m := tuiModel{ctx: ctx, store: s, refresh: refresh, filter: filter, snapshot: initial, width: 80, height: 24, viewport: viewport.New()}
-	m.resize()
-	_, err = tea.NewProgram(&m, tea.WithContext(ctx)).Run()
-	return err
-}
 
 func (m tuiModel) tick() tea.Cmd {
 	return tea.Tick(m.refresh, func(t time.Time) tea.Msg { return tuiTick(t) })
@@ -462,7 +433,7 @@ func (m tuiModel) View() tea.View {
 		content = lipgloss.JoinHorizontal(lipgloss.Top, lipgloss.NewStyle().Width(width/2).Render(m.listView(width/2-2, max(1, height-8))), " │ ", m.viewport.View())
 	}
 	if m.help {
-		content = "快捷键\n\n1/2/3  概览 / 请求 / 告警\n↑↓ j/k  选择或滚动   g/G  首尾\nn/p ←→ PgDn/PgUp  翻页\nEnter  打开详情   Tab/Shift+Tab  切换详情标签\n/  筛选   空格  暂停或恢复刷新   r  手动刷新\nEsc  返回列表   ?  帮助   q/Ctrl+C  退出\n\n筛选面板用 Tab 切换字段，Enter 应用，Ctrl+R 清空。\n详情内 PgUp/PgDn 滚动，Esc 返回列表。"
+		content = "快捷键\n\n1/2/3  概览 / 请求 / 告警\n↑↓ j/k  选择或滚动   g/G  首尾\nn/p ←→ PgDn/PgUp  翻页\nEnter  打开详情   Tab/Shift+Tab  切换详情标签\n/  筛选   空格  暂停或恢复刷新   r  手动刷新\nEsc  返回列表   s  切换会话   ?  帮助   q/Ctrl+C  退出\n\n筛选面板用 Tab 切换字段，Enter 应用，Ctrl+R 清空。\n详情内 PgUp/PgDn 滚动，Esc 返回列表。"
 	}
 	if m.filtering {
 		content = m.formView()
@@ -473,7 +444,7 @@ func (m tuiModel) View() tea.View {
 	} else {
 		notice = m.snapshot.StatusWarning
 	}
-	footer := "/ 筛选 · Enter 详情 · 空格 暂停 · r 刷新 · ? 帮助 · q 退出"
+	footer := "s 会话 · / 筛选 · Enter 详情 · 空格 暂停 · r 刷新 · ? 帮助 · q 退出"
 	frame := header + "\n" + tuiMuted.Render(zoneLabel) + "\n" + tuiMuted.Render(termansi.Truncate(m.filterLabel(), width, "…")) + "\n\n" +
 		lipgloss.NewStyle().Height(max(1, height-8)).Render(content) + "\n" + tuiDanger.Render(termansi.Truncate(notice, width, "…")) + "\n" + tuiMuted.Render(footer)
 	// Clip the final frame as well, including help/forms on very small terminals.

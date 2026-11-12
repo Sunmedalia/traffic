@@ -45,11 +45,12 @@ func run(args []string) error {
 	}
 	fs := flag.NewFlagSet("traffic-tui "+cmd, flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "traffic-tui [view|status|requests|events|show ID|export ID] --session DIR")
-		fmt.Fprintln(fs.Output(), "默认打开中文交互分析界面，查询命令输出 JSON。")
+		fmt.Fprintln(fs.Output(), "traffic-tui [--data-dir ROOT | --session DIR]\ntraffic-tui <status|requests|events|show ID|export ID> --session DIR")
+		fmt.Fprintln(fs.Output(), "默认打开中文会话选择界面，查询命令输出 JSON。")
 		fs.PrintDefaults()
 	}
 	dir := fs.String("session", "", "existing session directory")
+	dataDir := fs.String("data-dir", "", "session browser search directory")
 	refresh := fs.Duration("refresh", time.Second, "TUI refresh interval")
 	out := fs.String("out", "", "export archive (must not exist)")
 	limit := fs.Int("limit", 100, "maximum query results")
@@ -83,11 +84,11 @@ func run(args []string) error {
 		}
 		*since = stamp.UTC().Format(indexTimeFormat)
 	}
+	if cmd == "view" {
+		return runSessionBrowser(*dir, *dataDir, *refresh, tuiFilter{Client: *client, Rule: *rule, Severity: *severity, Since: *since})
+	}
 	if *dir == "" {
 		return errors.New("--session required")
-	}
-	if cmd == "view" {
-		return runTUI(*dir, *refresh, tuiFilter{Client: *client, Rule: *rule, Severity: *severity, Since: *since})
 	}
 	if cmd == "status" {
 		b, e := os.ReadFile(filepath.Join(*dir, "status.json"))
