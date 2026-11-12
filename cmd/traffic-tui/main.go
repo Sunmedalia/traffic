@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/Sunmedalia/traffic/internal/session"
@@ -29,7 +28,7 @@ func main() {
 	}
 }
 func run(args []string) error {
-	syscall.Umask(0077)
+	session.PrivateUmask()
 	cmd := "view"
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		cmd, args = args[0], args[1:]

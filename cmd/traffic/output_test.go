@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -23,7 +24,7 @@ func TestAutomaticOutputDirectories(t *testing.T) {
 		t.Fatalf("directory %s want %s", first, expected)
 	}
 	info, err := os.Stat(first)
-	if err != nil || info.Mode().Perm() != 0700 {
+	if err != nil || (runtime.GOOS != "windows" && info.Mode().Perm() != 0700) {
 		t.Fatalf("session permissions: %v %v", info, err)
 	}
 	const workers = 8

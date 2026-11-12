@@ -10,10 +10,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
 
+	"github.com/Sunmedalia/traffic/internal/session"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
@@ -109,8 +109,12 @@ func TestExportPacketScopeAndHashes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			snaplen := uint32(65535)
+			if folder == "organized" {
+				snaplen = 256 << 10
+			}
 			writer := pcapgo.NewWriter(packets)
-			if err = writer.WriteFileHeader(65535, layers.LinkTypeEthernet); err != nil {
+			if err = writer.WriteFileHeader(snaplen, layers.LinkTypeEthernet); err != nil {
 				t.Fatal(err)
 			}
 			now := time.Now().UTC().Truncate(time.Second)
@@ -120,6 +124,9 @@ func TestExportPacketScopeAndHashes(t *testing.T) {
 			}{{12345, now}, {9999, now}, {12345, now.Add(-61 * time.Second)}, {12345, now.Add(61 * time.Second)}}
 			for _, sample := range samples {
 				data := evidencePacket(t, false, sample.port)
+				if folder == "organized" {
+					data = append(data, make([]byte, 65539-len(data))...)
+				}
 				if err = writer.WritePacket(gopacket.CaptureInfo{Timestamp: sample.stamp, CaptureLength: len(data), Length: len(data)}, data); err != nil {
 					t.Fatal(err)
 				}
@@ -167,8 +174,15 @@ func TestExportPacketScopeAndHashes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, _, err = reader.ReadPacketData(); err != nil {
+			if reader.Snaplen() != snaplen {
+				t.Fatalf("export snaplen %d want %d", reader.Snaplen(), snaplen)
+			}
+			data, _, err := reader.ReadPacketData()
+			if err != nil {
 				t.Fatal(err)
+			}
+			if folder == "organized" && len(data) != 65539 {
+				t.Fatalf("large packet length %d", len(data))
 			}
 			if _, _, err = reader.ReadPacketData(); err != io.EOF {
 				t.Fatalf("unexpected extra packet: %v", err)
@@ -178,10 +192,10 @@ func TestExportPacketScopeAndHashes(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer lock.Close()
-			if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			if err = session.LockFile(lock, true); err != nil {
 				t.Fatal(err)
 			}
-			defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+			defer session.UnlockFile(lock)
 			blocked := filepath.Join(t.TempDir(), "blocked.zip")
 			if err = exportEvidence(s, transaction, raw, blocked); err == nil {
 				t.Fatal("export permitted during capture")

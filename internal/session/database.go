@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -15,7 +16,9 @@ func OpenDB(dir string, write bool) (*sql.DB, error) {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return nil, err
 		}
-		os.Chmod(dir, 0700)
+		if err := RestrictDirectory(dir); err != nil {
+			return nil, err
+		}
 	}
 	mode := "ro"
 	if write {
@@ -25,7 +28,11 @@ func OpenDB(dir string, write bool) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	databaseURL := url.URL{Scheme: "file", Path: absolute}
+	databasePath := filepath.ToSlash(absolute)
+	if runtime.GOOS == "windows" {
+		databasePath = "/" + databasePath
+	}
+	databaseURL := url.URL{Scheme: "file", Path: databasePath}
 	query := databaseURL.Query()
 	query.Set("mode", mode)
 	query.Set("_busy_timeout", "5000")

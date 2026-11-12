@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/Sunmedalia/traffic/internal/session"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,9 @@ func prepareOutputDir(output, root, name, host string, started time.Time) (strin
 			return "", err
 		}
 		if err = os.MkdirAll(absolute, 0700); err != nil {
+			return "", err
+		}
+		if err := session.RestrictDirectory(absolute); err != nil {
 			return "", err
 		}
 		return absolute, nil
@@ -68,6 +72,9 @@ func prepareOutputDir(output, root, name, host string, started time.Time) (strin
 			continue
 		}
 		if err != nil {
+			return "", err
+		}
+		if err := session.RestrictDirectory(dir); err != nil {
 			return "", err
 		}
 		return dir, nil

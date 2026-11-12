@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net"
@@ -13,6 +14,36 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
 )
+
+func TestPacketRingWindowsDeviceAndLargeFrame(t *testing.T) {
+	dir := t.TempDir()
+	device := `\Device\NPF_{010DBF10-606E-4FF7-9B78-CEEB459A8EB8}`
+	ring := packetRing{dir: dir, iface: device, link: layers.LinkTypeNull, snaplen: 256 << 10}
+	data := bytes.Repeat([]byte{1}, 65539)
+	if err := ring.write(gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: len(data), Length: len(data)}, data); err != nil {
+		t.Fatal(err)
+	}
+	if err := ring.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 1 {
+		t.Fatalf("device filename: %v %v", files, err)
+	}
+	file, err := os.Open(filepath.Join(dir, files[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	reader, err := pcapgo.NewReader(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := reader.ReadPacketData()
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("large frame was lost or truncated: %d bytes, %v", len(got), err)
+	}
+}
 
 func TestOfflineReassemblyOutOfOrderAndRetransmission(t *testing.T) {
 	if e := loadRules(""); e != nil {

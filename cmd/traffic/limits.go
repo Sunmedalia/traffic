@@ -1,3 +1,5 @@
+//go:build !windows
+
 package main
 
 import (
@@ -46,3 +48,5 @@ func limitResources() (func(), error) {
 	}
 	return cleanup, nil
 }
+
+func resourceLimitDescription() string { return "cgroup-v2: 256MiB, 50% of one CPU" }

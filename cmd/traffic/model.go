@@ -103,6 +103,9 @@ func (s *Store) save(t Transaction) error {
 		}
 		s.mu.Unlock()
 	}
+	if strings.HasPrefix(t.Connection, "tls:iis:") {
+		t.Backend = "iis-httpapi"
+	}
 	t.SchemaVersion = 1
 	if t.ID == "" {
 		h := sha256.Sum256([]byte(fmt.Sprintf("%s/%s/%d/%s", t.Connection, t.Source, time.Now().UnixNano(), t.URL)))

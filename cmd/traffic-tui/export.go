@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/Sunmedalia/traffic/internal/session"
@@ -61,10 +60,10 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 		return e
 	}
 	defer lock.Close()
-	if e = syscall.Flock(int(lock.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); e != nil {
+	if e = session.LockFile(lock, false); e != nil {
 		return fmt.Errorf("stop capture before exporting evidence: %w", e)
 	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	defer session.UnlockFile(lock)
 	host, port, e := net.SplitHostPort(t.Client)
 	if e == nil {
 		files, err := session.PacketFiles(s.dir)
@@ -94,7 +93,7 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 			}
 			hash := sha256.New()
 			writer := pcapgo.NewWriter(io.MultiWriter(w, hash))
-			if err := writer.WriteFileHeader(65535, handle.LinkType()); err != nil {
+			if err := writer.WriteFileHeader(handle.Snaplen(), handle.LinkType()); err != nil {
 				file.Close()
 				return err
 			}

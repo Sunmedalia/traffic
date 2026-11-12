@@ -13,3 +13,9 @@ The interactive terminal interface uses Charm libraries under the MIT license. E
 - Bubbles — https://github.com/charmbracelet/bubbles/blob/main/LICENSE
 - Lip Gloss — https://github.com/charmbracelet/lipgloss/blob/main/LICENSE
 - Charm terminal utilities — https://github.com/charmbracelet/x
+
+The optional Windows IIS helper runs Frida 17.5.1 as a separately installed Python dependency. Frida Core uses the wxWindows Library Licence 3.1, with its additional-use exception. Npcap is installed separately and its vendor licence applies. Neither component is bundled into the Go executable.
+
+- Frida Core licence — https://github.com/frida/frida-core/blob/17.5.1/COPYING
+- Frida Python source — https://github.com/frida/frida-python/tree/17.5.1
+- Npcap licence — https://npcap.com/npcap-license.html

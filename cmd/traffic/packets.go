@@ -79,6 +79,7 @@ type packetRing struct {
 	size       int64
 	index      int
 	link       layers.LinkType
+	snaplen    uint32
 }
 
 func (r *packetRing) write(ci gopacket.CaptureInfo, b []byte) error {
@@ -87,14 +88,14 @@ func (r *packetRing) write(ci gopacket.CaptureInfo, b []byte) error {
 			r.file.Close()
 		}
 		r.index = (r.index + 1) % 16
-		name := filepath.Join(r.dir, fmt.Sprintf("%s-%02d.pcap", r.iface, r.index))
+		name := filepath.Join(r.dir, fmt.Sprintf("%s-%02d.pcap", packetInterfaceName(r.iface), r.index))
 		f, e := os.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 		if e != nil {
 			return e
 		}
 		r.file = f
 		r.writer = pcapgo.NewWriter(f)
-		if e = r.writer.WriteFileHeader(65535, r.link); e != nil {
+		if e = r.writer.WriteFileHeader(r.snaplen, r.link); e != nil {
 			return e
 		}
 		r.size = 24
@@ -109,7 +110,7 @@ func capturePackets(ctx context.Context, s *Store, p *HTTPProcessor, iface, filt
 	if input != "" {
 		h, e = pcap.OpenOffline(input)
 	} else {
-		h, e = pcap.OpenLive(iface, 65535, false, 100*time.Millisecond)
+		h, e = pcap.OpenLive(iface, captureSnapshotLength(), false, 100*time.Millisecond)
 	}
 	if e != nil {
 		return e
@@ -134,7 +135,7 @@ func capturePackets(ctx context.Context, s *Store, p *HTTPProcessor, iface, filt
 	if err := os.MkdirAll(packetDir, 0700); err != nil {
 		return err
 	}
-	ring := packetRing{dir: packetDir, iface: iface, link: h.LinkType()}
+	ring := packetRing{dir: packetDir, iface: iface, link: h.LinkType(), snaplen: uint32(h.SnapLen())}
 	defer func() {
 		if ring.file != nil {
 			ring.file.Close()

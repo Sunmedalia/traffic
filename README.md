@@ -4,6 +4,8 @@
 
 当前为 **Linux ARM64 / x86_64 实验版本**。ARM64 已在 Debian 13、Linux 6.12、Nginx 1.26、OpenSSL 3.5 环境验证，x86_64 已在 Ubuntu 26.04、Linux 7.0、Nginx 1.28、OpenSSL 3.5 环境验证。运行中采集使用网卡抓包和 eBPF TLS 探针，采集过程无需重启或重载网站、修改网站配置。兼容性和性能验收状态见 [验证记录](VALIDATION.md)。
 
+另提供 **Windows x64 HTTP 实验版本**，已在 Windows 10 LTSC 17763 上完成 Npcap 抓包、HTTP 请求响应还原和证据导出测试。IIS / TLS 1.2 已完成显式启用的动态 HTTP Server API 明文采集验收。启动前已投递的接收调用存在漏采窗口，完整边界见验证记录。
+
 ## 程序职责
 
 | 程序 | 源码入口 | 功能 |
@@ -62,6 +64,50 @@ sudo apt-get install -y clang llvm bpftool libelf-dev libssl-dev flex bison make
 构建目录必须不存在。脚本检出上游提交 `143e771cf2b4919aedc27fd7b4b24ff87b8725b9`，应用补丁并生成 `bin/ecapture`、许可证和校验文件。构建细节见 [eCapture 构建文档](https://github.com/gojue/ecapture/blob/v2.9.1/docs/agent/build-test.md)。
 
 补丁修复实机发现的连接缓存崩溃和 FD 复用时的元数据竞争，并减少解码复制。socket 地址及 inode 身份与对应明文一起进入事件。多核机器上的 TLS 事件使用 100 毫秒时间排序窗口，空闲时也会刷新末批事件。补丁扩展了内部 eBPF ABI，需要配套构建探针字节码与用户态解码器。[补丁文件](patches/ecapture-v2.9.1-connection-cache.patch)
+
+### Windows 构建与测试站点
+
+Windows x64 构建需要 Go 1.26.7+、x64 MinGW GCC，以及用于运行采集和抓包测试的 [Npcap](https://npcap.com/)。在 PowerShell 中执行以下命令。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/windows/build.ps1
+.\bin\windows\traffic.exe doctor
+.\bin\windows\traffic.exe capture --no-tls --ports 8080,8443 --duration 60s --name windows-http
+.\bin\windows\traffic-tui.exe
+```
+
+默认枚举具有地址的可用适配器及回环接口，跳过标记为断开的设备。也可使用 `doctor` 返回的完整 Npcap 设备名，例如 `--interfaces '\Device\NPF_Loopback'`。Windows 抓包快照上限为 256 KiB，避免回环帧超过 65,535 字节导致尾部丢失。PCAP 文件名使用设备名的 SHA-256，原始设备名保留在请求来源中。证据目录使用继承 ACL，授权当前用户、SYSTEM 和 Administrators。采集器使用 Job Object 限制合计 256 MiB 内存及单核 50% CPU，生效情况写入状态文件。
+
+以下脚本为专用实验机安装 IIS、ASP.NET，并创建独立的 `TrafficLab` 站点、应用池、自签证书和防火墙规则，监听 HTTP 8080、HTTPS 8443。已有目录、同名站点或端口冲突会报错。安装组件可能要求首次重启，脚本会保留安装记录，重启后通过 `-Resume` 继续。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/windows/setup-iis.ps1
+# 仅在首次安装要求重启且已完成重启后执行
+powershell -ExecutionPolicy Bypass -File scripts/windows/setup-iis.ps1 -Resume
+python scripts/windows/verify-iis.py --binary C:\traffic\bin\windows\traffic.exe --analysis-binary C:\traffic\bin\windows\traffic-tui.exe --output C:\traffic-iis-verification
+```
+
+验收脚本发送 HTTP/1.1 请求，检查中文正文、分块、长连接、并发、大小限制、规则、配置哈希、工作进程身份及导出校验。报告记录 HTTPS 明文、启动预热漏采、卸载确认和已有连接复用。未显式启用 IIS 探针时，Windows TLS 状态报告 `unavailable`，HTTPS 网络包保存为密文。`--service iis` 根据 IIS 配置关联候选服务端口，HTTP.sys 监听端口不能直接确定具体站点或应用池。
+
+IIS HTTPS 探针通过固定版本 Frida 17.5.1 动态附加运行中的 x64 `w3wp.exe`，在 HTTP Server API 收发边界复制明文，通过 I/O 完成关联处理异步接收，无需安装 IIS 模块或回收应用池。需安装 Python 和 Frida，并显式指定辅助脚本及临时目录。`setup-iis.ps1` 为 `TrafficLab` 应用池创建专用可读的 `C:\traffic-lab\probe-runtime`，证据目录保持独立权限。其他应用池需要对应身份可读取探针临时目录。
+
+```powershell
+python -m pip install frida==17.5.1
+.\bin\windows\traffic.exe capture --service iis --ports 8080,8443 --iis-probe C:\traffic-lab\scripts\windows\probe-iis.py --iis-runtime-dir C:\traffic-lab\probe-runtime --duration 60s
+python scripts/windows/verify-iis.py --binary C:\traffic-lab\bin\traffic.exe --analysis-binary C:\traffic-lab\bin\traffic-tui.exe --iis-probe C:\traffic-lab\scripts\windows\probe-iis.py --output C:\traffic-iis-https-verification
+```
+
+辅助脚本、`iis-plaintext.js` 和 `probe-iis.js` 应放在同一目录，`--iis-python` 可指定装有 Frida 的 Python。原始 API 事件保存在会话 `tls/iis-*.jsonl`，诊断在 `logs/iis-*.log`，请求记录的 backend 为 `iis-httpapi`。正文和头部按 HTTP/1.1 重建，原始 API 事件及 PCAP 保留供复核。内存队列、正文复制和磁盘均有边界，丢弃及不完整记录显式报告。
+
+后附加无法恢复附加前已投递的异步接收调用，`attached` 表示拦截安装成功，首批请求仍可能漏采。验收将 24 次预热请求单独统计，随后检查 107 次 HTTP/HTTPS 请求。本机启动预热漏采 10 条，不能把预热后的成功视为首个请求无损。Windows 10 17763 本次验证 TLS 1.2、HTTP/1.1 和同一个 IIS 工作进程，TLS 1.3、内核缓存直接命中、HTTP/2、进程替换和长期性能尚未验收。缓存片段等无法复制的实体类型标记缺口。默认仍需显式启用动态探针。停止时逐个核对拦截位置原指令已恢复，但未完成 I/O 可能使 Frida 脚本卸载或传输断开停滞。辅助进程有界退出，Frida 运行时可能仍留在工作进程，报告单独记录 `hooks_removed`、`script_unloaded` 和 `transport_detached`，完整运行时卸载尚未验收。
+
+仅观察调用元数据时可运行以下命令。
+
+```powershell
+python scripts/windows/probe-iis.py --pid 1234 --duration 30 --runtime-dir C:\traffic-lab\probe-runtime --out C:\traffic-iis-api.jsonl
+```
+
+`scripts/windows/restore-iis.ps1` 移除实验站点、应用池、证书和防火墙规则，保留文件与安装记录。需要同时卸载本次新增的 IIS 组件时使用 `-RemoveInstalledFeatures`，Windows 可能再次要求重启。恢复脚本应在测试结束后运行。
 
 ## 快速使用
 

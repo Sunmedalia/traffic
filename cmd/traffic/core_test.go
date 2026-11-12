@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -216,7 +217,11 @@ func TestDecodeProvenance(t *testing.T) {
 }
 
 func TestStorePathAndTimeOrdering(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "case?mode=ro#evidence")
+	name := "case?mode=ro#evidence"
+	if runtime.GOOS == "windows" {
+		name = "case 空格%3fmode=ro#evidence"
+	}
+	dir := filepath.Join(t.TempDir(), name)
 	s, e := openStore(dir, true)
 	if e != nil {
 		t.Fatal(e)

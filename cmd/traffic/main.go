@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -21,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Sunmedalia/traffic/internal/session"
 	"github.com/google/gopacket/pcap"
 )
 
@@ -38,7 +38,7 @@ func main() {
 	}
 }
 func run(args []string) (runErr error) {
-	syscall.Umask(0077)
+	session.PrivateUmask()
 	if len(args) == 0 {
 		return errors.New("usage: traffic doctor|capture|import|rules")
 	}
@@ -71,11 +71,14 @@ func run(args []string) (runErr error) {
 	name := fs.String("name", "", "session name; default capture or import")
 	ports := fs.String("ports", "80,443", "TCP ports")
 	interfaces := fs.String("interfaces", "", "comma-separated interfaces")
+	fs.StringVar(&iisProbe, "iis-probe", "", "Windows IIS plaintext helper script; explicit opt-in")
+	fs.StringVar(&iisPython, "iis-python", "python", "Python executable with Frida installed")
+	fs.StringVar(&iisRuntime, "iis-runtime-dir", "", "probe runtime directory readable by the IIS worker identity")
 	javaAttach := fs.Bool("java-attach", false, "explicitly attach Java agent to --pid")
 	javaPID := fs.Int("java-pid", 0, "explicit JVM PID for Java attach while auto-discovering other services")
 	javaHelper := fs.String("java-helper", "", "Java executable with jdk.attach; default target executable")
 	javaAgent := fs.String("java-agent", "/opt/traffic/bin/traffic-java-agent.jar", "Java agent archive")
-	service := fs.String("service", "auto", "service: auto, nginx, apache, tomcat, openssl")
+	service := fs.String("service", "auto", "service: auto, iis (Windows), nginx, apache, tomcat, openssl")
 	pid := fs.Int("pid", 0, "target process PID; default discover service processes")
 	ecapture := fs.String("ecapture", "/opt/traffic/bin/ecapture", "eCapture v2.9.1 binary")
 	lib := fs.String("libssl", "", "TLS library override; default discover from process maps")
@@ -114,8 +117,20 @@ func run(args []string) (runErr error) {
 	if *javaAttach && *noTLS {
 		return errors.New("--java-attach conflicts with --no-tls")
 	}
-	if *service != "auto" && *service != "nginx" && *service != "apache" && *service != "tomcat" && *service != "openssl" {
+	if *service != "auto" && *service != "nginx" && *service != "apache" && *service != "tomcat" && *service != "openssl" && *service != "iis" {
 		return errors.New("invalid service")
+	}
+	if runtime.GOOS == "windows" && (*javaAttach || (*service != "auto" && *service != "iis")) {
+		return errors.New("Windows currently supports auto or iis discovery; Java attach is unavailable")
+	}
+	if runtime.GOOS != "windows" && iisProbe != "" {
+		return errors.New("--iis-probe requires Windows")
+	}
+	if iisProbe != "" && (iisRuntime == "" || *noTLS) {
+		return errors.New("--iis-probe requires --iis-runtime-dir and conflicts with --no-tls")
+	}
+	if runtime.GOOS != "windows" && *service == "iis" {
+		return errors.New("iis service requires Windows")
 	}
 	if *javaAttach {
 		selectedJavaPID := *javaPID
@@ -144,10 +159,7 @@ func run(args []string) (runErr error) {
 		if e != nil {
 			return e
 		}
-		maps, _ := exec.Command("sh", "-c", "for p in $(pgrep -x nginx); do echo PID=$p; grep libssl /proc/$p/maps | head -1; done").Output()
-		_, btf := os.Stat("/sys/kernel/btf/vmlinux")
-		_, probe := os.Stat(*ecapture)
-		emit(map[string]any{"os": runtime.GOOS, "arch": runtime.GOARCH, "root": os.Geteuid() == 0, "btf": btf == nil, "ecapture_installed": probe == nil, "nginx": string(maps), "interfaces": devices, "targets": discoverTargets("/proc", *service, *pid, *lib), "tls_verified": false})
+		emit(doctorReport(devices, *service, *pid, *lib, *ecapture))
 		return nil
 	}
 	if cmd == "capture" || cmd == "import" {
@@ -166,15 +178,11 @@ func run(args []string) (runErr error) {
 			filterParts = append(filterParts, fmt.Sprintf("port %d", number))
 		}
 		filter := "tcp and (" + strings.Join(filterParts, " or ") + ")"
-		names := []string{"any"}
-		if *interfaces != "" {
-			names = strings.Split(*interfaces, ",")
+		names, err := captureInterfaces(*interfaces, cmd == "import")
+		if err != nil {
+			return err
 		}
-		for _, iface := range names {
-			if strings.TrimSpace(iface) != iface || iface == "" || strings.ContainsAny(iface, "/\\") {
-				return fmt.Errorf("invalid interface %q", iface)
-			}
-		}
+
 		if cmd == "import" {
 			handle, err := pcap.OpenOffline(id)
 			if err != nil {
@@ -210,10 +218,10 @@ func run(args []string) (runErr error) {
 			return e
 		}
 		defer lock.Close()
-		if e = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); e != nil {
+		if e = session.LockFile(lock, true); e != nil {
 			return fmt.Errorf("session is locked: %w", e)
 		}
-		defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		defer session.UnlockFile(lock)
 		if _, e := os.Stat(filepath.Join(*output, "index.sqlite")); e == nil {
 			return errors.New("output already contains a session; choose a new directory")
 		}
@@ -245,7 +253,7 @@ func run(args []string) (runErr error) {
 				s.stats.ResourceLimits = "unavailable"
 				s.problem(fmt.Errorf("resource limits: %w", e))
 			} else {
-				s.stats.ResourceLimits = "cgroup-v2: 256MiB, 50% of one CPU"
+				s.stats.ResourceLimits = resourceLimitDescription()
 				defer cleanup()
 			}
 		}
@@ -260,10 +268,13 @@ func run(args []string) (runErr error) {
 			"schema_version": 1,
 			"layout_version": 2,
 			"hostname":       host,
+			"os":             runtime.GOOS,
+			"arch":           runtime.GOARCH,
 			"name":           *name,
 			"mode":           cmd,
 			"started":        s.stats.Started,
 			"filter":         filter,
+			"interfaces":     names,
 			"service":        *service,
 			"targets":        discoverTargets("/proc", *service, *pid, *lib),
 			"tls_enabled":    cmd == "capture" && !*noTLS,
@@ -275,7 +286,7 @@ func run(args []string) (runErr error) {
 		if cmd == "import" {
 			manifest["input_pcap"] = id
 		}
-		if cmd == "capture" && !*noTLS {
+		if cmd == "capture" && !*noTLS && runtime.GOOS != "windows" {
 			manifest["ecapture_version"] = "external; identified by ecapture_sha256"
 			if file, e := os.Open(*ecapture); e == nil {
 				hash := sha256.New()
@@ -379,12 +390,13 @@ func maintain(s *Store) error {
 	if total > int64(diskLimitMiB)<<20 {
 		return errors.New("session exceeds disk budget; capture stopped")
 	}
-	var stat syscall.Statfs_t
-	if e := syscall.Statfs(s.dir, &stat); e != nil {
-		return e
+	free, err := session.FreeBytes(s.dir)
+	if err != nil {
+		return err
 	}
-	if stat.Bavail*uint64(stat.Bsize) < 512<<20 {
+	if free < 512<<20 {
 		return errors.New("less than 512 MiB free; capture stopped")
 	}
+
 	return nil
 }

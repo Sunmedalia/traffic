@@ -3,11 +3,16 @@ package session
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
 func TestPacketFilesLayouts(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "case[1]?name")
+	name := "case[1]?name"
+	if runtime.GOOS == "windows" {
+		name = "case[1]%3fname"
+	}
+	root := filepath.Join(t.TempDir(), name)
 	if err := os.MkdirAll(filepath.Join(root, "packets"), 0700); err != nil {
 		t.Fatal(err)
 	}
