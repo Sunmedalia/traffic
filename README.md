@@ -2,7 +2,7 @@
 
 面向网站应急响应的流量采集与分析工具，提供 Linux ARM64 / x86_64 和 Windows x64 实验版本。独立采集程序保存 HTTP 请求、响应、检测依据和网络证据，分析程序通过中文 TUI、Web 界面或 JSON 命令实时查看及回看会话。
 
-Linux 使用 libpcap、eCapture/eBPF 和可选 Java Agent。Windows 使用 Npcap 和可选 IIS / OpenSSL 动态探针。已验证环境中的探针可附加到运行中的服务，采集期间保持服务进程和网站配置。各后端的启动缺口、依赖及退出行为见下表和对应使用说明。
+Linux 使用 libpcap、eCapture/eBPF、可选 Java Agent 和旧内核 OpenSSL 预加载后端。Windows 使用 Npcap 和可选 IIS / OpenSSL 动态探针。已验证环境中的探针可附加到运行中的服务，采集期间保持服务进程和网站配置。各后端的启动缺口、依赖及退出行为见下表和对应使用说明。
 
 ## 当前能力与验收范围
 
@@ -13,6 +13,7 @@ Linux 使用 libpcap、eCapture/eBPF 和可选 Java Agent。Windows 使用 Npcap
 | Linux Apache | 自动发现 apache2/httpd，采集 OpenSSL HTTPS 明文 | ARM64 的 event、worker、prefork 已测，worker/prefork 已有阻塞读取存在首次漏采边界 |
 | Linux Tomcat / JSSE | 显式动态附加 Java Agent，采集 HTTPS 明文 | ARM64 的 Tomcat 9/JDK 17、10.1/JDK 21 NIO Connector 已测，支持重复附加 |
 | Linux 通用 OpenSSL | 指定 PID 采集 OpenSSL API 明文 | ARM64 的 HAProxy、外部 `SSL_read_ex` / `SSL_write_ex` 调用已测，其他程序及库版本需验证 |
+| CentOS 7 x86_64 / OpenSSL 预加载 | 启动服务时加载 `LD_PRELOAD` 库，通过 Unix socket 获取明文 | 内核 3.10 / glibc 2.17 / OpenSSL 1.0.2k 的独立 HTTPS 服务已测，需启动时加载库 |
 | Windows x64 / IIS 10 | Npcap HTTP 采集，显式启用 IIS 动态 HTTPS 明文后端 | Windows 10 LTSC 17763、HTTP/1.1、TLS 1.2 已测，存在启动漏采窗口和 Frida 运行时卸载限制 |
 | Windows Nginx / Apache | 自动发现工作进程、Npcap HTTP、显式启用 OpenSSL HTTPS 明文采集 | Nginx 官方 1.28.0 x86、Apache 2.4.71 x64 的 TLS 1.2/1.3 正文比对通过，静态 Nginx 按二进制哈希适配 |
 | Windows 通用 OpenSSL | 指定 PID，支持导出的 SSL_read/write 及 _ex API | 外部 _ex 调用的 TLS 1.2/1.3 已测，s_server 内置 BIO 路径未取得明文，自定义 BIO 目前适配 Apache |
@@ -81,6 +82,41 @@ sudo apt-get install -y clang llvm bpftool libelf-dev libssl-dev flex bison make
 构建目录必须不存在。脚本检出上游提交 `143e771cf2b4919aedc27fd7b4b24ff87b8725b9`，应用补丁并生成 `bin/ecapture`、许可证和校验文件。构建细节见 [eCapture 构建文档](https://github.com/gojue/ecapture/blob/v2.9.1/docs/agent/build-test.md)。
 
 补丁修复实机发现的连接缓存崩溃和 FD 复用时的元数据竞争，并减少解码复制。socket 地址及 inode 身份与对应明文一起进入事件。多核机器上的 TLS 事件使用 100 毫秒时间排序窗口，空闲时也会刷新末批事件。补丁扩展了内部 eBPF ABI，需要配套构建探针字节码与用户态解码器。[补丁文件](patches/ecapture-v2.9.1-connection-cache.patch)
+
+
+### CentOS 7 / 旧内核的 OpenSSL 明文采集
+
+新增 Linux `LD_PRELOAD` 后端，适用于可在启动时加载动态库的 OpenSSL 服务。采集库在 `SSL_read`、`SSL_write` 及对应 `_ex` API 返回后复制实际消费或产生的明文，通过有界异步队列发送至本地 Unix socket，采集器复用 HTTP 还原、检测和证据存储。该路径可在内核 3.10 上运行。
+
+在目标系统构建，以匹配 glibc 和 libpcap。CentOS 7 需要 GCC、glibc-devel、libpcap-devel、Python 3 和项目 `go.mod` 指定版本的 Go。原生编译该库需要 libc 头文件，无需 OpenSSL 开发头文件。
+
+```bash
+go build -o bin/traffic ./cmd/traffic
+go build -o bin/traffic-tui ./cmd/traffic-tui
+bash scripts/build-openssl-preload.sh
+
+# 自动创建独立的回环 HTTPS 服务并完成测试，输出目录必须不存在
+sudo python3 scripts/linux/verify-preload.py \
+  --binary "$PWD/bin/traffic" --analysis-binary "$PWD/bin/traffic-tui" \
+  --library "$PWD/bin/libtraffic-openssl.so" --output /opt/traffic-preload-test
+```
+
+手动使用时先启动采集器，等待状态为 `listening-preload`，再以目标服务的启动命令加载采集库。
+
+```bash
+sudo ./bin/traffic capture --interfaces lo --ports 8443 \
+  --openssl-preload-socket /run/traffic-plaintext.sock --output ./sessions/old-kernel
+
+# 在另一个终端启动独立的测试服务，替换末尾为实际启动命令
+sudo env LD_PRELOAD="$PWD/bin/libtraffic-openssl.so" \
+  TRAFFIC_OPENSSL_SOCKET=/run/traffic-plaintext.sock /path/to/test-service
+```
+
+socket 为 `0600`，发送进程需要与采集器同 UID，并具有父目录访问权限。采集器校验 Unix socket 内核凭据与 `/proc` 进程启动标识，成功接收后状态为 `active-preload`，事务后端为 `openssl-preload`，原始事件写入 `tls/openssl-preload.jsonl`。`--ports` 继续筛选端口，此模式使用 `auto` 服务且不指定 `--pid`。加载该库的服务需要重新启动，库随服务进程退出而卸载。
+
+队列最多 128 条事件，单条最多约 19 KiB，发送线程遇到背压进行有界重试。可上报的传输缺口计入 `tls_dropped`，进程崩溃、`_exit`、采集器停机及最后无法送出的事件仍可能形成未知缺口。采集完整性保持 `unverified`。CentOS 7 的 cgroup v1 环境下，现有 cgroup v2 资源限制报告 `unavailable`。
+
+该后端目前验证动态 OpenSSL 1.0.2k / HTTP/1.1 / TLS 1.2。静态链接、绕过符号拦截的加载方式、自定义无 socket BIO、Go TLS、HTTP/2、其他 OpenSSL 版本及长期性能需要另行适配或验证。Nginx、Apache 等中间件需要分别实测。
 
 ### Windows 构建与 HTTP 采集
 

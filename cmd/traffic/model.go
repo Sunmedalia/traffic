@@ -112,6 +112,9 @@ func (s *Store) save(t Transaction) error {
 	if strings.HasPrefix(t.Connection, "tls:iis:") {
 		t.Backend = "iis-httpapi"
 	}
+	if strings.HasPrefix(t.Connection, "tls:preload/") {
+		t.Backend = "openssl-preload"
+	}
 	resolveClient(&t)
 	t.SchemaVersion = 1
 	if t.ID == "" {

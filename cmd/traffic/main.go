@@ -89,6 +89,7 @@ func run(args []string) (runErr error) {
 	ruleFile := fs.String("rules", "", "additional YAML rules")
 	proxyList := fs.String("trusted-proxies", "", "comma-separated trusted proxy IPs or CIDRs for X-Forwarded-For / X-Real-IP")
 	webhookURL := fs.String("alert-webhook", "", "POST alert JSON to HTTP(S) endpoint; optional TRAFFIC_WEBHOOK_TOKEN bearer token")
+	preloadSocket := fs.String("openssl-preload-socket", "", "Linux Unix datagram socket for LD_PRELOAD OpenSSL events")
 	noTLS := fs.Bool("no-tls", false, "disable TLS probes")
 	duration := fs.Duration("duration", 0, "optional capture duration")
 	fs.IntVar(&requestLimit, "request-limit", requestLimit, "maximum saved request body bytes")
@@ -115,6 +116,9 @@ func run(args []string) (runErr error) {
 	}
 	if err := validateWebhook(*webhookURL); err != nil {
 		return err
+	}
+	if *preloadSocket != "" && (runtime.GOOS != "linux" || cmd != "capture" || *noTLS || *javaAttach || *pid != 0 || *service != "auto") {
+		return errors.New("--openssl-preload-socket requires Linux capture with auto service, no --pid, and TLS enabled without Java attach")
 	}
 	if *pid < 0 || *javaPID < 0 {
 		return errors.New("PID must not be negative")
@@ -291,31 +295,32 @@ func run(args []string) (runErr error) {
 			defer stop()
 		}
 		manifest := map[string]any{
-			"schema_version":       1,
-			"layout_version":       2,
-			"hostname":             host,
-			"os":                   runtime.GOOS,
-			"arch":                 runtime.GOARCH,
-			"name":                 *name,
-			"mode":                 cmd,
-			"started":              s.stats.Started,
-			"filter":               filter,
-			"interfaces":           names,
-			"service":              *service,
-			"targets":              discoverTargets("/proc", *service, *pid, *lib),
-			"tls_enabled":          cmd == "capture" && !*noTLS,
-			"rules":                rules,
-			"trusted_proxies":      trustedProxies,
-			"tls_coverage":         "unverified",
-			"tls_missing_estimate": nil,
-			"header_limit":         32768,
-			"request_limit":        requestLimit,
-			"response_limit":       responseLimit,
+			"schema_version":         1,
+			"layout_version":         2,
+			"hostname":               host,
+			"os":                     runtime.GOOS,
+			"arch":                   runtime.GOARCH,
+			"name":                   *name,
+			"mode":                   cmd,
+			"started":                s.stats.Started,
+			"filter":                 filter,
+			"interfaces":             names,
+			"service":                *service,
+			"targets":                discoverTargets("/proc", *service, *pid, *lib),
+			"tls_enabled":            cmd == "capture" && !*noTLS,
+			"rules":                  rules,
+			"trusted_proxies":        trustedProxies,
+			"openssl_preload_socket": *preloadSocket,
+			"tls_coverage":           "unverified",
+			"tls_missing_estimate":   nil,
+			"header_limit":           32768,
+			"request_limit":          requestLimit,
+			"response_limit":         responseLimit,
 		}
 		if cmd == "import" {
 			manifest["input_pcap"] = id
 		}
-		if cmd == "capture" && !*noTLS && runtime.GOOS != "windows" {
+		if cmd == "capture" && !*noTLS && *preloadSocket == "" && runtime.GOOS != "windows" {
 			manifest["ecapture_version"] = "external; identified by ecapture_sha256"
 			if file, e := os.Open(*ecapture); e == nil {
 				hash := sha256.New()
@@ -360,7 +365,14 @@ func run(args []string) (runErr error) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				captureServices(ctx, s, p, *ecapture, *lib, *service, *pid, *javaAttach, *javaAgent, *javaHelper, *javaPID)
+				if *preloadSocket != "" {
+					if err := capturePreload(ctx, s, p, *preloadSocket); err != nil {
+						s.fail(err)
+						cancel()
+					}
+				} else {
+					captureServices(ctx, s, p, *ecapture, *lib, *service, *pid, *javaAttach, *javaAgent, *javaHelper, *javaPID)
+				}
 			}()
 		}
 		ticker := time.NewTicker(time.Second)

@@ -28,9 +28,10 @@ jobs:
         run: |
           go build -o bin/traffic ./cmd/traffic
           go build -o bin/traffic-tui ./cmd/traffic-tui
+          bash scripts/build-openssl-preload.sh
       - name: Check validation scripts
         run: |
-          python3 -m py_compile scripts/*.py
+          python3 -m py_compile scripts/*.py scripts/linux/*.py
           bash -n scripts/*.sh
 
   java-agent:

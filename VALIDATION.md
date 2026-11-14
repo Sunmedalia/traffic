@@ -1,5 +1,24 @@
 # 验证记录
 
+## 2026-11-13 CentOS 7 旧内核 OpenSSL 预加载后端
+
+在用户提供的 `192.168.1.12` 原生构建并测试，环境为 CentOS 7.9.2009、Linux `3.10.0-1160.119.1.el7.x86_64`、glibc 2.17、GCC 4.8.5、Python 3.6.8、OpenSSL 1.0.2k-fips。项目使用 Go 1.26.11，在目标机动态链接系统 libpcap 构建采集与分析程序，采集程序的 glibc 符号需求最高为 `GLIBC_2.14`，已在该机器执行成功。
+
+新增 `native/openssl-preload/traffic_openssl.c`、构建脚本 `scripts/build-openssl-preload.sh`、Linux Unix datagram 接收后端及 `scripts/linux/verify-preload.py`。库拦截实际完成的 OpenSSL API 读写，通过 128 条有界事件队列和发送线程传输至采集器。接收端校验内核凭据及 PID/进程启动时间，保存原始事件并复用现有请求响应解析、规则和证据导出。测试服务使用目标机 Python 的动态 OpenSSL，仅监听随机回环端口。
+
+最终样本位于目标机 `/opt/traffic-centos7-test/accepted`。19 条请求逐字节核对请求及响应正文通过，涵盖同一 HTTPS 长连接、HEAD、中文 POST、128 KiB POST/回显和四路并发的 12 条独立连接请求。SQLI-001 和 RESPONSE-PASSWD-001 分别命中一次，可信代理来源与直连端点保留正确。证据 ZIP 中的 SHA-256 清单通过逐项核验。客户端发起的 19 条请求均形成完整且未截断的记录，已观测网卡、队列及 TLS 丢弃均为 0。停止采集器后再次访问服务成功，随后测试脚本停止自己的服务，测试端口已关闭。
+
+最终采集程序 SHA-256 为 `7f42bb539bc2ce2f2798f11d41586daec3ca5f7ce610e6551cbfda58662c7552`，预加载库为 `bf1ef97849be33f171775d2e13baa5688ca1458e2ee5a5554cd67438f7ccb17d`。报告、网络包、明文事件、索引及导出包保留在验收目录。
+
+CentOS 7 全仓库 `go test -race ./...`、`go vet ./...` 通过。新增回归验证 socket 路径保护、内核发送凭据、伪造进程身份拒绝、响应规则与 socket 清理。macOS 全仓库竞态测试、静态检查及 Windows x64 交叉构建和静态检查通过。Linux CI 新增采集库编译及测试脚本语法检查。
+
+首轮直接 datagram 发送在大正文与并发下出现丢弃，改为有界异步发送后重测通过。测试脚本改用 `traffic-tui requests/show/export` 读取和核对索引，兼容 CentOS 7 自带 Python SQLite 无法识别部分索引的问题，并显式使用 UTF-8 读取状态报告。
+
+该方案要求在目标服务启动时设置 `LD_PRELOAD`，库驻留于服务进程直到退出。socket 限制为采集器相同 UID。现有 cgroup v2 资源限制在该 cgroup v1 主机报告 `unavailable`。测试期间安装了 libpcap-devel，工具链、源码和测试产物存放于 `/opt/traffic-centos7-test`，使用独立目录中的临时 Vault 仓库配置安装依赖。目标机系统服务配置保持原有值。
+
+本次覆盖动态 OpenSSL 1.0.2k、HTTP/1.1、TLS 1.2 和独立测试服务。Nginx、Apache、自定义无 socket BIO、其他库版本、进程 fork 后的采集、异常退出、长期压力与性能仍待分别验证。`SSL_read_ex` / `SSL_write_ex` 已提供拦截入口，但 OpenSSL 1.0.2k 缺少这些 API，本次样本覆盖 `SSL_read` / `SSL_write`。进程崩溃、`_exit`、发送队列未能最终送达等缺口仍可能未知，完整性状态保持 `unverified`。
+
+
 ## 2026-11-12 P0 检测与完整性改进
 
 新增常见 XSS、SSRF、XXE、SSTI、JNDI、反序列化、Webshell 上传及访问特征，并检测响应中的 passwd、命令输出特征。规则支持请求或响应的完整消息、全部头部、单个头部及正文，gzip 正文有界解压后检测。回归覆盖字段隔离、Host 和重复头部、压缩响应、响应补全后的告警，以及相同命中数量下规则变化时的告警外送。
