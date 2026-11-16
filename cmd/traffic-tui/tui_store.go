@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,6 +16,8 @@ import (
 // tuiFilter applies to persisted transactions, including records written by v1.
 type tuiFilter struct {
 	Client, Rule, Severity, Since, Keyword, Service string
+	// Until, Method and Status are only set by the web interface.
+	Until, Method, Status string
 }
 
 type tuiRow struct {
@@ -55,6 +58,27 @@ func (f tuiFilter) where(alertsOnly bool) (string, []any) {
 	if f.Service != "" {
 		clauses = append(clauses, "json_extract(CAST(data AS TEXT),'$.service')=?")
 		args = append(args, f.Service)
+	}
+	if f.Until != "" {
+		clauses = append(clauses, "time<?")
+		args = append(args, f.Until)
+	}
+	if f.Method != "" {
+		clauses = append(clauses, "json_extract(CAST(data AS TEXT),'$.method')=?")
+		args = append(args, f.Method)
+	}
+	if f.Status != "" {
+		// Status is "pending", a class such as "4xx", or an exact code; the web handler validates it.
+		low, high := 0, 0
+		if strings.HasSuffix(f.Status, "xx") {
+			low = int(f.Status[0]-'0') * 100
+			high = low + 99
+		} else if f.Status != "pending" {
+			low, _ = strconv.Atoi(f.Status)
+			high = low
+		}
+		clauses = append(clauses, "COALESCE(json_extract(CAST(data AS TEXT),'$.status'),0) BETWEEN ? AND ?")
+		args = append(args, low, high)
 	}
 	if f.Keyword != "" {
 		clauses = append(clauses, `(json_extract(CAST(data AS TEXT),'$.host') LIKE ? ESCAPE '\' OR json_extract(CAST(data AS TEXT),'$.url') LIKE ? ESCAPE '\')`)
