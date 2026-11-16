@@ -36,9 +36,35 @@ const tuiChrome = 5
 
 type tuiTick time.Time
 type tuiLoaded struct {
-	Version  uint64
-	Snapshot tuiSnapshot
-	Err      error
+	Version    uint64
+	Snapshot   tuiSnapshot
+	Err        error
+	Summary    *tuiSummary
+	SummaryKey string
+}
+
+// Alert tab views and overview blocks.
+const (
+	viewRules = iota
+	viewSources
+	viewList
+	alertViewCount
+)
+const (
+	blockLevels = iota
+	blockRules
+	blockSources
+	blockRecent
+	blockCount
+)
+
+// Summaries scan alert bodies, so they refresh less often than the list.
+const tuiSummaryInterval = 5 * time.Second
+
+// tuiDrill remembers where a drill-down started so Esc can return there.
+type tuiDrill struct {
+	tab, view, selected int
+	filter              tuiFilter
 }
 type tuiExported struct {
 	ID, Path string
@@ -62,6 +88,14 @@ type tuiModel struct {
 	busy, pending, paused, details, help bool
 	stale, pickDetail                    bool
 	detailID, errorText, flash           string
+	alertView                            int
+	aggSelected                          [viewList]int
+	block                                int
+	blockSelected                        [blockCount]int
+	summary                              *tuiSummary
+	summaryKey                           string
+	summaryAt                            time.Time
+	drill                                *tuiDrill
 	form                                 *tuiForm
 	export                               *tuiExport
 	viewport                             viewport.Model
@@ -82,8 +116,31 @@ func (m tuiModel) Init() tea.Cmd { return m.tick() }
 
 // following means new records enter at the top and the cursor stays on the newest.
 func (m tuiModel) following() bool { return m.page == 0 && m.selected == 0 && !m.details }
-func (m tuiModel) listTab() bool   { return m.tab == tabRequests || m.tab == tabAlerts }
-func (m tuiModel) modal() bool     { return m.form != nil || m.export != nil }
+func (m tuiModel) listTab() bool {
+	return m.tab == tabRequests || (m.tab == tabAlerts && m.alertView == viewList)
+}
+func (m tuiModel) aggView() bool { return m.tab == tabAlerts && m.alertView != viewList && !m.details }
+
+// summaryScope says whether the page shows aggregates and which filter they use.
+// The overview always covers the whole session.
+func (m tuiModel) summaryScope() (bool, tuiFilter, string) {
+	switch {
+	case m.tab == tabOverview && !m.details:
+		return true, tuiFilter{}, "overview"
+	case m.aggView():
+		return true, m.filter, fmt.Sprintf("alerts %#v", m.filter)
+	}
+	return false, tuiFilter{}, ""
+}
+
+// currentSummary returns the summary only when it matches the visible page.
+func (m tuiModel) currentSummary() *tuiSummary {
+	if ok, _, key := m.summaryScope(); ok && key == m.summaryKey {
+		return m.summary
+	}
+	return nil
+}
+func (m tuiModel) modal() bool { return m.form != nil || m.export != nil }
 
 func (m *tuiModel) load() tea.Cmd {
 	if m.busy {
@@ -99,12 +156,19 @@ func (m *tuiModel) load() tea.Cmd {
 		row := m.snapshot.Rows[0]
 		anchor = &row
 	}
+	wantSummary, summaryFilter, summaryKey := m.summaryScope()
+	wantSummary = wantSummary && (summaryKey != m.summaryKey || m.summary == nil || time.Since(m.summaryAt) >= tuiSummaryInterval)
 	rootCtx, store := m.ctx, m.store
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(rootCtx, 3*time.Second)
 		defer cancel()
 		snapshot, err := loadTUISnapshot(ctx, store, filter, alertsOnly, page, detailID, anchor)
-		return tuiLoaded{version, snapshot, err}
+		result := tuiLoaded{Version: version, Snapshot: snapshot, Err: err}
+		if err == nil && wantSummary {
+			result.Summary, result.Err = loadTUISummary(ctx, store, summaryFilter)
+			result.SummaryKey = summaryKey
+		}
+		return result
 	}
 }
 func (m *tuiModel) changed() tea.Cmd  { m.version++; return m.load() }
@@ -126,8 +190,6 @@ func (m *tuiModel) updateContent() {
 		content = m.detailContent()
 	case m.tab == tabHealth:
 		content = m.healthContent()
-	default:
-		content = m.overview()
 	}
 	m.viewport.SetContent(termansi.Hardwrap(content, max(1, m.viewport.Width()), true))
 }
@@ -138,6 +200,7 @@ func (m *tuiModel) switchTab(tab int) tea.Cmd {
 		return nil
 	}
 	m.lists[m.tab] = tuiListState{m.page, m.selected}
+	m.drill = nil
 	m.tab = tab
 	m.page, m.selected = m.lists[tab].page, m.lists[tab].selected
 	m.closeDetail()
@@ -154,6 +217,7 @@ func (m *tuiModel) closeDetail() {
 	m.snapshot.DetailMissing = false
 }
 func (m *tuiModel) applyFilter(filter tuiFilter) tea.Cmd {
+	m.drill = nil
 	m.filter = filter
 	m.page, m.selected = 0, 0
 	m.lists = [tuiTabCount]tuiListState{}
@@ -213,6 +277,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.Err != nil {
 				m.errorText = cleanTUIText(msg.Err.Error())
 			} else {
+				if msg.Summary != nil {
+					m.summary, m.summaryKey, m.summaryAt = msg.Summary, msg.SummaryKey, time.Now()
+				}
 				m.applySnapshot(msg.Snapshot)
 				if m.pickDetail && len(m.snapshot.Rows) > 0 {
 					m.pickDetail = false
@@ -262,6 +329,14 @@ func (m *tuiModel) applySnapshot(snapshot tuiSnapshot) {
 	if !wasFollowing && !m.pickDetail {
 		for i, row := range m.snapshot.Rows {
 			if row.ID == selectedID {
+				m.selected = i
+				break
+			}
+		}
+	}
+	if m.details && !m.pickDetail {
+		for i, row := range m.snapshot.Rows {
+			if row.ID == m.detailID {
 				m.selected = i
 				break
 			}
@@ -321,7 +396,24 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.resize()
 			return m, m.changed()
 		}
+		if m.drill != nil {
+			return m, m.returnFromDrill()
+		}
 		return m, nil
+	case "v":
+		if m.tab == tabAlerts && !m.details {
+			m.drill = nil
+			m.alertView = (m.alertView + 1) % alertViewCount
+			m.page, m.selected = 0, 0
+			m.stale = true
+			return m, m.changed()
+		}
+	}
+	if m.aggView() {
+		return m, m.updateAggKey(key)
+	}
+	if m.tab == tabOverview && !m.details {
+		return m, m.updateOverviewKey(key)
 	}
 	if m.details || m.listTab() {
 		switch key {
@@ -674,45 +766,6 @@ func (m tuiModel) startedText() string {
 	}
 	return s.Started.Local().Format("2006-01-02 15:04:05 MST -07:00")
 }
-func (m tuiModel) overview() string {
-	s := m.snapshot.Stats
-	elapsed := ""
-	if s.State == "running" && !s.Started.IsZero() {
-		d := time.Since(s.Started).Truncate(time.Second)
-		elapsed = fmt.Sprintf("    已采集 %02d:%02d:%02d", int(d.Hours()), int(d.Minutes())%60, int(d.Seconds())%60)
-	}
-	lines := []string{
-		tuiAccent.Render("采集概览"), "",
-		fmt.Sprintf("累计请求  %s    累计告警命中  %s    网络包  %s", tuiBold.Render(tuiCount(s.Transactions)), tuiDanger.Bold(true).Render(tuiCount(s.Alerts)), tuiCount(s.Packets)), "",
-		"会话  " + tuiLine(m.store.dir),
-		"状态  " + tuiStateBadge(s.State) + elapsed,
-		"开始  " + m.startedText(),
-	}
-	if s.TLS != "" {
-		lines = append(lines, "TLS   "+tuiLine(s.TLS))
-	}
-	lines = append(lines, "")
-	if len(s.Targets) > 0 {
-		names := []string{}
-		for _, target := range s.Targets {
-			names = append(names, fmt.Sprintf("%s · PID %d", tuiLine(target.Service), target.PID))
-		}
-		lines = append(lines, "服务  "+strings.Join(names, "    "), "")
-	}
-	level, reasons := m.tuiHealth()
-	lines = append(lines, tuiAccent.Render("采集可信度"))
-	switch level {
-	case 0:
-		lines = append(lines, "未发现丢弃、探针异常或采集错误。完整性仍未验证，按 4 查看详情。")
-	case 1:
-		lines = append(lines, tuiWarn.Render("需要关注："+strings.Join(reasons, "，")), "按 4 查看详情。")
-	default:
-		lines = append(lines, tuiDanger.Render("采集异常："+strings.Join(reasons, "，")), "已保存的请求仍可浏览，按 4 查看详情。")
-	}
-	lines = append(lines, "", tuiMuted.Render("按 2 查看全部请求，按 3 只看告警。"))
-	return strings.Join(lines, "\n")
-}
-
 func (m tuiModel) healthContent() string {
 	s := m.snapshot.Stats
 	level := func(n uint64) string {
@@ -1033,6 +1086,8 @@ func (m tuiModel) filterLabel() string {
 	line := tuiMuted.Render("筛选  ") + strings.Join(chips, " ")
 	if m.listTab() {
 		line += tuiMuted.Render(fmt.Sprintf("  共 %s 条 · x 清空", tuiCount(uint64(m.snapshot.Count))))
+	} else if m.aggView() {
+		line += tuiMuted.Render("  · x 清空")
 	} else {
 		line += tuiMuted.Render("  · 本页不受筛选影响")
 	}
@@ -1125,6 +1180,12 @@ func (m tuiModel) keysLine() string {
 		return "? 或 Esc 关闭帮助 · q 退出"
 	case m.details:
 		return "↑↓ 滚动 · J/K 上下一条 · Tab 切标签 · c 同客户端 · m 同规则 · H 同 Host · e 导出 · Esc 返回"
+	case m.aggView():
+		return "↑↓ 选择 · Enter 查看逐条 · v 切换视图 · / 筛选 · x 清空 · 空格 暂停 · s 会话 · ? 帮助"
+	case m.tab == tabOverview:
+		return "Tab 切换区块 · ↑↓ 选择 · Enter 跳到对应告警 · / 筛选 · 空格 暂停 · s 会话 · ? 帮助 · q 退出"
+	case m.listTab() && m.drill != nil:
+		return "Esc 返回上一层 · ↑↓ 选择 · Enter 详情 · c/m/H 按选中行筛选 · x 清空 · e 导出 · v 切换视图 · ? 帮助"
 	case m.listTab():
 		return "↑↓ 选择 · Enter 详情 · / 筛选 · c/m/H 按选中行筛选 · x 清空 · e 导出 · g 最新 · 空格 暂停 · s 会话 · ? 帮助"
 	}
@@ -1134,9 +1195,11 @@ func (m tuiModel) keysLine() string {
 const tuiHelpText = `快捷键
 
 页面    1 概览   2 请求   3 告警   4 采集健康   s 回到会话选择
+概览    Tab 切换区块，Enter 把规则、来源或级别作为条件跳到告警列表
+告警    v 在按规则、按来源、逐条三种视图间切换，聚合行上 Enter 查看逐条
 移动    ↑↓ / j k 选择或滚动    g 回到最新并恢复跟随    G 本页末尾
         n p / ← → / PgDn PgUp 翻页
-层级    Enter 打开详情    Esc 关闭弹层或详情
+层级    Enter 打开详情或下钻    Esc 关闭弹层、关闭详情、退出下钻
 详情    Tab / Shift+Tab 切换请求、响应、解码正文、检测依据
         J / K 不退出详情查看下一条、上一条
 筛选    / 打开筛选面板    x 清空全部筛选
@@ -1161,6 +1224,10 @@ func (m tuiModel) View() tea.View {
 	case m.split():
 		listWidth := width / 2
 		content = lipgloss.JoinHorizontal(lipgloss.Top, lipgloss.NewStyle().Width(listWidth).Render(m.listView(listWidth-1, contentHeight)), tuiMuted.Render(" │ "), m.viewport.View())
+	case m.tab == tabOverview && !m.details:
+		content = m.overviewView(width, contentHeight)
+	case m.tab == tabAlerts && !m.details:
+		content = m.alertsView(width, contentHeight)
 	case m.listTab() && !m.details:
 		content = m.listView(width, contentHeight)
 	}

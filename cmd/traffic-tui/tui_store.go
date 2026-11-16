@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -179,4 +180,150 @@ func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly
 		}
 	}
 	return result, tx.Commit()
+}
+
+// tuiRuleAgg and tuiSourceAgg summarize alerting requests; Hits counts requests.
+type tuiRuleAgg struct {
+	Rule, Severity, Last, Match string
+	Hits, Sources               int
+}
+type tuiSourceAgg struct {
+	Client, First, Last string
+	Hits                int
+	Rules               []string
+}
+type tuiSummary struct {
+	// Levels counts alerting requests by their highest matching severity rank.
+	Levels        [4]int
+	AlertRequests int
+	Rules         []tuiRuleAgg
+	Sources       []tuiSourceAgg
+	SourcesCapped bool
+	Recent        []tuiRow
+}
+
+const tuiSourceLimit = 200
+
+// loadTUISummary aggregates the alerts of matching requests in one scan. Rule and
+// severity conditions also restrict which alerts of a request are counted.
+func loadTUISummary(ctx context.Context, s *Store, filter tuiFilter) (*tuiSummary, error) {
+	where, args := filter.where(true)
+	// One json_extract with several paths parses each record once.
+	rows, err := s.db.QueryContext(ctx, `SELECT id, time, client, json_extract(CAST(data AS TEXT),'$.alerts','$.method','$.host','$.url')
+ FROM requests WHERE `+where+` ORDER BY time DESC, id DESC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type ruleState struct {
+		agg     tuiRuleAgg
+		sources map[string]bool
+	}
+	type sourceState struct {
+		agg   tuiSourceAgg
+		rules map[string]bool
+	}
+	result := &tuiSummary{}
+	byRule := map[string]*ruleState{}
+	bySource := map[string]*sourceState{}
+	minRank := severityRank(filter.Severity)
+	for rows.Next() {
+		var id, at, client string
+		var fields []byte
+		if err = rows.Scan(&id, &at, &client, &fields); err != nil {
+			return nil, err
+		}
+		var parts []json.RawMessage
+		var alerts []Alert
+		var method, host, url string
+		if json.Unmarshal(fields, &parts) != nil || len(parts) != 4 {
+			continue
+		}
+		json.Unmarshal(parts[0], &alerts)
+		json.Unmarshal(parts[1], &method)
+		json.Unmarshal(parts[2], &host)
+		json.Unmarshal(parts[3], &url)
+		best, highRule, seen := 0, "", map[string]bool{}
+		source := tuiClientHost(client)
+		for _, a := range alerts {
+			rank := severityRank(a.Severity)
+			if (filter.Rule != "" && a.Rule != filter.Rule) || rank < minRank {
+				continue
+			}
+			best = max(best, rank)
+			if rank == 3 && highRule == "" {
+				highRule = a.Rule
+			}
+			// Rows arrive newest first, so the first sighting holds the latest match.
+			r := byRule[a.Rule]
+			if r == nil {
+				r = &ruleState{agg: tuiRuleAgg{Rule: a.Rule, Last: at, Match: a.Match}, sources: map[string]bool{}}
+				byRule[a.Rule] = r
+			}
+			if rank > severityRank(r.agg.Severity) {
+				r.agg.Severity = a.Severity
+			}
+			if !seen[a.Rule] {
+				seen[a.Rule] = true
+				r.agg.Hits++
+				r.sources[source] = true
+			}
+		}
+		if len(seen) == 0 {
+			continue
+		}
+		result.Levels[best]++
+		result.AlertRequests++
+		src := bySource[source]
+		if src == nil {
+			src = &sourceState{agg: tuiSourceAgg{Client: source, Last: at}, rules: map[string]bool{}}
+			bySource[source] = src
+		}
+		src.agg.Hits++
+		src.agg.First = at
+		for rule := range seen {
+			src.rules[rule] = true
+		}
+		if highRule != "" && len(result.Recent) < 20 {
+			result.Recent = append(result.Recent, tuiRow{ID: id, Time: at, Client: client, Method: method, Host: host, URL: url, Rule: highRule, Severity: "high"})
+		}
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, r := range byRule {
+		r.agg.Sources = len(r.sources)
+		result.Rules = append(result.Rules, r.agg)
+	}
+	sort.Slice(result.Rules, func(i, j int) bool {
+		a, b := result.Rules[i], result.Rules[j]
+		if severityRank(a.Severity) != severityRank(b.Severity) {
+			return severityRank(a.Severity) > severityRank(b.Severity)
+		}
+		if a.Hits != b.Hits {
+			return a.Hits > b.Hits
+		}
+		return a.Rule < b.Rule
+	})
+	for _, src := range bySource {
+		for rule := range src.rules {
+			src.agg.Rules = append(src.agg.Rules, rule)
+		}
+		sort.Strings(src.agg.Rules)
+		result.Sources = append(result.Sources, src.agg)
+	}
+	sort.Slice(result.Sources, func(i, j int) bool {
+		a, b := result.Sources[i], result.Sources[j]
+		if a.Hits != b.Hits {
+			return a.Hits > b.Hits
+		}
+		if a.Last != b.Last {
+			return a.Last > b.Last
+		}
+		return a.Client < b.Client
+	})
+	if len(result.Sources) > tuiSourceLimit {
+		result.Sources, result.SourcesCapped = result.Sources[:tuiSourceLimit], true
+	}
+	return result, nil
 }

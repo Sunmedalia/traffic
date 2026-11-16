@@ -199,7 +199,7 @@ func tuiKey(s string) tea.KeyPressMsg {
 	panic(s)
 }
 func TestTUIRefreshAndNavigation(t *testing.T) {
-	m := &tuiModel{ctx: context.Background(), store: tuiTestStore(t), refresh: time.Second, width: 100, height: 30, viewport: viewport.New()}
+	m := &tuiModel{ctx: context.Background(), store: tuiTestStore(t), refresh: time.Second, width: 100, height: 30, viewport: viewport.New(), alertView: viewList}
 	m.snapshot.Rows = []tuiRow{{ID: "old"}, {ID: "selected"}}
 	m.resize()
 	m.Update(tuiKey("2"))
@@ -284,7 +284,7 @@ func TestTUIRefreshAndNavigation(t *testing.T) {
 	}
 }
 func TestTUIRowFiltersAndTabs(t *testing.T) {
-	m := &tuiModel{ctx: context.Background(), store: tuiTestStore(t), refresh: time.Second, width: 100, height: 30, viewport: viewport.New(), tab: tabAlerts}
+	m := &tuiModel{ctx: context.Background(), store: tuiTestStore(t), refresh: time.Second, width: 100, height: 30, viewport: viewport.New(), tab: tabAlerts, alertView: viewList}
 	m.snapshot.Rows = []tuiRow{{ID: "a", Client: "[2001:db8::1]:443", Rule: "SQLI-001", Host: "shop"}, {ID: "b", Client: "192.0.2.1:80"}}
 	m.resize()
 	m.Update(tuiKey("c"))
@@ -335,7 +335,7 @@ func TestTUIHealthLevels(t *testing.T) {
 	if level, _ = m.tuiHealth(); level != 2 {
 		t.Fatal("stale heartbeat not critical")
 	}
-	if !strings.Contains(m.healthContent(), "java-probe-required") || strings.Contains(m.overview(), "网卡丢包") {
+	if !strings.Contains(m.healthContent(), "java-probe-required") || strings.Contains(m.overviewView(100, 20), "网卡丢包") {
 		t.Fatal("diagnostics not moved to the health page")
 	}
 }
@@ -445,5 +445,157 @@ func TestTUILayoutAndDetailTabs(t *testing.T) {
 	m.Update(tuiKey("esc"))
 	if m.details || m.detailID != "" {
 		t.Fatal("detail did not close")
+	}
+}
+func TestTUISummaryAggregates(t *testing.T) {
+	s := tuiTestStore(t)
+	now := time.Now().UTC()
+	sqli := Alert{Rule: "SQLI-001", Severity: "high", Match: "union select"}
+	file := Alert{Rule: "FILE-001", Severity: "medium", Match: "/.env"}
+	putTUITransaction(t, s, Transaction{ID: "1", Time: now.Add(-3 * time.Minute), Client: "203.0.113.45:5000", URL: "/a", Alerts: []Alert{sqli, file}})
+	putTUITransaction(t, s, Transaction{ID: "2", Time: now.Add(-2 * time.Minute), Client: "203.0.113.45:5001", URL: "/b", Alerts: []Alert{{Rule: "SQLI-001", Severity: "high", Match: "sleep("}}})
+	putTUITransaction(t, s, Transaction{ID: "3", Time: now.Add(-time.Minute), Client: "[2001:db8::1]:443", URL: "/.env", Alerts: []Alert{file}})
+	putTUITransaction(t, s, Transaction{ID: "4", Time: now, Client: "192.0.2.9", URL: "/plain"})
+	sum, err := loadTUISummary(context.Background(), s, tuiFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.AlertRequests != 3 || sum.Levels[3] != 2 || sum.Levels[2] != 1 {
+		t.Fatalf("levels %+v", sum.Levels)
+	}
+	if len(sum.Rules) != 2 || sum.Rules[0].Rule != "SQLI-001" || sum.Rules[0].Hits != 2 || sum.Rules[0].Sources != 1 || sum.Rules[0].Match != "sleep(" {
+		t.Fatalf("rules %+v", sum.Rules)
+	}
+	if sum.Rules[1].Rule != "FILE-001" || sum.Rules[1].Hits != 2 || sum.Rules[1].Sources != 2 {
+		t.Fatalf("file rule %+v", sum.Rules[1])
+	}
+	if len(sum.Sources) != 2 || sum.Sources[0].Client != "203.0.113.45" || sum.Sources[0].Hits != 2 || strings.Join(sum.Sources[0].Rules, ",") != "FILE-001,SQLI-001" || sum.Sources[1].Client != "2001:db8::1" {
+		t.Fatalf("sources %+v", sum.Sources)
+	}
+	if len(sum.Recent) != 2 || sum.Recent[0].ID != "2" || sum.Recent[0].Rule != "SQLI-001" {
+		t.Fatalf("recent %+v", sum.Recent)
+	}
+	// A rule condition limits which alerts of a request are aggregated.
+	sum, err = loadTUISummary(context.Background(), s, tuiFilter{Rule: "FILE-001"})
+	if err != nil || len(sum.Rules) != 1 || sum.Levels[2] != 2 || sum.Levels[3] != 0 || len(sum.Recent) != 0 {
+		t.Fatalf("rule-filtered summary %+v %v", sum, err)
+	}
+	sum, err = loadTUISummary(context.Background(), s, tuiFilter{Severity: "high", Client: "203.0.113.45"})
+	if err != nil || len(sum.Rules) != 1 || sum.Rules[0].Rule != "SQLI-001" || len(sum.Sources) != 1 {
+		t.Fatalf("severity-filtered summary %+v %v", sum, err)
+	}
+}
+func tuiSummaryModel(t *testing.T) *tuiModel {
+	t.Helper()
+	s := tuiTestStore(t)
+	now := time.Now().UTC()
+	putTUITransaction(t, s, Transaction{ID: "1", Time: now.Add(-time.Minute), Client: "203.0.113.45:5000", Method: "GET", URL: "/a", Alerts: []Alert{{Rule: "SQLI-001", Severity: "high"}}})
+	putTUITransaction(t, s, Transaction{ID: "2", Time: now, Client: "198.51.100.7:5001", Method: "GET", URL: "/.env", Alerts: []Alert{{Rule: "FILE-001", Severity: "medium"}}})
+	m := &tuiModel{ctx: context.Background(), store: s, refresh: time.Second, width: 120, height: 30, viewport: viewport.New()}
+	m.resize()
+	return m
+}
+
+// runLoad performs the pending query synchronously, as the event loop would.
+func runLoad(m *tuiModel, cmd tea.Cmd) {
+	for cmd != nil {
+		msg := cmd()
+		if _, ok := msg.(tuiLoaded); !ok {
+			return
+		}
+		_, cmd = m.Update(msg)
+	}
+}
+
+func TestTUIOverviewDrillAndReturn(t *testing.T) {
+	m := tuiSummaryModel(t)
+	runLoad(m, m.load())
+	if m.currentSummary() == nil || !strings.Contains(m.overviewView(120, 25), "SQLI-001") {
+		t.Fatal("overview summary missing")
+	}
+	m.filter = tuiFilter{Keyword: "kept"}
+	m.Update(tuiKey("tab"))
+	m.Update(tuiKey("j"))
+	if m.block != blockRules || m.blockSelected[blockRules] != 1 {
+		t.Fatal("block navigation failed")
+	}
+	_, cmd := m.Update(tuiKey("enter"))
+	if m.tab != tabAlerts || m.alertView != viewList || m.filter != (tuiFilter{Rule: "FILE-001"}) || m.drill == nil {
+		t.Fatalf("rule drill: tab=%d view=%d %+v", m.tab, m.alertView, m.filter)
+	}
+	runLoad(m, cmd)
+	if len(m.snapshot.Rows) != 1 || m.snapshot.Rows[0].ID != "2" {
+		t.Fatalf("drilled rows %+v", m.snapshot.Rows)
+	}
+	_, cmd = m.Update(tuiKey("esc"))
+	runLoad(m, cmd)
+	if m.tab != tabOverview || m.filter != (tuiFilter{Keyword: "kept"}) || m.blockSelected[blockRules] != 1 || m.drill != nil {
+		t.Fatalf("return: tab=%d %+v", m.tab, m.filter)
+	}
+	// A recent high alert opens its detail directly.
+	m.block = blockRecent
+	_, cmd = m.Update(tuiKey("enter"))
+	runLoad(m, cmd)
+	if !m.details || m.detailID != "1" || m.snapshot.Detail == nil || m.detailTab != 3 {
+		t.Fatal("recent alert detail not opened")
+	}
+	m.Update(tuiKey("esc"))
+	m.Update(tuiKey("esc"))
+	if m.tab != tabOverview {
+		t.Fatal("second esc did not return to the overview")
+	}
+}
+
+func TestTUIAlertViewsAndDrill(t *testing.T) {
+	m := tuiSummaryModel(t)
+	runLoad(m, m.switchTab(tabAlerts))
+	if !m.aggView() || m.alertView != viewRules || m.currentSummary() == nil || len(m.currentSummary().Rules) != 2 {
+		t.Fatal("alerts tab does not open on the rule view")
+	}
+	_, cmd := m.Update(tuiKey("v"))
+	runLoad(m, cmd)
+	if m.alertView != viewSources || !strings.Contains(m.aggTable(120, 20), "198.51.100.7") {
+		t.Fatal("source view missing")
+	}
+	runLoad(m, m.applyFilter(tuiFilter{Severity: "medium"}))
+	m.Update(tuiKey("j"))
+	_, cmd = m.Update(tuiKey("enter"))
+	if m.filter.Severity != "medium" || m.filter.Client != "203.0.113.45" || m.alertView != viewList {
+		t.Fatalf("drill lost the existing filter: %+v", m.filter)
+	}
+	runLoad(m, cmd)
+	m.Update(tuiKey("esc"))
+	if m.alertView != viewSources || m.filter != (tuiFilter{Severity: "medium"}) || m.aggSelected[viewSources] != 1 {
+		t.Fatalf("esc did not restore the source view: %d %+v", m.alertView, m.filter)
+	}
+	m.Update(tuiKey("v"))
+	m.Update(tuiKey("v"))
+	if m.alertView != viewRules {
+		t.Fatal("v does not cycle")
+	}
+	// Unchanged scope inside the interval reuses the summary.
+	m.busy, m.summaryAt = false, time.Now()
+	msg := m.load()().(tuiLoaded)
+	if msg.Summary != nil {
+		t.Fatal("summary recomputed inside the interval")
+	}
+	m.busy, m.summaryAt = false, time.Now().Add(-tuiSummaryInterval)
+	if msg = m.load()().(tuiLoaded); msg.Summary == nil {
+		t.Fatal("summary not refreshed after the interval")
+	}
+	for _, size := range []tea.WindowSizeMsg{{Width: 40, Height: 12}, {Width: 80, Height: 24}, {Width: 140, Height: 40}} {
+		m.Update(size)
+		for _, setup := range []func(){
+			func() { m.tab, m.alertView = tabAlerts, viewRules },
+			func() { m.tab, m.alertView = tabAlerts, viewSources },
+			func() { m.tab, m.alertView = tabAlerts, viewList },
+			func() { m.tab, m.summaryKey = tabOverview, "overview" },
+		} {
+			setup()
+			content := m.View().Content
+			if lipgloss.Width(content) > size.Width || lipgloss.Height(content) > size.Height {
+				t.Fatalf("overflow %dx%d got %dx%d", size.Width, size.Height, lipgloss.Width(content), lipgloss.Height(content))
+			}
+		}
 	}
 }
