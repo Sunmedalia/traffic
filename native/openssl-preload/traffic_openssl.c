@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <pthread.h>
 #include <poll.h>
@@ -23,6 +25,7 @@ static pthread_mutex_t event_mutex = PTHREAD_MUTEX_INITIALIZER;
 static __thread unsigned int call_depth;
 static int event_socket = -1;
 static char destination[sizeof(((struct sockaddr_un *)0)->sun_path)];
+static char debug_path[256];
 #define EVENT_SIZE (CHUNK_SIZE * 4 / 3 + 2 * NI_MAXHOST + 512)
 #define EVENT_QUEUE 128
 static struct queued_event { size_t length; uint64_t loss_count; char data[EVENT_SIZE]; } events[EVENT_QUEUE];
@@ -59,6 +62,88 @@ __attribute__((constructor)) static void register_fork_handlers(void) {
     pthread_atfork(before_fork, after_fork, child_after_fork);
 }
 
+static char *trim(char *text) {
+    char *end;
+    while (*text && isspace((unsigned char)*text)) text++;
+    end = text + strlen(text);
+    while (end > text && isspace((unsigned char)end[-1])) end--;
+    *end = 0;
+    return text;
+}
+
+static void debug_note(const char *state) {
+    char message[512], comm[64] = "";
+    FILE *file;
+    int fd, length;
+    if (!debug_path[0]) return;
+    file = fopen("/proc/self/comm", "r");
+    if (file) {
+        if (!fgets(comm, sizeof(comm), file)) comm[0] = 0;
+        fclose(file);
+        trim(comm);
+    }
+    length = snprintf(message, sizeof(message), "pid=%ld comm=%s %s destination=%s\n",
+                      (long)getpid(), comm, state, destination);
+    fd = open(debug_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    if (write(fd, message, (size_t)length) < 0) { /* diagnostics only */ }
+    close(fd);
+}
+
+/* /etc/ld.so.preload cannot set environment variables, so a root-owned config
+ * file selects the socket and the process names that may report. Without the
+ * config (or with a non-matching comm) the interposer stays inert, which makes
+ * a system-wide preload safe for unrelated TLS clients such as sshd. */
+static void load_config(void) {
+    const char *config;
+    FILE *file;
+    char line[512], socket_path[sizeof(destination)] = "", targets[256] = "";
+    char *key, *value;
+    if (!getenv("TRAFFIC_OPENSSL_SOCKET")) {
+        config = getenv("TRAFFIC_OPENSSL_CONFIG");
+        if (!config || !*config) config = "/etc/traffic/openssl-preload.conf";
+        file = fopen(config, "r");
+        if (!file) return;
+        while (fgets(line, sizeof(line), file)) {
+            value = strchr(line, '=');
+            if (!value) continue;
+            *value++ = 0;
+            key = trim(line);
+            value = trim(value);
+            if (!strcmp(key, "socket") && strlen(value) < sizeof(socket_path)) {
+                strcpy(socket_path, value);
+            } else if (!strcmp(key, "targets") && strlen(value) < sizeof(targets)) {
+                strcpy(targets, value);
+            } else if (!strcmp(key, "debug_file") && strlen(value) < sizeof(debug_path)) {
+                strcpy(debug_path, value);
+            }
+        }
+        fclose(file);
+        if (!socket_path[0]) return;
+        if (targets[0] && strcmp(targets, "*") != 0) {
+            char comm[64] = "", *entry, *saved = NULL;
+            int matched = 0;
+            file = fopen("/proc/self/comm", "r");
+            if (!file) return;
+            if (!fgets(comm, sizeof(comm), file)) comm[0] = 0;
+            fclose(file);
+            trim(comm);
+            for (entry = strtok_r(targets, ",", &saved); entry; entry = strtok_r(NULL, ",", &saved)) {
+                size_t length;
+                entry = trim(entry);
+                length = strlen(entry);
+                if (length && entry[length - 1] == '*') {
+                    if (!strncmp(comm, entry, length - 1)) matched = 1;
+                } else if (!strcmp(comm, entry)) {
+                    matched = 1;
+                }
+            }
+            if (!matched) return;
+        }
+        strcpy(destination, socket_path);
+    }
+}
+
 static void initialize(void) {
     /* Python and other dlopen users may keep libssl in a local symbol scope. */
     const char *names[] = {"libssl.so.3", "libssl.so.1.1", "libssl.so.10", "libssl.so.1.0.0"};
@@ -66,6 +151,7 @@ static void initialize(void) {
     size_t i;
     const char *path = getenv("TRAFFIC_OPENSSL_SOCKET");
     if (path && strlen(path) < sizeof(destination)) strcpy(destination, path);
+    else load_config();
     for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         library = dlopen(names[i], RTLD_LAZY | RTLD_NOLOAD);
         if (library) break;
@@ -82,6 +168,7 @@ static void initialize(void) {
     RESOLVE("SSL_new", next_new);
     RESOLVE("SSL_free", next_free);
 #undef RESOLVE
+    debug_note(library && next_read ? "initialized" : "symbols-missing");
 }
 
 /* All event/socket/connection state is protected by event_mutex. Socket writes

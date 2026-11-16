@@ -1,5 +1,19 @@
 # 验证记录
 
+## 2026-11-16 Debian 13 / nginx 系统级预加载与漏洞靶场
+
+在用户提供的 `192.168.1.7` 搭建并验证。目标机为 Debian 13 (trixie)、Linux `6.12.107+deb13-arm64`、2 核 2 GiB、nginx 1.26.3、OpenSSL 3.5.7、glibc 2.41，使用 Go 1.26.11 在目标机原生构建 `traffic`、`traffic-tui` 和 `libtraffic-openssl.so`。既有 `traffic-lab` 站点和 18080 服务保持运行，仅新增独立站点和配置。
+
+新增内部 CA 与服务器证书，SAN 为 `traffic-lab.local`、`acme-lab.local`、`192.168.1.7`、`127.0.0.1`，CA 安装到系统信任库。nginx 以 TLS 1.2 和 TLS 1.3 提供 443，证书链校验 `ssl_verify_result=0`。新增 `acme-lab.service`（www-data，127.0.0.1:18081）和 `/acme/` 反向代理，站点包含真实可利用的 SQL 注入、命令注入、路径穿越、SSRF、反射 XSS、任意文件上传和敏感文件暴露；原有 18080 测试站未修改。
+
+eBPF 路径使用固定版本 eCapture 与项目补丁。外部客户端经 `enp0s5` 访问时，13 条 HTTPS 请求全部还原为 `backend=openssl`，命中 SQLI-001、XSS-001、SSRF-001、FILE-001、PATH-001、CMD-001 与响应侧 RESPONSE-PASSWD-001/RESPONSE-CMD-001，TLS 1.2/1.3 均覆盖。节流到约 2.5 请求/秒时 10 条请求采集 9 条，两个 worker 的事件均到达。突发 20 条请求时仅 5 条形成事务，`tls_dropped` 仍为 0，说明存在未上报的突发缺口；完整性继续标记 `unverified`。曾尝试按 PID 启动多个 eCapture 实例，实测两个实例对同一 `libssl.so.3` 的 uprobe 会互相覆盖，事件被单个实例的 PID 过滤器丢弃，因此保留按库+UID 分组，不采用每 worker 一个实例。
+
+`LD_PRELOAD` 路径先由仓库自带 `verify-preload.py` 完成 19 条请求、128 KiB 回显、四路并发、告警和证据 ZIP 校验，`tls_dropped`、`queue_dropped`、`dropped` 均为 0。随后验证系统级 `/etc/ld.so.preload`：配置 `socket=/run/traffic/plaintext.sock`、`targets=nginx`，采集器使用 `--openssl-preload-allow-uid 33`。socket 为 `0660 root:www-data`，父目录 `0755`；nginx master 重启后两个 www-data worker 均加载库。11 条 HTTPS 请求全部采集为 `backend=openssl-preload`，命中 9 条告警，包含 WEBSHELL-UPLOAD-001，TLS 1.2/1.3 均覆盖，`tls_dropped=0`。未匹配的 curl 进程保持惰性，未产生事件。删除 `/etc/ld.so.preload` 并重启 nginx 后，worker 的 `/proc/PID/maps` 不再包含该库，站点和证书访问保持正常。
+
+本轮根据实测修正四处预加载逻辑：`/etc/ld.so.preload` 无法设置环境变量，新增 `/etc/traffic/openssl-preload.conf` 的 `socket`/`targets`/`debug_file` 配置；非匹配进程保持惰性，避免系统级预加载影响 sshd 等无关 TLS 客户端；新增 `--openssl-preload-allow-uid`，socket 归属服务账号主组并接受该 UID 的内核凭据；采集器自动创建 socket 父目录并修正私有 umask 导致的 `0700` 目录，使非 root worker 可连接。回归覆盖 UID 解析、目录创建与权限、凭证校验和进程身份。
+
+边界：eBPF 突发流量存在未上报缺口，需要单独定位 perf/WS 背压；预加载需要重启目标服务，`nginx -s reload` 不会重新加载 master 的库；HTTP/2、HTTP/3、静态链接 OpenSSL、Go TLS 和长期压力未验证。测试期间 `traffic-lab` 与 `acme-lab` 均保持可用，证书、站点配置和 nginx 进程身份在回滚后核对一致。
+
 ## 2026-11-13 CentOS 7 旧内核 OpenSSL 预加载后端
 
 在用户提供的 `192.168.1.12` 原生构建并测试，环境为 CentOS 7.9.2009、Linux `3.10.0-1160.119.1.el7.x86_64`、glibc 2.17、GCC 4.8.5、Python 3.6.8、OpenSSL 1.0.2k-fips。项目使用 Go 1.26.11，在目标机动态链接系统 libpcap 构建采集与分析程序，采集程序的 glibc 符号需求最高为 `GLIBC_2.14`，已在该机器执行成功。

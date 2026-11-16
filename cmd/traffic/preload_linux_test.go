@@ -17,7 +17,7 @@ func TestPreloadSocketRefusesExistingPath(t *testing.T) {
 	if err := os.WriteFile(path, []byte("preserve"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if connection, err := openPreloadSocket(path); err == nil {
+	if connection, err := openPreloadSocket(path, nil); err == nil {
 		connection.Close()
 		t.Fatal("overwrote existing path")
 	}
@@ -25,7 +25,7 @@ func TestPreloadSocketRefusesExistingPath(t *testing.T) {
 	if err != nil || string(data) != "preserve" {
 		t.Fatal("existing file changed")
 	}
-	if connection, err := openPreloadSocket("relative.sock"); err == nil {
+	if connection, err := openPreloadSocket("relative.sock", nil); err == nil {
 		connection.Close()
 		t.Fatal("accepted relative socket")
 	}
@@ -50,7 +50,7 @@ func TestPreloadCredentialAndProcessIdentity(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- capturePreload(ctx, store, newHTTP(store), path) }()
+	go func() { done <- capturePreload(ctx, store, newHTTP(store), path, nil) }()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		if _, err := os.Stat(path); err == nil {
@@ -124,5 +124,24 @@ func TestPreloadCredentialAndProcessIdentity(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("socket leaked")
+	}
+}
+
+func TestPreloadSocketCreatesMissingDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "run", "traffic", "events.sock")
+	connection, err := openPreloadSocket(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("socket mode %o", info.Mode().Perm())
+	}
+	if directory, err := os.Stat(filepath.Dir(path)); err != nil || directory.Mode().Perm() != 0755 {
+		t.Fatalf("socket directory mode %v %v", directory, err)
 	}
 }
