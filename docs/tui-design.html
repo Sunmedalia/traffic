@@ -1,0 +1,395 @@
+<title>traffic-tui 界面设计</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap">
+<style>
+/* 布局：单栏文档，每个页面一块「终端样机 + 三栏说明」；终端样机在两种主题下都保持深色 */
+:root{
+  --bg:#f4f6f7; --card:#ffffff; --fg:#162026; --muted:#566670; --line:#d3dbe0; --accent:#0a7676; --mark:#e3f1f1;
+  --t-bg:#0f151a; --t-fg:#cdd7dc; --t-muted:#7c8a92; --t-accent:#5fd7d7; --t-red:#ff7b7b; --t-yellow:#e6c35c; --t-green:#7bd88f; --t-line:#27333c; --t-sel:#1f4e55;
+  --sans:"PingFang SC","Microsoft YaHei","Noto Sans SC","Hiragino Sans GB",system-ui,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,"SF Mono",Menlo,Consolas,"PingFang SC","Microsoft YaHei",monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0b1013;--card:#121a1f;--fg:#dde5e8;--muted:#94a2aa;--line:#25313a;--accent:#5fd7d7;--mark:#143236;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#0b1013;--card:#121a1f;--fg:#dde5e8;--muted:#94a2aa;--line:#25313a;--accent:#5fd7d7;--mark:#143236;color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:15px;line-height:1.7;padding-block:32px 64px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+main{max-width:1000px;margin:0 auto;display:flex;flex-direction:column;gap:48px}
+h1{font-size:30px;line-height:1.25;margin:0;text-wrap:balance}
+h2{font-size:21px;margin:0;padding-bottom:8px;border-bottom:2px solid var(--fg)}
+h3{font-size:16px;margin:0}
+p{margin:0;max-width:68ch}
+section{display:flex;flex-direction:column;gap:16px}
+.lead{color:var(--muted);font-size:16px}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.08em;color:var(--accent);text-transform:uppercase}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px 28px}
+.cols>div{min-width:0;display:flex;flex-direction:column;gap:6px}
+.cols h4{margin:0;font-size:13px;color:var(--muted);font-weight:600;letter-spacing:.04em}
+ul,ol{margin:0;padding-left:1.2em}
+li{margin:2px 0}
+kbd{font-family:var(--mono);font-size:12px;background:var(--card);border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 5px;white-space:nowrap}
+code{font-family:var(--mono);font-size:13px;background:var(--mark);padding:1px 4px;border-radius:3px}
+.new{font-size:11px;font-weight:700;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 4px;margin-left:6px;vertical-align:1px;white-space:nowrap}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{text-align:left;vertical-align:top;padding:7px 12px 7px 0;border-bottom:1px solid var(--line)}
+th{font-size:12px;color:var(--muted);font-weight:600;letter-spacing:.04em;white-space:nowrap}
+td:first-child{white-space:nowrap}
+/* 导航地图 */
+.map{display:flex;flex-wrap:wrap;align-items:stretch;gap:8px;font-size:13px}
+.map .n{flex:1 1 170px;min-width:0;border:1px solid var(--line);background:var(--card);border-radius:6px;padding:10px 12px;display:flex;flex-direction:column;gap:4px}
+.map .n b{font-size:14px}
+.map .n span{color:var(--muted)}
+.map .ar{align-self:center;color:var(--muted);font-family:var(--mono)}
+/* 终端样机 */
+.term{background:var(--t-bg);color:var(--t-fg);border:1px solid var(--t-line);border-radius:8px;overflow-x:auto}
+.term .in{font-family:var(--mono);font-size:12.5px;line-height:1.55;padding:12px 14px;min-width:96ch;font-variant-numeric:tabular-nums}
+.l{display:flex;white-space:pre;min-height:1.55em}
+.l>span{flex:0 0 auto;overflow:hidden}
+.l>.x{flex:1 1 0;min-width:0;text-overflow:ellipsis}
+.l>.r{margin-left:auto}
+.w2{width:2ch}.w4{width:4ch}.w6{width:6ch}.w8{width:8ch}.w10{width:10ch}.w12{width:12ch}.w14{width:14ch}.w16{width:16ch}.w18{width:18ch}.w22{width:22ch}.w26{width:26ch}
+.a{color:var(--t-accent);font-weight:700}.m{color:var(--t-muted)}.d{color:var(--t-red)}.y{color:var(--t-yellow)}.g{color:var(--t-green)}.b{font-weight:700}
+.sel{background:var(--t-sel)}
+.chip{border:1px solid var(--t-line);border-radius:3px;padding:0 5px;margin-right:6px}
+.hl{background:var(--t-red);color:var(--t-bg);font-weight:700}
+.split{display:grid;grid-template-columns:1fr 1fr}
+.split>div{min-width:0}
+.split>div+div{border-left:1px solid var(--t-line);padding-left:12px;margin-left:10px}
+.box{border:1px solid var(--t-accent);border-radius:4px;padding:8px 12px;margin:4px 0;max-width:72ch}
+.rule{border-top:1px solid var(--t-line);margin:5px 0}
+.cap{font-size:13px;color:var(--muted)}
+</style>
+
+<main>
+<header style="display:flex;flex-direction:column;gap:12px">
+  <div class="eyebrow">traffic-tui · 终端界面设计稿</div>
+  <h1>应急响应分析终端：页面与使用逻辑</h1>
+  <p class="lead">基于现有 <code>cmd/traffic-tui</code> 的会话选择、三标签页和详情视图重新规划。目标是让值守人员在一屏内回答三个问题：现在有没有人在打、打的是什么、采到的数据可不可信。</p>
+  <div class="cols">
+    <div><h4>原则一 · 告警先于流量</h4><p>进入会话先看到攻击态势，再按需下钻到单条请求，不让人从上万行请求里找告警。</p></div>
+    <div><h4>原则二 · 一个键一个意思</h4><p>同一按键在所有页面含义一致。<kbd>Enter</kbd> 永远是进入，<kbd>Esc</kbd> 永远是退一层，<kbd>/</kbd> 永远是在当前位置查找。</p></div>
+    <div><h4>原则三 · 可信度常驻</h4><p>漏采、丢包、心跳过期直接影响结论，状态栏常驻显示，不藏在概览底部。</p></div>
+  </div>
+</header>
+
+<section>
+  <h2>一、整体结构</h2>
+  <p>界面分四层，逐层进入、逐层返回。带 <span class="new">新增</span> 的是现有代码里没有的部分。</p>
+  <div class="map">
+    <div class="n"><b>① 会话选择</b><span>按主机分组列出采集会话，选一个打开</span></div>
+    <div class="ar">→</div>
+    <div class="n"><b>② 会话工作区</b><span><kbd>1</kbd> 概览　<kbd>2</kbd> 请求　<kbd>3</kbd> 告警　<kbd>4</kbd> 健康<span class="new">新增</span></span></div>
+    <div class="ar">→</div>
+    <div class="n"><b>③ 请求详情</b><span>请求 / 响应 / 解码正文 / 检测依据</span></div>
+    <div class="ar">→</div>
+    <div class="n"><b>④ 弹层</b><span>筛选、导出<span class="new">新增</span>、帮助</span></div>
+  </div>
+  <p class="cap">现状对照：概览目前是一页纯文本，同时承担态势和采集诊断两件事；告警页只是加了条件的请求列表；TUI 里没有导出入口（只有命令行和 Web 有）。</p>
+</section>
+
+<section>
+  <h2>二、通用框架</h2>
+  <p>工作区每个页面都用同一套五行框架，只替换中间的内容区。</p>
+  <div class="term"><div class="in">
+    <div class="l"><span class="a">TRAFFIC</span><span>  web-01 / 2026-11-16 / 15-04-05-nginx  </span><span class="g">● 采集中</span><span class="r m">请求 12,841 · 告警 37 · 跟随中 2s</span></div>
+    <div class="l"><span class="m">1 概览   </span><span class="a">[2 请求]</span><span class="m">   3 告警 </span><span class="d">37</span><span class="m">   4 健康 </span><span class="y">!</span><span class="r m">本地时间 CST +08:00</span></div>
+    <div class="l"><span class="m">筛选  </span><span class="chip">级别 ≥ 中</span><span class="chip">客户端 = 203.0.113.45</span><span class="m">共 9 条</span></div>
+    <div class="rule"></div>
+    <div class="l"><span class="m">                         （ 内 容 区 ）</span></div>
+    <div class="rule"></div>
+    <div class="l"><span class="y">⚠ 完整性未验证 · TLS 已知丢弃 3 · 按 4 查看</span></div>
+    <div class="l"><span class="m">↑↓ 选择 · Enter 详情 · / 筛选 · c 同客户端 · e 导出 · 空格 暂停 · ? 帮助 · q 退出</span></div>
+  </div></div>
+  <div class="cols">
+    <div><h4>第 1 行 · 身份栏</h4><p>主机 / 日期 / 会话名，采集状态，累计请求与告警数，刷新模式。任何页面都能看出自己在哪个会话、数据是否还在增长。</p></div>
+    <div><h4>第 2 行 · 标签栏</h4><p>告警标签带未读式计数。健康标签在有丢弃、探针异常或采集错误时显示黄色 <code>!</code>，失败时显示红色。</p></div>
+    <div><h4>第 3 行 · 筛选条</h4><p>当前生效的条件以标签形式列出，并显示命中条数。无筛选时显示「全部」。</p></div>
+    <div><h4>倒数第 2 行 · 提示栏</h4><p>优先显示刷新失败等错误，其次是采集可信度提醒。平时为空，不占注意力。</p></div>
+    <div><h4>最后 1 行 · 按键栏</h4><p>只列当前页面此刻可用的键，随页面和弹层变化。完整列表在 <kbd>?</kbd>。</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>三、页面设计</h2>
+
+  <h3>① 会话选择</h3>
+  <div class="term"><div class="in">
+    <div class="l"><span class="a">TRAFFIC  /  选择会话</span><span class="r m">5 个会话 · 1 个正在采集</span></div>
+    <div class="l"><span class="m">目录  /var/lib/traffic/sessions</span></div>
+    <div class="l"><span class="m">查找  </span><span>nginx▏</span></div>
+    <div class="l"></div>
+    <div class="l m"><span class="w2"></span><span class="w12">状态</span><span class="w18">开始时间</span><span class="w10">请求</span><span class="w8">告警</span><span class="x">会话</span></div>
+    <div class="l a"><span>web-01</span></div>
+    <div class="l sel"><span class="w2"></span><span class="w12 g">● 采集中</span><span class="w18">11-16 15:04:05</span><span class="w10">12,841</span><span class="w8 d">37</span><span class="x">15-04-05-nginx</span></div>
+    <div class="l"><span class="w2"></span><span class="w12">○ 已完成</span><span class="w18">11-15 09:12:40</span><span class="w10">88,102</span><span class="w8 d">212</span><span class="x">incident-001</span></div>
+    <div class="l"><span class="w2"></span><span class="w12 d">✕ 索引损坏</span><span class="w18">11-14 22:30:11</span><span class="w10 m">未知</span><span class="w8 m">未知</span><span class="x">nginx-night</span></div>
+    <div class="l a"><span>db-02</span></div>
+    <div class="l"><span class="w2"></span><span class="w12 y">! 心跳过期</span><span class="w18">11-16 14:50:02</span><span class="w10">3,410</span><span class="w8">0</span><span class="x">nginx-admin</span></div>
+    <div class="l"></div>
+    <div class="l m"><span>  /var/lib/traffic/sessions/web-01/2026-11-16/15-04-05-nginx</span></div>
+    <div class="l m"><span>↑↓ 选择 · Enter 打开 · / 查找 · o 指定目录或文件 · r 重新扫描 · q 退出</span></div>
+  </div></div>
+  <div class="cols">
+    <div><h4>看什么</h4><ul><li>按主机分组，组内从新到旧；正在采集的会话排在组内最前。</li><li>改成对齐的列，每个会话一行；完整路径只显示选中那一行的。</li></ul></div>
+    <div><h4>能做什么</h4><ul><li><kbd>/</kbd> 按会话名、主机名即时过滤<span class="new">新增</span>。</li><li><kbd>o</kbd> 输入会话目录、<code>index.sqlite</code> 或采集根目录。</li><li>索引损坏的会话可见但打不开，提示栏给出原因。</li></ul></div>
+    <div><h4>进入规则</h4><ul><li>带 <code>--session</code> 启动时跳过本页直接进工作区。</li><li>工作区里按 <kbd>s</kbd> 回到本页，光标停在刚才的会话上。</li><li>只扫到一个会话时仍停在本页，不自动打开，避免看错会话。</li></ul></div>
+  </div>
+
+  <h3>② 概览 <span class="new">重做</span></h3>
+  <div class="term"><div class="in">
+    <div class="l"><span class="w22">请求  <span class="b">12,841</span></span><span class="w22">告警命中  <span class="d b">37</span></span><span class="w26">不完整 / 截断  <span class="y">14</span> / <span class="y">2</span></span><span>已采集 00:42:17</span></div>
+    <div class="rule"></div>
+    <div class="split">
+      <div>
+        <div class="l a"><span>级别分布</span></div>
+        <div class="l"><span class="w4 d">高</span><span class="w6">18</span><span class="d">████████████████</span></div>
+        <div class="l"><span class="w4 y">中</span><span class="w6">15</span><span class="y">█████████████</span></div>
+        <div class="l"><span class="w4">低</span><span class="w6">4</span><span>████</span></div>
+        <div class="l"></div>
+        <div class="l a"><span>命中规则</span></div>
+        <div class="l sel"><span class="w22">SQLI-001</span><span class="w4 d">高</span><span class="w6">11</span><span class="m">3 个来源</span></div>
+        <div class="l"><span class="w22">FILE-001</span><span class="w4 y">中</span><span class="w6">15</span><span class="m">6 个来源</span></div>
+        <div class="l"><span class="w22">PATH-001</span><span class="w4 d">高</span><span class="w6">5</span><span class="m">2 个来源</span></div>
+        <div class="l"><span class="w22">JNDI-001</span><span class="w4 d">高</span><span class="w6">2</span><span class="m">1 个来源</span></div>
+      </div>
+      <div>
+        <div class="l a"><span>告警来源</span></div>
+        <div class="l"><span class="w18">203.0.113.45</span><span class="w6">19</span><span class="m">SQLI-001 等 3 条规则</span></div>
+        <div class="l"><span class="w18">198.51.100.7</span><span class="w6">9</span><span class="m">FILE-001</span></div>
+        <div class="l"><span class="w18">192.0.2.88</span><span class="w6">5</span><span class="m">PATH-001 等 2 条规则</span></div>
+        <div class="l"></div>
+        <div class="l a"><span>最近高危</span></div>
+        <div class="l"><span class="w10 m">15:46:09</span><span class="w12 d">JNDI-001</span><span class="x">203.0.113.45  POST /api/login</span></div>
+        <div class="l"><span class="w10 m">15:45:51</span><span class="w12 d">SQLI-001</span><span class="x">203.0.113.45  GET /item?id=1%27+union…</span></div>
+        <div class="l"><span class="w10 m">15:44:02</span><span class="w12 d">PATH-001</span><span class="x">192.0.2.88    GET /static/../../etc/pa…</span></div>
+      </div>
+    </div>
+    <div class="rule"></div>
+    <div class="l"><span class="m">Tab 切换区块 · ↑↓ 选择 · Enter 带条件跳到告警列表 · 4 采集健康</span></div>
+  </div></div>
+  <div class="cols">
+    <div><h4>看什么</h4><ul><li>第一行四个数：总量、告警量、数据质量、采集时长。</li><li>四个区块回答「多严重、什么攻击、谁在打、最新一条是什么」。</li><li>采集诊断信息全部移到「健康」页，这里只留提示栏一行。</li></ul></div>
+    <div><h4>能做什么</h4><ul><li><kbd>Tab</kbd> 在区块间移动，<kbd>↑↓</kbd> 在区块内选行。</li><li>在规则或来源上按 <kbd>Enter</kbd>：把它设为筛选条件并跳到告警页。</li><li>在「最近高危」上按 <kbd>Enter</kbd>：直接打开该请求详情。</li></ul></div>
+    <div><h4>数据来源</h4><ul><li>聚合只扫 <code>alert&gt;0</code> 的行，量小，随刷新周期更新。</li><li>概览不受筛选条影响，始终是整个会话的全貌。</li><li>无告警时区块显示「暂无告警」，不留空白。</li></ul></div>
+  </div>
+
+  <h3>③ 请求列表与详情</h3>
+  <div class="term"><div class="in">
+    <div class="split">
+      <div>
+        <div class="l m"><span class="w10">时间</span><span class="w6">方法</span><span class="w6">状态</span><span class="w4">级</span><span class="x">客户端 · URL</span></div>
+        <div class="l"><span class="w10">15:46:12</span><span class="w6">GET</span><span class="w6 g">200</span><span class="w4 m">—</span><span class="x">198.51.100.7  /index.html</span></div>
+        <div class="l"><span class="w10">15:46:09</span><span class="w6">POST</span><span class="w6 y">401</span><span class="w4 d">高</span><span class="x d">203.0.113.45  /api/login</span></div>
+        <div class="l sel"><span class="w10">15:45:51</span><span class="w6">GET</span><span class="w6 d">500</span><span class="w4 d">高</span><span class="x">203.0.113.45  /item?id=1%27+union…</span></div>
+        <div class="l"><span class="w10">15:45:40</span><span class="w6">GET</span><span class="w6 m">待响应</span><span class="w4 m">—</span><span class="x">192.0.2.14    /export.csv <span class="y">[不完整]</span></span></div>
+        <div class="l"><span class="w10">15:45:38</span><span class="w6">GET</span><span class="w6 y">404</span><span class="w4 y">中</span><span class="x">198.51.100.7  /.env</span></div>
+        <div class="l"><span class="w10">15:45:31</span><span class="w6">PUT</span><span class="w6 g">201</span><span class="w4 m">—</span><span class="x">192.0.2.14    /upload <span class="y">[截断]</span></span></div>
+        <div class="l"></div>
+        <div class="l m"><span>第 1/129 页 · 共 12,841 条 · </span><span class="a">↑ 新增 6 条，按 g 回到最新</span></div>
+      </div>
+      <div>
+        <div class="l"><span class="b">GET /item?id=1%27+union+select+1,2,3--</span></div>
+        <div class="l"><span class="m">时间    </span><span>11-16 15:45:51.204</span><span class="m">   响应 </span><span class="d">500</span></div>
+        <div class="l"><span class="m">客户端  </span><span>203.0.113.45:51822</span></div>
+        <div class="l"><span class="m">Host    </span><span>shop.example.com</span></div>
+        <div class="l"><span class="m">服务    </span><span>nginx · PID 1482 · 后端 ecapture</span></div>
+        <div class="l"><span class="m">ID      </span><span>01JCX7…9QF2</span></div>
+        <div class="l"></div>
+        <div class="l"><span class="m">请求   响应   解码正文   </span><span class="a">[检测依据 1]</span></div>
+        <div class="l"></div>
+        <div class="l"><span class="d b">SQLI-001</span><span class="m">  版本 1 · 级别 高 · 字段 request</span></div>
+        <div class="l"><span class="m">视图 url-decoded · 解码 1 轮</span></div>
+        <div class="l"><span>/item?id=1' </span><span class="hl">union select</span><span> 1,2,3--</span></div>
+      </div>
+    </div>
+    <div class="rule"></div>
+    <div class="l"><span class="m">j/k 滚动 · J/K 上下一条 · Tab 切标签 · / 文内查找 · c 同客户端 · m 同规则 · e 导出 · y 复制 · Esc 返回</span></div>
+  </div></div>
+  <div class="cols">
+    <div><h4>列表</h4><ul><li>列对齐。状态码按 2xx 绿、4xx 黄、5xx 红着色；级别列同时有文字和颜色，高危整行标红。</li><li>当天的记录只显示时分秒，跨天才显示日期。</li><li>窄屏依次隐藏 Host、客户端端口，URL 永远保留并截断在行尾。</li></ul></div>
+    <div><h4>详情</h4><ul><li>终端宽度 ≥ 120 列时左右分栏，否则详情全屏。</li><li>有告警的请求默认打开「检测依据」标签，否则打开「请求」。标签上显示告警条数。</li><li>匹配片段在依据和原文中都反色高亮<span class="new">新增</span>；<kbd>/</kbd> 文内查找，<kbd>n</kbd>/<kbd>N</kbd> 跳转<span class="new">新增</span>。</li></ul></div>
+    <div><h4>从一条请求出发</h4><ul><li><kbd>c</kbd> 只看这个客户端，<kbd>m</kbd> 只看这条规则，<kbd>H</kbd> 只看这个 Host<span class="new">新增</span>。</li><li><kbd>J</kbd>/<kbd>K</kbd> 不退出详情直接看上下一条<span class="new">新增</span>。</li><li><kbd>e</kbd> 导出证据，<kbd>y</kbd> 复制请求 ID<span class="new">新增</span>。</li></ul></div>
+  </div>
+
+  <h3>④ 告警 <span class="new">重做</span></h3>
+  <div class="term"><div class="in">
+    <div class="l"><span class="m">视图  </span><span class="a">[按规则]</span><span class="m">  按来源  逐条</span><span class="r m">v 切换视图</span></div>
+    <div class="l"></div>
+    <div class="l m"><span class="w22">规则</span><span class="w6">级别</span><span class="w8">命中</span><span class="w8">来源</span><span class="w12">最近</span><span class="x">最近一次匹配</span></div>
+    <div class="l sel"><span class="w22">SQLI-001</span><span class="w6 d">高</span><span class="w8">11</span><span class="w8">3</span><span class="w12">15:45:51</span><span class="x">union select</span></div>
+    <div class="l"><span class="w22">JNDI-001</span><span class="w6 d">高</span><span class="w8">2</span><span class="w8">1</span><span class="w12">15:46:09</span><span class="x">${jndi:ldap:</span></div>
+    <div class="l"><span class="w22">PATH-001</span><span class="w6 d">高</span><span class="w8">5</span><span class="w8">2</span><span class="w12">15:44:02</span><span class="x">../../</span></div>
+    <div class="l"><span class="w22">FILE-001</span><span class="w6 y">中</span><span class="w8">15</span><span class="w8">6</span><span class="w12">15:45:38</span><span class="x">/.env</span></div>
+    <div class="l"><span class="w22">local-scan-ua</span><span class="w6">低</span><span class="w8">4</span><span class="w8">1</span><span class="w12">15:31:07</span><span class="x">sqlmap/1.8</span></div>
+    <div class="l"></div>
+    <div class="l m"><span>5 条规则 · 37 次命中 · 级别高的在前，同级按命中数</span></div>
+  </div></div>
+  <div class="cols">
+    <div><h4>三种视图，<kbd>v</kbd> 循环</h4><ul><li><b>按规则</b>（默认）：一条规则一行，先知道是什么攻击。</li><li><b>按来源</b>：一个客户端 IP 一行，显示命中数、涉及规则数、首次与最近时间。</li><li><b>逐条</b>：就是现有的告警列表，与请求页同一套列和详情。</li></ul></div>
+    <div><h4>下钻</h4><ul><li>在聚合行上按 <kbd>Enter</kbd>：把该规则或来源加入筛选条，切到「逐条」视图。</li><li><kbd>Esc</kbd> 回到聚合视图并去掉刚加的那个条件，光标回到原行。</li><li>聚合视图同样受筛选条约束，例如先限定时间窗再看规则分布。</li></ul></div>
+  </div>
+
+  <h3>⑤ 健康 <span class="new">新增</span></h3>
+  <div class="term"><div class="in">
+    <div class="l"><span class="y b">⚠ 完整性未验证</span><span>　启动及探针盲区漏采数未知；TLS 已知丢弃是已观测下限，0 不代表采全</span></div>
+    <div class="rule"></div>
+    <div class="l a"><span>采集</span></div>
+    <div class="l"><span class="w16 m">状态</span><span class="g">采集中</span><span class="m">　心跳 1 秒前　开始于 2026-11-16 15:04:05 CST</span></div>
+    <div class="l"><span class="w16 m">网络包</span><span>1,204,551</span><span class="m">　网卡丢包 </span><span>0</span><span class="m">　队列丢弃 </span><span>0</span></div>
+    <div class="l"><span class="w16 m">TLS</span><span>外层记录 48,210　明文请求 9,377　</span><span class="y">已知丢弃 3</span></div>
+    <div class="l"><span class="w16 m">资源限制</span><span>cgroup v2 · 内存 256 MiB · CPU 50%</span></div>
+    <div class="l"><span class="w16 m">告警推送</span><span>已送达 35　</span><span class="d">失败 2</span><span>　队列丢弃 0</span></div>
+    <div class="l"></div>
+    <div class="l a"><span>服务探针</span></div>
+    <div class="l m"><span class="w12">服务</span><span class="w10">PID</span><span class="w14">端口</span><span class="x">状态</span></div>
+    <div class="l"><span class="w12">nginx</span><span class="w10">1482</span><span class="w14">80,443</span><span class="x g">attached</span></div>
+    <div class="l"><span class="w12">tomcat</span><span class="w10">2210</span><span class="w14">8080</span><span class="x y">java-probe-required</span></div>
+    <div class="l"></div>
+    <div class="l a"><span>采集错误 (1)</span></div>
+    <div class="l"><span class="d">• webhook: 连接 10.0.0.9:8443 超时</span></div>
+  </div></div>
+  <div class="cols">
+    <div><h4>为什么单独一页</h4><p>这些信息回答的是「数据可不可信」，和「有没有攻击」是两件事。分开后概览能专注态势，这里可以放全量诊断而不必压缩。</p></div>
+    <div><h4>何时提醒</h4><ul><li>任一丢弃计数 &gt; 0、探针未附加、推送失败或有采集错误：标签栏 <span style="white-space:nowrap">「4 健康」</span> 变黄。</li><li>状态为采集失败或心跳过期：变红，并在提示栏常驻。</li><li>完整性提示作为页首横幅，始终显示。</li></ul></div>
+  </div>
+
+  <h3>⑥ 弹层：筛选与导出</h3>
+  <div class="term"><div class="in">
+    <div class="split">
+      <div>
+        <div class="box">
+          <div class="l a"><span>筛选</span></div>
+          <div class="l"></div>
+          <div class="l"><span class="w12 m">级别</span><span class="m">全部  低+  </span><span class="a">[中+]</span><span class="m">  仅高</span></div>
+          <div class="l"><span class="w12 m">时间从</span><span>30m▏</span></div>
+          <div class="l"><span class="w12 m">时间到</span><span class="m">现在</span></div>
+          <div class="l"><span class="w12 m">客户端</span><span>203.0.113.45</span></div>
+          <div class="l"><span class="w12 m">规则</span><span class="m">（空）</span></div>
+          <div class="l"><span class="w12 m">服务</span><span class="a">[全部]</span><span class="m">  nginx  tomcat</span></div>
+          <div class="l"><span class="w12 m">关键词</span><span class="m">Host 或 URL 包含…</span></div>
+          <div class="l"></div>
+          <div class="l m"><span>= 15:16:12 起，预计命中 9 条</span></div>
+          <div class="l m"><span>Tab 换行 · ←→ 选项 · Enter 应用 · Ctrl+R 清空 · Esc 取消</span></div>
+        </div>
+      </div>
+      <div>
+        <div class="box">
+          <div class="l a"><span>导出证据</span></div>
+          <div class="l"></div>
+          <div class="l"><span class="m">请求  </span><span>GET /item?id=1%27+union…</span></div>
+          <div class="l"><span class="m">保存到</span></div>
+          <div class="l"><span>./evidence-01JCX7-9QF2.zip▏</span></div>
+          <div class="l"></div>
+          <div class="l m"><span>包含 请求、响应、事件 JSON、关联 PCAP、</span></div>
+          <div class="l m"><span>SHA-256 清单</span></div>
+          <div class="l y"><span>采集仍在进行，关联网络包可能尚未写全</span></div>
+          <div class="l"></div>
+          <div class="l m"><span>Enter 导出 · Esc 取消</span></div>
+        </div>
+      </div>
+    </div>
+  </div></div>
+  <div class="cols">
+    <div><h4>筛选</h4><ul><li>级别和服务改为选项，不再手打 <code>low/medium/high</code>。级别按「不低于」理解。</li><li>时间接受 <code>30m</code>、<code>2h</code>、<code>today</code>、<code>14:30</code>、<code>11-16 14:30</code> 和 RFC3339，输入时下方实时换算成绝对时间。</li><li>新增「时间到」，可以框定一个时间窗<span class="new">新增</span>。</li><li>服务选项取自本会话实际出现过的服务。</li></ul></div>
+    <div><h4>导出</h4><ul><li>在详情或列表选中行上按 <kbd>e</kbd>。默认文件名带请求 ID，目标已存在时报错，不覆盖。</li><li>完成后提示栏显示绝对路径和压缩包大小；失败时弹层保留并显示原因。</li><li>复用现有 <code>exportEvidence</code>，在后台执行，界面不冻结。</li></ul></div>
+  </div>
+</section>
+
+<section>
+  <h2>四、使用逻辑</h2>
+
+  <h3>按键语法</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>类别</th><th>按键</th><th>含义</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>移动</td><td><kbd>↑</kbd><kbd>↓</kbd> <kbd>j</kbd><kbd>k</kbd></td><td>上下一行，详情里是滚动</td><td><kbd>g</kbd>/<kbd>G</kbd> 首尾，<kbd>PgUp</kbd>/<kbd>PgDn</kbd> 整屏</td></tr>
+      <tr><td></td><td><kbd>n</kbd><kbd>p</kbd> <kbd>←</kbd><kbd>→</kbd></td><td>列表翻页</td><td>文内查找激活时 <kbd>n</kbd>/<kbd>N</kbd> 改为跳到下一处匹配</td></tr>
+      <tr><td></td><td><kbd>J</kbd><kbd>K</kbd></td><td>详情里换到上下一条请求</td><td>到页边界时自动翻页</td></tr>
+      <tr><td>层级</td><td><kbd>Enter</kbd></td><td>进入：打开会话、下钻聚合行、打开详情</td><td></td></tr>
+      <tr><td></td><td><kbd>Esc</kbd></td><td>退一层：关弹层 → 关详情 → 退出下钻</td><td>只管层级，不清筛选；工作区顶层按下无动作</td></tr>
+      <tr><td></td><td><kbd>1</kbd>–<kbd>4</kbd></td><td>切换标签页</td><td>各页记住自己的光标位置和视图</td></tr>
+      <tr><td></td><td><kbd>s</kbd></td><td>回到会话选择</td><td></td></tr>
+      <tr><td>查找</td><td><kbd>/</kbd></td><td>在当前位置找</td><td>会话页找会话，列表里开筛选，详情里找文本</td></tr>
+      <tr><td></td><td><kbd>c</kbd> <kbd>m</kbd> <kbd>H</kbd></td><td>以选中行的客户端 / 规则 / Host 作为筛选</td><td>再按一次同一个键取消该条件</td></tr>
+      <tr><td></td><td><kbd>x</kbd></td><td>清空全部筛选</td><td></td></tr>
+      <tr><td>动作</td><td><kbd>e</kbd> <kbd>y</kbd></td><td>导出证据 / 复制请求 ID</td><td>复制走 OSC 52，终端不支持时提示栏显示 ID 供手动选取</td></tr>
+      <tr><td></td><td><kbd>v</kbd></td><td>切换告警视图</td><td>仅告警页</td></tr>
+      <tr><td>刷新</td><td><kbd>空格</kbd> <kbd>r</kbd></td><td>暂停或恢复 / 立即刷新一次</td><td></td></tr>
+      <tr><td>全局</td><td><kbd>?</kbd> <kbd>q</kbd> <kbd>Ctrl+C</kbd></td><td>帮助 / 退出 / 强制退出</td><td>输入框内 <kbd>q</kbd> 和其他字母键只作为文字</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>刷新：跟随、定格、暂停</h3>
+  <p>现在的问题是光标停在第一页时，新请求不断把行往下推，正在看的那行会移走。改为三种明确的状态，身份栏右侧始终显示当前是哪一种。</p>
+  <div class="scroll"><table>
+    <thead><tr><th>状态</th><th>何时进入</th><th>行为</th><th>如何离开</th></tr></thead>
+    <tbody>
+      <tr><td>跟随中</td><td>光标在第 1 页第 1 行</td><td>新记录从顶部进入，光标始终在最新一条</td><td>移动光标、翻页或打开详情</td></tr>
+      <tr><td>已定格</td><td>光标离开顶部，或详情打开</td><td>列表锚定在当前首行，行不再移动；页脚显示「↑ 新增 N 条」；计数继续更新</td><td><kbd>g</kbd> 回到最新并恢复跟随</td></tr>
+      <tr><td>已暂停</td><td>按 <kbd>空格</kbd></td><td>完全停止查询，计数也冻结</td><td>再按 <kbd>空格</kbd>，回到暂停前的状态</td></tr>
+      <tr><td>静态</td><td>会话已完成、已停止或是导入的 PCAP</td><td>不显示刷新状态，只低频检查状态文件</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+  <p class="cap">定格用的是现有翻页锚点机制（按首行的时间和 ID 定位），把它从「第 2 页起生效」扩展到第 1 页即可。</p>
+
+  <h3>筛选</h3>
+  <div class="cols">
+    <div><h4>作用范围</h4><ul><li>一个会话一套筛选，请求页和告警页共用，条件之间是「并且」。</li><li>概览和健康页不受筛选影响。</li><li>切换会话时恢复为启动参数给出的初始条件。</li></ul></div>
+    <div><h4>四个入口</h4><ul><li><kbd>/</kbd> 打开表单，一次改多个条件。</li><li><kbd>c</kbd> <kbd>m</kbd> <kbd>H</kbd> 从选中行直接取值。</li><li>概览区块上的 <kbd>Enter</kbd>。</li><li>告警聚合行上的 <kbd>Enter</kbd>。</li></ul></div>
+    <div><h4>反馈</h4><ul><li>每个条件在筛选条上是一个标签，带命中条数。</li><li>结果为空时内容区写明「当前筛选无匹配，按 x 清空」。</li><li>应用筛选后回到第 1 页并恢复跟随。</li></ul></div>
+  </div>
+
+  <h3>状态与异常</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>情况</th><th>界面表现</th><th>可做的操作</th></tr></thead>
+    <tbody>
+      <tr><td>采集中</td><td>绿色 ● 采集中，自动刷新</td><td>全部</td></tr>
+      <tr><td>已完成 / 已停止</td><td>○ 灰色，无刷新状态</td><td>全部</td></tr>
+      <tr><td>心跳过期</td><td>黄色 ! 心跳过期，提示栏「采集心跳超过 5 秒未更新，请检查采集进程」</td><td>已保存数据照常浏览</td></tr>
+      <tr><td>采集失败</td><td>红色 ✕，健康标签变红</td><td>已保存数据照常浏览，健康页看错误</td></tr>
+      <tr><td>状态文件缺失或损坏</td><td>身份栏状态显示「未知」，计数改用索引里的实际条数</td><td>列表和详情照常</td></tr>
+      <tr><td>刷新查询失败</td><td>提示栏「刷新失败，保留上次结果」加原因，界面保留旧数据</td><td><kbd>r</kbd> 重试</td></tr>
+      <tr><td>详情对应记录被保留期清理</td><td>详情区显示「该记录已被保留期清理」</td><td><kbd>Esc</kbd> 返回，或 <kbd>J</kbd>/<kbd>K</kbd> 看相邻记录</td></tr>
+      <tr><td>正文不完整 / 截断</td><td>列表行尾黄色标记；详情事实区同样标出</td><td>导出包里保留这些标记</td></tr>
+      <tr><td>终端小于 40 × 12</td><td>只显示「终端过小」提示</td><td><kbd>Ctrl+C</kbd></td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>宽度适配</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>终端宽度</th><th>列表</th><th>详情</th><th>概览</th></tr></thead>
+    <tbody>
+      <tr><td>40–79 列</td><td>时间、方法、状态、级别、URL</td><td>全屏</td><td>区块纵向堆叠</td></tr>
+      <tr><td>80–119 列</td><td>加客户端 IP 和 Host</td><td>全屏</td><td>两栏</td></tr>
+      <tr><td>≥ 120 列</td><td>左半屏，列同窄屏</td><td>右半屏分栏</td><td>两栏</td></tr>
+    </tbody>
+  </table></div>
+  <p class="cap">颜色只做强调，不单独承载信息：级别有文字、状态有符号。设置 <code>NO_COLOR</code> 时全部降为粗体和反色。</p>
+</section>
+
+<section>
+  <h2>五、三条典型路径</h2>
+  <div class="cols">
+    <div><h4>实时值守</h4><ol><li>打开正在采集的会话，停在概览。</li><li>告警计数跳动，看「最近高危」。</li><li><kbd>Enter</kbd> 打开详情，看匹配片段和响应状态码判断是否打成功。</li><li><kbd>c</kbd> 只看这个来源，确认它还做了什么。</li><li><kbd>e</kbd> 导出，<kbd>1</kbd> 回概览继续盯。</li></ol></div>
+    <div><h4>事后回溯</h4><ol><li>会话选择页按 <kbd>/</kbd> 找到事发那天的会话。</li><li><kbd>4</kbd> 先看健康，确认那段时间没有大量丢弃。</li><li><kbd>3</kbd> 告警页按规则看全貌，<kbd>v</kbd> 换成按来源。</li><li><kbd>Enter</kbd> 下钻到最可疑的来源。</li><li><kbd>x</kbd> 清筛选后用 <kbd>c</kbd> 看它的全部请求，包括没触发规则的。</li></ol></div>
+    <div><h4>按线索查</h4><ol><li>已知攻击者 IP 或一个 URL 片段。</li><li><kbd>2</kbd> 请求页，<kbd>/</kbd> 填客户端或关键词，时间从填 <code>2h</code>。</li><li><kbd>J</kbd>/<kbd>K</kbd> 在详情里连续翻看。</li><li>详情内 <kbd>/</kbd> 查找响应里的敏感字段。</li><li>逐条 <kbd>e</kbd> 导出需要留存的请求。</li></ol></div>
+  </div>
+</section>
+
+<section>
+  <h2>六、落地顺序</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>阶段</th><th>内容</th><th>涉及改动</th></tr></thead>
+    <tbody>
+      <tr><td>第一步<br>不加新查询</td><td>五行框架与身份栏；列表列对齐和着色；健康页（从概览拆出）；筛选标签与 <kbd>c</kbd>/<kbd>m</kbd>/<kbd>H</kbd>/<kbd>x</kbd>；选项式筛选表单和相对时间；导出弹层；跟随 / 定格；<kbd>J</kbd>/<kbd>K</kbd>；会话页分组和查找</td><td><code>tui.go</code>、<code>browser.go</code>；导出复用 <code>export.go</code>；级别「不低于」需改 <code>tuiFilter.where</code></td></tr>
+      <tr><td>第二步<br>新增聚合查询</td><td>概览四个区块；告警按规则、按来源两种视图及下钻</td><td><code>tui_store.go</code> 新增对 <code>alert&gt;0</code> 行的分组统计</td></tr>
+      <tr><td>第三步<br>细节</td><td>匹配片段高亮；详情文内查找；<kbd>y</kbd> 复制；「时间到」条件；<code>NO_COLOR</code></td><td><code>tui.go</code>；<code>tuiFilter</code> 加截止时间字段</td></tr>
+    </tbody>
+  </table></div>
+  <h3>需要你定的三件事</h3>
+  <ul>
+    <li><b>进入会话后默认停在哪页。</b>建议概览；如果你们主要用于盯实时流量，可以改成请求页。</li>
+    <li><b>级别筛选的含义。</b>设计里改成「不低于」，命令行 <code>--severity</code> 目前是精确匹配。建议两边一起改，否则同一个词两种含义。</li>
+    <li><b>关键词是否搜正文。</b>现在只搜 Host 和 URL。搜请求和响应正文对排查很有用，但在几万条记录的会话上会慢，设计稿里暂未包含。</li>
+  </ul>
+</section>
+</main>
