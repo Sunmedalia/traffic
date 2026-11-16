@@ -60,14 +60,16 @@ jobs:
           go-version-file: go.mod
           cache: true
       - uses: msys2/setup-msys2@v2
+        id: msys2
         with:
           msystem: MINGW64
           install: mingw-w64-x86_64-gcc
       - name: Configure CGO
         shell: pwsh
         run: |
-          "CC=C:\msys64\mingw64\bin\gcc.exe" >> $env:GITHUB_ENV
-          "C:\msys64\mingw64\bin" >> $env:GITHUB_PATH
+          $root = '${{ steps.msys2.outputs.msys2-location }}'
+          "CC=$root\mingw64\bin\gcc.exe" >> $env:GITHUB_ENV
+          "$root\mingw64\bin" >> $env:GITHUB_PATH
       # Hosted runners have no Npcap driver or DLL. The two offline libpcap
       # integration tests run in Linux jobs. All other tests run natively here.
       - name: Windows native race tests
