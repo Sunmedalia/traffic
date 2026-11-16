@@ -87,7 +87,7 @@ func TestWebServesSessionsOverTokenProtectedAPI(t *testing.T) {
 		Count int      `json:"count"`
 		Stats Stats    `json:"stats"`
 	}
-	cases := map[string]int{"": 2, "?alerts=1": 1, "?severity=high&rule=RULE-A": 1, "?severity=low": 0, "?keyword=plain": 1, "?client=192.0.2.2": 1,
+	cases := map[string]int{"": 2, "?alerts=1": 1, "?severity=high&rule=RULE-A": 1, "?severity=low": 1, "?severity=medium&rule=RULE-B": 0, "?keyword=plain": 1, "?client=192.0.2.2": 1,
 		"?since=" + url.QueryEscape(now.Add(-time.Second).Format(time.RFC3339Nano)): 1}
 	for query, want := range cases {
 		status, body, _ = webGet(t, server, token, base+query)

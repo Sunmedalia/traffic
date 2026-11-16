@@ -58,7 +58,7 @@ func run(args []string) error {
 	service := fs.String("service", "", "service filter")
 	client := fs.String("client", "", "source address filter")
 	rule := fs.String("rule", "", "rule ID filter")
-	severity := fs.String("severity", "", "severity filter: low, medium, high")
+	severity := fs.String("severity", "", "minimum severity: low, medium, high")
 	since := fs.String("since", "", "RFC3339 start time")
 	fs.Bool("json", false, "JSON output for query commands (default)")
 	if err := fs.Parse(args); err != nil {
@@ -172,7 +172,7 @@ func run(args []string) error {
 		if *rule != "" || *severity != "" {
 			match := false
 			for _, a := range t.Alerts {
-				if (*rule == "" || a.Rule == *rule) && (*severity == "" || a.Severity == *severity) {
+				if (*rule == "" || a.Rule == *rule) && severityRank(a.Severity) >= severityRank(*severity) {
 					match = true
 				}
 			}

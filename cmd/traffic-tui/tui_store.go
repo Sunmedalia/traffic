@@ -18,9 +18,9 @@ type tuiFilter struct {
 }
 
 type tuiRow struct {
-	ID, Time, Client, Method, Host, URL, Severity string
-	Status                                        int
-	Incomplete, Truncated                         bool
+	ID, Time, Client, Method, Host, URL, Severity, Rule string
+	Status                                              int
+	Incomplete, Truncated                               bool
 }
 
 type tuiSnapshot struct {
@@ -31,7 +31,24 @@ type tuiSnapshot struct {
 	StatusWarning string
 	Detail        *Transaction
 	DetailMissing bool
+	// Newer counts matching records above an anchored first row.
+	Newer int
 }
+
+// severityRank orders levels so a severity filter means "at least".
+func severityRank(s string) int {
+	switch s {
+	case "high":
+		return 3
+	case "medium":
+		return 2
+	case "low":
+		return 1
+	}
+	return 0
+}
+
+const sqlSeverityRank = `CASE json_extract(a.value,'$.severity') WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END`
 
 func (f tuiFilter) where(alertsOnly bool) (string, []any) {
 	clauses := []string{"time>=?"}
@@ -49,8 +66,8 @@ func (f tuiFilter) where(alertsOnly bool) (string, []any) {
 		args = append(args, f.Client, prefix)
 	}
 	if f.Rule != "" || f.Severity != "" {
-		clauses = append(clauses, `EXISTS (SELECT 1 FROM json_each(CAST(requests.data AS TEXT), '$.alerts') a WHERE (?='' OR json_extract(a.value,'$.rule')=?) AND (?='' OR json_extract(a.value,'$.severity')=?))`)
-		args = append(args, f.Rule, f.Rule, f.Severity, f.Severity)
+		clauses = append(clauses, `EXISTS (SELECT 1 FROM json_each(CAST(requests.data AS TEXT), '$.alerts') a WHERE (?='' OR json_extract(a.value,'$.rule')=?) AND `+sqlSeverityRank+`>=?)`)
+		args = append(args, f.Rule, f.Rule, severityRank(f.Severity))
 	}
 	if f.Service != "" {
 		clauses = append(clauses, "json_extract(CAST(data AS TEXT),'$.service')=?")
@@ -107,11 +124,16 @@ func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly
  COALESCE(json_extract(CAST(data AS TEXT),'$.status'),0),
  COALESCE(json_extract(CAST(data AS TEXT),'$.incomplete'),0),
  COALESCE(json_extract(CAST(data AS TEXT),'$.truncated'),0),
- CASE COALESCE((SELECT max(CASE json_extract(a.value,'$.severity') WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END) FROM json_each(CAST(requests.data AS TEXT),'$.alerts') a),0)
- WHEN 3 THEN 'high' WHEN 2 THEN 'medium' WHEN 1 THEN 'low' ELSE '' END
+ CASE COALESCE((SELECT max(` + sqlSeverityRank + `) FROM json_each(CAST(requests.data AS TEXT),'$.alerts') a),0)
+ WHEN 3 THEN 'high' WHEN 2 THEN 'medium' WHEN 1 THEN 'low' ELSE '' END,
+ COALESCE((SELECT json_extract(a.value,'$.rule') FROM json_each(CAST(requests.data AS TEXT),'$.alerts') a ORDER BY ` + sqlSeverityRank + ` DESC LIMIT 1),'')
  FROM requests WHERE ` + where + ` ORDER BY time DESC,id DESC LIMIT 100 OFFSET ?`
 	offset := result.Page * 100
 	if anchor != nil && result.Page == page {
+		newerArgs := append(append([]any{}, args...), anchor.Time, anchor.Time, anchor.ID)
+		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM requests WHERE "+where+" AND (time>? OR (time=? AND id>?))", newerArgs...).Scan(&result.Newer); err != nil {
+			return result, err
+		}
 		query = strings.Replace(query, " ORDER BY time DESC,id DESC", " AND (time<? OR (time=? AND id<=?)) ORDER BY time DESC,id DESC", 1)
 		args = append(args, anchor.Time, anchor.Time, anchor.ID)
 		offset = 0
@@ -123,7 +145,7 @@ func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly
 	}
 	for rows.Next() {
 		var row tuiRow
-		if err = rows.Scan(&row.ID, &row.Time, &row.Client, &row.Method, &row.Host, &row.URL, &row.Status, &row.Incomplete, &row.Truncated, &row.Severity); err != nil {
+		if err = rows.Scan(&row.ID, &row.Time, &row.Client, &row.Method, &row.Host, &row.URL, &row.Status, &row.Incomplete, &row.Truncated, &row.Severity, &row.Rule); err != nil {
 			rows.Close()
 			return result, err
 		}
