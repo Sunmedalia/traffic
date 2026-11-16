@@ -14,6 +14,7 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	termansi "github.com/charmbracelet/x/ansi"
 
 	"github.com/Sunmedalia/traffic/internal/session"
 )
@@ -597,5 +598,113 @@ func TestTUIAlertViewsAndDrill(t *testing.T) {
 				t.Fatalf("overflow %dx%d got %dx%d", size.Width, size.Height, lipgloss.Width(content), lipgloss.Height(content))
 			}
 		}
+	}
+}
+func TestTUIHighlight(t *testing.T) {
+	text := "GET /?q=UNION Select 1\nunion\nselect 中文38"
+	alert := tuiPattern([]string{"union select", "union\nselect", ""})
+	out := tuiHighlight(text, alert, tuiPattern([]string{"38"}))
+	if termansi.Strip(out) != text {
+		t.Fatalf("highlight changed the text: %q", termansi.Strip(out))
+	}
+	if !strings.Contains(out, tuiMatchStyle.Render("UNION Select")) || !strings.Contains(out, tuiMatchStyle.Render("union")) || !strings.Contains(out, tuiMatchStyle.Render("select")) {
+		t.Fatalf("matches not marked: %q", out)
+	}
+	if !strings.Contains(out, tuiSearchStyle.Render("38")) {
+		t.Fatal("search hit not marked")
+	}
+	if tuiPattern(nil) != nil || tuiHighlight("x", nil, nil) != "x" {
+		t.Fatal("empty patterns")
+	}
+	if got := tuiOccurrences("union select", "GET /?q=union+select", ""); !strings.Contains(got, "未直接出现") {
+		t.Fatalf("encoded match: %s", got)
+	}
+	if got := tuiOccurrences("<script>", "a <SCRIPT> b <script>", "<script>"); !strings.Contains(got, "请求中 2 处 · 响应中 1 处") {
+		t.Fatalf("occurrences: %s", got)
+	}
+}
+func TestTUIDetailSearchAndCopy(t *testing.T) {
+	m := &tuiModel{ctx: context.Background(), store: tuiTestStore(t), refresh: time.Second, width: 100, height: 20, viewport: viewport.New(), tab: tabRequests, details: true, detailID: "id"}
+	body := strings.Repeat("filler line\n", 40) + "needle one\n" + strings.Repeat("more\n", 40) + "NEEDLE two\n"
+	m.snapshot.Detail = &Transaction{ID: "id", Request: []byte(body), Alerts: []Alert{{Rule: "R", Severity: "high", Match: "filler"}}}
+	m.snapshot.Rows = []tuiRow{{ID: "id"}}
+	m.resize()
+	if !strings.Contains(m.viewport.GetContent(), tuiMatchStyle.Render("filler")) {
+		t.Fatal("alert match not highlighted in the request")
+	}
+	m.Update(tuiKey("/"))
+	if m.searchInput == nil || m.form != nil {
+		t.Fatal("slash in detail did not open search")
+	}
+	for _, r := range "needle" {
+		m.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+	m.Update(tuiKey("enter"))
+	if m.searchTerm != "needle" || len(m.searchLines) != 2 || m.viewport.YOffset() == 0 {
+		t.Fatalf("search: %q lines=%v offset=%d", m.searchTerm, m.searchLines, m.viewport.YOffset())
+	}
+	first := m.viewport.YOffset()
+	m.Update(tuiKey("n"))
+	if m.searchIndex != 1 || m.viewport.YOffset() <= first {
+		t.Fatal("n did not move to the next hit")
+	}
+	m.Update(tuiKey("N"))
+	if m.searchIndex != 0 || !strings.Contains(m.noticeLine(), "第 1/2 处") {
+		t.Fatalf("N did not go back: %s", m.noticeLine())
+	}
+	_, cmd := m.Update(tuiKey("y"))
+	if cmd == nil || !strings.Contains(m.flash, "id") {
+		t.Fatal("copy not issued")
+	}
+	m.Update(tuiKey("esc"))
+	if m.searchTerm != "" || !m.details {
+		t.Fatal("first esc should only clear the search")
+	}
+	m.Update(tuiKey("esc"))
+	if m.details {
+		t.Fatal("second esc should close the detail")
+	}
+	for _, size := range []tea.WindowSizeMsg{{Width: 40, Height: 12}, {Width: 140, Height: 40}} {
+		m.details = true
+		m.Update(size)
+		m.openSearch()
+		content := m.View().Content
+		if lipgloss.Width(content) > size.Width || lipgloss.Height(content) > size.Height {
+			t.Fatalf("search overflow %dx%d", size.Width, size.Height)
+		}
+		m.searchInput = nil
+	}
+}
+func TestTUITimeRange(t *testing.T) {
+	s := tuiTestStore(t)
+	base := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		putTUITransaction(t, s, Transaction{ID: fmt.Sprint(i), Time: base.Add(time.Duration(i) * time.Hour)})
+	}
+	f := tuiFilter{Since: base.Add(time.Hour).Format(indexTimeFormat), Until: base.Add(3 * time.Hour).Format(indexTimeFormat)}
+	result, err := loadTUISnapshot(context.Background(), s, f, false, 0, "", nil)
+	if err != nil || result.Count != 3 {
+		t.Fatalf("range count %d %v", result.Count, err)
+	}
+	form := newTUIForm(tuiFilter{}, nil, 100)
+	form.now = func() time.Time { return base.Add(5 * time.Hour) }
+	form.fields[formSince].input.SetValue("1h")
+	form.fields[formUntil].input.SetValue("2h")
+	if _, err := form.filter(); err == nil || !strings.Contains(err.Error(), "晚于") {
+		t.Fatalf("reversed range accepted: %v", err)
+	}
+	form.fields[formUntil].input.SetValue("bad")
+	if _, err := form.filter(); err == nil || !strings.HasPrefix(err.Error(), "时间到") {
+		t.Fatalf("bad until: %v", err)
+	}
+	form.fields[formSince].input.SetValue("3h")
+	form.fields[formUntil].input.SetValue("1h")
+	got, err := form.filter()
+	if err != nil || got.Until == "" {
+		t.Fatalf("range rejected: %v", err)
+	}
+	m := &tuiModel{store: s, filter: got}
+	if !strings.Contains(m.filterLabel(), "时间 ≤") {
+		t.Fatal("until chip missing")
 	}
 }

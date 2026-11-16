@@ -229,8 +229,8 @@ func (m *sessionBrowser) openSession(dir string) error {
 	return nil
 }
 
-// Tag every child command, including batches and ticks, so results from a closed
-// session cannot update the next session or start duplicate refresh loops.
+// Tag the child's session results, including those inside batches, so results from
+// a closed session cannot update the next session or start duplicate refresh loops.
 func sessionCommand(cmd tea.Cmd, generation uint64) tea.Cmd {
 	if cmd == nil {
 		return nil
@@ -244,10 +244,13 @@ func sessionCommand(cmd tea.Cmd, generation uint64) tea.Cmd {
 			}
 			return tea.Batch(commands...)()
 		}
-		if _, ok := msg.(tea.QuitMsg); ok {
-			return msg
+		// Only session data needs the tag. Runtime messages such as clipboard
+		// writes must reach Bubble Tea itself; input widgets accept them untagged.
+		switch msg.(type) {
+		case tuiTick, tuiLoaded, tuiExported:
+			return sessionChildMsg{generation, msg}
 		}
-		return sessionChildMsg{generation, msg}
+		return msg
 	}
 }
 func (m *sessionBrowser) scan() tea.Cmd {

@@ -90,6 +90,9 @@ func TestBrowserCommandBatchesAndLayout(t *testing.T) {
 	if !ok || message.Generation != 7 {
 		t.Fatal("batch child not tagged")
 	}
+	if _, ok := sessionCommand(tea.SetClipboard("id"), 7)().(sessionChildMsg); ok {
+		t.Fatal("runtime clipboard message was hidden from Bubble Tea")
+	}
 	m := &sessionBrowser{roots: []string{"/会话/" + strings.Repeat("长", 100)}, query: newSessionQuery()}
 	m.Update(sessionsFound{Entries: []sessionEntry{{Name: "正常访问", Dir: "/test", Host: "web-01"}, {Name: "夜间", Dir: "/night", Host: "web-01", Stats: Stats{State: "running"}}, {Name: "后台", Dir: "/admin", Host: "db-02"}}})
 	for _, size := range []tea.WindowSizeMsg{{Width: 80, Height: 24}, {Width: 140, Height: 40}, {Width: 40, Height: 12}, {Width: 20, Height: 5}} {

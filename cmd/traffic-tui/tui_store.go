@@ -16,6 +16,8 @@ import (
 // tuiFilter applies to persisted transactions, including records written by v1.
 type tuiFilter struct {
 	Client, Rule, Severity, Since, Keyword, Service string
+	// Until is an inclusive upper bound in index time format; only the TUI sets it.
+	Until string
 }
 
 type tuiRow struct {
@@ -54,6 +56,10 @@ const sqlSeverityRank = `CASE json_extract(a.value,'$.severity') WHEN 'high' THE
 func (f tuiFilter) where(alertsOnly bool) (string, []any) {
 	clauses := []string{"time>=?"}
 	args := []any{f.Since}
+	if f.Until != "" {
+		clauses = append(clauses, "time<=?")
+		args = append(args, f.Until)
+	}
 	if alertsOnly {
 		clauses = append(clauses, "alert>0")
 	}

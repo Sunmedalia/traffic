@@ -96,6 +96,10 @@ type tuiModel struct {
 	summaryKey                           string
 	summaryAt                            time.Time
 	drill                                *tuiDrill
+	searchInput                          *textinput.Model
+	searchTerm                           string
+	searchLines                          []int
+	searchIndex                          int
 	form                                 *tuiForm
 	export                               *tuiExport
 	viewport                             viewport.Model
@@ -191,7 +195,9 @@ func (m *tuiModel) updateContent() {
 	case m.tab == tabHealth:
 		content = m.healthContent()
 	}
-	m.viewport.SetContent(termansi.Hardwrap(content, max(1, m.viewport.Width()), true))
+	wrapped := termansi.Hardwrap(content, max(1, m.viewport.Width()), true)
+	m.viewport.SetContent(wrapped)
+	m.findSearchLines(wrapped)
 }
 
 // switchTab keeps each list tab's own page and cursor.
@@ -210,6 +216,7 @@ func (m *tuiModel) switchTab(tab int) tea.Cmd {
 	return m.changed()
 }
 func (m *tuiModel) closeDetail() {
+	m.searchTerm, m.searchInput, m.searchLines = "", nil, nil
 	m.details = false
 	m.detailID = ""
 	m.pickDetail = false
@@ -357,6 +364,9 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.export != nil {
 		return m, m.updateExport(msg)
 	}
+	if m.searchInput != nil {
+		return m, m.updateSearch(msg)
+	}
 	m.flash = ""
 	if key == "q" {
 		return m, tea.Quit
@@ -372,6 +382,9 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.help = true
 		return m, nil
 	case "/":
+		if m.details {
+			return m, m.openSearch()
+		}
 		m.form = newTUIForm(m.filter, m.services(), m.width)
 		return m, m.form.focus()
 	case " ", "space":
@@ -390,6 +403,11 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "esc":
+		if m.details && m.searchTerm != "" {
+			m.searchTerm = ""
+			m.updateContent()
+			return m, nil
+		}
 		if m.details {
 			m.closeDetail()
 			m.viewport.GotoTop()
@@ -421,6 +439,8 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, m.toggleFromRow(key)
 		case "e":
 			return m, m.openExport()
+		case "y":
+			return m, m.copyID()
 		}
 	}
 	if m.details {
@@ -434,6 +454,15 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.viewport.GotoTop()
 			m.updateContent()
 			return m, nil
+		case "n", "N":
+			if m.searchTerm != "" {
+				step := 1
+				if key == "N" {
+					step = -1
+				}
+				m.jumpSearch(step)
+				return m, nil
+			}
 		case "J":
 			return m, m.stepDetail(1)
 		case "K":
@@ -874,27 +903,30 @@ func (m tuiModel) detailContent() string {
 		if len(t.Request) == 0 {
 			b.WriteString("暂无请求内容")
 		} else {
-			b.WriteString(cleanTUIText(session.SafeText(t.Request)))
+			b.WriteString(m.highlightBody(cleanTUIText(session.SafeText(t.Request))))
 		}
 	case 1:
 		if len(t.Response) == 0 {
 			b.WriteString("暂无响应内容")
 		} else {
-			b.WriteString(cleanTUIText(session.SafeText(t.Response)))
+			b.WriteString(m.highlightBody(cleanTUIText(session.SafeText(t.Response))))
 		}
 	case 2:
 		body, view := session.DecodedBody(t.Request, 1<<20)
 		if view == "" {
 			b.WriteString("暂无可用的 gzip 解码正文，请查看请求标签")
 		} else {
-			fmt.Fprintf(&b, "解码视图 %s\n\n%s", tuiLine(view), cleanTUIText(body))
+			fmt.Fprintf(&b, "解码视图 %s\n\n%s", tuiLine(view), m.highlightBody(cleanTUIText(body)))
 		}
 	case 3:
 		if len(t.Alerts) == 0 {
 			b.WriteString("暂无告警")
 		}
+		request, response := cleanTUIText(session.SafeText(t.Request)), cleanTUIText(session.SafeText(t.Response))
+		search := m.searchPattern()
 		for _, a := range t.Alerts {
-			fmt.Fprintf(&b, "%s  %s\n%s\n%s\n%s\n\n", tuiSeverityStyle(a.Severity).Bold(true).Render(tuiLine(a.Rule)), tuiMuted.Render(fmt.Sprintf("版本 %d · 级别 %s · 字段 %s", a.Version, tuiSeverity(a.Severity), tuiLine(a.Field))), tuiMuted.Render(fmt.Sprintf("视图 %s · 解码 %d 轮", alertView(a.View), a.Decoding)), tuiMuted.Render("匹配片段"), cleanTUIText(a.Match))
+			match := cleanTUIText(a.Match)
+			fmt.Fprintf(&b, "%s  %s\n%s\n%s\n%s\n%s\n\n", tuiSeverityStyle(a.Severity).Bold(true).Render(tuiLine(a.Rule)), tuiMuted.Render(fmt.Sprintf("版本 %d · 级别 %s · 字段 %s", a.Version, tuiSeverity(a.Severity), tuiLine(a.Field))), tuiMuted.Render(fmt.Sprintf("视图 %s · 解码 %d 轮", alertView(a.View), a.Decoding)), tuiMuted.Render("匹配片段"), tuiHighlight(match, tuiPattern([]string{match}), search), tuiMuted.Render(tuiOccurrences(a.Match, request, response)))
 		}
 	}
 	return b.String()
@@ -1072,6 +1104,11 @@ func (m tuiModel) filterChips() []string {
 			add(f.Since, "时间 ≥ ")
 		}
 	}
+	if f.Until != "" {
+		if t, err := time.Parse(indexTimeFormat, f.Until); err == nil {
+			chips = append(chips, "[时间 ≤ "+t.Local().Format("01-02 15:04:05")+"]")
+		}
+	}
 	add(f.Client, "客户端 = ")
 	add(f.Rule, "规则 = ")
 	add(f.Service, "服务 = ")
@@ -1154,8 +1191,14 @@ func (m tuiModel) noticeLine() string {
 	if m.errorText != "" {
 		return tuiDanger.Render("刷新失败，保留上次结果 · " + tuiLine(m.errorText))
 	}
+	if m.searchInput != nil {
+		return m.searchInput.View()
+	}
 	if m.flash != "" {
 		return tuiAccent.Render(tuiLine(m.flash))
+	}
+	if notice := m.searchNotice(); notice != "" {
+		return notice
 	}
 	level, reasons := m.tuiHealth()
 	if level == 0 {
@@ -1172,6 +1215,8 @@ func (m tuiModel) noticeLine() string {
 }
 func (m tuiModel) keysLine() string {
 	switch {
+	case m.searchInput != nil:
+		return "输入后按 Enter 查找 · Esc 取消"
 	case m.form != nil:
 		return "Tab/↑↓ 换行 · ←→ 选项 · Enter 应用 · Ctrl+R 清空 · Esc 取消"
 	case m.export != nil:
@@ -1179,7 +1224,7 @@ func (m tuiModel) keysLine() string {
 	case m.help:
 		return "? 或 Esc 关闭帮助 · q 退出"
 	case m.details:
-		return "↑↓ 滚动 · J/K 上下一条 · Tab 切标签 · c 同客户端 · m 同规则 · H 同 Host · e 导出 · Esc 返回"
+		return "↑↓ 滚动 · J/K 上下一条 · Tab 切标签 · / 查找 · c/m/H 按此筛选 · e 导出 · y 复制 ID · Esc 返回"
 	case m.aggView():
 		return "↑↓ 选择 · Enter 查看逐条 · v 切换视图 · / 筛选 · x 清空 · 空格 暂停 · s 会话 · ? 帮助"
 	case m.tab == tabOverview:
@@ -1187,7 +1232,7 @@ func (m tuiModel) keysLine() string {
 	case m.listTab() && m.drill != nil:
 		return "Esc 返回上一层 · ↑↓ 选择 · Enter 详情 · c/m/H 按选中行筛选 · x 清空 · e 导出 · v 切换视图 · ? 帮助"
 	case m.listTab():
-		return "↑↓ 选择 · Enter 详情 · / 筛选 · c/m/H 按选中行筛选 · x 清空 · e 导出 · g 最新 · 空格 暂停 · s 会话 · ? 帮助"
+		return "↑↓ 选择 · Enter 详情 · / 筛选 · c/m/H 按选中行筛选 · x 清空 · e 导出 · y 复制 ID · g 最新 · 空格 暂停 · s 会话 · ? 帮助"
 	}
 	return "1-4 切换页面 · ↑↓ 滚动 · / 筛选 · 空格 暂停 · r 刷新 · s 会话 · ? 帮助 · q 退出"
 }
@@ -1202,10 +1247,12 @@ const tuiHelpText = `快捷键
 层级    Enter 打开详情或下钻    Esc 关闭弹层、关闭详情、退出下钻
 详情    Tab / Shift+Tab 切换请求、响应、解码正文、检测依据
         J / K 不退出详情查看下一条、上一条
+        / 在当前标签中查找，n / N 跳到下一处、上一处，Esc 清除
+        告警匹配片段在请求、响应和解码正文中反色高亮
 筛选    / 打开筛选面板    x 清空全部筛选
         c 只看选中行的客户端    m 只看它命中的规则    H 只看它的 Host
         再按一次同一个键取消该条件
-证据    e 导出选中请求的证据压缩包（需要先停止采集）
+证据    e 导出选中请求的证据压缩包（需要先停止采集）    y 复制请求 ID
 刷新    光标在第一页第一行时跟随最新记录，离开后列表定格
         空格 暂停或恢复    r 立即刷新
 退出    q 或 Ctrl+C`
@@ -1260,6 +1307,7 @@ type tuiForm struct {
 const (
 	formSeverity = iota
 	formSince
+	formUntil
 	formClient
 	formRule
 	formService
@@ -1276,10 +1324,13 @@ func newTUIForm(f tuiFilter, services []string, width int) *tuiForm {
 		input.CharLimit = 512
 		return tuiFormField{label: label, input: input}
 	}
-	since := ""
-	if t, err := time.Parse(indexTimeFormat, f.Since); err == nil {
-		since = t.Local().Format("2006-01-02 15:04:05")
+	local := func(stamp string) string {
+		if t, err := time.Parse(indexTimeFormat, stamp); err == nil {
+			return t.Local().Format("2006-01-02 15:04:05")
+		}
+		return ""
 	}
+	since, until := local(f.Since), local(f.Until)
 	form := &tuiForm{now: time.Now}
 	severity := tuiFormField{label: "级别", values: []string{"", "low", "medium", "high"}, names: []string{"全部", "低及以上", "中及以上", "仅高"}}
 	service := tuiFormField{label: "服务", values: append([]string{""}, services...), names: append([]string{"全部"}, services...)}
@@ -1296,6 +1347,7 @@ func newTUIForm(f tuiFilter, services []string, width int) *tuiForm {
 	form.fields = []tuiFormField{
 		severity,
 		text("时间从", "30m、2h、1d、today、14:30、11-16 14:30 或 RFC3339", since),
+		text("时间到", "留空表示到现在，格式同上", until),
 		text("客户端", "IP 或 IP:端口", f.Client),
 		text("规则", "规则 ID，例如 SQLI-001", f.Rule),
 		service,
@@ -1325,18 +1377,29 @@ func (f *tuiForm) filter() (tuiFilter, error) {
 	value := func(i int) string { return strings.TrimSpace(f.fields[i].input.Value()) }
 	choice := func(i int) string { return f.fields[i].values[f.fields[i].choice] }
 	filter := tuiFilter{Severity: choice(formSeverity), Client: value(formClient), Rule: value(formRule), Service: choice(formService), Keyword: value(formKeyword)}
-	if since := value(formSince); since != "" {
-		t, err := parseTUISince(since, f.now())
+	var since, until time.Time
+	if text := value(formSince); text != "" {
+		t, err := parseTUISince(text, f.now())
 		if err != nil {
-			return filter, err
+			return filter, fmt.Errorf("时间从 %w", err)
 		}
-		filter.Since = t.UTC().Format(indexTimeFormat)
+		since, filter.Since = t, t.UTC().Format(indexTimeFormat)
+	}
+	if text := value(formUntil); text != "" {
+		t, err := parseTUISince(text, f.now())
+		if err != nil {
+			return filter, fmt.Errorf("时间到 %w", err)
+		}
+		until, filter.Until = t, t.UTC().Format(indexTimeFormat)
+	}
+	if !since.IsZero() && !until.IsZero() && !until.After(since) {
+		return filter, errors.New("时间到 需要晚于时间从")
 	}
 	return filter, nil
 }
 func (f *tuiForm) view(height int) string {
 	lines := []string{tuiAccent.Render("筛选"), ""}
-	compact := height < 16
+	compact := height < 17
 	for i, field := range f.fields {
 		if compact && i != f.index {
 			continue
@@ -1365,11 +1428,18 @@ func (f *tuiForm) view(height int) string {
 		lines = append(lines, tuiMuted.Render(fmt.Sprintf("字段 %d/%d", f.index+1, len(f.fields))))
 	}
 	lines = append(lines, "")
-	if since := strings.TrimSpace(f.fields[formSince].input.Value()); since != "" {
-		if t, err := parseTUISince(since, f.now()); err == nil {
-			lines = append(lines, tuiMuted.Render("时间从 = "+t.Local().Format("2006-01-02 15:04:05 MST")+" 起"))
+	for _, field := range []struct {
+		index       int
+		name, after string
+	}{{formSince, "时间从", " 起"}, {formUntil, "时间到", " 止"}} {
+		text := strings.TrimSpace(f.fields[field.index].input.Value())
+		if text == "" {
+			continue
+		}
+		if t, err := parseTUISince(text, f.now()); err == nil {
+			lines = append(lines, tuiMuted.Render(field.name+" = "+t.Local().Format("2006-01-02 15:04:05 MST")+field.after))
 		} else {
-			lines = append(lines, tuiWarn.Render("时间从 "+err.Error()))
+			lines = append(lines, tuiWarn.Render(field.name+" "+err.Error()))
 		}
 	}
 	lines = append(lines, tuiMuted.Render("级别按「不低于」筛选；规则和级别需要同一条告警同时满足"))
@@ -1410,7 +1480,7 @@ func (m *tuiModel) updateForm(msg tea.KeyPressMsg) tea.Cmd {
 	case "enter":
 		filter, err := f.filter()
 		if err != nil {
-			f.err = "时间从 " + err.Error()
+			f.err = err.Error()
 			return nil
 		}
 		m.form = nil
