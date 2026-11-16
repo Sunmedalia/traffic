@@ -2,6 +2,7 @@
 #include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <pthread.h>
 #include <poll.h>
@@ -24,6 +25,7 @@ static pthread_mutex_t event_mutex = PTHREAD_MUTEX_INITIALIZER;
 static __thread unsigned int call_depth;
 static int event_socket = -1;
 static char destination[sizeof(((struct sockaddr_un *)0)->sun_path)];
+static char debug_path[256];
 #define EVENT_SIZE (CHUNK_SIZE * 4 / 3 + 2 * NI_MAXHOST + 512)
 #define EVENT_QUEUE 128
 static struct queued_event { size_t length; uint64_t loss_count; char data[EVENT_SIZE]; } events[EVENT_QUEUE];
@@ -69,6 +71,25 @@ static char *trim(char *text) {
     return text;
 }
 
+static void debug_note(const char *state) {
+    char message[512], comm[64] = "";
+    FILE *file;
+    int fd, length;
+    if (!debug_path[0]) return;
+    file = fopen("/proc/self/comm", "r");
+    if (file) {
+        if (!fgets(comm, sizeof(comm), file)) comm[0] = 0;
+        fclose(file);
+        trim(comm);
+    }
+    length = snprintf(message, sizeof(message), "pid=%ld comm=%s %s destination=%s\n",
+                      (long)getpid(), comm, state, destination);
+    fd = open(debug_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    if (write(fd, message, (size_t)length) < 0) { /* diagnostics only */ }
+    close(fd);
+}
+
 /* /etc/ld.so.preload cannot set environment variables, so a root-owned config
  * file selects the socket and the process names that may report. Without the
  * config (or with a non-matching comm) the interposer stays inert, which makes
@@ -93,6 +114,8 @@ static void load_config(void) {
                 strcpy(socket_path, value);
             } else if (!strcmp(key, "targets") && strlen(value) < sizeof(targets)) {
                 strcpy(targets, value);
+            } else if (!strcmp(key, "debug_file") && strlen(value) < sizeof(debug_path)) {
+                strcpy(debug_path, value);
             }
         }
         fclose(file);
@@ -145,6 +168,7 @@ static void initialize(void) {
     RESOLVE("SSL_new", next_new);
     RESOLVE("SSL_free", next_free);
 #undef RESOLVE
+    debug_note(library && next_read ? "initialized" : "symbols-missing");
 }
 
 /* All event/socket/connection state is protected by event_mutex. Socket writes

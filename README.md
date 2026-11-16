@@ -13,7 +13,7 @@ Linux 使用 libpcap、eCapture/eBPF、可选 Java Agent 和旧内核 OpenSSL �
 | Linux Apache | 自动发现 apache2/httpd，采集 OpenSSL HTTPS 明文 | ARM64 的 event、worker、prefork 已测，worker/prefork 已有阻塞读取存在首次漏采边界 |
 | Linux Tomcat / JSSE | 显式动态附加 Java Agent，采集 HTTPS 明文 | ARM64 的 Tomcat 9/JDK 17、10.1/JDK 21 NIO Connector 已测，支持重复附加 |
 | Linux 通用 OpenSSL | 指定 PID 采集 OpenSSL API 明文 | ARM64 的 HAProxy、外部 `SSL_read_ex` / `SSL_write_ex` 调用已测，其他程序及库版本需验证 |
-| CentOS 7 x86_64 / OpenSSL 预加载 | 启动服务时加载 `LD_PRELOAD` 库，通过 Unix socket 获取明文 | 内核 3.10 / glibc 2.17 / OpenSSL 1.0.2k 的独立 HTTPS 服务已测，需启动时加载库 |
+| CentOS 7 x86_64 / OpenSSL 预加载 | 启动服务时加载 `LD_PRELOAD` 库，通过 Unix socket 获取明文；支持 `/etc/ld.so.preload` 配置与进程白名单 | 内核 3.10 / glibc 2.17 / OpenSSL 1.0.2k 的独立 HTTPS 服务已测；Debian 13 / OpenSSL 3.5 / nginx 1.26 的系统级预加载、TLS 1.2/1.3 与非 root worker 已测 |
 | Windows x64 / IIS 10 | Npcap HTTP 采集，显式启用 IIS 动态 HTTPS 明文后端 | Windows 10 LTSC 17763、HTTP/1.1、TLS 1.2 已测，存在启动漏采窗口和 Frida 运行时卸载限制 |
 | Windows Nginx / Apache | 自动发现工作进程、Npcap HTTP、显式启用 OpenSSL HTTPS 明文采集 | Nginx 官方 1.28.0 x86、Apache 2.4.71 x64 的 TLS 1.2/1.3 正文比对通过，静态 Nginx 按二进制哈希适配 |
 | Windows 通用 OpenSSL | 指定 PID，支持导出的 SSL_read/write 及 _ex API | 外部 _ex 调用的 TLS 1.2/1.3 已测，s_server 内置 BIO 路径未取得明文，自定义 BIO 目前适配 Apache |
