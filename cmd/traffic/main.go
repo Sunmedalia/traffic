@@ -90,6 +90,7 @@ func run(args []string) (runErr error) {
 	proxyList := fs.String("trusted-proxies", "", "comma-separated trusted proxy IPs or CIDRs for X-Forwarded-For / X-Real-IP")
 	webhookURL := fs.String("alert-webhook", "", "POST alert JSON to HTTP(S) endpoint; optional TRAFFIC_WEBHOOK_TOKEN bearer token")
 	preloadSocket := fs.String("openssl-preload-socket", "", "Linux Unix datagram socket for LD_PRELOAD OpenSSL events")
+	preloadAllowUID := fs.String("openssl-preload-allow-uid", "", "comma-separated sender UIDs allowed to write preload events; opens the socket to their group")
 	noTLS := fs.Bool("no-tls", false, "disable TLS probes")
 	duration := fs.Duration("duration", 0, "optional capture duration")
 	fs.IntVar(&requestLimit, "request-limit", requestLimit, "maximum saved request body bytes")
@@ -119,6 +120,13 @@ func run(args []string) (runErr error) {
 	}
 	if *preloadSocket != "" && (runtime.GOOS != "linux" || cmd != "capture" || *noTLS || *javaAttach || *pid != 0 || *service != "auto") {
 		return errors.New("--openssl-preload-socket requires Linux capture with auto service, no --pid, and TLS enabled without Java attach")
+	}
+	preloadUIDs, uidErr := parsePreloadUIDs(*preloadAllowUID)
+	if uidErr != nil {
+		return uidErr
+	}
+	if len(preloadUIDs) > 0 && *preloadSocket == "" {
+		return errors.New("--openssl-preload-allow-uid requires --openssl-preload-socket")
 	}
 	if *pid < 0 || *javaPID < 0 {
 		return errors.New("PID must not be negative")
@@ -311,6 +319,7 @@ func run(args []string) (runErr error) {
 			"rules":                  rules,
 			"trusted_proxies":        trustedProxies,
 			"openssl_preload_socket": *preloadSocket,
+			"openssl_preload_allow_uid": preloadUIDs,
 			"tls_coverage":           "unverified",
 			"tls_missing_estimate":   nil,
 			"header_limit":           32768,
@@ -366,7 +375,7 @@ func run(args []string) (runErr error) {
 			go func() {
 				defer wg.Done()
 				if *preloadSocket != "" {
-					if err := capturePreload(ctx, s, p, *preloadSocket); err != nil {
+					if err := capturePreload(ctx, s, p, *preloadSocket, preloadUIDs); err != nil {
 						s.fail(err)
 						cancel()
 					}

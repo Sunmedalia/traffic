@@ -114,6 +114,32 @@ sudo env LD_PRELOAD="$PWD/bin/libtraffic-openssl.so" \
 
 socket 为 `0600`，发送进程需要与采集器同 UID，并具有父目录访问权限。采集器校验 Unix socket 内核凭据与 `/proc` 进程启动标识，成功接收后状态为 `active-preload`，事务后端为 `openssl-preload`，原始事件写入 `tls/openssl-preload.jsonl`。`--ports` 继续筛选端口，此模式使用 `auto` 服务且不指定 `--pid`。加载该库的服务需要重新启动，库随服务进程退出而卸载。
 
+#### 系统级 `ld.so.preload` 与不同 UID 的服务
+
+`/etc/ld.so.preload` 无法为单个服务设置环境变量，因此库支持配置文件。文件默认位于 `/etc/traffic/openssl-preload.conf`，也可用 `TRAFFIC_OPENSSL_CONFIG` 指定：
+
+```ini
+socket=/run/traffic/plaintext.sock
+targets=nginx,httpd,apache2
+# debug_file=/tmp/traffic-preload-debug.log
+```
+
+`targets` 为逗号分隔的进程名，支持末尾 `*` 前缀匹配，`*` 表示全部进程；不匹配的进程保持惰性，不会拦截或发送事件。这使系统级预加载可以安全地覆盖 sshd、curl 等无关 TLS 客户端。采集器使用 `--openssl-preload-allow-uid` 允许服务账号写入，socket 变为 `0660` 并归属该 UID 的主组，父目录自动创建并保持可穿越：
+
+```bash
+sudo ./bin/traffic capture --interfaces any --ports 443 \
+  --openssl-preload-socket /run/traffic/plaintext.sock \
+  --openssl-preload-allow-uid 33 --output ./sessions/incident-preload
+
+echo /opt/traffic/bin/libtraffic-openssl.so > /etc/ld.so.preload
+systemctl restart nginx
+# 采集结束后回滚
+rm -f /etc/ld.so.preload
+systemctl restart nginx
+```
+
+`ld.so.preload` 只影响之后启动的进程；`nginx -s reload` 会复用 master 的已加载库，必须重启 master 才能让新 worker 加载。worker 由 master fork，库在 master 启动时载入后同样覆盖 worker。回滚时删除文件并重启服务，确认 worker 的 `/proc/PID/maps` 不再包含该库。`debug_file` 仅用于诊断，每次进程首次初始化写入一行，默认关闭。
+
 队列最多 128 条事件，单条最多约 19 KiB，发送线程遇到背压进行有界重试。可上报的传输缺口计入 `tls_dropped`，进程崩溃、`_exit`、采集器停机及最后无法送出的事件仍可能形成未知缺口。采集完整性保持 `unverified`。CentOS 7 的 cgroup v1 环境下，现有 cgroup v2 资源限制报告 `unavailable`。
 
 该后端目前验证动态 OpenSSL 1.0.2k / HTTP/1.1 / TLS 1.2。静态链接、绕过符号拦截的加载方式、自定义无 socket BIO、Go TLS、HTTP/2、其他 OpenSSL 版本及长期性能需要另行适配或验证。Nginx、Apache 等中间件需要分别实测。
