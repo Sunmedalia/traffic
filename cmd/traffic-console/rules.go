@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -13,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -22,16 +22,16 @@ import (
 )
 
 type Rule struct {
-	ID               string `yaml:"id"`
-	Version          int    `yaml:"version"`
-	Severity         string `yaml:"severity"`
-	Field            string `yaml:"field"`
-	Pattern          string `yaml:"pattern"`
+	ID               string `yaml:"id" json:"id"`
+	Version          int    `yaml:"version" json:"version"`
+	Severity         string `yaml:"severity" json:"severity"`
+	Field            string `yaml:"field" json:"field"`
+	Pattern          string `yaml:"pattern" json:"pattern"`
 	rx               *regexp.Regexp
 	requiredLiterals [][]string
 }
 
-var rules = []Rule{
+var builtinRules = []Rule{
 	{ID: "SQLI-001", Version: 1, Severity: "high", Field: "request", Pattern: `(?i)(union\s+(all\s+)?select\b|\bor\s+['"]?\d+['"]?\s*=\s*['"]?\d+|\b(sleep|benchmark)\s*\()`},
 	{ID: "CMD-001", Version: 1, Severity: "high", Field: "request", Pattern: "(?i)([;|&]\\s*(id|whoami|cat|curl|wget|bash|sh)\\b|\\$\\([^)]*\\)|`[^`]+`)"},
 	{ID: "PATH-001", Version: 1, Severity: "high", Field: "request", Pattern: `(?i)(\.\.[/\\]){2,}`},
@@ -48,15 +48,11 @@ var rules = []Rule{
 	{ID: "RESPONSE-CMD-001", Version: 1, Severity: "high", Field: "response.body", Pattern: `\buid=[0-9]+\([^)]*\)\s+gid=[0-9]+\(`},
 }
 
-var ruleRevision atomic.Uint64
-
-func detectionRevision() uint64 {
-	revision := ruleRevision.Load() << 1
-	if noDetect {
-		revision |= 1
-	}
-	return revision
-}
+var rules = append([]Rule(nil), builtinRules...)
+var requestLimit = 1 << 20
+var responseLimit = 1 << 20
+var scanWindow = time.Minute
+var scanThreshold = 20
 
 func compileRules(rs []Rule) error {
 	seen := map[string]bool{}
@@ -83,34 +79,53 @@ func compileRules(rs []Rule) error {
 		}
 		r.requiredLiterals = necessaryRuleLiterals(expression)
 	}
-	ruleRevision.Add(1)
 	return nil
 }
-func loadRules(path string) error {
-	if path != "" {
-		b, e := os.ReadFile(path)
-		if e != nil {
-			return e
-		}
+func rulesFromYAML(data []byte) ([]Rule, error) {
+	rs := append([]Rule(nil), builtinRules...)
+	if len(data) > 0 {
 		var extra []Rule
-		decoder := yaml.NewDecoder(bytes.NewReader(b))
+		decoder := yaml.NewDecoder(bytes.NewReader(data))
 		decoder.KnownFields(true)
-		if e = decoder.Decode(&extra); e != nil {
-			return e
+		if err := decoder.Decode(&extra); err != nil {
+			return nil, err
 		}
-		rules = append(rules, extra...)
+		var trailing any
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			return nil, fmt.Errorf("rule file must contain exactly one YAML document")
+		}
+		if len(extra) == 0 {
+			return nil, fmt.Errorf("rule file must contain a non-empty rule list")
+		}
+		rs = append(rs, extra...)
 	}
-	return compileRules(rules)
+	if err := compileRules(rs); err != nil {
+		return nil, err
+	}
+	return rs, nil
+}
+func loadRules(path string) error {
+	var data []byte
+	if path != "" {
+		var err error
+		data, err = os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if len(bytes.TrimSpace(data)) == 0 {
+			return fmt.Errorf("empty rule file")
+		}
+	}
+	rs, err := rulesFromYAML(data)
+	if err == nil {
+		rules = rs
+	}
+	return err
 }
 
-var noDetect bool
+func detect(t Transaction) []Alert { return detectWithRules(t, rules) }
 
-func detect(t Transaction) []Alert { return detectWithPrevious(t, nil) }
-
-func detectWithPrevious(t Transaction, previous *Transaction) []Alert {
-	if noDetect {
-		return nil
-	}
+func detectWithRules(t Transaction, rs []Rule) []Alert {
 	var out []Alert
 	var request, response *detectionHTTP
 	type fieldView struct{ field, view string }
@@ -124,17 +139,8 @@ func detectWithPrevious(t Transaction, previous *Transaction) []Alert {
 		}
 		return matchDecodedViews(rule, variants, view)
 	}
-	for _, rule := range rules {
+	for _, rule := range rs {
 		responseRule := strings.HasPrefix(rule.Field, "response")
-		if previous != nil && !responseRule {
-			for _, alert := range previous.Alerts {
-				if alert.Rule == rule.ID {
-					out = append(out, alert)
-					break
-				}
-			}
-			continue
-		}
 		var message *detectionHTTP
 		if rule.Field != "url" {
 			if responseRule {
@@ -203,8 +209,7 @@ func detectionMessage(raw []byte, response bool, limit int) detectionHTTP {
 		_, headers, _ := bytes.Cut(head, []byte("\n"))
 		message.headers, message.body = string(headers), string(payload)
 	}
-	reader, releaseReader := borrowHTTPReader(bytes.NewReader(raw), min(4096, len(raw)))
-	defer releaseReader()
+	reader := bufio.NewReaderSize(bytes.NewReader(raw), 4096)
 	var body io.ReadCloser
 	if response {
 		parsed, err := http.ReadResponse(reader, nil)
@@ -291,8 +296,6 @@ func decodePercent(text string) string {
 	})
 }
 
-func decodedBody(raw []byte) (string, string) { return session.DecodedBody(raw, requestLimit) }
-
 type scanPath struct {
 	when   time.Time
 	status int
@@ -302,13 +305,17 @@ type scanState struct {
 	lastAlert time.Time
 }
 
-var scans = struct {
+type scanTracker struct {
 	sync.Mutex
 	clients map[string]*scanState
-}{clients: map[string]*scanState{}}
+}
 
-func scan(t Transaction) *Alert {
-	if noDetect || t.Status == 0 {
+var scans = scanTracker{clients: map[string]*scanState{}}
+
+func scan(t Transaction) *Alert { return scanWithState(t, &scans, scanWindow, scanThreshold) }
+
+func scanWithState(t Transaction, scans *scanTracker, scanWindow time.Duration, scanThreshold int) *Alert {
+	if t.Status == 0 {
 		return nil
 	}
 	host, _, e := net.SplitHostPort(t.Client)

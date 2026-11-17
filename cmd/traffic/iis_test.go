@@ -15,9 +15,6 @@ func TestIISRequestResponseAndLoss(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.db.Close()
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	assembler := &iisAssembler{store: store, target: session.Target{ID: "worker", Service: "iis"}}
 	events := []iisEvent{
 		{Type: "request", ID: "one", Time: time.Now(), Method: "POST", URL: "/api/echo", Local: "127.0.0.1:8443", Headers: [][2]string{{"Host", "test"}, {"Content-Length", "6"}}},

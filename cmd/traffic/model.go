@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -30,26 +29,25 @@ const indexTimeFormat = session.IndexTimeFormat
 var serial atomic.Uint64
 
 type Store struct {
-	requests              requestCache
-	indexMu               sync.Mutex
-	indexTx               *sql.Tx
-	indexRead, indexWrite *sql.Stmt
-	indexBatching         bool
-	indexOps, indexBytes  int
-	checkMu               sync.Mutex
-	checks                map[string]captureCheck
-	probeCheck            func(session.Target) captureCheck
-	gapMu                 sync.Mutex
-	gapEvents             uint64
-	targetTimes           map[string]session.Target
-	webhook               *alertWebhook
-	localAddresses        map[string]bool
-	packetDrops           map[string]uint64
-	fatal                 error
-	db                    *sql.DB
-	dir                   string
-	mu                    sync.Mutex
-	stats                 Stats
+	requests                           requestCache
+	indexMu                            sync.Mutex
+	indexTx                            *sql.Tx
+	indexRead, indexWrite, indexExists *sql.Stmt
+	indexBatching                      bool
+	indexOps, indexBytes               int
+	checkMu                            sync.Mutex
+	checks                             map[string]captureCheck
+	probeCheck                         func(session.Target) captureCheck
+	gapMu                              sync.Mutex
+	gapEvents                          uint64
+	targetTimes                        map[string]session.Target
+	localAddresses                     map[string]bool
+	packetDrops                        map[string]uint64
+	fatal                              error
+	db                                 *sql.DB
+	dir                                string
+	mu                                 sync.Mutex
+	stats                              Stats
 }
 
 func openStore(dir string, write bool) (*Store, error) {
@@ -151,27 +149,11 @@ func (s *Store) save(t Transaction) error {
 		h := sha256.Sum256([]byte(fmt.Sprintf("%s/%s/%d/%s", t.Connection, t.Source, time.Now().UnixNano(), t.URL)))
 		t.ID = hex.EncodeToString(h[:12])
 	}
-	previous, revision, cached := s.requests.get(t.ID)
-	if cached && revision == detectionRevision() && bytes.Equal(previous.Request, t.Request) && previous.URL == t.URL {
-		t.Alerts = detectWithPrevious(t, &previous)
-	} else {
-		t.Alerts = detect(t)
-	}
-	if a := scan(t); a != nil {
-		t.Alerts = append(t.Alerts, *a)
-	}
-	newAlerts, err := s.persist(t)
-	if err != nil {
+	t.Alerts = nil
+	if _, err := s.persist(t); err != nil {
 		return err
 	}
-	s.requests.put(t, detectionRevision())
-	for _, a := range newAlerts {
-		out, _ := json.Marshal(map[string]any{"id": t.ID, "url": t.URL, "client": t.Client, "peer_client": t.PeerClient, "client_source": t.ClientSource, "time": t.Time, "alert": a})
-		fmt.Println(string(out))
-		if s.webhook != nil {
-			s.webhook.enqueue(out)
-		}
-	}
+	s.requests.put(t)
 	return nil
 }
 func (s *Store) report() {
@@ -247,5 +229,6 @@ func (s *Store) restore(record *Transaction) error {
 	if err := s.indexReadRowLocked(reader, record.ID).Scan(&data); err != nil {
 		return err
 	}
+	*record = Transaction{}
 	return json.Unmarshal(data, record)
 }

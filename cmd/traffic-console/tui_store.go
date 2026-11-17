@@ -148,6 +148,15 @@ func readTUIStatus(dir string) (Stats, string) {
 func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly bool, page int, detailID string, anchor *tuiRow) (tuiSnapshot, error) {
 	result := tuiSnapshot{Page: page}
 	result.Stats, result.StatusWarning = readTUIStatus(s.dir)
+	if s.analysis != nil {
+		result.Stats.Alerts = s.analysis.Alerts
+	}
+	if s.analysisNote != "" {
+		if result.StatusWarning != "" {
+			result.StatusWarning += "；"
+		}
+		result.StatusWarning += s.analysisNote
+	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return result, err

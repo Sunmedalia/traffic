@@ -2,7 +2,7 @@
 
 [← 返回项目首页](../README.md) · [下载版本](https://github.com/Sunmedalia/traffic/releases)
 
-面向网站应急响应的流量采集与分析工具。在 Linux / Windows 目标机上采集 HTTP/HTTPS 请求、响应、检测依据和网络证据，用中文 TUI、浏览器或 JSON 命令回看，并导出可校验的证据包。
+面向网站应急响应的流量采集与分析工具。在 Linux / Windows 目标机上采集 HTTP/HTTPS 请求、响应和网络证据，在本地分析时生成检测依据，用中文 TUI、浏览器或 JSON 命令回看，并导出可校验的证据包。
 
 - **不装 CA、不改业务代码**：Linux 用 eCapture/eBPF 在 OpenSSL 读写处取明文，Windows 用随包 WinDivert 加动态探针。
 - **采集与分析分离**：采集器只写会话目录，分析器可在另一台机器打开。
@@ -148,14 +148,16 @@ sudo ./bin/traffic capture --service auto --ports 80,443,8081,8444,8083,8446 \
   --java-attach --java-pid 1234 --java-agent "$PWD/bin/traffic-java-agent.jar"
 ```
 
-### 加规则、限制时长、外送告警
+### 限时采集，再在本地加规则和外送告警
 
 ```bash
 sudo ./bin/traffic capture --ports 80,443 --ecapture "$PWD/bin/ecapture" --duration 10m \
-  --rules ./rules.yaml \
   --trusted-proxies 10.0.0.0/8,192.0.2.10 \
-  --alert-webhook https://siem.example/traffic \
   --output ./sessions/incident-002
+
+# 停采后，把整个会话复制到本地，再执行：
+./bin/traffic-console analyze --session ./sessions/incident-002 \
+  --rules ./rules.yaml --alert-webhook https://siem.example/traffic
 ```
 
 `TRAFFIC_WEBHOOK_TOKEN` 可带 Bearer 令牌。规则格式见[检测规则](#检测规则)。
@@ -315,9 +317,7 @@ IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集]
 | `--no-tls` | 关 | 只做 HTTP，不启动 TLS 探针 |
 | `--openssl-preload-socket` | 空 | 启用预加载后端 |
 | `--openssl-preload-allow-uid` | 空 | 允许非 root 服务账号写入 |
-| `--rules` | 内置 | 追加 YAML 规则 |
 | `--trusted-proxies` | 空 | 可信代理 IP/CIDR |
-| `--alert-webhook` | 空 | 告警外送地址 |
 | `--output` | 自动 | 精确会话目录 |
 | `--data-dir` | `./sessions` | 自动命名会话的根目录 |
 | `--name` | `capture` | 会话名 |
@@ -325,13 +325,13 @@ IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集]
 | `--request-limit` / `--response-limit` | 256 KiB / 64 KiB | 正文保存上限，最大 1 MiB |
 | `--disk-limit-mib` | 2048 | 会话磁盘预算 |
 | `--retention` | 24h | 索引保留期 |
-| `--no-detect` | 关 | 关闭攻击检测 |
+| `--no-detect` | 兼容参数 | 采集始终不执行检测 |
 | `--require-tls` | 关 | 所选目标未通过 HTTPS 预检时拒绝开始 |
 | `--collector-memory-mib` / `--collector-cpu-percent` | 256 / 50 | 限制采集器及子进程，不含目标内探针 |
 | `--drain-timeout` | 5s | 部分后端的数据排空预算，最大 15s |
 | `--netns-pid` | 0 | Linux 显式选择抓包网络命名空间 |
 
-`traffic capture --help`、`traffic doctor`、`traffic rules check FILE` 可随时查看。`doctor` 默认显示中文自检报告，网卡掩码转为 CIDR；自动化读取请使用 `traffic doctor --json`，原始 JSON 字段保持兼容。分析器参数用 `traffic-console --help`。
+`traffic capture --help`、`traffic doctor`、`traffic-console rules check FILE` 可随时查看。`doctor` 默认显示中文自检报告，网卡掩码转为 CIDR；自动化读取请使用 `traffic doctor --json`，原始 JSON 字段保持兼容。分析器用 `traffic-console --help` / `--cn-help` 查看总览，`traffic-console web --cn-help`、`analyze --cn-help`、`rules --cn-help` 查看各命令的中文参数和示例；`--help` 为英文帮助。
 
 ## 会话目录与完整性
 
@@ -373,6 +373,28 @@ sessions/web-01/2026-11-11/15-04-05-nginx/
 
 ## 检测规则
 
+### Web 规则文件管理
+
+启动 `traffic-console web` 后，点击顶部「规则与分析」。左侧选择文件，右侧编辑 YAML；支持新建、导入 UTF-8 文件、校验、保存、下载及删除。内置规则只读。保存前校验规则 ID、字段、级别和正则，校验失败不会覆盖文件；文件版本冲突时需重新打开，避免覆盖其他窗口的修改。
+
+默认目录为程序旁的 `rules/`，从源码构建到 `bin/` 时使用项目根目录的 `rules/`。Web 启动时自动创建目录，与当前工作目录无关；用 `--rules-dir` 可覆盖默认位置。单文件最多 1 MiB，最多 256 个文件，不接受目录穿越或符号链接文件。
+
+```bash
+./traffic-console web --data-dir ./sessions --rules-dir ./rules
+```
+
+面板下方选择会话，再选「仅内置规则」或「内置 + 文件名」，点击「开始分析」。任务在后台运行，页面可继续浏览；可用「停止分析」取消任务。每次使用启动时的规则快照，修改或删除文件不改变正在运行的任务或已有结果。任务完成后，页面自动刷新告警；同一 Web 服务一次只运行一个分析任务，服务退出时取消未完成任务。Web 分析不触发 Webhook。
+
+### 命令行分析与规则格式
+
+当前源码已将检测移到本地分析器（尚未发布；v0.1.2 包仍采用旧流程）。`capture` 和 `import` 只保存流量；先停止采集，再执行 `traffic-console analyze --session DIR`。不需要匹配规则时，直接打开控制台浏览流量即可。
+
+每次分析按采集时间顺序读取已保存事务，重新执行内置及本次追加的规则，替换上次结果。`analysis.sqlite` 保存告警、规则内容/指纹、扫描窗口及完成时间；原始索引、正文、PCAP、TLS 事件和状态文件保持只读。分析失败或取消时保留上次完整结果。已有会话中的历史告警可直接读取，重跑后以新结果为准。
+
+TUI、Web、JSON 查询及导出共用本地结果；重跑分析后重新打开控制台。索引或其 WAL 文件变化（含部分复制方式）会使结果失效，需重新分析。该快速变化检查不代替证据哈希校验。导出另含 `analysis.json` 与 `captured-event.json`，区分本地告警和原始记录。
+
+分析只覆盖已保存的内容：默认最多解压每侧正文 1 MiB；截断、轮换和采集缺口无法通过规则补回。
+
 内置规则覆盖疑似 SQL 注入、命令注入、路径穿越、敏感文件探测、扫描、XSS、SSRF、XXE、SSTI、JNDI、反序列化、Webshell 上传，以及响应中的 passwd / 命令输出特征。原始内容和最多两轮 URL 解码视图参与匹配，gzip 正文有界解压。告警是疑似信号，结论要结合响应和现场证据。
 
 ```yaml
@@ -384,11 +406,11 @@ sessions/web-01/2026-11-11/15-04-05-nginx/
 ```
 
 ```bash
-./bin/traffic rules check rules.yaml
-sudo ./bin/traffic capture --rules rules.yaml --ports 80,443
+./bin/traffic-console rules check rules.yaml
+./bin/traffic-console analyze --session ./sessions/incident-002 --rules rules.yaml
 ```
 
-`field` 支持 `url`、`request`、`response`、`request.headers`、`response.headers`、`request.body`、`response.body`，单个头部用 `request.header.User-Agent` 这类写法。`severity` 为 `low` / `medium` / `high`。扫描检测默认 60 秒内至少 20 个不同路径且一半以上为 404，用 `--scan-window`、`--scan-paths` 调整。
+`field` 支持 `url`、`request`、`response`、`request.headers`、`response.headers`、`request.body`、`response.body`，单个头部用 `request.header.User-Agent` 这类写法。`severity` 为 `low` / `medium` / `high`。扫描检测默认 60 秒内至少 20 个不同路径且一半以上为 404，在 `traffic-console analyze` 中用 `--scan-window`、`--scan-paths` 调整。
 
 ### 可信代理与来源地址
 
@@ -400,7 +422,7 @@ sudo ./bin/traffic capture --rules rules.yaml --ports 80,443
 
 ### 告警外送
 
-`--alert-webhook` 异步 POST 告警 JSON，`TRAFFIC_WEBHOOK_TOKEN` 发送 Bearer 令牌，接收端可用 `Idempotency-Key` 去重。单次超时 3 秒，429/5xx 最多重试三次；队列 128 条、4 MiB，退出最多等 5 秒。投递计数在 `status.json`、TUI 和 Web 中显示，失败或溢出的告警仍可从会话索引读取。
+`traffic-console analyze --alert-webhook URL` 在分析成功后异步 POST 告警 JSON，`TRAFFIC_WEBHOOK_TOKEN` 发送 Bearer 令牌，接收端可用 `Idempotency-Key` 去重。单次超时 3 秒，429/5xx 最多重试三次；队列 128 条、4 MiB，退出最多等 5 秒。投递计数和失败信息在本次 analyze 的 JSON 输出中返回，不写入采集状态；失败或溢出的告警仍保存在本地分析库。重跑并指定 Webhook 会再次发送本次全部告警。
 
 ## 资源与证据限制
 
@@ -432,7 +454,7 @@ sudo apt-get install -y clang llvm bpftool libelf-dev libssl-dev \
 
 ### 预加载（LD_PRELOAD / ld.so.preload）
 
-库在 `SSL_read`、`SSL_write` 及 `_ex` API 返回后复制实际消费或产生的明文，经有界异步队列发送到 Unix socket；采集器校验内核凭据和 `/proc` 进程启动标识，复用 HTTP 还原、检测和证据存储。该路径可在内核 3.10 上运行。
+库在 `SSL_read`、`SSL_write` 及 `_ex` API 返回后复制实际消费或产生的明文，经有界异步队列发送到 Unix socket；采集器校验内核凭据和 `/proc` 进程启动标识，复用 HTTP 还原和证据存储。该路径可在内核 3.10 上运行。
 
 #### 系统级 `ld.so.preload` 与不同 UID 的服务
 

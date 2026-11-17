@@ -29,13 +29,13 @@ type alertWebhook struct {
 	cancel          context.CancelFunc
 	client          *http.Client
 	endpoint, token string
-	store           *Store
+	store           *deliveryReport
 	mu              sync.Mutex
 	closed          bool
 	queuedBytes     int
 }
 
-func newAlertWebhook(s *Store, endpoint, token string) *alertWebhook {
+func newAlertWebhook(s *deliveryReport, endpoint, token string) *alertWebhook {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &alertWebhook{
 		queue: make(chan []byte, 128), done: make(chan struct{}), cancel: cancel,
@@ -150,4 +150,18 @@ func (w *alertWebhook) close() {
 	}
 	w.cancel()
 	w.client.CloseIdleConnections()
+}
+
+// Delivery counters are local analysis output; capture status remains untouched.
+type deliveryReport struct {
+	mu    sync.Mutex
+	stats Stats
+}
+
+func (s *deliveryReport) problem(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.stats.Errors) < 100 {
+		s.stats.Errors = append(s.stats.Errors, err.Error())
+	}
 }

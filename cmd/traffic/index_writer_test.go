@@ -9,9 +9,6 @@ import (
 )
 
 func TestBatchedIndexRestoresUncommittedRequest(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -34,9 +31,6 @@ func TestBatchedIndexRestoresUncommittedRequest(t *testing.T) {
 	}
 }
 func TestBatchedIndexBoundAndFinalFlush(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -69,9 +63,6 @@ func TestBatchedIndexBoundAndFinalFlush(t *testing.T) {
 	}
 }
 func TestBatchedIndexCommitFailureIsVisible(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -96,9 +87,6 @@ func TestBatchedIndexCommitFailureIsVisible(t *testing.T) {
 }
 
 func TestRetentionUsesActiveIndexBatch(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -140,7 +128,7 @@ func TestRetentionUsesActiveIndexBatch(t *testing.T) {
 	}
 }
 
-func TestIndexBatchesPreserveBodyAndAlertHistory(t *testing.T) {
+func TestIndexBatchesPreserveBodiesWithoutAnalysis(t *testing.T) {
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -152,14 +140,13 @@ func TestIndexBatchesPreserveBodyAndAlertHistory(t *testing.T) {
 	responseAlert := Alert{Rule: "response-rule"}
 	body := []byte(strings.Repeat("large request body ", 8192))
 	original := Transaction{ID: "paired", Time: time.Now(), Request: body, Alerts: []Alert{scanAlert, requestAlert}}
-	if added, err := s.persist(original); err != nil || len(added) != 2 {
+	if added, err := s.persist(original); err != nil || len(added) != 0 {
 		t.Fatal("initial alerts", added, err)
 	}
 	if err := s.flushIndex(); err != nil {
 		t.Fatal(err)
 	}
-	// A new batch must restore the committed request, then retain its scan
-	// alert while deduplicating alerts already delivered for that request.
+	// A new batch restores the committed request without retaining analysis fields.
 	restored := Transaction{ID: original.ID}
 	if err := s.restore(&restored); err != nil {
 		t.Fatal(err)
@@ -167,14 +154,14 @@ func TestIndexBatchesPreserveBodyAndAlertHistory(t *testing.T) {
 	restored.Response = []byte("response")
 	restored.Status = 200
 	restored.Alerts = []Alert{requestAlert, responseAlert}
-	if added, err := s.persist(restored); err != nil || len(added) != 1 || added[0] != responseAlert {
+	if added, err := s.persist(restored); err != nil || len(added) != 0 {
 		t.Fatal("response alert deduplication", added, err)
 	}
 	// Restore before committing exercises the transaction-bound read statement.
 	if err := s.restore(&restored); err != nil {
 		t.Fatal(err)
 	}
-	if string(restored.Request) != string(body) || restored.Status != 200 || len(restored.Alerts) != 3 {
+	if string(restored.Request) != string(body) || restored.Status != 200 || len(restored.Alerts) != 0 {
 		t.Fatal("paired evidence or retained scan alert changed")
 	}
 	if err := s.flushIndex(); err != nil {
@@ -186,7 +173,7 @@ func TestIndexBatchesPreserveBodyAndAlertHistory(t *testing.T) {
 	if err := s.flushIndex(); err != nil {
 		t.Fatal(err)
 	}
-	if s.stats.Transactions != 2 || s.stats.Alerts != 3 {
+	if s.stats.Transactions != 2 || s.stats.Alerts != 0 {
 		t.Fatal("counters changed across batches", s.stats.Transactions, s.stats.Alerts)
 	}
 }

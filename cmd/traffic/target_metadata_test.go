@@ -10,9 +10,6 @@ import (
 )
 
 func TestSavedRequestKeepsProcessIdentityAfterPIDReuse(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -35,9 +32,6 @@ func TestSavedRequestKeepsProcessIdentityAfterPIDReuse(t *testing.T) {
 	}
 }
 func TestNewRequestUsesSelectedTargetWithVerifiedStartIdentity(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -63,9 +57,6 @@ func TestNewRequestUsesSelectedTargetWithVerifiedStartIdentity(t *testing.T) {
 }
 
 func TestTLSFrameCarriesVerifiedIdentityToStoredRequest(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -84,9 +75,6 @@ func TestTLSFrameCarriesVerifiedIdentityToStoredRequest(t *testing.T) {
 }
 
 func TestSerialTLSResponseDoesNotWaitForRequestInSameQueue(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)

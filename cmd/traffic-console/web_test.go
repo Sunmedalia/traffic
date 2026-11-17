@@ -204,7 +204,7 @@ func TestWebListenRequiresLoopbackByDefault(t *testing.T) {
 			t.Fatalf("loopback(%q) != %t", address, want)
 		}
 	}
-	if err := runWeb("", t.TempDir(), "0.0.0.0:0", false, time.Second); err == nil || !strings.Contains(err.Error(), "--allow-remote") {
+	if err := runWeb("", t.TempDir(), t.TempDir(), "0.0.0.0:0", false, time.Second); err == nil || !strings.Contains(err.Error(), "--allow-remote") {
 		t.Fatalf("remote listen was not refused: %v", err)
 	}
 }

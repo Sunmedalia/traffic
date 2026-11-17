@@ -72,7 +72,7 @@ kbd {
 .link { color: var(--accent); cursor: pointer; text-decoration: none; }
 .link:hover { text-decoration: underline; }
 
-button, input, select {
+button, input, select, textarea {
   font: inherit; color: inherit;
   background: var(--panel-2);
   border: 1px solid var(--line);
@@ -365,6 +365,39 @@ dialog h1 { font-size: 15px; }
 dialog p { padding: 0 18px 16px; font-size: 12px; }
 .keys { display: grid; grid-template-columns: max-content 1fr; gap: 9px 18px; margin: 0; padding: 16px 18px; }
 .keys dd { margin: 0; color: var(--muted); }
+
+/* Rule library follows the console's existing palette and compact controls. */
+#rules-dialog { width: min(1080px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow: auto; }
+.rules-location { display: flex; align-items: baseline; gap: 10px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
+.rules-location > .muted { flex: none; white-space: nowrap; }
+.rules-location code { overflow-wrap: anywhere; }
+.rules-workspace { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 350px; }
+.rules-sidebar { border-right: 1px solid var(--line); padding: 14px; min-width: 0; }
+.rules-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.rules-files { display: grid; align-content: start; gap: 5px; margin-top: 12px; max-height: 390px; overflow: auto; }
+.rules-files button { text-align: left; overflow: hidden; text-overflow: ellipsis; }
+.rules-files button[aria-current="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.rules-files small { display: block; color: var(--muted); }
+.rules-editor { display: grid; grid-template-columns: minmax(0,1fr); gap: 8px; padding: 14px 18px; }
+.rules-editor label { color: var(--text); }
+.rules-editor input { width: 100%; }
+.rules-editor textarea { resize: vertical; min-height: 235px; width: 100%; font: 12px/1.6 var(--mono); white-space: pre; tab-size: 2; }
+.rules-message { min-height: 20px; color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+.rules-message.error { color: var(--high); }
+.rules-message.success { color: var(--ok); }
+.rules-analysis { border-top: 1px solid var(--line); display: grid; gap: 12px; padding: 16px 18px; }
+.rules-analysis h2 { color: var(--text); margin-bottom: 4px; }
+.rules-analysis label { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.rules-analysis select { max-width: 300px; }
+button.danger { color: var(--high); }
+@media (max-width: 720px) {
+  .rules-workspace { grid-template-columns: minmax(0,1fr); }
+  .rules-sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
+  .rules-files { max-height: 130px; }
+  .rules-analysis .rules-toolbar { align-items: stretch; }
+  .rules-analysis label { width: 100%; }
+  .rules-analysis select { flex: 1; max-width: 100%; min-width: 0; }
+}
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }

@@ -54,9 +54,6 @@ func BenchmarkDetectionViews(b *testing.B) {
 	if err := loadRules(""); err != nil {
 		b.Fatal(err)
 	}
-	old := noDetect
-	noDetect = false
-	defer func() { noDetect = old }()
 	for _, payload := range []string{strings.Repeat("normal-x", 128), strings.Repeat("normal%2520", 90)} {
 		record := Transaction{URL: "/api/echo", Request: []byte(fmt.Sprintf("POST /api/echo HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n%s", len(payload), payload)), Response: []byte(fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(payload), payload))}
 		b.Run(fmt.Sprint(len(payload)), func(b *testing.B) {

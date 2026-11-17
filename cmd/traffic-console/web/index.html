@@ -14,6 +14,7 @@
   <nav class="crumb" id="crumb" aria-label="当前会话"></nav>
   <div class="spacer"></div>
   <span class="live" id="live" hidden></span>
+  <button type="button" id="rules-open" hidden>规则与分析</button>
   <button type="button" class="ghost" id="pause" hidden title="暂停或恢复自动刷新（空格）">暂停</button>
   <button type="button" class="ghost" id="tz" title="切换时间显示的时区"></button>
   <button type="button" class="ghost" id="theme" title="切换配色"></button>
@@ -184,6 +185,35 @@
 </main>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
+
+<dialog id="rules-dialog" aria-labelledby="rules-title">
+  <header><h1 id="rules-title">规则文件</h1><button type="button" class="ghost icon" id="rules-close" aria-label="关闭规则管理">✕</button></header>
+  <div class="rules-location"><span class="muted">规则目录</span><code id="rules-dir"></code></div>
+  <div class="rules-workspace">
+    <aside class="rules-sidebar">
+      <div class="rules-toolbar"><button type="button" id="rules-new">新建</button><button type="button" id="rules-upload">导入文件</button><input type="file" id="rules-upload-input" accept=".yaml,.yml" hidden></div>
+      <div id="rules-files" class="rules-files" aria-label="规则文件列表"></div>
+    </aside>
+    <section class="rules-editor">
+      <label for="rules-name">文件名 <span class="muted">· .yaml / .yml</span></label>
+      <input id="rules-name" autocomplete="off" spellcheck="false" placeholder="custom.yaml" maxlength="128">
+      <label for="rules-content">YAML 规则 <span class="muted" id="rules-editor-note"></span></label>
+      <textarea id="rules-content" spellcheck="false" aria-label="YAML 规则内容"></textarea>
+      <div id="rules-validation" class="rules-message" role="status" aria-live="polite"></div>
+      <div class="rules-toolbar"><button type="button" id="rules-validate">校验</button><button type="button" class="primary" id="rules-save">保存文件</button><button type="button" id="rules-download">下载</button><span class="spacer"></span><button type="button" id="rules-delete" class="danger">删除文件</button></div>
+    </section>
+  </div>
+  <section class="rules-analysis" aria-labelledby="analysis-title">
+    <div><h2 id="analysis-title">本地分析</h2><span class="muted">保存规则后选择会话分析；只更新告警，原始流量保持只读。</span></div>
+    <div class="rules-toolbar">
+      <label>会话<select id="analysis-session" aria-label="选择分析会话"></select></label>
+      <label>规则<select id="analysis-rule" aria-label="选择分析规则文件"></select></label>
+      <button type="button" class="primary" id="analysis-start">开始分析</button>
+      <button type="button" id="analysis-cancel" hidden>停止分析</button>
+    </div>
+    <div class="rules-message" id="analysis-status" role="status" aria-live="polite">请选择已停止采集的会话。修改规则后需要重新分析。</div>
+  </section>
+</dialog>
 
 <dialog id="help">
   <header><h1>快捷键</h1><button type="button" class="ghost icon" id="help-close" aria-label="关闭">✕</button></header>

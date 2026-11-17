@@ -11,10 +11,9 @@ import (
 const requestCacheBudget = 16 << 20
 
 type requestCacheEntry struct {
-	record   Transaction
-	revision uint64
-	size     int
-	added    time.Time
+	record Transaction
+	size   int
+	added  time.Time
 }
 
 // This cache is an accelerator only: requests are still persisted immediately.
@@ -85,17 +84,17 @@ func (c *requestCache) expire(now time.Time) {
 		c.remove(e)
 	}
 }
-func (c *requestCache) get(id string) (Transaction, uint64, bool) {
+func (c *requestCache) get(id string) (Transaction, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.expire(time.Now())
 	if e := c.items[id]; e != nil {
 		v := e.Value.(requestCacheEntry)
-		return v.record, v.revision, true
+		return v.record, true
 	}
-	return Transaction{}, 0, false
+	return Transaction{}, false
 }
-func (c *requestCache) put(t Transaction, revision uint64) {
+func (c *requestCache) put(t Transaction) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.expire(time.Now())
@@ -123,11 +122,11 @@ func (c *requestCache) put(t Transaction, revision uint64) {
 	if c.items == nil {
 		c.items = make(map[string]*list.Element)
 	}
-	c.items[t.ID] = c.order.PushBack(requestCacheEntry{copied, revision, size, time.Now()})
+	c.items[t.ID] = c.order.PushBack(requestCacheEntry{copied, size, time.Now()})
 	c.bytes += size
 }
 func (s *Store) restorePending(record *Transaction) error {
-	if cached, _, ok := s.requests.get(record.ID); ok {
+	if cached, ok := s.requests.get(record.ID); ok {
 		copied, _ := cloneRequest(cached)
 		*record = copied
 		return nil

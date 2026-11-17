@@ -173,6 +173,8 @@ def verify(args):
         stop(collector)
         if collector.returncode != 0:
             raise RuntimeError('collector failed: {}'.format(collector.returncode))
+        subprocess.check_call([str(Path(args.analysis_binary).resolve()), 'analyze',
+                               '--session', str(root / 'session')])
         # After collector shutdown the application still serves requests. Sending
         # to a missing socket must leave application TLS behavior intact.
         client = connection()

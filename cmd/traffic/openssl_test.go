@@ -13,9 +13,6 @@ func TestOpenSSLConnectionBoundaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.db.Close()
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	p := newHTTP(store)
 	a := &opensslAssembler{processor: p, frames: &Frames{}, prefix: "openssl-test/"}
 	send := func(kind, direction, data string) {
@@ -65,9 +62,6 @@ func TestOpenSSLConnectionBoundaries(t *testing.T) {
 }
 
 func TestConcurrentHEADResponseFraming(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	store, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -110,9 +104,6 @@ func TestConcurrentHEADResponseFraming(t *testing.T) {
 }
 
 func TestTruncatedBodyKeepsFollowingResponse(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	previous := responseLimit
 	responseLimit = 4
 	defer func() { responseLimit = previous }()

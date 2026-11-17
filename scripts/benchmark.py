@@ -34,9 +34,9 @@ parser.add_argument("--rounds", type=int, default=3)
 parser.add_argument("--rates", type=int, nargs="+", default=[20, 100])
 parser.add_argument(
     "--modes",
-    choices=["baseline", "packets", "tls", "full"],
+    choices=["baseline", "packets", "tls"],
     nargs="+",
-    default=["baseline", "packets", "tls", "full"],
+    default=["baseline", "packets", "tls"],
 )
 args = parser.parse_args()
 if args.seconds < 1 or args.rounds < 1 or any(rate < 1 for rate in args.rates):
@@ -147,8 +147,6 @@ for rate in args.rates:
                 ]
                 if mode == "packets":
                     command.append("--no-tls")
-                if mode in ("packets", "tls"):
-                    command.append("--no-detect")
                 capture_started = time.monotonic()
                 process = subprocess.Popen(
                     command, stdout=log, stderr=subprocess.STDOUT
@@ -219,7 +217,7 @@ for rate in args.rates:
                 )
                 row["exit_code"] = process.returncode
                 row["capture"] = json.loads((session / "status.json").read_text())
-                if mode in ("tls", "full"):
+                if mode == "tls":
                     database = sqlite3.connect(session / "index.sqlite")
                     paired = 0
                     markers = set()

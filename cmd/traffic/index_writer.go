@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"slices"
 	"sync"
 	"time"
 )
@@ -36,6 +35,12 @@ func (s *Store) indexExecutorLocked() (indexExecutor, error) {
 			_ = tx.Rollback()
 			return nil, err
 		}
+		exists, err := tx.Prepare("SELECT EXISTS(SELECT 1 FROM requests WHERE id=?)")
+		if err != nil {
+			_ = tx.Rollback()
+			return nil, err
+		}
+		s.indexExists = exists
 		s.indexTx = tx
 		s.indexRead, s.indexWrite = read, write
 	}
@@ -58,37 +63,17 @@ func (s *Store) persist(t Transaction) ([]Alert, error) {
 	if err != nil {
 		return nil, err
 	}
-	var previousData []byte
-	err = s.indexReadRowLocked(writer, t.ID).Scan(&previousData)
-	fresh := err == sql.ErrNoRows
-	if err != nil && !fresh {
+	var exists bool
+	if s.indexExists != nil {
+		err = s.indexExists.QueryRow(t.ID).Scan(&exists)
+	} else {
+		err = writer.QueryRow("SELECT EXISTS(SELECT 1 FROM requests WHERE id=?)", t.ID).Scan(&exists)
+	}
+	if err != nil {
 		return nil, err
 	}
-	// Only alert history is needed here. Decoding request and response bodies
-	// again allocates and base64-decodes evidence already restored by the caller.
-	var previous struct {
-		Alerts []Alert `json:"alerts"`
-	}
-	if !fresh {
-		if err := json.Unmarshal(previousData, &previous); err != nil {
-			return nil, err
-		}
-	}
-	known := make(map[Alert]bool, len(previous.Alerts))
-	for _, alert := range previous.Alerts {
-		known[alert] = true
-	}
-	var added []Alert
-	for _, alert := range t.Alerts {
-		if !known[alert] {
-			added = append(added, alert)
-		}
-	}
-	for _, alert := range previous.Alerts {
-		if alert.Rule == "SCAN-001" && !slices.Contains(t.Alerts, alert) {
-			t.Alerts = append(t.Alerts, alert)
-		}
-	}
+	fresh := !exists
+	t.Alerts = nil
 	data, err := json.Marshal(t)
 	if err != nil {
 		return nil, err
@@ -121,9 +106,9 @@ func (s *Store) persist(t Transaction) ([]Alert, error) {
 			s.stats.TLSRequests++
 		}
 	}
-	s.stats.Alerts += uint64(len(added))
+
 	s.mu.Unlock()
-	return added, nil
+	return nil, nil
 }
 func (s *Store) flushIndexLocked() error {
 	if s.indexTx == nil {
@@ -131,7 +116,7 @@ func (s *Store) flushIndexLocked() error {
 	}
 	tx, ops := s.indexTx, s.indexOps
 	s.indexTx = nil
-	s.indexRead, s.indexWrite = nil, nil
+	s.indexRead, s.indexWrite, s.indexExists = nil, nil, nil
 	s.indexOps = 0
 	s.indexBytes = 0
 	err := tx.Commit()

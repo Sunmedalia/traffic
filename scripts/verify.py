@@ -100,6 +100,12 @@ assert before_hash == hashlib.sha256(config.read_bytes()).hexdigest()
 assert before_pids == subprocess.check_output(["pgrep", "-x", "nginx"]).split()
 connection = sqlite3.connect(output / "index.sqlite")
 rows = [json.loads(row[0]) for row in connection.execute("SELECT data FROM requests")]
+assert not any(row.get("alerts") for row in rows), "collector performed detection"
+subprocess.run([args.analysis_binary, "analyze", "--session", str(output)], check=True)
+with sqlite3.connect(output / "analysis.sqlite") as analysis:
+    matches = {row[0]: json.loads(row[1]) for row in analysis.execute("SELECT id, alerts FROM results")}
+for row in rows:
+    row["alerts"] = matches[row["id"]]
 assert len(rows) == 126, f"captured {len(rows)} of 126"
 assert all(not row["incomplete"] and not row["truncated"] for row in rows), (
     "incomplete or truncated request/response"

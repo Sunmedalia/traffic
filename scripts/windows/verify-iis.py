@@ -162,6 +162,13 @@ def main():
         failures.append({"preexisting_https_connection_changed": expected[0]["client_endpoint"]})
     with sqlite3.connect(session / "index.sqlite") as db:
         rows = [json.loads(data) for (data,) in db.execute("SELECT data FROM requests")]
+    if any(row.get("alerts") for row in rows):
+        raise AssertionError("collector performed detection")
+    subprocess.run([str(args.analysis_binary), "analyze", "--session", str(session)], check=True)
+    with sqlite3.connect(session / "analysis.sqlite") as analysis:
+        matches = {row[0]: json.loads(row[1]) for row in analysis.execute("SELECT id, alerts FROM results")}
+    for row in rows:
+        row["alerts"] = matches[row["id"]]
     for sample in expected:
         if sample["secure"] and not args.iis_probe:
             continue

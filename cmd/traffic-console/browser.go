@@ -142,6 +142,9 @@ func discoverSessions(ctx context.Context, roots []string) sessionsFound {
 			}
 			s, err := openStore(dir)
 			if err == nil {
+				if s.analysis != nil {
+					item.Stats.Alerts = s.analysis.Alerts
+				}
 				checkCtx, cancel := context.WithTimeout(ctx, time.Second)
 				// Validate the schema, even for an empty or legacy session without a manifest.
 				rows, queryErr := s.db.QueryContext(checkCtx, "SELECT id,time,client,alert,data FROM requests LIMIT 0")

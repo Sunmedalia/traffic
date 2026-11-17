@@ -43,6 +43,25 @@ flowchart LR
 
 > **当前发布边界**：HTTP/2 已有有界解析和自动化回归，完整后端实机矩阵仍待验收。持续高负载仍有接收队列溢出样本，低影响门槛、八小时长压和部分后端排空确认尚未完成。已知缺口见 [优化进度](OPTIMIZATION.md)，实测结果见 [验证记录](VALIDATION.md)。
 
+## 采集与本地分析分离（当前源码）
+
+当前源码中的 `traffic capture` / `traffic import` 只还原并保存流量，不执行规则匹配、扫描检测或告警外送。停止采集后，将整个会话目录复制到本地，运行：
+
+```bash
+./traffic-console analyze --session ./sessions/first-capture
+# 可追加自定义规则；每次 analyze 都重新计算并替换上次结果
+./traffic-console analyze --session ./sessions/first-capture --rules ./rules.yaml
+./traffic-console --session ./sessions/first-capture
+# 或用浏览器查看同一份分析结果
+./traffic-console web --session ./sessions/first-capture
+```
+
+分析结果单独保存在会话旁的 `analysis.sqlite`，只包含告警和规则信息，不复制正文、不改写 `index.sqlite`、PCAP、TLS 明文或采集状态。查询和导出自动读取这份结果；未分析会话仍可浏览流量。旧会话原有告警可继续查看，执行 `analyze` 后采用本次规则结果。分析依据是已保存的流量，无法找回采集时截断或遗漏的内容。
+
+Web 顶部的「规则与分析」支持新建、导入、编辑、校验、保存、下载和删除 YAML 文件，并选择会话及规则执行 / 停止后台分析；完成后页面自动更新告警。规则默认存放在程序旁的 `rules/`（源码 `bin/` 构建使用项目根目录），可用 `traffic-console web --rules-dir /path/to/rules` 指定。内置规则只读，自定义文件按需追加，修改文件后需重新分析。[规则目录说明](rules/README.md)
+
+`--rules`、`--scan-window`、`--scan-paths`、`--alert-webhook` 已移到 `traffic-console analyze`；规则校验改用 `traffic-console rules check FILE`。`--no-detect` 仅保留为采集器兼容参数。**此变更尚未发布，下面列出的 v0.1.2 发行包仍采用旧检测流程。**
+
 ## 下载与安装
 
 从 [Releases](https://github.com/Sunmedalia/traffic/releases) 下载对应系统、架构与组件的包，用同版本 `SHA256SUMS` 核对。**采集器和分析器分开下载**：只采集时下载 `traffic`，查看会话时下载 `traffic-console`（原 `traffic-tui`）。
@@ -98,6 +117,9 @@ sudo ./traffic capture --no-tls --ports 80,8080 \
 ### 2 · 打开会话
 
 ```bash
+# 停采后在本地执行规则分析（当前源码）
+./traffic-console analyze --session ./sessions/first-capture
+
 # 中文终端界面；无参数时进入会话选择页
 ./traffic-console --session ./sessions/first-capture
 

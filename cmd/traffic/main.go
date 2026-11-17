@@ -54,27 +54,16 @@ func run(args []string) (runErr error) {
 		args = []string{helpCommand}
 	}
 	cmd, args := args[0], args[1:]
+	if cmd == "rules" {
+		return errors.New("rule validation moved to traffic-console rules check FILE")
+	}
 	id := ""
 	if cmd == "import" && len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		id = args[0]
 		args = args[1:]
 	}
-	if cmd != "doctor" && cmd != "capture" && cmd != "import" && cmd != "rules" {
+	if cmd != "doctor" && cmd != "capture" && cmd != "import" {
 		return fmt.Errorf("unknown collector command %q; use traffic-console for session analysis", cmd)
-	}
-	if cmd == "rules" && wantsHelp {
-		printCollectorHelp(os.Stdout, cmd, cnHelp, nil)
-		return nil
-	}
-	if cmd == "rules" {
-		if len(args) != 2 || args[0] != "check" {
-			return errors.New("usage: traffic rules check FILE")
-		}
-		if e := loadRules(args[1]); e != nil {
-			return e
-		}
-		emit(map[string]any{"valid": true, "rules": len(rules)})
-		return nil
 	}
 	defaults := portableDefaults()
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
@@ -100,9 +89,7 @@ func run(args []string) (runErr error) {
 	pid := fs.Int("pid", 0, "target process PID; default discover service processes")
 	ecapture := fs.String("ecapture", session.BundleFile("deps/ecapture/ecapture", "/opt/traffic/bin/ecapture"), "eCapture v2.9.1 binary")
 	lib := fs.String("libssl", "", "TLS library override; Windows module name or Linux library path")
-	ruleFile := fs.String("rules", "", "additional YAML rules")
 	proxyList := fs.String("trusted-proxies", "", "comma-separated trusted proxy IPs or CIDRs for X-Forwarded-For / X-Real-IP")
-	webhookURL := fs.String("alert-webhook", "", "POST alert JSON to HTTP(S) endpoint; optional TRAFFIC_WEBHOOK_TOKEN bearer token")
 	preloadSocket := fs.String("openssl-preload-socket", "", "Linux Unix datagram socket for LD_PRELOAD OpenSSL events")
 	preloadAllowUID := fs.String("openssl-preload-allow-uid", "", "comma-separated sender UIDs allowed to write preload events; opens the socket to their group")
 	requireTLS := fs.Bool("require-tls", false, "fail before capture if selected HTTPS targets fail read-only preflight")
@@ -115,9 +102,7 @@ func run(args []string) (runErr error) {
 	fs.IntVar(&responseLimit, "response-limit", responseLimit, "maximum saved response body bytes")
 	fs.IntVar(&diskLimitMiB, "disk-limit-mib", diskLimitMiB, "session disk budget MiB")
 	fs.DurationVar(&retention, "retention", retention, "transaction retention")
-	fs.DurationVar(&scanWindow, "scan-window", scanWindow, "scan aggregation window")
-	fs.IntVar(&scanThreshold, "scan-paths", scanThreshold, "distinct paths for scan detection")
-	fs.BoolVar(&noDetect, "no-detect", false, "capture without attack detection")
+	fs.Bool("no-detect", true, "deprecated compatibility flag; collection never runs detection")
 	jsonUsage := "JSON output (default)"
 	if cmd == "doctor" {
 		jsonUsage = "print raw JSON instead of the readable diagnostic report"
@@ -157,9 +142,6 @@ func run(args []string) (runErr error) {
 	trustedProxies, proxyErr = parseTrustedProxies(*proxyList)
 	if proxyErr != nil {
 		return proxyErr
-	}
-	if err := validateWebhook(*webhookURL); err != nil {
-		return err
 	}
 	if *preloadSocket != "" && (runtime.GOOS != "linux" || cmd != "capture" || *noTLS || *javaAttach || *pid != 0 || *service != "auto") {
 		return errors.New("--openssl-preload-socket requires Linux capture with auto service, no --pid, and TLS enabled without Java attach")
@@ -232,11 +214,8 @@ func run(args []string) (runErr error) {
 	if *requireTLS && (*noTLS || cmd != "capture") {
 		return errors.New("--require-tls requires capture with TLS enabled")
 	}
-	if requestLimit < 1 || requestLimit > 1<<20 || responseLimit < 1 || responseLimit > 1<<20 || diskLimitMiB < 64 || retention <= 0 || scanWindow <= 0 || scanThreshold < 1 {
+	if requestLimit < 1 || requestLimit > 1<<20 || responseLimit < 1 || responseLimit > 1<<20 || diskLimitMiB < 64 || retention <= 0 {
 		return errors.New("invalid resource or result limits")
-	}
-	if e := loadRules(*ruleFile); e != nil {
-		return e
 	}
 	if cmd == "doctor" {
 		capturePorts = map[int]bool{}
@@ -346,10 +325,6 @@ func run(args []string) (runErr error) {
 			}
 			return result[0]
 		}
-		if *webhookURL != "" {
-			s.webhook = newAlertWebhook(s, *webhookURL, os.Getenv("TRAFFIC_WEBHOOK_TOKEN"))
-			defer func() { s.webhook.close(); s.report() }()
-		}
 		defer func() {
 			if runErr != nil {
 				s.mu.Lock()
@@ -408,7 +383,7 @@ func run(args []string) (runErr error) {
 			"service":                          *service,
 			"targets":                          discoverTargets("/proc", *service, *pid, *lib),
 			"tls_enabled":                      cmd == "capture" && !*noTLS,
-			"rules":                            rules,
+			"detection_mode":                   "offline",
 			"trusted_proxies":                  trustedProxies,
 			"openssl_preload_socket":           *preloadSocket,
 			"openssl_preload_allow_uid":        preloadUIDs,
@@ -452,9 +427,6 @@ func run(args []string) (runErr error) {
 			s.mu.Lock()
 			s.stats.State = "complete"
 			s.mu.Unlock()
-			if s.webhook != nil {
-				s.webhook.close()
-			}
 			s.report()
 			return nil
 		}
@@ -555,9 +527,6 @@ func run(args []string) (runErr error) {
 			s.stats.DrainState = "unverified"
 		}
 		s.mu.Unlock()
-		if s.webhook != nil {
-			s.webhook.close()
-		}
 		s.report()
 		emit(s.stats)
 		return s.fatal

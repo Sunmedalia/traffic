@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,19 +14,6 @@ import (
 	"github.com/google/gopacket/tcpassembly"
 )
 
-func TestRules(t *testing.T) {
-	if e := loadRules(""); e != nil {
-		t.Fatal(e)
-	}
-	for _, x := range []struct {
-		s    string
-		want bool
-	}{{"/search?q=union%20select%201", true}, {"/?q=hello", false}, {"/?q=%252e%252e%252f%252e%252e%252fetc/passwd", true}, {"/?q=hello;whoami", true}, {"/.env", true}, {"/?q=O'Reilly", false}} {
-		if got := len(detect(Transaction{URL: x.s, Request: []byte(x.s)})) > 0; got != x.want {
-			t.Errorf("%s got %v", x.s, got)
-		}
-	}
-}
 func TestFrames(t *testing.T) {
 	f := &Frames{}
 	req := []byte("POST /api/echo HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n\r\nhello")
@@ -45,7 +31,6 @@ func TestFrames(t *testing.T) {
 	}
 }
 func TestResponsePairing(t *testing.T) {
-	loadRules("")
 	s, e := openStore(t.TempDir(), true)
 	if e != nil {
 		t.Fatal(e)
@@ -91,18 +76,6 @@ func TestProtobufMalformed(t *testing.T) {
 	}
 }
 
-func TestScan(t *testing.T) {
-	scans.Lock()
-	scans.clients = map[string]*scanState{}
-	scans.Unlock()
-	now := time.Now()
-	for i := 0; i < 20; i++ {
-		a := scan(Transaction{Time: now, Client: "192.0.2.1:1234", URL: fmt.Sprintf("/path-%d", i), Status: 404})
-		if (a != nil) != (i == 19) {
-			t.Fatalf("threshold at %d: %+v", i, a)
-		}
-	}
-}
 func TestLossyQueue(t *testing.T) {
 	s, e := openStore(t.TempDir(), true)
 	if e != nil {
@@ -121,7 +94,6 @@ func TestLossyQueue(t *testing.T) {
 }
 
 func TestTruncatedEvidencePreserved(t *testing.T) {
-	loadRules("")
 	s, e := openStore(t.TempDir(), true)
 	if e != nil {
 		t.Fatal(e)
@@ -140,7 +112,6 @@ func TestTruncatedEvidencePreserved(t *testing.T) {
 	}
 }
 func TestInterimResponse(t *testing.T) {
-	loadRules("")
 	s, e := openStore(t.TempDir(), true)
 	if e != nil {
 		t.Fatal(e)
@@ -159,7 +130,6 @@ func TestInterimResponse(t *testing.T) {
 }
 
 func TestPartialTLSExpiry(t *testing.T) {
-	loadRules("")
 	s, e := openStore(t.TempDir(), true)
 	if e != nil {
 		t.Fatal(e)
@@ -199,23 +169,6 @@ func TestDropCountersAcrossInterfaces(t *testing.T) {
 	}
 }
 
-func TestDecodeProvenance(t *testing.T) {
-	loadRules("")
-	var compressed bytes.Buffer
-	writer := gzip.NewWriter(&compressed)
-	writer.Write([]byte("union select 1"))
-	writer.Close()
-	payload := append([]byte(fmt.Sprintf("POST / HTTP/1.1\r\nHost: test\r\nContent-Encoding: gzip\r\nContent-Length: %d\r\n\r\n", compressed.Len())), compressed.Bytes()...)
-	alerts := detect(Transaction{Request: payload})
-	if len(alerts) == 0 || alerts[0].View != "gzip-body" {
-		t.Fatalf("missing gzip provenance %+v", alerts)
-	}
-	alerts = detect(Transaction{Request: []byte("GET /?q=%75nion%20select%201 HTTP/1.1\r\nHost: test\r\nX-Literal-Percent: %\r\n\r\n")})
-	if len(alerts) == 0 || alerts[0].Decoding != 1 {
-		t.Fatalf("valid escapes hidden by invalid escape %+v", alerts)
-	}
-}
-
 func TestStorePathAndTimeOrdering(t *testing.T) {
 	name := "case?mode=ro#evidence"
 	if runtime.GOOS == "windows" {
@@ -227,7 +180,6 @@ func TestStorePathAndTimeOrdering(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer s.db.Close()
-	loadRules("")
 	stamp := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	for i, nano := range []int{0, 1, 10} {
 		if e = s.save(Transaction{ID: fmt.Sprint(i), Time: stamp.Add(time.Duration(nano)), Client: "test"}); e != nil {

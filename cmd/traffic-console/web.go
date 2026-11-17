@@ -30,15 +30,24 @@ import (
 //go:embed web/index.html web/app.css web/app.js
 var webAssets embed.FS
 
-// webServer exposes the same read-only queries as the TUI over a token-protected HTTP API.
+// webServer keeps capture evidence read-only; managed rules and local analysis
+// are explicit token-protected writes.
 type webServer struct {
 	token   string
 	roots   []string
 	refresh time.Duration
 
-	mu       sync.Mutex
-	sessions map[string]sessionEntry
-	stores   map[string]*Store
+	mu          sync.Mutex
+	sessions    map[string]sessionEntry
+	stores      map[string]*Store
+	apiMu       sync.RWMutex
+	ruleLibrary *ruleLibrary
+	ctx         context.Context
+	cancel      context.CancelFunc
+	jobMu       sync.Mutex
+	job         *webAnalysisJob
+	jobCancel   context.CancelFunc
+	jobs        sync.WaitGroup
 }
 
 type webSession struct {
@@ -70,7 +79,8 @@ type webRow struct {
 var errWebSessionNotFound = errors.New("会话不存在，请重新扫描")
 
 func newWebServer(roots []string, token string, refresh time.Duration) *webServer {
-	return &webServer{token: token, roots: roots, refresh: refresh, sessions: map[string]sessionEntry{}, stores: map[string]*Store{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &webServer{token: token, roots: roots, refresh: refresh, sessions: map[string]sessionEntry{}, stores: map[string]*Store{}, ctx: ctx, cancel: cancel}
 }
 
 func webSessionID(dir string) string {
@@ -79,11 +89,18 @@ func webSessionID(dir string) string {
 }
 
 func (w *webServer) close() {
+	w.cancel()
+	w.jobs.Wait()
+	w.apiMu.Lock()
+	defer w.apiMu.Unlock()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for dir, s := range w.stores {
 		s.db.Close()
 		delete(w.stores, dir)
+	}
+	if w.ruleLibrary != nil {
+		w.ruleLibrary.root.Close()
 	}
 }
 
@@ -147,6 +164,14 @@ func (w *webServer) handler() http.Handler {
 	mux.HandleFunc("GET /api/sessions/{sid}/summary", w.handleSummary)
 	mux.HandleFunc("GET /api/sessions/{sid}/requests/{rid}", w.handleDetail)
 	mux.HandleFunc("GET /api/sessions/{sid}/requests/{rid}/export", w.handleExport)
+	mux.HandleFunc("GET /api/rules", w.handleRuleList)
+	mux.HandleFunc("POST /api/rules/validate", w.handleRuleValidate)
+	mux.HandleFunc("GET /api/rules/{name}", w.handleRuleFile)
+	mux.HandleFunc("PUT /api/rules/{name}", w.handleRuleFile)
+	mux.HandleFunc("DELETE /api/rules/{name}", w.handleRuleFile)
+	mux.HandleFunc("POST /api/sessions/{sid}/analyze", w.handleAnalyze)
+	mux.HandleFunc("GET /api/analysis", w.handleAnalysisStatus)
+	mux.HandleFunc("DELETE /api/analysis", w.handleAnalysisCancel)
 	static, _ := fs.Sub(webAssets, "web")
 	files := http.FileServerFS(static)
 	mux.HandleFunc("GET /{file}", func(rw http.ResponseWriter, r *http.Request) {
@@ -172,6 +197,8 @@ func (w *webServer) handler() http.Handler {
 				webError(rw, http.StatusUnauthorized, errors.New("访问令牌无效"))
 				return
 			}
+			w.apiMu.RLock()
+			defer w.apiMu.RUnlock()
 		}
 		mux.ServeHTTP(rw, r)
 	})
@@ -358,7 +385,7 @@ func webLoopback(listen string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func runWeb(dir, root, listen string, allowRemote bool, refresh time.Duration) error {
+func runWeb(dir, root, rulesDir, listen string, allowRemote bool, refresh time.Duration) error {
 	if refresh < 500*time.Millisecond {
 		return errors.New("--refresh 在 Web 模式下不能小于 500ms")
 	}
@@ -390,12 +417,18 @@ func runWeb(dir, root, listen string, allowRemote bool, refresh time.Duration) e
 	}
 	w := newWebServer(roots, token, refresh)
 	defer w.close()
+	w.ruleLibrary, err = openRuleLibrary(rulesDir)
+	if err != nil {
+		listener.Close()
+		return fmt.Errorf("规则目录: %w", err)
+	}
 	server := &http.Server{Handler: w.handler(), ReadHeaderTimeout: 10 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	address := listener.Addr().String()
 	// The token travels in the URL fragment, which browsers never send to the server.
 	fmt.Fprintf(os.Stderr, "Web 界面  http://%s/#token=%s\n会话目录  %s\n按 Ctrl+C 停止\n", address, token, strings.Join(roots, " · "))
+	fmt.Fprintln(os.Stderr, "规则目录 ", w.ruleLibrary.dir)
 	if !webLoopback(listen) {
 		fmt.Fprintln(os.Stderr, "警告  正在非回环地址上以明文 HTTP 提供证据，令牌和流量内容可被链路上的第三方读取")
 	}

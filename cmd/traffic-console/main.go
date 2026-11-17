@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Sunmedalia/traffic/internal/session"
@@ -33,14 +36,37 @@ func main() {
 }
 func run(args []string) error {
 	session.PrivateUmask()
+	if len(args) > 0 && args[0] == "help" {
+		if len(args) == 1 || strings.HasPrefix(args[1], "-") {
+			printConsoleHelp(os.Stdout, "", consoleHelpFlag(args, "cn-help"), nil)
+			return nil
+		}
+		args = append(append([]string{args[1]}, args[2:]...), "--help")
+	}
+	globalHelp := len(args) > 0 && strings.HasPrefix(args[0], "-")
+	cnHelp := consoleHelpFlag(args, "cn-help")
 	cmd := "view"
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		cmd, args = args[0], args[1:]
 	}
 	switch cmd {
-	case "view", "web", "status", "requests", "events", "show", "export":
+	case "view", "web", "status", "requests", "events", "show", "export", "analyze", "rules":
 	default:
 		return fmt.Errorf("unknown analysis command %q; use traffic for collection", cmd)
+	}
+	if cmd == "rules" {
+		if cnHelp || consoleHelpFlag(args, "help") || consoleHelpFlag(args, "h") {
+			printConsoleHelp(os.Stdout, "rules", cnHelp, nil)
+			return nil
+		}
+		if len(args) != 2 || args[0] != "check" {
+			return errors.New("usage: traffic-console rules check FILE")
+		}
+		if err := loadRules(args[1]); err != nil {
+			return err
+		}
+		emit(map[string]any{"valid": true, "rules": len(rules)})
+		return nil
 	}
 	id := ""
 	if (cmd == "show" || cmd == "export") && len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -48,12 +74,20 @@ func run(args []string) error {
 	}
 	fs := flag.NewFlagSet("traffic-console "+cmd, flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "traffic-console [--data-dir ROOT | --session DIR]\ntraffic-console web [--listen ADDR] [--data-dir ROOT | --session DIR]\ntraffic-console <status|requests|events|show ID|export ID> --session DIR")
-		fmt.Fprintln(fs.Output(), "默认打开中文会话选择界面，查询命令输出 JSON。")
-		fs.PrintDefaults()
+		helpCmd := cmd
+		if globalHelp {
+			helpCmd = ""
+		}
+		printConsoleHelp(fs.Output(), helpCmd, cnHelp, fs)
 	}
+	cnRequested := fs.Bool("cn-help", false, "show Chinese command help")
+	ruleFile := fs.String("rules", "", "additional YAML rules for analyze")
+	scanDuration := fs.Duration("scan-window", time.Minute, "scan correlation window for analyze")
+	scanPaths := fs.Int("scan-paths", 20, "distinct paths for scan detection in analyze")
+	webhookURL := fs.String("alert-webhook", "", "send local analysis alerts to HTTP(S) endpoint")
 	dir := fs.String("session", "", "existing session directory")
 	dataDir := fs.String("data-dir", "", "session browser search directory")
+	rulesDir := fs.String("rules-dir", defaultRulesDir(), "managed YAML rule directory for web")
 	refresh := fs.Duration("refresh", time.Second, "TUI or web refresh interval")
 	listen := fs.String("listen", "127.0.0.1:8080", "web listen address")
 	allowRemote := fs.Bool("allow-remote", false, "allow web to listen on a non-loopback address over plain HTTP")
@@ -71,8 +105,47 @@ func run(args []string) error {
 		}
 		return err
 	}
+	if *cnRequested {
+		fs.Usage()
+		return nil
+	}
+	if cmd != "analyze" {
+		var invalid string
+		fs.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "rules", "scan-window", "scan-paths", "alert-webhook":
+				invalid = f.Name
+			}
+		})
+		if invalid != "" {
+			return fmt.Errorf("--%s requires traffic-console analyze", invalid)
+		}
+	} else {
+		var invalid string
+		fs.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "session", "rules", "scan-window", "scan-paths", "alert-webhook", "json":
+			default:
+				invalid = f.Name
+			}
+		})
+		if invalid != "" {
+			return fmt.Errorf("--%s is not an analyze option", invalid)
+		}
+	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	if cmd != "web" {
+		var used bool
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "rules-dir" {
+				used = true
+			}
+		})
+		if used {
+			return errors.New("--rules-dir requires traffic-console web")
+		}
 	}
 	if *limit < 1 {
 		return errors.New("--limit must be positive")
@@ -91,13 +164,33 @@ func run(args []string) error {
 		*since = stamp.UTC().Format(indexTimeFormat)
 	}
 	if cmd == "web" {
-		return runWeb(*dir, *dataDir, *listen, *allowRemote, *refresh)
+		return runWeb(*dir, *dataDir, *rulesDir, *listen, *allowRemote, *refresh)
 	}
 	if cmd == "view" {
 		return runSessionBrowser(*dir, *dataDir, *refresh, tuiFilter{Client: *client, Rule: *rule, Severity: *severity, Since: *since, Service: *service})
 	}
 	if *dir == "" {
 		return errors.New("--session required")
+	}
+	if cmd == "analyze" {
+		if *scanDuration <= 0 || *scanPaths < 1 {
+			return errors.New("invalid scan detection limits")
+		}
+		if err := validateWebhook(*webhookURL); err != nil {
+			return err
+		}
+		scanWindow, scanThreshold = *scanDuration, *scanPaths
+		if err := loadRules(*ruleFile); err != nil {
+			return err
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		report, err := analyzeSession(ctx, *dir, *webhookURL)
+		if err != nil {
+			return err
+		}
+		emit(report)
+		return nil
 	}
 	if cmd == "status" {
 		b, e := os.ReadFile(filepath.Join(*dir, "status.json"))
@@ -106,6 +199,9 @@ func run(args []string) error {
 		}
 		var status map[string]any
 		if json.Unmarshal(b, &status) == nil {
+			if report, err := readAnalysisReport(*dir); err == nil {
+				status["analysis"] = report
+			}
 			if info, e := os.Stat(filepath.Join(*dir, "status.json")); e == nil && time.Since(info.ModTime()) > 5*time.Second && status["state"] == "running" {
 				checked, note := readTUIStatus(*dir)
 				status["state"] = checked.State
@@ -122,6 +218,9 @@ func run(args []string) error {
 		return e
 	}
 	defer s.db.Close()
+	if s.analysisNote != "" {
+		fmt.Fprintln(os.Stderr, s.analysisNote)
+	}
 	if cmd == "show" || cmd == "export" {
 		var b []byte
 		if e = s.db.QueryRow("SELECT data FROM requests WHERE id=?", id).Scan(&b); e != nil {

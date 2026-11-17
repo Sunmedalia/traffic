@@ -127,7 +127,7 @@ def main():
     parser.add_argument("--target-pid", type=int, action="append", required=True, help="service PID; descendants are sampled too")
     parser.add_argument("--capacity-rps", type=float, required=True, help="independently measured baseline service capacity")
     parser.add_argument("--fractions", type=float, nargs="+", default=[0.3, 0.6, 0.8])
-    parser.add_argument("--modes", choices=["packets", "tls", "full"], nargs="+", default=["packets", "tls", "full"])
+    parser.add_argument("--modes", choices=["packets", "tls"], nargs="+", default=["packets", "tls"])
     parser.add_argument("--seconds", type=int, default=900)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--concurrency", type=int, default=64)
@@ -179,9 +179,7 @@ def main():
                         log = (args.output / f"{label}.log").open("x", encoding="utf-8")
                         command = [str(args.binary), "capture", "--output", str(session), *extra]
                         if mode == "packets":
-                            command += ["--no-tls", "--no-detect"]
-                        elif mode == "tls":
-                            command += ["--no-detect"]
+                            command += ["--no-tls"]
                         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if platform.system() == "Windows" else 0)
                         deadline = time.monotonic() + 30
                         ready = False

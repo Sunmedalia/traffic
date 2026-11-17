@@ -9,7 +9,7 @@ import (
 )
 
 func TestAnalysisCommandBoundary(t *testing.T) {
-	for _, command := range []string{"capture", "doctor", "import", "rules"} {
+	for _, command := range []string{"capture", "doctor", "import"} {
 		err := run([]string{command})
 		if err == nil || !strings.Contains(err.Error(), "use traffic") {
 			t.Fatalf("analyst accepted collector command %q: %v", command, err)

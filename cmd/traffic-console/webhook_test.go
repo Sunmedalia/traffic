@@ -7,7 +7,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 func TestWebhookRetryAndUpdatedAlertIdentity(t *testing.T) {
@@ -39,31 +38,18 @@ func TestWebhookRetryAndUpdatedAlertIdentity(t *testing.T) {
 		w.WriteHeader(204)
 	}))
 	defer server.Close()
-	store, err := openStore(t.TempDir(), true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.db.Close()
-	store.webhook = newAlertWebhook(store, server.URL, "test-token")
-	defer store.webhook.close()
-	record := Transaction{ID: "same", Time: time.Now(), Response: []byte("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst")}
-	if err := store.save(record); err != nil {
-		t.Fatal(err)
-	}
-	record.Response = []byte("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond")
-	if err := store.save(record); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.save(record); err != nil {
-		t.Fatal(err)
-	}
-	store.webhook.close()
+	store := &deliveryReport{}
+	webhook := newAlertWebhook(store, server.URL, "test-token")
+	defer webhook.close()
+	webhook.enqueue([]byte(`{"id":"same","alert":{"rule":"A"}}`))
+	webhook.enqueue([]byte(`{"id":"same","alert":{"rule":"B"}}`))
+	webhook.close()
 	mu.Lock()
 	defer mu.Unlock()
 	if len(payloads) != 3 || payloads[0] != payloads[1] || keys[0] == "" || keys[0] != keys[1] || keys[1] == keys[2] || !strings.Contains(payloads[2], `"rule":"B"`) {
 		t.Fatalf("bad deliveries %v %v", payloads, keys)
 	}
-	if store.stats.AlertDelivered != 2 || store.stats.AlertDeliveryFailed != 0 || store.stats.Alerts != 2 {
+	if store.stats.AlertDelivered != 2 || store.stats.AlertDeliveryFailed != 0 {
 		t.Fatalf("bad counters %+v", store.stats)
 	}
 }
@@ -74,7 +60,7 @@ func TestWebhookRejectsRedirectAndCountsFailure(t *testing.T) {
 	defer destination.Close()
 	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, destination.URL, 302) }))
 	defer redirect.Close()
-	store := &Store{}
+	store := &deliveryReport{}
 	webhook := newAlertWebhook(store, redirect.URL, "test-token")
 	webhook.enqueue([]byte(`{"id":"test"}`))
 	webhook.close()
@@ -89,7 +75,7 @@ func TestWebhookRejectsRedirectAndCountsFailure(t *testing.T) {
 }
 
 func TestWebhookQueueBounds(t *testing.T) {
-	store := &Store{}
+	store := &deliveryReport{}
 	webhook := &alertWebhook{queue: make(chan []byte, 1), store: store}
 	webhook.enqueue([]byte("first"))
 	webhook.enqueue([]byte("second"))

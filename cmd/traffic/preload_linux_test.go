@@ -32,9 +32,6 @@ func TestPreloadSocketRefusesExistingPath(t *testing.T) {
 }
 
 func TestPreloadCredentialAndProcessIdentity(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	store, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -119,7 +116,7 @@ func TestPreloadCredentialAndProcessIdentity(t *testing.T) {
 	if err := json.Unmarshal(raw, &record); err != nil {
 		t.Fatal(err)
 	}
-	if record.URL != "/valid" || record.Backend != "openssl-preload" || record.Status != 200 || len(record.Alerts) != 1 {
+	if record.URL != "/valid" || record.Backend != "openssl-preload" || record.Status != 200 || len(record.Alerts) != 0 {
 		t.Fatalf("bad capture %+v", record)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {

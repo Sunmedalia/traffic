@@ -51,9 +51,6 @@ func TestPacketRingWindowsDeviceAndLargeFrame(t *testing.T) {
 }
 
 func TestOfflineReassemblyOutOfOrderAndRetransmission(t *testing.T) {
-	if e := loadRules(""); e != nil {
-		t.Fatal(e)
-	}
 	input := filepath.Join(t.TempDir(), "source.pcap")
 	f, e := os.Create(input)
 	if e != nil {

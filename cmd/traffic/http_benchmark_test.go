@@ -12,12 +12,6 @@ import (
 // readers. It includes parsing, indexing and response restoration, not just the
 // allocation of bufio.Reader itself.
 func BenchmarkHTTPReaderBuffers(b *testing.B) {
-	if err := loadRules(""); err != nil {
-		b.Fatal(err)
-	}
-	previous := noDetect
-	noDetect = true
-	defer func() { noDetect = previous }()
 	body := bytes.Repeat([]byte("x"), 1024)
 	request := append([]byte(fmt.Sprintf("POST /benchmark HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n", len(body))), body...)
 	response := append([]byte(fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", len(body))), body...)

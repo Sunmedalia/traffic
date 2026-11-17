@@ -70,6 +70,22 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 		return fmt.Errorf("%w: %w", errCaptureRunning, e)
 	}
 	defer session.UnlockFile(lock)
+	if s.analysis != nil {
+		metadata, err := json.MarshalIndent(s.analysis, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err = add("analysis.json", metadata); err != nil {
+			return err
+		}
+		var original []byte
+		if err = s.db.QueryRow("SELECT data FROM main.requests WHERE id=?", t.ID).Scan(&original); err != nil {
+			return err
+		}
+		if err = add("captured-event.json", original); err != nil {
+			return err
+		}
+	}
 	// Capture diagnostics describe the whole session; gap entries are limited
 	// to this connection / target or an unattributable backend discontinuity.
 	if status, err := os.ReadFile(filepath.Join(s.dir, "status.json")); err == nil {

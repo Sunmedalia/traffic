@@ -23,6 +23,7 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--analysis-binary", type=Path, required=True)
     parser.add_argument("--probe", type=Path, default=Path(__file__).with_name("probe-openssl.py"))
     parser.add_argument("--runtime-dir", default="C:/traffic-lab/probe-runtime")
     parser.add_argument("--service", choices=("auto", "nginx", "apache"), default="auto")
@@ -143,6 +144,13 @@ def main():
         failures.append({"reason": "middleware configuration changed"})
     with sqlite3.connect(session / "index.sqlite") as database:
         rows = [json.loads(row[0]) for row in database.execute("SELECT data FROM requests")]
+    if any(row.get("alerts") for row in rows):
+        raise AssertionError("collector performed detection")
+    subprocess.run([str(args.analysis_binary), "analyze", "--session", str(session)], check=True)
+    with sqlite3.connect(session / "analysis.sqlite") as analysis:
+        matches = {row[0]: json.loads(row[1]) for row in analysis.execute("SELECT id, alerts FROM results")}
+    for row in rows:
+        row["alerts"] = matches[row["id"]]
     for sample in expected:
         matches = [row for row in rows if row.get("url") == sample["path"] and row.get("backend") == ("openssl" if sample["secure"] else "pcap")]
         if len(matches) != 1:

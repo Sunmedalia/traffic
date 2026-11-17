@@ -41,9 +41,6 @@ func readRecords(t *testing.T, s *Store) map[string]Transaction {
 	return out
 }
 func TestFrameEvictionIsLocalAndAccounted(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -81,9 +78,6 @@ func TestFrameEvictionIsLocalAndAccounted(t *testing.T) {
 	}
 }
 func TestGapCannotPairAcrossBoundary(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -112,9 +106,6 @@ func h2Headers(t *testing.T, encoder *hpack.Encoder, block *bytes.Buffer, framer
 	}
 }
 func TestHTTP2MultiplexingHPACKAndTruncation(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -151,9 +142,6 @@ func TestHTTP2MultiplexingHPACKAndTruncation(t *testing.T) {
 	}
 }
 func TestHTTP2HookByteFragments(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -181,9 +169,6 @@ func TestHTTP2HookByteFragments(t *testing.T) {
 	}
 }
 func TestHTTP2MissingHPACKHistoryFailsExplicitly(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -204,9 +189,6 @@ func TestHTTP2MissingHPACKHistoryFailsExplicitly(t *testing.T) {
 	}
 }
 func TestPreflightStrictFailure(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	if requireCaptureChecks(nil) == nil || requireCaptureChecks([]captureCheck{{Status: "unavailable"}}) == nil {
 		t.Fatal("strict preflight accepted unsupported target")
 	}
@@ -216,9 +198,6 @@ func TestPreflightStrictFailure(t *testing.T) {
 }
 
 func TestTLSLargeBodyDrainsBeforeNextRequest(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -252,9 +231,6 @@ func TestOversizedFragmentDoesNotEvictOtherConnections(t *testing.T) {
 	}
 }
 func TestHTTP2ResetAndContinuation(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -285,9 +261,6 @@ func TestHTTP2ResetAndContinuation(t *testing.T) {
 }
 
 func TestTLSHeadThenGetInSameRead(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
@@ -305,9 +278,6 @@ func TestTLSHeadThenGetInSameRead(t *testing.T) {
 }
 
 func TestHTTP2TrailersSurviveSave(t *testing.T) {
-	if err := loadRules(""); err != nil {
-		t.Fatal(err)
-	}
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
