@@ -16,7 +16,7 @@
     <a href="#/rules" data-nav="rules">规则</a>
     <a href="#/analysis" data-nav="analysis">分析<span class="dot running" id="nav-job" hidden></span></a>
   </nav>
-  <nav class="crumb" id="crumb" aria-label="当前会话"></nav>
+  <nav class="crumb" id="crumb" aria-label="当前会话" hidden></nav>
   <div class="spacer"></div>
   <span class="live" id="live" hidden></span>
   <button type="button" class="ghost" id="pause" hidden title="暂停或恢复自动刷新（空格）">暂停</button>
@@ -53,9 +53,9 @@
 
   <section id="view-session" class="session" hidden>
     <nav class="tabs" role="tablist">
-      <button type="button" role="tab" data-tab="overview"><kbd>1</kbd>概览</button>
-      <button type="button" role="tab" data-tab="requests"><kbd>2</kbd>请求<span class="badge" id="count-requests"></span></button>
-      <button type="button" role="tab" data-tab="alerts"><kbd>3</kbd>告警<span class="badge alert" id="count-alerts"></span></button>
+      <button type="button" role="tab" data-tab="overview" title="概览（快捷键 1）">概览</button>
+      <button type="button" role="tab" data-tab="requests" title="请求（快捷键 2）">请求<span class="badge" id="count-requests"></span></button>
+      <button type="button" role="tab" data-tab="alerts" title="告警（快捷键 3）">告警<span class="badge alert" id="count-alerts"></span></button>
       <span class="spacer"></span>
       <a class="tab-action" id="session-analyze" title="用内置或自定义规则重新分析这个会话">重新分析</a>
     </nav>
@@ -343,5 +343,9 @@
   <p class="muted">在时间线上拖选可以把列表限定到一段时间，点击详情里的来源、Host、服务或规则可以直接按它筛选。</p>
 </dialog>
 <script src="app.js"></script>
+<script src="decoder.js"></script>
+<script src="rules.js"></script>
+<script src="analysis.js"></script>
+<script src="main.js"></script>
 </body>
 </html>

@@ -28,14 +28,18 @@ import (
 	"github.com/Sunmedalia/traffic/internal/session"
 )
 
-//go:embed web/index.html web/app.css web/app.js
+//go:embed web/index.html web/app.css web/*.js
 var webAssets embed.FS
+
+// webScripts are the page's classic scripts, loaded in this order by
+// index.html. They share one global scope; main.js runs boot() last.
+var webScripts = []string{"app.js", "decoder.js", "rules.js", "analysis.js", "main.js"}
 
 // webAssetTags lets browsers revalidate the embedded assets instead of
 // downloading them on every page load.
 var webAssetTags = func() map[string]string {
 	tags := map[string]string{}
-	for _, name := range []string{"index.html", "app.css", "app.js"} {
+	for _, name := range append([]string{"index.html", "app.css"}, webScripts...) {
 		data, err := webAssets.ReadFile("web/" + name)
 		if err != nil {
 			continue
@@ -266,16 +270,17 @@ func (w *webServer) handler() http.Handler {
 			files.ServeHTTP(rw, r)
 		}
 	}
-	appCSS, appJS, index := serveAsset("app.css"), serveAsset("app.js"), serveAsset("index.html")
+	index := serveAsset("index.html")
+	assets := map[string]http.HandlerFunc{"app.css": serveAsset("app.css")}
+	for _, name := range webScripts {
+		assets[name] = serveAsset(name)
+	}
 	mux.HandleFunc("GET /{file}", func(rw http.ResponseWriter, r *http.Request) {
-		switch r.PathValue("file") {
-		case "app.css":
-			appCSS.ServeHTTP(rw, r)
-		case "app.js":
-			appJS.ServeHTTP(rw, r)
-		default:
-			http.NotFound(rw, r)
+		if handler, ok := assets[r.PathValue("file")]; ok {
+			handler.ServeHTTP(rw, r)
+			return
 		}
+		http.NotFound(rw, r)
 	})
 	mux.HandleFunc("GET /{$}", index.ServeHTTP)
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {

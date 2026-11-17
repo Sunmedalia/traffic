@@ -84,8 +84,12 @@ type ProbeTransportStats struct {
 	QueuedMessages   int    `json:"queued_messages"`
 	HighWaterBytes   int64  `json:"high_water_bytes"`
 	Overflows        uint64 `json:"overflows"`
-	LastError        string `json:"last_error,omitempty"`
-	Ended            bool   `json:"ended"`
+	// Shed counters report messages discarded while the receive queue was
+	// over budget. The transport keeps running and marks a loss boundary.
+	ShedMessages uint64 `json:"shed_messages,omitempty"`
+	ShedBytes    uint64 `json:"shed_bytes,omitempty"`
+	LastError    string `json:"last_error,omitempty"`
+	Ended        bool   `json:"ended"`
 }
 
 type Stats struct {

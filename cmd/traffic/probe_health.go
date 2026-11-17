@@ -47,7 +47,10 @@ func (s *Store) setTLSTargetsState(identities map[string]bool, state string) {
 func (s *Store) observeProbeTransport(key string, generation uint64, t *probeTransport) func() {
 	stop, done := make(chan struct{}), make(chan struct{})
 	sample := func() {
-		value := session.ProbeTransportStats{Generation: generation, ReceivedMessages: t.receivedMessages.Load(), ReceivedBytes: t.receivedBytes.Load(), DequeuedMessages: t.dequeuedMessages.Load(), DequeuedBytes: t.dequeuedBytes.Load(), PendingBytes: t.pending.Load(), QueuedMessages: len(t.queue), HighWaterBytes: t.highWater.Load(), Overflows: t.overflows.Load()}
+		value := session.ProbeTransportStats{Generation: generation, ReceivedMessages: t.receivedMessages.Load(), ReceivedBytes: t.receivedBytes.Load(), DequeuedMessages: t.dequeuedMessages.Load(), DequeuedBytes: t.dequeuedBytes.Load(), PendingBytes: t.pending.Load(), QueuedMessages: len(t.queue), HighWaterBytes: t.highWater.Load(), Overflows: t.overflows.Load(), ShedMessages: t.shedMessages.Load(), ShedBytes: t.shedBytes.Load()}
+		if last := t.lastOverflow.Load(); last != nil {
+			value.LastError = *last
+		}
 		select {
 		case <-t.done:
 			value.Ended = true

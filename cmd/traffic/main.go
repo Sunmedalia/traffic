@@ -97,6 +97,7 @@ func run(args []string) (runErr error) {
 	fs.IntVar(&collectorMemoryMiB, "collector-memory-mib", 256, "collector and helper memory budget MiB; excludes in-process probes")
 	fs.IntVar(&collectorCPUPercent, "collector-cpu-percent", 50, "collector CPU budget as percent of one CPU")
 	fs.DurationVar(&drainTimeout, "drain-timeout", 5*time.Second, "maximum probe data drain time")
+	fs.DurationVar(&stopTimeout, "stop-timeout", 30*time.Second, "total shutdown budget after stop is requested; must be at least --drain-timeout")
 	noTLS := fs.Bool("no-tls", false, "disable TLS probes")
 	duration := fs.Duration("duration", 0, "optional capture duration")
 	fs.IntVar(&diskLimitMiB, "disk-limit-mib", diskLimitMiB, "session disk budget MiB")
@@ -206,7 +207,7 @@ func run(args []string) (runErr error) {
 	if *service == "openssl" && *pid <= 0 {
 		return errors.New("openssl service requires --pid")
 	}
-	if collectorMemoryMiB < 64 || collectorMemoryMiB > 65536 || collectorCPUPercent < 1 || collectorCPUPercent > 100 || drainTimeout <= 0 || drainTimeout > 15*time.Second {
+	if collectorMemoryMiB < 64 || collectorMemoryMiB > 65536 || collectorCPUPercent < 1 || collectorCPUPercent > 100 || drainTimeout <= 0 || drainTimeout > 15*time.Second || stopTimeout < drainTimeout || stopTimeout > 5*time.Minute {
 		return errors.New("invalid collector resource or drain limits")
 	}
 	if *requireTLS && (*noTLS || cmd != "capture") {
@@ -351,7 +352,12 @@ func run(args []string) (runErr error) {
 		s.report()
 		s.stats.Targets = discoverTargets("/proc", *service, *pid, *lib)
 		p := newRecorder(s)
-		defer p.close()
+		recorderFinalized := false
+		defer func() {
+			if !recorderFinalized {
+				_ = p.close()
+			}
+		}()
 		if cmd == "capture" {
 			cleanup, e := limitResources()
 			if e != nil {
@@ -399,6 +405,7 @@ func run(args []string) (runErr error) {
 			"collector_memory_mib":             collectorMemoryMiB,
 			"collector_cpu_percent":            collectorCPUPercent,
 			"probe_drain_timeout_ms":           drainTimeout.Milliseconds(),
+			"stop_timeout_ms":                  stopTimeout.Milliseconds(),
 			"in_process_probe_budget_included": false,
 		}
 		if cmd == "import" {
@@ -502,41 +509,109 @@ func run(args []string) (runErr error) {
 		s.mu.Unlock()
 		s.report()
 		cancel()
-		wg.Wait()
-		if err := p.close(); err != nil {
-			s.fail(err)
+		recorderFinalized = true // No unbounded second close in the deferred cleanup.
+		budgetExceeded, closeErr := shutdownWithin(wg.Wait, p.close, stopTimeout)
+		if closeErr != nil {
+			s.fail(closeErr)
 		}
-		s.mu.Lock()
-		s.stats.DrainState = "unverified"
-		if *noTLS {
-			s.stats.DrainState = "confirmed"
-		} else if len(s.stats.ProbeExits) > 0 {
-			confirmed := true
-			for _, exit := range s.stats.ProbeExits {
-				confirmed = confirmed && exit.DataDrained
-			}
-			if confirmed {
-				s.stats.DrainState = "confirmed"
-			}
+		if budgetExceeded {
+			s.gap("collector", "", "stop_budget_exceeded", "shutdowns", 1)
+			s.fail(fmt.Errorf("shutdown exceeded --stop-timeout %s; remaining probe data not confirmed", stopTimeout))
 		}
-		finishIISObservability(s, *requirePlaintext)
-		s.stats.StopReason = "signal_or_duration"
-		s.stats.State = "stopped"
-		if s.stats.RawEvidenceWriters > 0 || s.stats.RawEvidencePendingBytes > 0 || s.stats.RawEvidenceDrainUnconfirmed {
-			s.stats.DrainState = "unverified"
-		}
-		if s.fatal != nil {
-			s.stats.State = "failed"
-			s.stats.StopReason = "fatal_error"
-			s.stats.DrainState = "unverified"
-		}
-		s.mu.Unlock()
+		fatal := finishCaptureState(s, *noTLS, *requirePlaintext, budgetExceeded)
 		s.report()
-		emit(s.stats)
-		return s.fatal
+		emit(snapshotStats(s))
+		return fatal
 	}
 	return fmt.Errorf("unknown command %s", cmd)
 }
+
+// finishCaptureState reads the final error only after plaintext checks, which
+// may themselves fail the capture. Callers use the same outcome for JSON and
+// the process exit status.
+func finishCaptureState(s *Store, noTLS, requirePlaintext, budgetExceeded bool) error {
+	s.mu.Lock()
+	s.stats.DrainState = "unverified"
+	if noTLS {
+		s.stats.DrainState = "confirmed"
+	} else if len(s.stats.ProbeExits) > 0 {
+		confirmed := true
+		for _, exit := range s.stats.ProbeExits {
+			confirmed = confirmed && exit.DataDrained
+		}
+		if confirmed {
+			s.stats.DrainState = "confirmed"
+		}
+	}
+	finishIISObservability(s, requirePlaintext)
+	s.stats.StopReason = "signal_or_duration"
+	s.stats.State = "stopped"
+	if s.stats.RawEvidenceWriters > 0 || s.stats.RawEvidencePendingBytes > 0 || s.stats.RawEvidenceDrainUnconfirmed {
+		s.stats.DrainState = "unverified"
+	}
+	if budgetExceeded {
+		s.stats.StopReason = "stop_budget_exceeded"
+		s.stats.DrainState = "unverified"
+	}
+	fatal := s.fatal
+	if fatal != nil {
+		s.stats.State = "failed"
+		if !budgetExceeded {
+			s.stats.StopReason = "fatal_error"
+		}
+		s.stats.DrainState = "unverified"
+	}
+	s.mu.Unlock()
+	return fatal
+}
+
+// shutdownWithin shares one deadline between workers and recorder. A blocked
+// close is never invoked a second time on return, and background goroutines do
+// not read mutable timeout flags or modify the caller's error result.
+func shutdownWithin(wait func(), closeRecorder func() error, budget time.Duration) (bool, error) {
+	deadline := time.Now().Add(budget)
+	workersStopped := waitWithin(wait, budget)
+	closed := make(chan error, 1)
+	go func() { closed <- closeRecorder() }()
+	if !workersStopped {
+		return true, nil
+	}
+	timer := time.NewTimer(max(0, time.Until(deadline)))
+	defer timer.Stop()
+	select {
+	case err := <-closed:
+		return false, err
+	case <-timer.C:
+		return true, nil
+	}
+}
+
+// Workers may still finish after a shutdown timeout. Never emit references to
+// their live maps and slices after releasing the store lock.
+func snapshotStats(s *Store) Stats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, _ := json.Marshal(s.stats)
+	var snapshot Stats
+	_ = json.Unmarshal(b, &snapshot)
+	return snapshot
+}
+
+// waitWithin runs fn and reports whether it returned within budget. On
+// timeout fn keeps running in the background; the process is about to exit.
+func waitWithin(fn func(), budget time.Duration) bool {
+	done := make(chan struct{})
+	go func() { fn(); close(done) }()
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
 func maintain(s *Store) error {
 	return checkDisk(s)
 }

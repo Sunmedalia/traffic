@@ -106,3 +106,109 @@ func TestPacketSegmentsNeverOverwriteEarlierEvidence(t *testing.T) {
 		t.Fatal("segments overwritten", len(files), err)
 	}
 }
+
+func TestPacketWriterPersistsInOrderOffCaptureLoop(t *testing.T) {
+	dir := t.TempDir()
+	s := &Store{}
+	ring := &packetRing{dir: dir, iface: "lo", link: layers.LinkTypeEthernet, snaplen: uint32(captureSnapshotLength())}
+	w := newPacketWriter(s, "lo", ring)
+	for i := 0; i < 100; i++ {
+		data := []byte{byte(i), 1, 2, 3}
+		if err := w.write(gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: len(data), Length: len(data)}, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.close(); err != nil {
+		t.Fatal("second close", err)
+	}
+	files, _ := os.ReadDir(dir)
+	if len(files) != 1 {
+		t.Fatal("segments", files)
+	}
+	file, err := os.Open(filepath.Join(dir, files[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	reader, err := pcapgo.NewReader(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ {
+		got, _, err := reader.ReadPacketData()
+		if err != nil || got[0] != byte(i) {
+			t.Fatal("packet lost or reordered", i, err)
+		}
+	}
+	if w.pending.Load() != 0 || s.stats.GapCounts != nil {
+		t.Fatal("unexpected pending bytes or gaps", w.pending.Load(), s.stats.GapCounts)
+	}
+}
+
+func TestPacketWriterShedsWithExplicitGapWhenQueueFull(t *testing.T) {
+	s := &Store{}
+	// Do not start the consumer yet, so the two-slot queue fills.
+	ring := &packetRing{dir: t.TempDir(), iface: "eth0", link: layers.LinkTypeEthernet, snaplen: uint32(captureSnapshotLength())}
+	w := &packetWriter{store: s, iface: "eth0", ring: ring, queue: make(chan packetWriteItem, 2), done: make(chan struct{})}
+	data := make([]byte, 64)
+	info := gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: len(data), Length: len(data)}
+	for i := 0; i < 5; i++ {
+		if err := w.write(info, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if w.dropped.Load() != 3 {
+		t.Fatal("queue overflow was not counted", w.dropped.Load())
+	}
+	w.pending.Store(packetWriteQueueBytes)
+	if err := w.write(info, data); err != nil || w.dropped.Load() != 4 {
+		t.Fatal("byte budget was not enforced", w.dropped.Load())
+	}
+	w.pending.Store(int64(2 * len(data)))
+	go w.run()
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.stats.GapCounts["pcap/write_queue_overflow/packets"]; got != 4 {
+		t.Fatal("shed packets not reported as a gap", s.stats.GapCounts)
+	}
+}
+
+func TestPacketWriterReportsWriteFailure(t *testing.T) {
+	s := &Store{}
+	ring := &packetRing{dir: filepath.Join(t.TempDir(), "missing"), iface: "eth0", link: layers.LinkTypeEthernet, snaplen: uint32(captureSnapshotLength())}
+	w := newPacketWriter(s, "eth0", ring)
+	data := []byte("x")
+	_ = w.write(gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: 1, Length: 1}, data)
+	deadline := time.Now().Add(time.Second)
+	for w.failure() == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if w.failure() == nil {
+		t.Fatal("write failure not surfaced to the capture loop")
+	}
+	if err := w.write(gopacket.CaptureInfo{}, data); err == nil {
+		t.Fatal("write accepted after failure")
+	}
+	if err := w.close(); err == nil {
+		t.Fatal("close hid the write failure")
+	}
+}
+
+func TestWaitWithinBoundsShutdown(t *testing.T) {
+	if !waitWithin(func() {}, time.Second) {
+		t.Fatal("fast stop reported as timeout")
+	}
+	release := make(chan struct{})
+	defer close(release)
+	started := time.Now()
+	if waitWithin(func() { <-release }, 20*time.Millisecond) {
+		t.Fatal("hung stop reported as complete")
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("stop budget not enforced")
+	}
+}

@@ -101,7 +101,9 @@ button.icon { min-width: 30px; padding: 4px 6px; }
 }
 .brand { display: inline-flex; align-items: center; gap: 8px; margin-right: 10px; font: 700 13px var(--mono); letter-spacing: .2em; color: var(--text); text-decoration: none; }
 .brand-mark { width: 10px; height: 16px; border-radius: 2px; background: linear-gradient(180deg, var(--accent), color-mix(in srgb, var(--accent) 35%, transparent)); }
-.crumb { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--muted); white-space: nowrap; }
+.crumb { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--muted); white-space: nowrap; padding-left: 14px; border-left: 1px solid var(--line); }
+.crumb[hidden] { display: none; }
+.crumb .started { color: var(--faint); font-family: var(--mono); font-size: .9em; }
 .crumb a { color: var(--muted); text-decoration: none; }
 .crumb a:hover { color: var(--text); }
 .crumb strong { color: var(--text); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -442,7 +444,7 @@ button.danger { color: var(--high); }
 .rules-preview { display: flex; flex-direction: column; gap: 6px; min-width: 0; min-height: 0; overflow: auto; padding: 12px 14px; }
 .rules-preview .table-wrap { overflow: visible; }
 .rules-table td.pattern { min-width: 180px; white-space: pre-wrap; word-break: break-all; color: var(--muted); }
-.rules-table td:nth-child(3) { max-width: 150px; white-space: normal; word-break: break-all; }
+.rules-table td:nth-child(3) { white-space: nowrap; }
 .rules-table tbody tr { vertical-align: top; }
 .rules-body.readonly .rules-table tbody tr { cursor: default; }
 .rules-ref { margin-top: 8px; border-top: 1px solid var(--line-soft); padding-top: 8px; }
@@ -546,7 +548,7 @@ button.danger { color: var(--high); }
 @media (max-width: 720px) {
   .top { padding: 7px 10px; gap: 2px; }
   .brand { letter-spacing: .12em; margin-right: 6px; }
-  .tabs kbd, .search kbd, #tz, #theme, .crumb .host, .crumb .root, .crumb .sep.h { display: none; }
+  .search kbd, #tz, #theme, .crumb .host, .crumb .sep.h, .crumb .started { display: none; }
   .extra, .time .date { display: none; }
   .filterbar, .strip, .split { padding-left: 10px; padding-right: 10px; }
   .page { padding: 12px 10px 24px; }
@@ -557,4 +559,14 @@ button.danger { color: var(--high); }
   .recent button { grid-template-columns: 30px 64px minmax(0, 1fr); }
   .recent .who { display: none; }
   #detail-curl { display: none; }
+}
+
+.facts ul.gaps { margin: 0; padding: 0; list-style: none; }
+.facts ul.gaps li { display: flex; gap: 8px; justify-content: space-between; }
+.facts ul.gaps code { overflow-wrap: anywhere; }
+.mainnav a { white-space: nowrap; }
+.card-head { flex-wrap: wrap; }
+#health:empty { display: none; }
+@media (max-width: 560px) {
+  .crumb { display: none; }
 }

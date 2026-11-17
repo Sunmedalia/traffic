@@ -19,12 +19,22 @@ type probeMessageReader interface {
 	Close() error
 }
 
-// Read the probe socket independently of parsing and SQLite writes. Buffers are
-// bounded by bytes as well as count; overload terminates this transport with a
-// visible gap rather than silently parsing across missing events.
+// probeMessage carries one received payload. shed is the number of messages
+// discarded immediately before it while the queue was over budget, so the
+// consumer can mark an explicit loss boundary before parsing data again.
+type probeMessage struct {
+	data []byte
+	shed uint64
+}
+
+// Read the probe socket independently of parsing and evidence writes. Buffers
+// are bounded by bytes as well as count. Overload no longer tears down the
+// transport (which lost every event until reattach and reopened the attach
+// window); instead the receiver sheds messages until the queue drains to half
+// its budget, then hands the shed count to the consumer with the next message.
 type probeTransport struct {
 	reader           probeMessageReader
-	queue            chan []byte
+	queue            chan probeMessage
 	done             chan struct{}
 	stopOnce         sync.Once
 	pending          atomic.Int64
@@ -34,13 +44,17 @@ type probeTransport struct {
 	dequeuedBytes    atomic.Uint64
 	highWater        atomic.Int64
 	overflows        atomic.Uint64
+	shedMessages     atomic.Uint64
+	shedBytes        atomic.Uint64
+	lastOverflow     atomic.Pointer[string]
+	tailShed         uint64 // shed after the last queued message; read after done
 	err              error
 }
 
 func startProbeTransport(reader probeMessageReader, onError ...func(error)) *probeTransport {
 	// Small events exhausted 1024 slots at only about 809 KiB in the lab.
 	// Preserve the byte budget while allowing it to absorb a small-event burst.
-	t := &probeTransport{reader: reader, queue: make(chan []byte, probeConnectionMessages), done: make(chan struct{})}
+	t := &probeTransport{reader: reader, queue: make(chan probeMessage, probeConnectionMessages), done: make(chan struct{})}
 	go func() {
 		defer close(t.done)
 		defer close(t.queue)
@@ -51,68 +65,99 @@ func startProbeTransport(reader probeMessageReader, onError ...func(error)) *pro
 				}
 			}
 		}()
+		shedding := false
+		var shed uint64
 		for {
 			_, data, err := reader.ReadMessage()
 			if err != nil {
-				t.err = err
+				t.err, t.tailShed = err, shed
 				return
 			}
 			t.receivedMessages.Add(1)
 			t.receivedBytes.Add(uint64(len(data)))
-			n := int64(len(data))
-			if t.pending.Add(n) > probeConnectionBudget {
-				t.err = t.overflow("connection_bytes")
-				t.pending.Add(-n)
-				return
+			if shedding && !t.drained() {
+				shed++
+				t.shedMessages.Add(1)
+				t.shedBytes.Add(uint64(len(data)))
+				continue
 			}
-			if probeTransportBytes.Add(n) > probeTransportBudget {
-				t.err = t.overflow("global_bytes")
-				probeTransportBytes.Add(-n)
-				t.pending.Add(-n)
-				return
+			shedding = false
+			if reason := t.reserve(data); reason != "" {
+				shedding = true
+				shed++
+				t.shedMessages.Add(1)
+				t.shedBytes.Add(uint64(len(data)))
+				t.overflow(reason)
+				continue
 			}
-			select {
-			case t.queue <- data:
-				for value := t.pending.Load(); value > t.highWater.Load(); {
-					if old := t.highWater.Load(); value <= old || t.highWater.CompareAndSwap(old, value) {
-						break
-					}
+			t.queue <- probeMessage{data: data, shed: shed}
+			shed = 0
+			for value := t.pending.Load(); value > t.highWater.Load(); {
+				if old := t.highWater.Load(); value <= old || t.highWater.CompareAndSwap(old, value) {
+					break
 				}
-			default:
-				t.err = t.overflow("message_count")
-				t.release(data)
-				return
 			}
 		}
 	}()
 	return t
 }
-func (t *probeTransport) overflow(reason string) error {
+
+// reserve accounts for one message, returning the overflow reason if it does
+// not fit. A reserved message always has a free queue slot because only this
+// goroutine sends and the slot check happens first.
+func (t *probeTransport) reserve(data []byte) string {
+	if len(t.queue) >= cap(t.queue) {
+		return "message_count"
+	}
+	n := int64(len(data))
+	if t.pending.Add(n) > probeConnectionBudget {
+		t.pending.Add(-n)
+		return "connection_bytes"
+	}
+	if probeTransportBytes.Add(n) > probeTransportBudget {
+		probeTransportBytes.Add(-n)
+		t.pending.Add(-n)
+		return "global_bytes"
+	}
+	return ""
+}
+
+// drained reports hysteresis: resume only once half the local budget and
+// queue are free, so one slow parse does not alternate accept/shed per event.
+func (t *probeTransport) drained() bool {
+	return t.pending.Load() <= probeConnectionBudget/2 && len(t.queue) <= cap(t.queue)/2 && probeTransportBytes.Load() <= probeTransportBudget/2
+}
+
+func (t *probeTransport) overflow(reason string) {
 	t.overflows.Add(1)
-	return fmt.Errorf("%w: reason=%s pending_bytes=%d queued_messages=%d global_bytes=%d", errProbeTransportBackpressure, reason, t.pending.Load(), len(t.queue), probeTransportBytes.Load())
+	text := fmt.Errorf("%w: reason=%s pending_bytes=%d queued_messages=%d global_bytes=%d", errProbeTransportBackpressure, reason, t.pending.Load(), len(t.queue), probeTransportBytes.Load()).Error()
+	t.lastOverflow.Store(&text)
 }
 func (t *probeTransport) release(data []byte) {
 	n := int64(len(data))
 	t.pending.Add(-n)
 	probeTransportBytes.Add(-n)
 }
-func (t *probeTransport) next() ([]byte, error) {
-	data, ok := <-t.queue
+
+// next returns the next payload and the number of messages shed before it.
+// A final shed count with no following message is returned with the error.
+func (t *probeTransport) next() ([]byte, uint64, error) {
+	message, ok := <-t.queue
 	if !ok {
 		<-t.done
-		return nil, t.err
+		return nil, t.tailShed, t.err
 	}
-	t.release(data)
+	t.release(message.data)
 	t.dequeuedMessages.Add(1)
-	t.dequeuedBytes.Add(uint64(len(data)))
-	return data, nil
+	t.dequeuedBytes.Add(uint64(len(message.data)))
+	return message.data, message.shed, nil
 }
 func (t *probeTransport) close() {
 	t.stopOnce.Do(func() {
 		_ = t.reader.Close()
 		<-t.done
-		for data := range t.queue {
-			t.release(data)
+		for message := range t.queue {
+			t.release(message.data)
 		}
 	})
 }

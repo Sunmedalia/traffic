@@ -52,35 +52,56 @@ func TestProbeTransportReceivesBurstWhileParserPaused(t *testing.T) {
 		t.Fatal("receiver blocked on the parser", tr.pending.Load())
 	}
 	for i := 0; i < 512; i++ {
-		data, err := tr.next()
-		if err != nil || len(data) != 2 || int(data[0])*256+int(data[1]) != i {
+		data, shed, err := tr.next()
+		if err != nil || shed != 0 || len(data) != 2 || int(data[0])*256+int(data[1]) != i {
 			t.Fatal("probe messages reordered", i, data, err)
 		}
 	}
-	if _, err := tr.next(); !errors.Is(err, io.EOF) {
+	if _, _, err := tr.next(); !errors.Is(err, io.EOF) {
 		t.Fatal(err)
 	}
 	if probeTransportBytes.Load() != before {
 		t.Fatal("probe byte reservation leaked")
 	}
 }
-func TestProbeTransportBoundsAndEarlyParserExit(t *testing.T) {
+func TestProbeTransportShedsAndRecoversWithinBounds(t *testing.T) {
 	before := probeTransportBytes.Load()
 	for _, size := range []int{1, 2 << 20} {
 		r := newFakeProbeReader()
-		for i := 0; i <= probeConnectionMessages; i++ {
+		total := probeConnectionMessages + 1
+		if size > 1 {
+			total = 6
+		}
+		for i := 0; i < total; i++ {
 			r.messages <- make([]byte, size)
-			if size > 1 && i == 5 {
-				break
-			}
 		}
 		tr := startProbeTransport(r)
-		awaitProbeDone(t, tr)
-		if !errors.Is(tr.err, errProbeTransportBackpressure) {
-			t.Fatal("overflow was silent", tr.err)
+		deadline := time.Now().Add(time.Second)
+		for tr.shedMessages.Load() == 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if tr.overflows.Load() != 1 || tr.shedMessages.Load() == 0 {
+			t.Fatal("overflow was silent", tr.overflows.Load(), tr.shedMessages.Load())
 		}
 		if tr.pending.Load() > probeConnectionBudget || probeTransportBytes.Load()-before > probeConnectionBudget {
 			t.Fatal("receive memory budget exceeded")
+		}
+		select {
+		case <-tr.done:
+			t.Fatal("overflow tore down the transport")
+		default:
+		}
+		// Drain, then deliver one more message: it must carry the shed count.
+		queued := len(tr.queue)
+		for i := 0; i < queued; i++ {
+			if _, shed, err := tr.next(); err != nil || shed != 0 {
+				t.Fatal("unexpected shed before boundary", shed, err)
+			}
+		}
+		r.messages <- []byte("after")
+		data, shed, err := tr.next()
+		if err != nil || string(data) != "after" || shed != tr.shedMessages.Load() {
+			t.Fatal("shed boundary not delivered with next message", string(data), shed, err)
 		}
 		tr.close()
 		tr.close()
@@ -98,13 +119,15 @@ func TestProbeTransportBoundsAndEarlyParserExit(t *testing.T) {
 func TestProbeTransportGlobalBudget(t *testing.T) {
 	before := probeTransportBytes.Load()
 	probeTransportBytes.Add(probeTransportBudget)
-	defer probeTransportBytes.Add(-probeTransportBudget)
 	r := newFakeProbeReader()
 	r.messages <- []byte("over global budget")
+	close(r.messages)
 	tr := startProbeTransport(r)
 	awaitProbeDone(t, tr)
+	_, shed, err := tr.next()
+	probeTransportBytes.Add(-probeTransportBudget)
 	tr.close()
-	if !errors.Is(tr.err, errProbeTransportBackpressure) || tr.pending.Load() != 0 || probeTransportBytes.Load() != before+probeTransportBudget {
-		t.Fatal("global receive budget was not enforced", tr.err)
+	if !errors.Is(err, io.EOF) || shed != 1 || tr.overflows.Load() != 1 || tr.pending.Load() != 0 || probeTransportBytes.Load() != before {
+		t.Fatal("global receive budget was not enforced", err, shed)
 	}
 }
