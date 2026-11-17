@@ -350,7 +350,7 @@ function renderChrome() {
   const session = currentSession();
   const crumb = $('crumb');
   if (state.sid && state.token) {
-    set(crumb, 
+    set(crumb,
       h('a', { href: '#/', class: 'root' }, '会话'), h('span', { class: 'sep h' }, '/'),
       session && session.host ? [h('span', { class: 'host' }, session.host), h('span', { class: 'sep h' }, '/')] : null,
       h('strong', { title: session ? session.dir : '' }, session ? session.name : state.sid));
@@ -552,7 +552,7 @@ function renderOverview() {
   renderHealth();
   const tile = (label, value, note, tone) => h('div', { class: 'tile ' + (tone || '') },
     h('div', { class: 'label' }, label), h('div', { class: 'value' }, state.stats ? number(value) : '—'), h('div', { class: 'note' }, note || ''));
-  set($('tiles'), 
+  set($('tiles'),
     tile('累计请求', s.transactions, sum ? `索引内保留 ${number(sum.total)} 条` : ''),
     tile('累计告警命中', s.alerts, sum ? `涉及 ${number(sum.alerted)} 条请求` : '', s.alerts > 0 ? 'alerting' : ''),
     tile('网络包', s.packets, s.tls_wire_records ? `TLS 外层记录 ${number(s.tls_wire_records)}` : ''),
@@ -954,7 +954,7 @@ function renderDetail() {
   const t = data.transaction;
   const alerts = t.alerts || [];
   const needles = [...new Set(alerts.map((a) => a.match).filter(Boolean))];
-  set($('detail-pills'), 
+  set($('detail-pills'),
     h('span', { class: 'method' }, t.method || '—'),
     h('span', { class: 'status st-' + (t.status ? String(t.status)[0] : '0') }, t.status ? String(t.status) : '待响应'),
     t.incomplete && h('span', { class: 'flag' }, '不完整'), t.truncated && h('span', { class: 'flag' }, '截断'),

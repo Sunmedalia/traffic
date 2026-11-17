@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"runtime"
 	"testing"
 )
 
@@ -58,7 +59,13 @@ func TestKernelScopeFileTracksPIDReuseAndRemoval(t *testing.T) {
 	if cfg = read(); len(cfg.PIDs) != 0 {
 		t.Fatal("empty scope must revoke every PID", cfg)
 	}
-	if st, _ := os.Stat(scope.path); st.Mode().Perm()&0077 != 0 {
+	st, err := os.Stat(scope.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Windows FileMode does not expose Unix group/other permission bits.
+	// The eBPF scope file is consumed on Linux; keep its privacy check on Unix.
+	if runtime.GOOS != "windows" && st.Mode().Perm()&0077 != 0 {
 		t.Fatal("scope snapshot is not private", st.Mode())
 	}
 }

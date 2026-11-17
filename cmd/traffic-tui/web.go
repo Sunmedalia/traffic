@@ -207,7 +207,7 @@ func (w *webServer) sessionStore(rw http.ResponseWriter, r *http.Request) *Store
 func webFilter(r *http.Request) (tuiFilter, func(string) string, error) {
 	q := r.URL.Query()
 	get := func(name string) string { return strings.TrimSpace(q.Get(name)) }
-	filter := tuiFilter{Client: get("client"), Rule: get("rule"), Severity: get("severity"), Keyword: get("keyword"), Service: get("service"), Method: get("method"), Status: get("status")}
+	filter := tuiFilter{UntilExclusive: true, Client: get("client"), Rule: get("rule"), Severity: get("severity"), Keyword: get("keyword"), Service: get("service"), Method: get("method"), Status: get("status")}
 	if filter.Severity != "" && filter.Severity != "low" && filter.Severity != "medium" && filter.Severity != "high" {
 		return filter, get, errors.New("级别必须是 low、medium 或 high")
 	}

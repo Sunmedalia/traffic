@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -21,6 +22,8 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
 )
+
+var errCaptureRunning = errors.New("stop capture before exporting evidence")
 
 func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 	f, e := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
@@ -64,7 +67,7 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 	}
 	defer lock.Close()
 	if e = session.LockFile(lock, false); e != nil {
-		return fmt.Errorf("stop capture before exporting evidence: %w", e)
+		return fmt.Errorf("%w: %w", errCaptureRunning, e)
 	}
 	defer session.UnlockFile(lock)
 	// Capture diagnostics describe the whole session; gap entries are limited

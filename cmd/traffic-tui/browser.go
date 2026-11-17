@@ -39,7 +39,10 @@ type sessionBrowser struct {
 	entries                 []sessionEntry
 	selected, width, height int
 	scanning, editing       bool
-	path                    textinput.Model
+	searching               bool
+	path, query             textinput.Model
+	order                   []int
+	lastDir                 string
 	notice                  string
 	child                   *tuiModel
 	childCancel             context.CancelFunc
@@ -182,7 +185,7 @@ func runSessionBrowser(dir, root string, refresh time.Duration, filter tuiFilter
 	input.SetVirtualCursor(true)
 	input.CharLimit = 4096
 	input.SetWidth(74)
-	m := &sessionBrowser{ctx: ctx, roots: sessionRoots(root), refresh: refresh, filter: filter, width: 80, height: 24, path: input}
+	m := &sessionBrowser{ctx: ctx, roots: sessionRoots(root), refresh: refresh, filter: filter, width: 80, height: 24, path: input, query: newSessionQuery()}
 	defer m.closeSession()
 	if dir != "" {
 		m.roots = append(m.roots, sessionPath(dir))
@@ -220,13 +223,14 @@ func (m *sessionBrowser) openSession(dir string) error {
 	}
 	m.closeSession()
 	m.childCancel = cancel
-	m.child = &tuiModel{ctx: ctx, store: s, refresh: m.refresh, filter: m.filter, snapshot: snapshot, width: m.width, height: m.height, viewport: viewport.New()}
+	m.lastDir = dir
+	m.child = &tuiModel{ctx: ctx, store: s, refresh: m.refresh, filter: m.filter, snapshot: snapshot, title: sessionTitle(dir), width: m.width, height: m.height, viewport: viewport.New()}
 	m.child.resize()
 	return nil
 }
 
-// Tag every child command, including batches and ticks, so results from a closed
-// session cannot update the next session or start duplicate refresh loops.
+// Tag the child's session results, including those inside batches, so results from
+// a closed session cannot update the next session or start duplicate refresh loops.
 func sessionCommand(cmd tea.Cmd, generation uint64) tea.Cmd {
 	if cmd == nil {
 		return nil
@@ -240,10 +244,13 @@ func sessionCommand(cmd tea.Cmd, generation uint64) tea.Cmd {
 			}
 			return tea.Batch(commands...)()
 		}
-		if _, ok := msg.(tea.QuitMsg); ok {
-			return msg
+		// Only session data needs the tag. Runtime messages such as clipboard
+		// writes must reach Bubble Tea itself; input widgets accept them untagged.
+		switch msg.(type) {
+		case tuiTick, tuiLoaded, tuiExported:
+			return sessionChildMsg{generation, msg}
 		}
-		return sessionChildMsg{generation, msg}
+		return msg
 	}
 }
 func (m *sessionBrowser) scan() tea.Cmd {
@@ -266,17 +273,12 @@ func (m *sessionBrowser) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.path.SetWidth(max(1, msg.Width-6))
 	case sessionsFound:
-		selectedDir := ""
-		if m.selected < len(m.entries) {
-			selectedDir = m.entries[m.selected].Dir
+		selectedDir := m.lastDir
+		if entry, ok := m.current(); ok {
+			selectedDir = entry.Dir
 		}
 		m.entries, m.notice, m.scanning = msg.Entries, msg.Warning, false
-		m.selected = 0
-		for i, entry := range m.entries {
-			if entry.Dir == selectedDir {
-				m.selected = i
-			}
-		}
+		m.reorder(selectedDir)
 		return m, nil
 	case sessionChildMsg:
 		if m.child == nil || msg.Generation != m.generation {
@@ -290,10 +292,28 @@ func (m *sessionBrowser) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		if m.child != nil {
-			if key == "s" && !m.child.filtering {
+			if key == "s" && !m.child.modal() {
 				m.closeSession()
 				return m, m.scan()
 			}
+		} else if m.searching {
+			switch key {
+			case "esc":
+				m.query.SetValue("")
+				fallthrough
+			case "enter":
+				m.searching = false
+				m.query.Blur()
+				m.reorder(m.selectedDir())
+				return m, nil
+			case "up", "down":
+				m.move(map[string]int{"up": -1, "down": 1}[key])
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.query, cmd = m.query.Update(msg)
+			m.reorder(m.selectedDir())
+			return m, cmd
 		} else if m.editing {
 			switch key {
 			case "esc":
@@ -325,24 +345,32 @@ func (m *sessionBrowser) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.path.SetWidth(max(1, m.width-6))
 				m.path.SetValue(m.roots[0])
 				return m, m.path.Focus()
+			case "/":
+				m.searching = true
+				m.query.SetWidth(max(1, m.width-8))
+				return m, m.query.Focus()
+			case "esc":
+				if m.query.Value() != "" {
+					m.query.SetValue("")
+					m.reorder(m.selectedDir())
+				}
 			case "up", "k":
-				m.selected = max(0, m.selected-1)
+				m.move(-1)
 			case "down", "j":
-				m.selected = min(max(0, len(m.entries)-1), m.selected+1)
+				m.move(1)
 			case "g", "home":
 				m.selected = 0
 			case "G", "end":
-				m.selected = max(0, len(m.entries)-1)
+				m.selected = max(0, len(m.order)-1)
 			case "pgdown":
-				m.selected = min(max(0, len(m.entries)-1), m.selected+max(1, (m.height-10)/2))
+				m.move(max(1, (m.height-10)/2))
 			case "pgup":
-				m.selected = max(0, m.selected-max(1, (m.height-10)/2))
+				m.move(-max(1, (m.height-10)/2))
 			case "enter":
 				if m.scanning {
 					return m, nil
 				}
-				if m.selected < len(m.entries) {
-					entry := m.entries[m.selected]
+				if entry, ok := m.current(); ok {
 					if entry.Problem != "" {
 						m.notice = "会话索引不可用 · " + entry.Problem
 						return m, nil
@@ -368,47 +396,191 @@ func (m *sessionBrowser) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	return m, nil
 }
+func newSessionQuery() textinput.Model {
+	query := textinput.New()
+	query.SetVirtualCursor(true)
+	query.CharLimit = 256
+	query.Placeholder = "会话名、主机或路径"
+	return query
+}
+
+// sessionTitle names a session as host / date / name for the workspace header.
+func sessionTitle(dir string) string {
+	var manifest struct {
+		Name    string    `json:"name"`
+		Host    string    `json:"hostname"`
+		Started time.Time `json:"started"`
+	}
+	parts := []string{}
+	if b, err := os.ReadFile(filepath.Join(dir, "manifest.json")); err == nil && json.Unmarshal(b, &manifest) == nil {
+		if manifest.Host != "" {
+			parts = append(parts, manifest.Host)
+		}
+		if !manifest.Started.IsZero() {
+			parts = append(parts, manifest.Started.Local().Format("2006-01-02"))
+		}
+	}
+	name := manifest.Name
+	if name == "" {
+		name = filepath.Base(dir)
+	}
+	return strings.Join(append(parts, name), " / ")
+}
+
+func sessionHost(entry sessionEntry) string {
+	if entry.Host == "" {
+		return "未知主机"
+	}
+	return entry.Host
+}
+
+// reorder applies the search and groups sessions by host. Hosts follow their newest
+// session, and live captures come first within a host.
+func (m *sessionBrowser) reorder(selectedDir string) {
+	query := strings.ToLower(strings.TrimSpace(m.query.Value()))
+	hostRank := map[string]int{}
+	m.order = m.order[:0]
+	for i, entry := range m.entries {
+		if query != "" && !strings.Contains(strings.ToLower(entry.Name+" "+entry.Host+" "+entry.Dir), query) {
+			continue
+		}
+		if _, ok := hostRank[sessionHost(entry)]; !ok {
+			hostRank[sessionHost(entry)] = len(hostRank)
+		}
+		m.order = append(m.order, i)
+	}
+	sort.SliceStable(m.order, func(a, b int) bool {
+		x, y := m.entries[m.order[a]], m.entries[m.order[b]]
+		if hostRank[sessionHost(x)] != hostRank[sessionHost(y)] {
+			return hostRank[sessionHost(x)] < hostRank[sessionHost(y)]
+		}
+		return x.Stats.State == "running" && y.Stats.State != "running"
+	})
+	m.selected = 0
+	for i, index := range m.order {
+		if m.entries[index].Dir == selectedDir {
+			m.selected = i
+		}
+	}
+}
+func (m *sessionBrowser) current() (sessionEntry, bool) {
+	if m.selected < len(m.order) && m.order[m.selected] < len(m.entries) {
+		return m.entries[m.order[m.selected]], true
+	}
+	return sessionEntry{}, false
+}
+func (m *sessionBrowser) selectedDir() string {
+	entry, _ := m.current()
+	return entry.Dir
+}
+func (m *sessionBrowser) move(step int) {
+	m.selected = max(0, min(len(m.order)-1, m.selected+step))
+}
+
+func sessionBadge(entry sessionEntry) string {
+	if entry.Problem != "" {
+		return tuiDanger.Render("✕ 索引不可用")
+	}
+	return tuiStateBadge(entry.Stats.State)
+}
+
 func (m *sessionBrowser) View() tea.View {
 	if m.child != nil {
 		return m.child.View()
 	}
 	width, height := max(1, m.width), max(1, m.height)
-	clip := func(s string) string { return termansi.Truncate(tuiLine(s), max(1, width-2), "…") }
-	header := tuiAccent.Render("TRAFFIC  /  选择会话")
-	count := fmt.Sprintf("%d 个会话 · 按开始时间从新到旧", len(m.entries))
+	clip := func(s string) string { return termansi.Truncate(s, width, "…") }
+	running := 0
+	for _, entry := range m.entries {
+		if entry.Stats.State == "running" {
+			running++
+		}
+	}
+	count := fmt.Sprintf("%d 个会话", len(m.entries))
+	if running > 0 {
+		count += fmt.Sprintf(" · %d 个正在采集", running)
+	}
+	if len(m.order) != len(m.entries) {
+		count = fmt.Sprintf("显示 %d / %d 个会话", len(m.order), len(m.entries))
+	}
 	if m.scanning {
 		count = "正在识别会话…"
 	}
-	lines := []string{header, tuiMuted.Render(clip(count)), tuiMuted.Render(clip("目录  " + strings.Join(m.roots, " · "))), ""}
-	visible := max(1, (height-10)/2)
-	start := max(0, m.selected-visible+1)
-	for i := start; i < min(len(m.entries), start+visible); i++ {
-		entry := m.entries[i]
-		state := tuiState(entry.Stats.State)
-		if entry.Problem != "" {
-			state = "索引不可用"
+	header := []string{tuiSpread(tuiAccent.Render("TRAFFIC  /  选择会话"), tuiMuted.Render(count), width), tuiMuted.Render(clip(tuiLine("目录  " + strings.Join(m.roots, " · "))))}
+	if m.searching || m.query.Value() != "" {
+		search := tuiMuted.Render("查找  ") + tuiLine(m.query.Value())
+		if m.searching {
+			search = tuiMuted.Render("查找  ") + m.query.View()
 		}
-		counts := "请求 未知 · 告警 未知"
+		header = append(header, clip(search))
+	}
+	header = append(header, "")
+
+	// Build every row, then show the window that keeps the cursor visible.
+	numbers := width >= 70
+	columns := tuiCell("", 2) + tuiCell("状态", 14) + tuiCell("开始时间", 16)
+	if numbers {
+		columns += tuiCell("请求", 10) + tuiCell("告警", 8)
+	}
+	rows := []string{}
+	cursor := 0
+	lastHost := ""
+	for i, index := range m.order {
+		entry := m.entries[index]
+		if host := sessionHost(entry); i == 0 || host != lastHost {
+			rows = append(rows, tuiAccent.Render(clip(tuiLine(host))))
+			lastHost = host
+		}
+		requests, alerts := tuiMuted.Render(tuiCell("未知", 10)), tuiMuted.Render(tuiCell("未知", 8))
 		if entry.CountsKnown {
-			counts = fmt.Sprintf("请求 %d · 告警 %d", entry.Stats.Transactions, entry.Stats.Alerts)
+			requests = tuiCell(tuiCount(entry.Stats.Transactions), 10)
+			alerts = tuiCell(tuiCount(entry.Stats.Alerts), 8)
+			if entry.Stats.Alerts > 0 {
+				alerts = tuiDanger.Render(alerts)
+			}
 		}
-		label := fmt.Sprintf("%s  %s  %s  %s", entry.Started.Local().Format("2006-01-02 15:04:05"), tuiLine(entry.Name), state, counts)
-		label = clip(label)
 		if i == m.selected {
-			label = tuiSelected.Render(label)
+			cursor = len(rows)
+			plain := tuiCell("", 2) + tuiCell(termansi.Strip(sessionBadge(entry)), 14) + tuiCell(entry.Started.Local().Format("01-02 15:04:05"), 16)
+			if numbers {
+				plain += termansi.Strip(requests) + termansi.Strip(alerts)
+			}
+			plain += tuiLine(entry.Name)
+			rows = append(rows, tuiSelected.Render(tuiCell(plain, width)))
+			continue
 		}
-		lines = append(lines, label, tuiMuted.Render(clip("  "+tuiLine(entry.Dir))))
+		line := tuiCell("", 2) + tuiCell(sessionBadge(entry), 14) + tuiCell(entry.Started.Local().Format("01-02 15:04:05"), 16)
+		if numbers {
+			line += requests + alerts
+		}
+		rows = append(rows, clip(line+tuiLine(entry.Name)))
 	}
-	if len(m.entries) == 0 && !m.scanning {
-		lines = append(lines, "暂无会话，按 o 选择采集目录或 index.sqlite 文件")
+	if len(m.order) == 0 && !m.scanning {
+		if len(m.entries) > 0 {
+			rows = append(rows, "没有匹配的会话，按 Esc 清除查找")
+		} else {
+			rows = append(rows, "暂无会话，按 o 选择采集目录或 index.sqlite 文件")
+		}
 	}
-	body := lipgloss.NewStyle().Height(max(1, height-4)).Render(strings.Join(lines, "\n"))
-	footer := "↑↓ 选择 · Enter 打开 · o 选择目录/文件 · r 重新扫描 · q 退出"
+	visible := max(1, height-len(header)-5)
+	start := max(0, cursor-visible+1)
+	end := min(len(rows), start+visible)
+	body := append(append(header, tuiMuted.Render(clip(columns+"会话"))), rows[start:end]...)
+	path := ""
+	if entry, ok := m.current(); ok {
+		path = entry.Dir
+	}
+	footer := "↑↓ 选择 · Enter 打开 · / 查找 · o 指定目录或文件 · r 重新扫描 · q 退出"
+	if m.searching {
+		footer = "输入即筛选 · ↑↓ 选择 · Enter 完成 · Esc 清除"
+	}
+	content := lipgloss.NewStyle().Height(max(1, height-3)).MaxHeight(max(1, height-3)).Render(strings.Join(body, "\n"))
 	if m.editing {
-		body = tuiAccent.Render("选择会话位置") + "\n\n会话目录 / index.sqlite / 采集根目录\n\n" + m.path.View()
+		content = lipgloss.NewStyle().Height(max(1, height-3)).Render(tuiAccent.Render("选择会话位置") + "\n\n会话目录 / index.sqlite / 采集根目录\n\n" + m.path.View())
 		footer = "Enter 识别会话 · Esc 取消"
+		path = ""
 	}
-	frame := body + "\n" + tuiDanger.Render(clip(tuiLine(m.notice))) + "\n" + tuiMuted.Render(clip(footer))
+	frame := content + "\n" + tuiMuted.Render(clip(tuiLine(path))) + "\n" + tuiDanger.Render(clip(tuiLine(m.notice))) + "\n" + tuiMuted.Render(clip(footer))
 	if width < 40 || height < 12 {
 		frame = "终端过小，请调整到至少 40 列 × 12 行\nCtrl+C 退出"
 	}
