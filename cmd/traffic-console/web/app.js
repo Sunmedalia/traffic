@@ -983,6 +983,7 @@ const utf8Out = new TextDecoder('utf-8');
 const utf8In = new TextEncoder();
 const latin1 = (bytes) => Array.from(bytes, (b) => String.fromCharCode(b)).join('');
 const MAX_DECODE_INPUT = 1 << 20;
+const MAX_DECODE_OUTPUT = 16 << 20;
 
 function percentBytes(text, plus) {
   const out = [];
@@ -998,7 +999,7 @@ function percentBytes(text, plus) {
       let j = i;
       while (j < text.length && text[j] !== '%' && !(plus && text[j] === '+')) j++;
       if (j === i) j = i + 1;
-      out.push(...utf8In.encode(text.slice(i, j)));
+      for (const byte of utf8In.encode(text.slice(i, j))) out.push(byte);
       i = j - 1;
     }
   }
@@ -1050,8 +1051,29 @@ const DECODERS = [
     for (const format of formats) {
       try {
         const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(format));
-        return new Uint8Array(await new Response(stream).arrayBuffer());
-      } catch (_) { /* try the next container */ }
+        const reader = stream.getReader();
+        const chunks = [];
+        let length = 0;
+        try {
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            length += value.byteLength;
+            if (length > MAX_DECODE_OUTPUT) throw new RangeError('解压结果不能超过 16 MiB');
+            chunks.push(value);
+          }
+        } finally {
+          await reader.cancel().catch(() => {});
+          reader.releaseLock();
+        }
+        const result = new Uint8Array(length);
+        let offset = 0;
+        for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.byteLength; }
+        return result;
+      } catch (error) {
+        if (error instanceof RangeError) throw error;
+        // Try the next container only for a format mismatch.
+      }
     }
     throw new Error('不是可解压的数据');
   } },
