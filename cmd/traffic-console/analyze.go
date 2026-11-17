@@ -114,7 +114,7 @@ func openAnalysisDB(dir string, write bool) (*sql.DB, error) {
 			return nil, err
 		}
 	}
-	db, err := sql.Open("sqlite3", analysisURL(path, mode))
+	db, err := sql.Open(index.Driver, analysisURL(path, mode))
 	if err != nil {
 		return nil, err
 	}

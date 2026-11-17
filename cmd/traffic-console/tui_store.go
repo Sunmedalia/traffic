@@ -12,7 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
+	"github.com/Sunmedalia/traffic/internal/index"
 	"github.com/Sunmedalia/traffic/internal/session"
 )
 
@@ -23,7 +25,20 @@ type tuiFilter struct {
 	// Method and Status are only set by the web interface.
 	Until, Method, Status string
 	UntilExclusive        bool
+	// Web-only refinements. Decode is how many URL-decoding rounds the keyword
+	// and exclusions see (0 matches the stored text); Exclude holds terms that
+	// must not appear in Host or URL; Param is a query parameter name.
+	Decode     int
+	Exclude    string
+	Param      string
+	HideStatic bool
 }
+
+// maxFilterDecodeRounds mirrors the bound enforced inside traffic_url_decode.
+const maxFilterDecodeRounds = index.MaxURLDecodeRounds
+
+// staticExtensions are the asset types hidden by the web "隐藏静态资源" toggle.
+var staticExtensions = []string{"js", "mjs", "css", "map", "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "bmp", "avif", "woff", "woff2", "ttf", "otf", "eot", "mp3", "mp4", "webm"}
 
 type tuiRow struct {
 	ID, Time, Client, Method, Host, URL, Severity, Rule string
@@ -106,12 +121,43 @@ func (f tuiFilter) where(alertsOnly bool) (string, []any) {
 		clauses = append(clauses, "COALESCE(json_extract(CAST(data AS TEXT),'$.status'),0) BETWEEN ? AND ?")
 		args = append(args, low, high)
 	}
+	const hostExpr = `json_extract(CAST(data AS TEXT),'$.host')`
+	urlExpr := `json_extract(CAST(data AS TEXT),'$.url')`
+	if f.Decode > 0 {
+		urlExpr = fmt.Sprintf(`traffic_url_decode(%s,%d)`, urlExpr, f.Decode)
+	}
 	if f.Keyword != "" {
-		clauses = append(clauses, `(json_extract(CAST(data AS TEXT),'$.host') LIKE ? ESCAPE '\' OR json_extract(CAST(data AS TEXT),'$.url') LIKE ? ESCAPE '\')`)
+		clauses = append(clauses, `(`+hostExpr+` LIKE ? ESCAPE '\' OR `+urlExpr+` LIKE ? ESCAPE '\')`)
 		pattern := "%" + escapeLike(f.Keyword) + "%"
 		args = append(args, pattern, pattern)
 	}
+	for _, term := range excludeTerms(f.Exclude) {
+		clauses = append(clauses, `NOT (COALESCE(`+hostExpr+`,'') LIKE ? ESCAPE '\' OR COALESCE(`+urlExpr+`,'') LIKE ? ESCAPE '\')`)
+		pattern := "%" + escapeLike(term) + "%"
+		args = append(args, pattern, pattern)
+	}
+	if f.Param != "" {
+		// Parameter names are matched as typed in the stored URL, at the start of
+		// the query or after a separator, with or without a value.
+		raw := `json_extract(CAST(data AS TEXT),'$.url')`
+		name := escapeLike(f.Param)
+		clauses = append(clauses, `(`+raw+` LIKE ? ESCAPE '\' OR `+raw+` LIKE ? ESCAPE '\' OR `+raw+` LIKE ? ESCAPE '\' OR `+raw+` LIKE ? ESCAPE '\' OR `+raw+` LIKE ? ESCAPE '\' OR `+raw+` LIKE ? ESCAPE '\')`)
+		args = append(args, "%?"+name+"=%", "%&"+name+"=%", "%?"+name+"&%", "%&"+name+"&%", "%?"+name, "%&"+name)
+	}
+	if f.HideStatic {
+		path := `lower(CASE WHEN instr(u,'?')>0 THEN substr(u,1,instr(u,'?')-1) ELSE u END)`
+		var tests []string
+		for _, extension := range staticExtensions {
+			tests = append(tests, path+" LIKE '%."+extension+"'")
+		}
+		clauses = append(clauses, `NOT EXISTS (SELECT 1 FROM (SELECT COALESCE(json_extract(CAST(requests.data AS TEXT),'$.url'),'') AS u) WHERE `+strings.Join(tests, " OR ")+`)`)
+	}
 	return strings.Join(clauses, " AND "), args
+}
+
+// excludeTerms splits the exclusion list on spaces and ASCII or full-width commas.
+func excludeTerms(value string) []string {
+	return strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == '，' || unicode.IsSpace(r) })
 }
 
 func escapeLike(s string) string {

@@ -35,6 +35,7 @@ jobs:
           python3 -m py_compile scripts/*.py scripts/linux/*.py scripts/windows/*.py
           python3 -m unittest discover -s scripts -p 'test_*.py'
           node scripts/windows/test-iis-plaintext.js
+          node scripts/web/test-decoder.cjs
           bash -n scripts/*.sh
 
   ecapture-patches:
