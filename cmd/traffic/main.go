@@ -32,6 +32,10 @@ func emit(v any) {
 	fmt.Println(string(b))
 }
 func main() {
+	if err := session.InitRuntime(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -40,7 +44,8 @@ func main() {
 func run(args []string) (runErr error) {
 	session.PrivateUmask()
 	if len(args) == 0 {
-		return errors.New("usage: traffic doctor|capture|import|rules")
+		fmt.Printf("traffic doctor|capture|import|rules; use COMMAND --help for flags\nData: %s\n", session.DefaultDataDir())
+		return nil
 	}
 	if args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
 		fmt.Println("traffic doctor|capture|import|rules; use COMMAND --help for flags")
@@ -67,7 +72,7 @@ func run(args []string) (runErr error) {
 	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	output := fs.String("output", "", "exact session directory; default is auto-created under --data-dir")
-	dataDir := fs.String("data-dir", "./sessions", "root directory for automatically named sessions")
+	dataDir := fs.String("data-dir", session.DefaultDataDir(), "root directory for automatically named sessions")
 	name := fs.String("name", "", "session name; default capture or import")
 	fs.IntVar(&networkNamespacePID, "netns-pid", 0, "Linux target network namespace PID; open packet handles there without changing the target")
 	ports := fs.String("ports", "80,443", "TCP ports")

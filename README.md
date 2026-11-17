@@ -45,31 +45,34 @@ flowchart LR
 
 ## 下载与安装
 
-从 [Releases](https://github.com/Sunmedalia/traffic/releases) 下载对应架构的包，使用同一版本的 `SHA256SUMS` 核对。每个程序包附带使用手册、依赖说明及构建信息。
+从 [Releases](https://github.com/Sunmedalia/traffic/releases) 下载对应架构的包，使用同一版本的 `SHA256SUMS` 核对。基础包只含可执行文件、Linux 可选预加载库与必要许可证；不再包含测试脚本、构建工具或验证记录。使用手册保留在仓库中。
 
 | 发布包 | 内容 | 运行依赖 |
 | :--- | :--- | :--- |
-| `traffic-v0.1.0-linux-amd64.tar.gz` | 采集器、分析器、OpenSSL 预加载库 | Ubuntu 24.04 / glibc 2.39 或兼容环境、libpcap |
-| `traffic-v0.1.0-linux-arm64.tar.gz` | 同上，ARM64 | 同上，ARM64 |
-| `traffic-v0.1.0-windows-amd64.zip` | 采集器、分析器、Windows 探针脚本 | Windows x64；采集需单独安装 Npcap |
-| `traffic-v0.1.0-java.zip` | Java Agent 与组件说明 | JDK 17/21，Tomcat NIO 场景 |
+| `traffic-v0.1.1-linux-amd64.tar.gz` | 采集器、分析器、OpenSSL 预加载库 | Ubuntu 24.04 / glibc 2.39 或兼容环境、libpcap |
+| `traffic-v0.1.1-linux-arm64.tar.gz` | 同上，ARM64 | 同上，ARM64 |
+| `traffic-v0.1.1-windows-amd64.zip` | 采集器、分析器 | Windows x64；采集需单独安装 Npcap |
+| `traffic-v0.1.1-java.zip` | Java Agent | JDK 17/21，Tomcat NIO 场景 |
+| `traffic-v0.1.1-windows-amd64-deps.zip` | 可选：便携 Python、Frida、运行探针 | 解压到 Windows 程序所在目录 |
 
-Linux 二进制在 Ubuntu 24.04 构建；**CentOS 7 等旧 glibc 环境请在目标系统从源码构建**。Windows 的 IIS/OpenSSL 明文探针另需 Python 与 Frida 17.5.1。eCapture、Npcap 和 Frida 不随二进制包分发。
+Linux 二进制在 Ubuntu 24.04 构建；**CentOS 7 等旧 glibc 环境请在目标系统从源码构建**。Windows 抓包需从 [Npcap 官方](https://npcap.com/#download) 安装驱动；IIS/OpenSSL 明文探针可下载独立依赖包，无需安装系统 Python。详细操作见 [Windows 依赖说明](docs/windows-dependencies.md)。eCapture 单独构建。
 
 ```bash
 # 示例：Linux x64，先下载对应压缩包与 SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
-tar -xzf traffic-v0.1.0-linux-amd64.tar.gz
-cd traffic-v0.1.0-linux-amd64
-./bin/traffic doctor
+tar -xzf traffic-v0.1.1-linux-amd64.tar.gz
+cd traffic-v0.1.1-linux-amd64
+./traffic doctor
 ```
+
+首次启动任一程序会自动在程序旁创建 `sessions/` 和 `exports/`，从其他目录启动也会使用同一默认数据目录。源码构建位于 `bin/` 时，目录创建在项目根目录；显式 `--data-dir` / `--output` 仍按指定路径处理。请将程序解压到可写目录。
 
 从源码构建需要 Go 1.26.7+、CGO 和 C 编译器：
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential libpcap-dev git
-git clone --branch v0.1.0 https://github.com/Sunmedalia/traffic.git
+git clone --branch v0.1.1 https://github.com/Sunmedalia/traffic.git
 cd traffic
 ./scripts/build-linux.sh
 ```
@@ -82,33 +85,33 @@ macOS 可从源码构建分析器：`go build -o bin/traffic-tui ./cmd/traffic-t
 
 ```bash
 # 指定业务的实际 HTTP 端口；--no-tls 不启动明文探针
-sudo ./bin/traffic capture --no-tls --ports 80,8080 \
+sudo ./traffic capture --no-tls --ports 80,8080 \
   --duration 60s --output ./sessions/first-capture
 ```
 
-省略接口时，Linux 使用 `any`，包含回环。程序在 stderr 打印会话路径；`Ctrl+C` 正常停止并保存摘要。
+省略接口时，Linux 使用 `any`，包含回环。省略 `--output` 时自动存入程序旁的 `sessions/`。程序在 stderr 打印会话路径；`Ctrl+C` 正常停止并保存摘要。
 
 ### 2 · 打开会话
 
 ```bash
 # 中文终端界面；无参数时进入会话选择页
-./bin/traffic-tui --session ./sessions/first-capture
+./traffic-tui --session ./sessions/first-capture
 
 # 浏览器界面；打开启动时打印的完整令牌地址
-./bin/traffic-tui web --session ./sessions/first-capture
+./traffic-tui web --session ./sessions/first-capture
 ```
 
 ### 3 · 按需启用 HTTPS 明文采集
 
-现代 Linux 的 OpenSSL 服务可使用配套 eCapture，构建目录必须不存在：
+现代 Linux 的 OpenSSL 服务可使用配套 eCapture。以下构建命令在源码仓库执行（构建目录必须不存在），生成的 `bin/ecapture` 可复制到程序目录；使用二进制包时直接执行后面的采集命令：
 
 ```bash
 sudo apt-get install -y clang llvm bpftool libelf-dev libssl-dev \
   flex bison make file pkg-config
 ./scripts/build-ecapture.sh /tmp/traffic-ecapture-build
 
-sudo ./bin/traffic capture --ports 80,443 \
-  --ecapture "$PWD/bin/ecapture" --output ./sessions/https-capture
+sudo ./traffic capture --ports 80,443 \
+  --ecapture "$PWD/ecapture" --output ./sessions/https-capture
 ```
 
 eCapture 走进程明文读取路径，无需安装 CA 或解密 PCAP。附加存在启动窗口；用已知请求的唯一编号逐条核对请求、响应和正文，不能只根据 `attached` 或零丢弃判定采全。
@@ -154,10 +157,10 @@ ssh -L 8080:127.0.0.1:8080 user@capture-host
 ### JSON：查询与证据导出
 
 ```bash
-./bin/traffic-tui status --session ./sessions/https-capture
-./bin/traffic-tui events --session ./sessions/https-capture --severity medium
-./bin/traffic-tui show REQUEST_ID --session ./sessions/https-capture
-./bin/traffic-tui export REQUEST_ID --session ./sessions/https-capture --out ./evidence.zip
+./traffic-tui status --session ./sessions/https-capture
+./traffic-tui events --session ./sessions/https-capture --severity medium
+./traffic-tui show REQUEST_ID --session ./sessions/https-capture
+./traffic-tui export REQUEST_ID --session ./sessions/https-capture --out ./evidence.zip
 ```
 
 `--severity medium` 表示中危及以上。**导出前需要停止采集**，同名 ZIP 不覆盖。
@@ -188,7 +191,7 @@ sessions/<host>/<date>/<session>/
 | [使用手册](docs/guide.md) | 后端、规则、Windows、参数、停止与回滚、故障排查 |
 | [验证记录](VALIDATION.md) | 实机环境、构建哈希、成功与失败样本 |
 | [优化进度](OPTIMIZATION.md) | 已实现机制、性能门槛与待完成项目 |
-| [v0.1.0 发布说明](docs/releases/v0.1.0.md) | 下载包、升级变化和已知限制 |
+| [v0.1.1 发布说明](docs/releases/v0.1.1.md) | 下载包、升级变化和已知限制 |
 | [第三方组件](THIRD_PARTY_NOTICES.md) | 依赖、探针与许可证说明 |
 
 ```bash

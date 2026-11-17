@@ -35,6 +35,16 @@ jobs:
           ldd bin/traffic
       - name: Package
         run: python3 scripts/package-release.py --version "$GITHUB_REF_NAME" --platform "${{ matrix.platform }}"
+      - name: Smoke test extracted Linux package
+        run: |
+          set -euo pipefail
+          tar -xzf "dist/traffic-$GITHUB_REF_NAME-${{ matrix.platform }}.tar.gz" -C "$RUNNER_TEMP"
+          app="$RUNNER_TEMP/traffic-$GITHUB_REF_NAME-${{ matrix.platform }}"
+          cd /tmp
+          "$app/traffic"
+          "$app/traffic-tui" --help
+          test -d "$app/sessions"
+          test -d "$app/exports"
       - uses: actions/upload-artifact@v4
         with:
           name: package-${{ matrix.platform }}
@@ -70,9 +80,9 @@ jobs:
           go vet ./...
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force bin | Out-Null
-          go build -trimpath -o bin/traffic.exe ./cmd/traffic
+          go build -trimpath -ldflags="-s -w -linkmode external -extldflags '-static'" -o bin/traffic.exe ./cmd/traffic
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          go build -trimpath -o bin/traffic-tui.exe ./cmd/traffic-tui
+          go build -trimpath -ldflags="-s -w -linkmode external -extldflags '-static'" -o bin/traffic-tui.exe ./cmd/traffic-tui
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           ./bin/traffic.exe --help
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -80,6 +90,27 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Package
         run: python scripts/package-release.py --version "$env:GITHUB_REF_NAME" --platform windows-amd64
+      - name: Package optional Windows dependencies
+        run: python scripts/package-windows-deps.py --version "$env:GITHUB_REF_NAME"
+      - name: Smoke test portable binaries and dependencies
+        shell: pwsh
+        run: |
+          $testRoot = Join-Path $env:RUNNER_TEMP 'traffic-portable'
+          New-Item -ItemType Directory -Force $testRoot | Out-Null
+          Expand-Archive "dist/traffic-$env:GITHUB_REF_NAME-windows-amd64.zip" $testRoot
+          $app = Join-Path $testRoot "traffic-$env:GITHUB_REF_NAME-windows-amd64"
+          Expand-Archive "dist/traffic-$env:GITHUB_REF_NAME-windows-amd64-deps.zip" $app
+          & "$app/deps/python/python.exe" -c "import frida; assert frida.__version__ == '17.5.1'"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & "$app/deps/python/python.exe" "$app/deps/probes/probe-iis.py" --help
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & "$app/deps/python/python.exe" "$app/deps/probes/probe-openssl.py" --help
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & "$app/traffic.exe"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & "$app/traffic-tui.exe" --help
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (!(Test-Path "$app/sessions") -or !(Test-Path "$app/exports")) { throw 'Missing runtime directories' }
       - uses: actions/upload-artifact@v4
         with:
           name: package-windows-amd64
@@ -123,7 +154,7 @@ jobs:
         run: |
           set -euo pipefail
           test -f "docs/releases/$GITHUB_REF_NAME.md"
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 4
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 5
           (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" dist/* \
             --verify-tag --draft --title "traffic $GITHUB_REF_NAME" \

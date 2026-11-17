@@ -22,6 +22,10 @@ func emit(v any) {
 	fmt.Println(string(b))
 }
 func main() {
+	if err := session.InitRuntime(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
