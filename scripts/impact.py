@@ -105,6 +105,19 @@ def external_load(command, config, record, stderr_path):
             worker.stdout.close()
 
 
+def capture_health(status, mode):
+    """A final attached state cannot erase an earlier transport loss."""
+    gaps = status.get("gap_counts", {})
+    discontinuity = any(count and any(reason in key for reason in (
+        "/receive_queue_overflow/", "/transport_interrupted/", "/sequence_gap/",
+        "/sequence_reset_or_reorder/", "/probe_restart/", "/probe_queue_loss/"))
+        for key, count in gaps.items())
+    return ((mode == "packets" or status.get("tls") in ("attached", "active-preload"))
+            and not status.get("probe_failures", 0) and not discontinuity
+            and not any(status.get(name, 0) for name in ("tls_dropped", "queue_dropped", "dropped"))
+            and not any(sample.get("overflows", 0) for sample in status.get("probe_transports", {}).values()))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
@@ -270,7 +283,7 @@ def main():
                         row["capture_status"] = json.loads((session / "status.json").read_text(encoding="utf-8"))
                         row["comparison"] = compare(row, baseline)
                         row["comparison"]["checks"]["capture_exit"] = process.returncode == 0 and row["capture_status"].get("state") == "stopped"
-                        row["comparison"]["checks"]["capture_backend"] = mode == "packets" or row["capture_status"].get("tls") in ("attached", "active-preload")
+                        row["comparison"]["checks"]["capture_backend"] = capture_health(row["capture_status"], mode)
                         row["comparison"]["checks"]["sampling"] = not sampling_errors and not baseline.get("sampling_errors") and not sampler.is_alive()
                         row["comparison"]["passed"] = all(row["comparison"]["checks"].values())
                     else:

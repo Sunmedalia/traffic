@@ -768,6 +768,9 @@ func (m tuiModel) tuiHealth() (int, []string) {
 			warn(1, fmt.Sprintf("%s 探针 %s", tuiLine(target.Service), tuiLine(target.State)))
 		}
 	}
+	if s.ProbeFailures > 0 {
+		warn(1, fmt.Sprintf("探针传输失败 %d 次", s.ProbeFailures))
+	}
 	if len(s.Errors) > 0 {
 		warn(1, fmt.Sprintf("采集错误 %d 条", len(s.Errors)))
 	}
@@ -830,6 +833,13 @@ func (m tuiModel) healthContent() string {
 	if len(s.ProbeExits) > 0 {
 		data, _ := json.Marshal(s.ProbeExits)
 		lines = append(lines, "退出确认  "+tuiLine(string(data)))
+	}
+	if len(s.ProbeTransports) > 0 {
+		data, _ := json.Marshal(s.ProbeTransports)
+		lines = append(lines, "探针传输  "+tuiLine(string(data)))
+	}
+	if s.ProbeFailures > 0 {
+		lines = append(lines, fmt.Sprintf("探针传输失败  %d 次（恢复后仍保留）", s.ProbeFailures))
 	}
 	if len(s.Targets) == 0 {
 		lines = append(lines, "暂无服务探针记录")

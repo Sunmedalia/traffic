@@ -53,7 +53,7 @@ func (p *HTTPProcessor) invalidate(connection, reason string) {
 }
 func (p *HTTPProcessor) invalidateLocked(connection, reason string) {
 	for _, record := range p.pending[connection] {
-		if err := p.s.restore(&record); err != nil {
+		if err := p.s.restorePending(&record); err != nil {
 			p.s.fail(err)
 			continue
 		}

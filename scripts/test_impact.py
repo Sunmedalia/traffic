@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
-from impact import compare, warmup_request, external_load
+from impact import compare, warmup_request, external_load, capture_health
 from impact_load import LatencyHistogram
 
 
@@ -16,6 +16,17 @@ class ImpactChecks(unittest.TestCase):
         self.baseline = dict(successful_rps=100, p99_ms=10,
                              target_cpu_one_core_percent=20, errors=0,
                              generator_dropped=0, target_private_peak_bytes=100 << 20)
+
+    def test_recovered_backend_does_not_erase_transport_failure(self):
+        self.assertTrue(capture_health({"tls": "attached"}, "tls"))
+        for extra in ({"probe_failures": 1},
+                      {"gap_counts": {"ecapture/receive_queue_overflow/transports": 1}},
+                      {"gap_counts": {"ecapture/sequence_gap/published_events": 2}},
+                      {"probe_transports": {"probe": {"overflows": 1}}},
+                      {"tls_dropped": 1}):
+            self.assertFalse(capture_health(dict(tls="attached", **extra), "full"))
+        self.assertFalse(capture_health({"tls": "unavailable"}, "tls"))
+        self.assertTrue(capture_health({"tls": "disabled"}, "packets"))
 
     def test_threshold_edges(self):
         row = dict(self.baseline, successful_rps=97, p99_ms=11,

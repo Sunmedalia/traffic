@@ -55,7 +55,7 @@ func protoFields(b []byte) (map[int][]byte, map[int]uint64, error) {
 	}
 	return s, v, nil
 }
-func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string, pid, uid int, accepts func(int, string) string, snapshot kernelScopeSnapshot, attached func()) error {
+func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string, pid, uid int, accepts func(int, string) string, snapshot kernelScopeSnapshot, attached func(), failed ...func(error)) error {
 	listener, e := net.Listen("tcp", "127.0.0.1:0")
 	if e != nil {
 		return e
@@ -135,8 +135,20 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 		defer stopScope()
 	}
 	ws.SetReadLimit(2 << 20)
-	transport := startProbeTransport(ws)
+	transport := startProbeTransport(ws, func(err error) {
+		if ctx.Err() == nil {
+			s.mu.Lock()
+			s.stats.ProbeFailures++
+			s.mu.Unlock()
+			for _, callback := range failed {
+				callback(err)
+			}
+		}
+	})
 	defer transport.close()
+	epoch := serial.Add(1)
+	stopMetrics := s.observeProbeTransport(fmt.Sprintf("ecapture/%s/%d/%d", lib, uid, pid), epoch, transport)
+	defer stopMetrics()
 	watchDone := make(chan struct{})
 	defer close(watchDone)
 	go func() {
@@ -146,18 +158,12 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 		case <-watchDone:
 		}
 	}()
-	s.mu.Lock()
-	s.stats.TLS = "starting"
-	s.mu.Unlock()
 	ready := false
 	markReady := func() {
 		if ready {
 			return
 		}
 		ready = true
-		s.mu.Lock()
-		s.stats.TLS = "attached"
-		s.mu.Unlock()
 		attached()
 	}
 	events, err := os.OpenFile(filepath.Join(s.dir, "tls", "events.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
@@ -167,14 +173,16 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 	evidence := newEvidenceWriter(s, events, "ecapture")
 	defer evidence.Close()
 	enc := json.NewEncoder(evidence)
-	epoch := serial.Add(1)
 	var sequence probeSequence
 	transportUncertain := false
 	identityWarning := false
 	portWarning := false
 	frames := &Frames{}
 	stopExpiry := frames.startExpiry(ctx, p)
-	defer stopExpiry()
+	defer func() {
+		stopExpiry()
+		p.invalidatePrefix(fmt.Sprintf("tls:probe-%d/", epoch), "probe_connection_closed")
+	}()
 	for {
 		b, e := transport.next()
 		if e != nil {

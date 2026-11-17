@@ -57,3 +57,48 @@ func TestServiceDiscoveryAndPIDIdentity(t *testing.T) {
 		t.Fatal("root probe must target PID")
 	}
 }
+
+func TestListeningSnapshotSharesNamespaceButRefreshesPorts(t *testing.T) {
+	root := t.TempDir()
+	for _, pid := range []string{"10", "20"} {
+		dir := filepath.Join(root, pid)
+		for _, sub := range []string{"net", "ns", "fd"} {
+			if err := os.MkdirAll(filepath.Join(dir, sub), 0700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Symlink("net:[shared]", filepath.Join(dir, "ns/net")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("socket:[123]", filepath.Join(dir, "fd/3")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	table := func(port string) []byte { return []byte("0: 0100007F:" + port + " 00000000:0000 0A 0 0 0 0 0 123\n") }
+	if err := os.WriteFile(filepath.Join(root, "10/net/tcp"), table("01BB"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "20/net/tcp"), table("0050"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	snapshots := map[string]map[string]int{}
+	first := listeningPortsSnapshot(root, filepath.Join(root, "10"), snapshots)
+	second := listeningPortsSnapshot(root, filepath.Join(root, "20"), snapshots)
+	if len(first) != 1 || first[0] != 443 || len(second) != 1 || second[0] != 443 {
+		t.Fatal("namespace not shared", first, second)
+	}
+	fresh := listeningPortsSnapshot(root, filepath.Join(root, "20"), map[string]map[string]int{})
+	if len(fresh) != 1 || fresh[0] != 80 {
+		t.Fatal("discovery retained stale namespace ports", fresh)
+	}
+	if err := os.Remove(filepath.Join(root, "20/ns/net")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("net:[different]", filepath.Join(root, "20/ns/net")); err != nil {
+		t.Fatal(err)
+	}
+	isolated := listeningPortsSnapshot(root, filepath.Join(root, "20"), snapshots)
+	if len(isolated) != 1 || isolated[0] != 80 {
+		t.Fatal("namespaces mixed", isolated)
+	}
+}

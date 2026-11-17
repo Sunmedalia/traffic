@@ -20,6 +20,7 @@ type Frames struct {
 	evicted         []evictedFrame
 	http2           map[string]bool
 	drains          map[string]int64
+	lengths         map[string]frameLength
 	byteLimit       int
 	connectionLimit int
 }
@@ -166,6 +167,45 @@ func (f *Frames) feed(key string, payload []byte, head ...bool) ([][]byte, bool)
 		if !bytes.Contains(b, []byte("\r\n\r\n")) && !bytes.Contains(b, []byte("\n\n")) {
 			break
 		}
+		expected, known := f.lengths[key]
+		if !known {
+			end, separator := bytes.Index(b, []byte("\r\n\r\n")), 4
+			if end < 0 {
+				end, separator = bytes.Index(b, []byte("\n\n")), 2
+			}
+			isHead := len(head) > responseIndex && head[responseIndex]
+			expected, known = knownHTTPFrameLength(b[:end+separator], isHead)
+			if known && expected.bytes <= max(requestLimit, responseLimit)+(64<<10) {
+				if f.lengths == nil {
+					f.lengths = map[string]frameLength{}
+				}
+				f.lengths[key] = expected
+			} else {
+				known = false
+			}
+		}
+		if known {
+			if len(b) < expected.bytes {
+				break
+			}
+			used := expected.bytes
+			if used <= 0 {
+				f.remove(key)
+				return frames, true
+			}
+			if used == len(b) {
+				frames = append(frames, b)
+				b = nil
+			} else {
+				frames = append(frames, bytes.Clone(b[:used]))
+				b = b[used:]
+			}
+			delete(f.lengths, key)
+			if expected.advanceResponse {
+				responseIndex++
+			}
+			continue
+		}
 		reader := bytes.NewReader(b)
 		br := bufio.NewReader(reader)
 		var body io.ReadCloser
@@ -232,8 +272,49 @@ func (f *Frames) remove(key string) {
 	delete(f.touched, key)
 	delete(f.contexts, key)
 	delete(f.drains, key)
+	delete(f.lengths, key)
 }
 func (f *Frames) set(key string, b []byte) {
 	f.buffered += len(b) - len(f.buffers[key])
 	f.buffers[key] = b
+}
+
+// For fixed-length messages only headers need parsing while a fragmented body
+// accumulates. Chunked and close-delimited messages retain the standard parser
+// fallback, including all existing recovery/truncation limits.
+type frameLength struct {
+	bytes           int
+	advanceResponse bool
+}
+
+func knownHTTPFrameLength(header []byte, head bool) (frameLength, bool) {
+	reader, release := borrowHTTPReader(bytes.NewReader(header), min(4096, len(header)))
+	defer release()
+	length := int64(-1)
+	advance := false
+	if bytes.HasPrefix(header, []byte("HTTP/")) {
+		var request *http.Request
+		if head {
+			request = &http.Request{Method: "HEAD"}
+		}
+		response, err := http.ReadResponse(reader, request)
+		if err != nil || len(response.TransferEncoding) > 0 {
+			return frameLength{}, false
+		}
+		length = response.ContentLength
+		if head || response.StatusCode < 200 || response.StatusCode == 204 || response.StatusCode == 304 {
+			length = 0
+		}
+		advance = response.StatusCode >= 200 || response.StatusCode == 101
+	} else {
+		request, err := http.ReadRequest(reader)
+		if err != nil || len(request.TransferEncoding) > 0 {
+			return frameLength{}, false
+		}
+		length = request.ContentLength
+	}
+	if length < 0 || length > int64(max(requestLimit, responseLimit)+(64<<10)) {
+		return frameLength{}, false
+	}
+	return frameLength{len(header) + int(length), advance}, true
 }

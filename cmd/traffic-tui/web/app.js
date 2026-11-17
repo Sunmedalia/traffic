@@ -537,6 +537,7 @@ function renderHealth() {
   if (s.state === 'failed') issues.push('采集以失败状态结束，数据可能不完整。');
   if (s.dropped > 0) issues.push(`网卡丢包 ${number(s.dropped)} 个，部分请求可能无法还原。`);
   if (s.queue_dropped > 0) issues.push(`用户态队列丢弃 ${number(s.queue_dropped)} 个。`);
+  if (s.probe_failures > 0) issues.push(`探针传输失败 ${number(s.probe_failures)} 次，恢复后仍保留。`);
   if (s.tls_dropped > 0) issues.push(`TLS 已知丢弃 ${number(s.tls_dropped)} 个，这是已观测到的下限。`);
   if (s.alert_delivery_failed > 0 || s.alert_delivery_dropped > 0) issues.push(`告警 Webhook 失败 ${number(s.alert_delivery_failed)} 次，队列丢弃 ${number(s.alert_delivery_dropped)} 次。`);
   if ((s.errors || []).length) issues.push(`采集过程记录了 ${s.errors.length} 条错误，详见“采集状态”。`);
@@ -601,6 +602,11 @@ function renderOverview() {
     ['告警 Webhook', `已送达 ${number(s.alert_delivered)} · 失败 ${number(s.alert_delivery_failed)} · 队列丢弃 ${number(s.alert_delivery_dropped)}`],
     ['资源限制', s.resource_limits || '—', true],
     ['采集完整性', state.coverage || '—'],
+    ['数据排空', s.drain_state || '未知'],
+    ['已知缺口', s.gap_counts ? JSON.stringify(s.gap_counts) : '未知'],
+    ['退出确认', s.probe_exits ? JSON.stringify(s.probe_exits) : '未知'],
+    ['探针传输', s.probe_transports ? JSON.stringify(s.probe_transports) : '未知'],
+    ['探针传输失败', s.probe_failures == null ? '未知' : `${number(s.probe_failures)} 次，恢复后仍保留`],
   ];
   set($('facts'), ...facts.flatMap(([name, value, mono]) => [h('dt', {}, name), h('dd', { class: mono ? 'mono' : '' }, value)]));
   const targets = s.targets || [];

@@ -43,7 +43,7 @@ func (a *opensslAssembler) close(connection string) error {
 			continue
 		}
 		for _, record := range queue {
-			if err := p.s.restore(&record); err != nil {
+			if err := p.s.restorePending(&record); err != nil {
 				return err
 			}
 			record.Incomplete = true

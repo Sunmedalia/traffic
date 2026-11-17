@@ -69,6 +69,10 @@ func processTarget(root string, pid int) (session.Target, error) {
 }
 
 func populateTarget(root string, t *session.Target) {
+	populateTargetWithListeners(root, t, nil)
+}
+
+func populateTargetWithListeners(root string, t *session.Target, tables map[string]map[string]int) {
 	dir := filepath.Join(root, strconv.Itoa(t.PID))
 	b, _ := os.ReadFile(filepath.Join(dir, "maps"))
 	for _, line := range strings.Split(string(b), "\n") {
@@ -78,7 +82,7 @@ func populateTarget(root string, t *session.Target) {
 			break
 		}
 	}
-	t.Ports = listeningPorts(root, dir)
+	t.Ports = listeningPortsSnapshot(root, dir, tables)
 	t.State = "http-only"
 	if t.Library != "" {
 		t.State = "discovered"
@@ -86,7 +90,13 @@ func populateTarget(root string, t *session.Target) {
 }
 
 func discoverTargets(root, service string, pid int, library string) []session.Target {
-	dirs, _ := filepath.Glob(filepath.Join(root, "[0-9]*"))
+	var dirs []string
+	if pid > 0 {
+		dirs = []string{filepath.Join(root, strconv.Itoa(pid))}
+	} else {
+		dirs, _ = filepath.Glob(filepath.Join(root, "[0-9]*"))
+	}
+	tables := map[string]map[string]int{}
 	var targets []session.Target
 	for _, dir := range dirs {
 		id, err := strconv.Atoi(filepath.Base(dir))
@@ -100,7 +110,7 @@ func discoverTargets(root, service string, pid int, library string) []session.Ta
 		if pid == 0 && (t.Service == "unknown" || (service != "auto" && service != t.Service)) {
 			continue
 		}
-		populateTarget(root, &t)
+		populateTargetWithListeners(root, &t, tables)
 		if service == "openssl" && pid > 0 {
 			t.Service = "openssl"
 		}
@@ -303,6 +313,18 @@ func captureServices(ctx context.Context, s *Store, p *HTTPProcessor, bin, libra
 					}
 					return selected
 				}
+				setState := func(state string) {
+					mu.Lock()
+					states[g] = state
+					identities := map[string]bool{}
+					for id, target := range targets {
+						if targetGroups[id] == g {
+							identities[target.ID] = true
+						}
+					}
+					s.setTLSTargetsState(identities, state)
+					mu.Unlock()
+				}
 				for attempt := 0; attempt < 3; attempt++ {
 					if attempt > 0 {
 						select {
@@ -311,16 +333,19 @@ func captureServices(ctx context.Context, s *Store, p *HTTPProcessor, bin, libra
 						case <-time.After(time.Second << (attempt - 1)):
 						}
 					}
-					mu.Lock()
-					states[g] = "starting"
-					mu.Unlock()
-					err := captureTLS(groupCtx, s, p, bin, g.Library, g.PID, g.UID, accepts, snapshot, func() { mu.Lock(); states[g] = "attached"; mu.Unlock() })
+					setState("starting")
+					err := captureTLS(groupCtx, s, p, bin, g.Library, g.PID, g.UID, accepts, snapshot, func() {
+						if groupCtx.Err() == nil {
+							setState("attached")
+						}
+					}, func(error) { setState("unavailable") })
 					if groupCtx.Err() != nil {
 						return
 					}
 					if err == nil {
 						return
 					}
+					setState("unavailable")
 					s.problem(fmt.Errorf("%s UID %d: %w", g.Library, g.UID, err))
 				}
 				mu.Lock()
@@ -346,34 +371,11 @@ func captureServices(ctx context.Context, s *Store, p *HTTPProcessor, bin, libra
 				}
 			}
 		}
-		mu.RUnlock()
-		attached, unavailable := 0, 0
-		for _, t := range current {
-			if t.State == "attached" {
-				attached++
-			}
-			if t.State == "unavailable" {
-				unavailable++
-			}
-		}
 		s.mu.Lock()
-		if attached > 0 && unavailable > 0 {
-			s.stats.TLS = "partial"
-		} else if attached > 0 {
-			s.stats.TLS = "attached"
-		} else if unavailable > 0 {
-			s.stats.TLS = "unavailable"
-		} else {
-			s.stats.TLS = "starting"
-			if len(current) == 0 {
-				s.stats.TLS = "no-targets"
-			}
-		}
-		if attached > 0 && attached < len(current) {
-			s.stats.TLS = "partial"
-		}
+		s.stats.TLS = tlsTargetsState(current)
 		s.stats.Targets = current
 		s.mu.Unlock()
+		mu.RUnlock()
 	}
 	refresh()
 	ticker := time.NewTicker(2 * time.Second)
@@ -389,34 +391,53 @@ func captureServices(ctx context.Context, s *Store, p *HTTPProcessor, bin, libra
 	}
 }
 
-func listeningPorts(root, dir string) []int {
-	inodes := map[string]bool{}
-	fds, _ := filepath.Glob(filepath.Join(dir, "fd", "*"))
-	for _, fd := range fds {
-		target, _ := os.Readlink(fd)
-		if strings.HasPrefix(target, "socket:[") {
-			inodes[strings.TrimSuffix(strings.TrimPrefix(target, "socket:["), "]")] = true
+func listeningPorts(root, dir string) []int { return listeningPortsSnapshot(root, dir, nil) }
+
+// A network table belongs to a namespace, not a process. Share one immutable
+// snapshot per discovery pass, but resolve FD ownership separately per process.
+// Never cache across refreshes: ports and worker/library identities can change.
+func listeningPortsSnapshot(root, dir string, tables map[string]map[string]int) []int {
+	namespace, namespaceErr := os.Readlink(filepath.Join(dir, "ns", "net"))
+	tableDir := filepath.Join(dir, "net")
+	if namespaceErr != nil {
+		namespace = root
+		tableDir = filepath.Join(root, "net")
+	}
+	listeners, ok := tables[namespace]
+	if !ok {
+		listeners = map[string]int{}
+		for _, name := range []string{"tcp", "tcp6"} {
+			b, _ := os.ReadFile(filepath.Join(tableDir, name))
+			for _, line := range strings.Split(string(b), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) < 10 || fields[3] != "0A" {
+					continue
+				}
+				_, portText, found := strings.Cut(fields[1], ":")
+				if !found {
+					continue
+				}
+				port, err := strconv.ParseInt(portText, 16, 32)
+				if err == nil {
+					listeners[fields[9]] = int(port)
+				}
+			}
+		}
+		if tables != nil {
+			tables[namespace] = listeners
 		}
 	}
 	found := map[int]bool{}
-	for _, name := range []string{"tcp", "tcp6"} {
-		b, _ := os.ReadFile(filepath.Join(root, "net", name))
-		for _, line := range strings.Split(string(b), "\n") {
-			f := strings.Fields(line)
-			if len(f) < 10 || f[3] != "0A" || !inodes[f[9]] {
-				continue
-			}
-			parts := strings.Split(f[1], ":")
-			if len(parts) != 2 {
-				continue
-			}
-			port, err := strconv.ParseInt(parts[1], 16, 32)
-			if err == nil {
-				found[int(port)] = true
+	fds, _ := filepath.Glob(filepath.Join(dir, "fd", "*"))
+	for _, fd := range fds {
+		target, _ := os.Readlink(fd)
+		if inode, ok := strings.CutPrefix(target, "socket:["); ok {
+			if port, ok := listeners[strings.TrimSuffix(inode, "]")]; ok {
+				found[port] = true
 			}
 		}
 	}
-	ports := []int{}
+	ports := make([]int, 0, len(found))
 	for port := range found {
 		ports = append(ports, port)
 	}

@@ -49,7 +49,8 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			bufferSize = min(bufferSize, sized.Len())
 		}
 	}
-	br := bufio.NewReaderSize(r, bufferSize)
+	br, releaseReader := borrowHTTPReader(r, bufferSize)
+	defer releaseReader()
 	for {
 		if state, ok := r.(interface{ Aborted() bool }); ok && state.Aborted() {
 			return
@@ -128,7 +129,7 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			queue := p.pending[key]
 			if len(queue) > 0 {
 				t := queue[0]
-				if err := p.s.restore(&t); err != nil {
+				if err := p.s.restorePending(&t); err != nil {
 					t.Incomplete = true
 					p.s.problem(err)
 				}

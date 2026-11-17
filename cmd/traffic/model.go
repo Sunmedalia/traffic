@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -29,6 +30,7 @@ const indexTimeFormat = session.IndexTimeFormat
 var serial atomic.Uint64
 
 type Store struct {
+	requests              requestCache
 	indexMu               sync.Mutex
 	indexTx               *sql.Tx
 	indexRead, indexWrite *sql.Stmt
@@ -149,7 +151,12 @@ func (s *Store) save(t Transaction) error {
 		h := sha256.Sum256([]byte(fmt.Sprintf("%s/%s/%d/%s", t.Connection, t.Source, time.Now().UnixNano(), t.URL)))
 		t.ID = hex.EncodeToString(h[:12])
 	}
-	t.Alerts = detect(t)
+	previous, revision, cached := s.requests.get(t.ID)
+	if cached && revision == detectionRevision() && bytes.Equal(previous.Request, t.Request) && previous.URL == t.URL {
+		t.Alerts = detectWithPrevious(t, &previous)
+	} else {
+		t.Alerts = detect(t)
+	}
 	if a := scan(t); a != nil {
 		t.Alerts = append(t.Alerts, *a)
 	}
@@ -157,6 +164,7 @@ func (s *Store) save(t Transaction) error {
 	if err != nil {
 		return err
 	}
+	s.requests.put(t, detectionRevision())
 	for _, a := range newAlerts {
 		out, _ := json.Marshal(map[string]any{"id": t.ID, "url": t.URL, "client": t.Client, "peer_client": t.PeerClient, "client_source": t.ClientSource, "time": t.Time, "alert": a})
 		fmt.Println(string(out))

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -10,9 +9,11 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"regexp/syntax"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -21,12 +22,13 @@ import (
 )
 
 type Rule struct {
-	ID       string `yaml:"id"`
-	Version  int    `yaml:"version"`
-	Severity string `yaml:"severity"`
-	Field    string `yaml:"field"`
-	Pattern  string `yaml:"pattern"`
-	rx       *regexp.Regexp
+	ID               string `yaml:"id"`
+	Version          int    `yaml:"version"`
+	Severity         string `yaml:"severity"`
+	Field            string `yaml:"field"`
+	Pattern          string `yaml:"pattern"`
+	rx               *regexp.Regexp
+	requiredLiterals [][]string
 }
 
 var rules = []Rule{
@@ -44,6 +46,16 @@ var rules = []Rule{
 	{ID: "WEBSHELL-ACCESS-001", Version: 1, Severity: "medium", Field: "url", Pattern: `(?i)/(shell|webshell|cmd|c99|r57|antsword|behinder)\.(php[0-9]?|phtml|jsp[x]?|asp[x]?)([?/#]|$)`},
 	{ID: "RESPONSE-PASSWD-001", Version: 1, Severity: "high", Field: "response.body", Pattern: `\broot:[^:\r\n]*:0:0:`},
 	{ID: "RESPONSE-CMD-001", Version: 1, Severity: "high", Field: "response.body", Pattern: `\buid=[0-9]+\([^)]*\)\s+gid=[0-9]+\(`},
+}
+
+var ruleRevision atomic.Uint64
+
+func detectionRevision() uint64 {
+	revision := ruleRevision.Load() << 1
+	if noDetect {
+		revision |= 1
+	}
+	return revision
 }
 
 func compileRules(rs []Rule) error {
@@ -65,7 +77,13 @@ func compileRules(rs []Rule) error {
 			return e
 		}
 		r.rx = rx
+		expression, parseErr := syntax.Parse(r.Pattern, syntax.Perl)
+		if parseErr != nil {
+			return parseErr
+		}
+		r.requiredLiterals = necessaryRuleLiterals(expression)
 	}
+	ruleRevision.Add(1)
 	return nil
 }
 func loadRules(path string) error {
@@ -87,25 +105,59 @@ func loadRules(path string) error {
 
 var noDetect bool
 
-func detect(t Transaction) []Alert {
+func detect(t Transaction) []Alert { return detectWithPrevious(t, nil) }
+
+func detectWithPrevious(t Transaction, previous *Transaction) []Alert {
 	if noDetect {
 		return nil
 	}
 	var out []Alert
-	request := detectionMessage(t.Request, false, requestLimit)
-	response := detectionMessage(t.Response, true, responseLimit)
+	var request, response *detectionHTTP
+	type fieldView struct{ field, view string }
+	views := map[fieldView][]decodedView{}
+	match := func(rule Rule, text, view string) *Alert {
+		key := fieldView{rule.Field, view}
+		variants, ok := views[key]
+		if !ok {
+			variants = decodeViews(text)
+			views[key] = variants
+		}
+		return matchDecodedViews(rule, variants, view)
+	}
 	for _, rule := range rules {
-		message := request
-		if strings.HasPrefix(rule.Field, "response") {
-			message = response
+		responseRule := strings.HasPrefix(rule.Field, "response")
+		if previous != nil && !responseRule {
+			for _, alert := range previous.Alerts {
+				if alert.Rule == rule.ID {
+					out = append(out, alert)
+					break
+				}
+			}
+			continue
 		}
-		text, view := message.content(rule.Field)
-		if rule.Field == "url" {
-			text, view = t.URL, "url"
+		var message *detectionHTTP
+		if rule.Field != "url" {
+			if responseRule {
+				if response == nil {
+					m := detectionMessage(t.Response, true, responseLimit)
+					response = &m
+				}
+				message = response
+			} else {
+				if request == nil {
+					m := detectionMessage(t.Request, false, requestLimit)
+					request = &m
+				}
+				message = request
+			}
 		}
-		alert := matchView(rule, text, view)
-		if alert == nil && (rule.Field == "request" || rule.Field == "response" || rule.Field == "request.body" || rule.Field == "response.body") && message.decoded != "" {
-			alert = matchView(rule, message.decoded, message.decodedView)
+		text, view := t.URL, "url"
+		if message != nil {
+			text, view = message.content(rule.Field)
+		}
+		alert := match(rule, text, view)
+		if alert == nil && message != nil && (rule.Field == "request" || rule.Field == "response" || rule.Field == "request.body" || rule.Field == "response.body") && message.decoded != "" {
+			alert = match(rule, message.decoded, message.decodedView)
 		}
 		if alert != nil {
 			out = append(out, *alert)
@@ -151,7 +203,8 @@ func detectionMessage(raw []byte, response bool, limit int) detectionHTTP {
 		_, headers, _ := bytes.Cut(head, []byte("\n"))
 		message.headers, message.body = string(headers), string(payload)
 	}
-	reader := bufio.NewReader(bytes.NewReader(raw))
+	reader, releaseReader := borrowHTTPReader(bytes.NewReader(raw), min(4096, len(raw)))
+	defer releaseReader()
 	var body io.ReadCloser
 	if response {
 		parsed, err := http.ReadResponse(reader, nil)
@@ -189,18 +242,40 @@ func (m detectionHTTP) content(field string) (string, string) {
 	return m.raw, field
 }
 
-func matchView(rule Rule, text, view string) *Alert {
-	for round := 0; round <= 2; round++ {
-		if match := rule.rx.FindString(text); match != "" {
-			return &Alert{Rule: rule.ID, Version: rule.Version, Severity: rule.Severity, Field: rule.Field, Match: match, Decoding: round, View: view}
-		}
+type decodedView struct {
+	text   string
+	round  int
+	folded string
+	ascii  bool
+}
+
+func decodeViews(text string) []decodedView {
+	folded, ascii := foldedASCII(text)
+	variants := []decodedView{{text: text, round: 0, folded: folded, ascii: ascii}}
+	for round := 1; round <= 2; round++ {
 		decoded := decodePercent(text)
 		if decoded == text {
 			break
 		}
+		folded, ascii := foldedASCII(decoded)
+		variants = append(variants, decodedView{text: decoded, round: round, folded: folded, ascii: ascii})
 		text = decoded
 	}
+	return variants
+}
+func matchDecodedViews(rule Rule, variants []decodedView, view string) *Alert {
+	for _, variant := range variants {
+		if !rule.mayMatch(variant) {
+			continue
+		}
+		if match := rule.rx.FindString(variant.text); match != "" {
+			return &Alert{Rule: rule.ID, Version: rule.Version, Severity: rule.Severity, Field: rule.Field, Match: match, Decoding: variant.round, View: view}
+		}
+	}
 	return nil
+}
+func matchView(rule Rule, text, view string) *Alert {
+	return matchDecodedViews(rule, decodeViews(text), view)
 }
 
 var validPercentEscape = regexp.MustCompile(`%[0-9a-fA-F]{2}`)
