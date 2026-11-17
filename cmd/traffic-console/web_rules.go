@@ -42,6 +42,7 @@ type ruleFile struct {
 	Count    int       `json:"rule_count"`
 	Valid    bool      `json:"valid"`
 	Error    string    `json:"error,omitempty"`
+	Rules    []Rule    `json:"rules,omitempty"`
 }
 
 func openRuleLibrary(dir string) (*ruleLibrary, error) {
@@ -159,6 +160,7 @@ func (l *ruleLibrary) read(name string) (ruleFile, error) {
 	} else {
 		result.Valid = true
 		result.Count = len(rs) - len(builtinRules)
+		result.Rules = rs[len(builtinRules):]
 	}
 	return result, nil
 }
@@ -333,5 +335,5 @@ func (w *webServer) handleRuleValidate(rw http.ResponseWriter, r *http.Request) 
 		webError(rw, 422, err)
 		return
 	}
-	webJSON(rw, 200, map[string]any{"valid": true, "rule_count": len(rs) - len(builtinRules), "total_rules": len(rs)})
+	webJSON(rw, 200, map[string]any{"valid": true, "rule_count": len(rs) - len(builtinRules), "total_rules": len(rs), "rules": rs[len(builtinRules):]})
 }

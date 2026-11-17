@@ -76,6 +76,14 @@ func TestWebRuleLibraryCRUDValidationAndBoundaries(t *testing.T) {
 	if status, data = call("GET", "/api/rules/local.yaml", nil); status != 200 || !bytes.Contains(data, []byte("local-marker")) {
 		t.Fatalf("read failed: %d %s", status, data)
 	}
+	// The editor previews only the file's own rules, never the built-ins it is merged with.
+	var parsed ruleFile
+	if err = json.Unmarshal(data, &parsed); err != nil || len(parsed.Rules) != 1 || parsed.Rules[0].ID != "LOCAL-001" {
+		t.Fatalf("read did not return parsed rules: %s", data)
+	}
+	if status, data = call("POST", "/api/rules/validate", map[string]string{"content": testManagedRules}); status != 200 || !bytes.Contains(data, []byte(`"rules":[{"id":"LOCAL-001"`)) {
+		t.Fatalf("validate did not return parsed rules: %d %s", status, data)
+	}
 	var listing struct {
 		Dir   string     `json:"dir"`
 		Files []ruleFile `json:"files"`
@@ -199,6 +207,13 @@ func TestWebAnalyzesWithManagedRuleSnapshotAndRefreshesReaders(t *testing.T) {
 	}
 	if status, data := ruleRequest(t, server, web.token, "GET", path+"/requests?alerts=1", nil); status != 200 || !bytes.Contains(data, []byte(`"count":0`)) {
 		t.Fatalf("stale analysis visible %d %s", status, data)
+	}
+	status, data := ruleRequest(t, server, web.token, "GET", "/api/analysis", nil)
+	var recent struct {
+		History []webAnalysisJob `json:"history"`
+	}
+	if err = json.Unmarshal(data, &recent); err != nil || status != 200 || len(recent.History) != 2 || recent.History[0].ID != job.ID || recent.History[1].RulesFile != "local.yaml" {
+		t.Fatalf("analysis history not newest first: %d %s", status, data)
 	}
 	if status, _ := ruleRequest(t, server, web.token, "DELETE", "/api/analysis", map[string]string{"id": job.ID}); status != 409 {
 		t.Fatal("cancelled completed task", status)

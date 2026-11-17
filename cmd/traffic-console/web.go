@@ -122,6 +122,7 @@ type webServer struct {
 	cancel      context.CancelFunc
 	jobMu       sync.Mutex
 	job         *webAnalysisJob
+	jobHistory  []*webAnalysisJob
 	jobCancel   context.CancelFunc
 	jobs        sync.WaitGroup
 

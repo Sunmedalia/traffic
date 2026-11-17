@@ -289,12 +289,17 @@ function go(patch, replace) {
 }
 
 function show(view) {
-  for (const name of ['gate', 'sessions', 'session']) $('view-' + name).hidden = name !== view;
+  for (const name of ['gate', 'sessions', 'session', 'rules', 'analysis']) $('view-' + name).hidden = name !== view;
   $('pause').hidden = $('live').hidden = view !== 'session';
+  $('mainnav').hidden = view === 'gate';
+  const section = view === 'session' ? 'sessions' : view;
+  for (const link of document.querySelectorAll('[data-nav]')) {
+    if (link.dataset.nav === section) link.setAttribute('aria-current', 'page');
+    else link.removeAttribute('aria-current');
+  }
 }
 
 function showGate(message) {
-  if ($('rules-dialog').open) $('rules-dialog').close();
   try {
     sessionStorage.removeItem('traffic-token');
   } catch (_) { /* nothing stored */ }
@@ -307,13 +312,29 @@ function showGate(message) {
   $('gate-token').focus();
 }
 
+function leaveSession() {
+  Object.assign(state, { sid: null, selected: null, detail: null, listKey: '', warning: '', error: '', summaryAt: 0 });
+  state.seq++;
+  closeDetail();
+}
+
 function route() {
   if (!state.token) return showGate();
+  if (!guardRuleEdits()) return;
+  const page = parsePage();
+  if (page) {
+    if (state.sid) leaveSession();
+    show(page.view);
+    renderChrome();
+    renderBanner();
+    if (page.view === 'rules') routeRules(page);
+    else routeAnalysis(page);
+    schedule();
+    return;
+  }
   const next = parseHash();
   if (!next) {
-    Object.assign(state, { sid: null, selected: null, detail: null, listKey: '', warning: '', error: '', summaryAt: 0 });
-    state.seq++;
-    closeDetail();
+    leaveSession();
     show('sessions');
     renderChrome();
     renderBanner();
@@ -357,8 +378,8 @@ function route() {
 const currentSession = () => state.sessions.find((s) => s.id === state.sid);
 
 function renderChrome() {
-  $('rules-open').hidden = !state.token;
   const session = currentSession();
+  if (state.sid) $('session-analyze').href = `#/analysis?session=${state.sid}`;
   const crumb = $('crumb');
   if (state.sid && state.token) {
     set(crumb,
@@ -368,7 +389,8 @@ function renderChrome() {
     document.title = `${session ? session.name : '会话'} · Traffic`;
   } else {
     set(crumb);
-    document.title = 'Traffic 流量分析';
+    const page = !$('view-rules').hidden ? '规则' : !$('view-analysis').hidden ? '分析' : '';
+    document.title = page ? `${page} · Traffic` : 'Traffic 流量分析';
   }
   for (const button of document.querySelectorAll('[data-tab]')) {
     button.setAttribute('aria-selected', String(button.dataset.tab === state.tab));
@@ -407,6 +429,7 @@ async function loadSessions(force) {
       renderBanner();
     }
     renderSessions();
+    renderAnalysisSessions();
     return true;
   } catch (error) {
     if (!state.sid) fail(error, '扫描会话失败');
@@ -1105,7 +1128,7 @@ async function exportEvidence() {
 async function tick() {
   if (!state.token || document.hidden) return;
   if (!state.sid) {
-    if (!$('view-sessions').hidden) await loadSessions();
+    if (!$('view-sessions').hidden || !$('view-analysis').hidden) await loadSessions();
     return;
   }
   if (state.paused || state.busy) return;
@@ -1272,7 +1295,7 @@ function togglePause() {
 }
 
 function onKey(event) {
-  if (event.ctrlKey || event.metaKey || event.altKey || $('help').open || $('rules-dialog').open) return;
+  if (event.ctrlKey || event.metaKey || event.altKey || $('help').open) return;
   const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(event.target.tagName);
   if (event.key === 'Escape') {
     if (typing) event.target.blur();
@@ -1286,7 +1309,8 @@ function onKey(event) {
   }
   if (!state.sid) {
     if (event.key === '/') {
-      $('sessions-search').focus();
+      const search = !$('view-rules').hidden ? 'rules-search' : !$('view-analysis').hidden ? 'analysis-search' : 'sessions-search';
+      $(search).focus();
       event.preventDefault();
     }
     return;
@@ -1316,116 +1340,231 @@ function onKey(event) {
 }
 
 // ---- managed rules and local analysis ----
-const ruleUI = { files: [], builtins: [], selected: null, revision: '', dirty: false, busy: false, seq: 0, job: null, poll: 0, completed: '' };
+// Both are routed pages (#/rules, #/analysis) rather than overlays, so they can be
+// linked, reloaded and used side by side with a session in another tab.
+const ruleUI = { files: [], builtins: [], dir: '', loaded: false, selected: null, revision: '', dirty: false, busy: false, seq: 0, hash: '', parsed: null, checkSeq: 0, checking: 0 };
+const jobUI = { job: null, history: [], poll: 0, completed: '', page: null };
 const RULE_TEMPLATE = '- id: CUSTOM-001\n  version: 1\n  severity: medium\n  field: url\n  pattern: \'(?i)/suspicious-endpoint\'\n';
+const NEW_RULE = '~new';
+const ruleHash = (name) => (name === NEW_RULE ? '#/rules/' + NEW_RULE : name ? '#/rules/' + encodeURIComponent(name) : '#/rules');
+
+function parsePage() {
+  let match = /^#\/rules(?:\/([^?]+))?$/.exec(location.hash);
+  if (match) {
+    let name = '';
+    try { name = match[1] ? decodeURIComponent(match[1]) : ''; } catch (_) { /* malformed link opens the built-in rules */ }
+    return { view: 'rules', name };
+  }
+  match = /^#\/analysis(?:\?(.*))?$/.exec(location.hash);
+  if (match) {
+    const params = new URLSearchParams(match[1] || '');
+    return { view: 'analysis', session: params.get('session') || '', rules: params.get('rules') || '' };
+  }
+  return null;
+}
 
 function ruleMessage(text, kind = '') {
   $('rules-validation').textContent = text;
   $('rules-validation').className = 'rules-message ' + kind;
 }
+
 function updateRuleControls() {
   const builtin = ruleUI.selected === '';
-  for (const id of ['rules-save', 'rules-validate', 'rules-new', 'rules-upload']) $(id).disabled = ruleUI.busy || (builtin && (id === 'rules-save' || id === 'rules-validate'));
-  $('rules-delete').disabled = ruleUI.busy || !ruleUI.revision || builtin;
+  const fresh = ruleUI.selected === null;
+  $('rules-body').classList.toggle('readonly', builtin);
+  $('rules-save').disabled = ruleUI.busy || builtin || (!ruleUI.dirty && !fresh);
+  $('rules-validate').disabled = ruleUI.busy || builtin;
+  $('rules-save').hidden = $('rules-validate').hidden = builtin;
+  $('rules-new').disabled = $('rules-upload').disabled = ruleUI.busy;
+  $('rules-delete').hidden = builtin || fresh;
+  $('rules-delete').disabled = ruleUI.busy || !ruleUI.revision;
   $('rules-content').readOnly = builtin || ruleUI.busy;
-  $('rules-name').readOnly = ruleUI.selected !== null || ruleUI.busy;
-  $('rules-editor-note').textContent = builtin ? '· 内置规则只读，分析时始终启用' : ruleUI.dirty ? '· 尚未保存' : ruleUI.revision ? '· 已保存' : '· 新文件';
-  const running = ruleUI.job && ruleUI.job.state === 'running';
-  $('analysis-start').disabled = running || !$('analysis-session').value || ruleUI.busy || ruleUI.dirty;
-  $('analysis-cancel').hidden = !running;
+  $('rules-name').readOnly = !fresh || ruleUI.busy;
+  const ready = builtin || (ruleUI.revision && !ruleUI.dirty);
+  const analyze = $('rules-analyze');
+  analyze.classList.toggle('disabled', !ready);
+  analyze.setAttribute('aria-disabled', String(!ready));
+  analyze.title = ready ? '带着这份规则去选择会话' : '先保存文件，再用它分析';
+  analyze.href = ready ? '#/analysis' + (builtin ? '' : '?rules=' + encodeURIComponent(ruleUI.selected)) : '';
+  const tag = $('rules-state');
+  const [label, tone] = builtin ? ['内置 · 只读', ''] : ruleUI.dirty ? ['未保存', 'warn'] : fresh ? ['新文件', 'warn'] : ['已保存', 'ok'];
+  tag.textContent = label;
+  tag.className = 'pill ' + tone;
 }
-function discardRuleEdits() { return !ruleUI.dirty || window.confirm('当前修改尚未保存，确定放弃修改？'); }
+
+function discardRuleEdits() { return !ruleUI.dirty || window.confirm('当前规则修改尚未保存，确定放弃？'); }
+
 function renderRuleFiles() {
-  const item = (name, label, size) => h('button', { type: 'button', 'aria-current': String(ruleUI.selected === name), disabled: ruleUI.busy, onclick: () => openRuleFile(name) }, label, h('small', {}, size));
-  set($('rules-files'), item('', '内置规则', `${ruleUI.builtins.length} 条 · 只读`), ruleUI.files.map((file) => item(file.name, file.name, `${number(file.size)} 字节`)));
-  const previous = $('analysis-rule').value;
-  set($('analysis-rule'), h('option', { value: '' }, '仅内置规则'), ruleUI.files.map((file) => h('option', { value: file.name }, '内置 + ' + file.name)));
-  $('analysis-rule').value = ruleUI.files.some((file) => file.name === previous) ? previous : '';
+  const query = $('rules-search').value.trim().toLowerCase();
+  const item = (name, label, sub) => h('a', { href: ruleHash(name), class: 'rule-file', 'aria-current': ruleUI.selected === name ? 'page' : null }, h('span', { class: 'name' }, label), h('small', {}, sub));
+  set($('rules-files'),
+    !query || '内置规则'.includes(query) ? item('', '内置规则', `${ruleUI.builtins.length} 条 · 只读 · 始终启用`) : null,
+    ruleUI.selected === null ? item(NEW_RULE, ($('rules-name').value.trim() || '未命名') + ' *', '新文件 · 尚未保存') : null,
+    ruleUI.files.filter((file) => !query || file.name.toLowerCase().includes(query))
+      .map((file) => item(file.name, file.name + (ruleUI.dirty && ruleUI.selected === file.name ? ' *' : ''), `${number(file.size)} 字节 · ${relativeTime(file.modified) || formatTime(file.modified)}`)));
+  $('rules-summary').textContent = `${ruleUI.files.length} 个文件`;
+  $('rules-dir').textContent = ruleUI.dir;
 }
+
 async function refreshRuleLibrary() {
   const data = await api('rules');
   ruleUI.files = data.files || [];
   ruleUI.builtins = data.builtin_rules || [];
-  $('rules-dir').textContent = data.dir;
+  ruleUI.dir = data.dir || '';
+  ruleUI.loaded = true;
   renderRuleFiles();
+  renderRuleOptions();
 }
-async function openRuleFile(name, force = false) {
-  if (ruleUI.busy || (!force && !discardRuleEdits())) return;
+
+// The preview lists what the engine actually parsed, so a typo in a key or
+// severity shows up as a missing or rejected rule before anything is saved.
+function renderRulePreview(rules, note) {
+  ruleUI.parsed = rules;
+  const list = rules || [];
+  set($('rules-table'), list.map((rule) => h('tr', { 'data-rule': rule.id, title: ruleUI.selected === '' ? null : '定位到编辑器中的这条规则' },
+    h('td', {}, rule.id), h('td', {}, h('span', { class: 'sev ' + rule.severity }, SEVERITIES[rule.severity] || rule.severity)),
+    h('td', {}, rule.field), h('td', { class: 'wide pattern' }, rule.pattern))));
+  const empty = $('rules-table-empty');
+  empty.hidden = list.length > 0;
+  empty.textContent = note || '没有可显示的规则';
+  $('rules-preview-meta').textContent = rules ? `${list.length} 条` : '';
+}
+
+function builtinYAML() {
+  return ruleUI.builtins.map((rule) => `- id: ${rule.id}\n  version: ${rule.version}\n  severity: ${rule.severity}\n  field: ${rule.field}\n  pattern: ${JSON.stringify(rule.pattern)}\n`).join('\n');
+}
+
+function setEditor(content) {
+  $('rules-content').value = content;
+  $('rules-content').scrollTop = 0;
+  renderGutter();
+}
+
+function renderGutter() {
+  const area = $('rules-content');
+  const lines = area.value.split('\n').length;
+  const gutter = $('rules-gutter');
+  if (Number(gutter.dataset.lines) !== lines) {
+    gutter.dataset.lines = String(lines);
+    gutter.textContent = Array.from({ length: lines }, (_, i) => i + 1).join('\n');
+  }
+  gutter.scrollTop = area.scrollTop;
+  const before = area.value.slice(0, area.selectionStart);
+  const line = before.split('\n').length;
+  $('rules-cursor').textContent = `第 ${line} 行，第 ${before.length - before.lastIndexOf('\n')} 列 · 共 ${lines} 行`;
+}
+
+async function openRuleFile(name) {
   const seq = ++ruleUI.seq;
+  ruleUI.checkSeq++;
   ruleUI.busy = true;
   updateRuleControls();
   try {
-    let file;
-    if (name) file = await api('rules/' + encodeURIComponent(name));
+    if (!ruleUI.loaded) await refreshRuleLibrary();
+    const file = name ? await api('rules/' + encodeURIComponent(name)) : null;
     if (seq !== ruleUI.seq) return;
-    ruleUI.selected = name;
-    ruleUI.revision = file ? file.revision : '';
-    ruleUI.dirty = false;
-    $('rules-name').value = name || '内置规则（只读）';
-    $('rules-content').value = file ? file.content : ruleUI.builtins.map((rule) => `- id: ${rule.id}\n  version: ${rule.version}\n  severity: ${rule.severity}\n  field: ${rule.field}\n  pattern: ${JSON.stringify(rule.pattern)}\n`).join('\n');
-    $('analysis-rule').value = name;
-    ruleMessage(file && !file.valid ? file.error : file ? `${file.rule_count} 条自定义规则；分析时与内置规则一起执行。` : '内置规则随程序提供。请新建或导入 YAML 文件来追加规则。', file && !file.valid ? 'error' : '');
+    Object.assign(ruleUI, { selected: name, revision: file ? file.revision : '', dirty: false, hash: ruleHash(name) });
+    $('rules-name').value = name || '内置规则';
+    setEditor(file ? file.content : builtinYAML());
+    if (!file) {
+      renderRulePreview(ruleUI.builtins);
+      ruleMessage('内置规则随程序提供，每次分析都会启用。自定义文件在此基础上追加，ID 不能与内置规则重复。');
+    } else if (file.valid) {
+      renderRulePreview(file.rules || []);
+      ruleMessage(`${file.rule_count} 条自定义规则，分析时与 ${ruleUI.builtins.length} 条内置规则一起执行。`);
+    } else {
+      renderRulePreview(null, '文件当前无法解析，修复后会显示规则列表');
+      ruleMessage(file.error, 'error');
+    }
   } catch (error) {
-    ruleMessage(error.message, 'error');
+    if (seq !== ruleUI.seq) return;
+    Object.assign(ruleUI, { selected: name, revision: '', dirty: false, hash: ruleHash(name) });
+    $('rules-name').value = name;
+    setEditor('');
+    renderRulePreview(null, '无法读取文件');
+    ruleMessage(error.status === 404 ? `规则目录中没有 ${name}，可能已被删除。` : error.message, 'error');
   } finally {
-    ruleUI.busy = false;
-    renderRuleFiles();
-    updateRuleControls();
+    if (seq === ruleUI.seq) {
+      ruleUI.busy = false;
+      renderRuleFiles();
+      updateRuleControls();
+    }
   }
 }
+
 function newRuleFile(name = 'custom.yaml', content = RULE_TEMPLATE) {
-  if (ruleUI.busy || !discardRuleEdits()) return;
   ruleUI.seq++;
-  ruleUI.selected = null;
-  ruleUI.revision = '';
-  ruleUI.dirty = true;
+  Object.assign(ruleUI, { selected: null, revision: '', dirty: true, hash: ruleHash(NEW_RULE) });
+  if (location.hash !== ruleUI.hash) history.replaceState(null, '', ruleUI.hash);
   $('rules-name').value = name;
-  $('rules-content').value = content;
-  ruleMessage('保存前会检查 YAML、规则 ID、字段、级别和正则表达式。');
+  setEditor(content);
   renderRuleFiles();
   updateRuleControls();
+  checkRules(0);
   $('rules-name').focus();
+  $('rules-name').select();
 }
-async function validateRuleEditor() {
-  ruleUI.busy = true;
-  updateRuleControls();
-  try {
-    const result = await mutate('rules/validate', 'POST', { content: $('rules-content').value });
-    ruleMessage(`校验通过：${result.rule_count} 条自定义规则，共 ${result.total_rules} 条规则。`, 'success');
-  } catch (error) { ruleMessage(error.message, 'error'); }
-  finally { ruleUI.busy = false; updateRuleControls(); }
+
+// Edits are checked as the user types, like a linter, so saving is rarely the first time an error shows.
+function checkRules(delay = 500) {
+  clearTimeout(ruleUI.checking);
+  const seq = ++ruleUI.checkSeq;
+  if (ruleUI.selected === '') return;
+  ruleUI.checking = setTimeout(async () => {
+    const content = $('rules-content').value;
+    if (!content.trim()) {
+      renderRulePreview(null, '文件为空');
+      return ruleMessage('请输入 YAML 规则列表，可参考右侧字段说明。', 'error');
+    }
+    try {
+      const result = await mutate('rules/validate', 'POST', { content });
+      if (seq !== ruleUI.checkSeq) return;
+      renderRulePreview(result.rules || []);
+      ruleMessage(`校验通过：${result.rule_count} 条自定义规则，加上内置共 ${result.total_rules} 条。` + (ruleUI.dirty ? ' 尚未保存。' : ''), 'success');
+    } catch (error) {
+      if (seq !== ruleUI.checkSeq) return;
+      renderRulePreview(null, '修复错误后会显示解析出的规则');
+      ruleMessage(error.message, 'error');
+    }
+  }, delay);
 }
+
 async function saveRuleFile() {
+  if ($('rules-save').disabled) return;
   const name = $('rules-name').value.trim();
   ruleUI.busy = true;
   updateRuleControls();
   try {
     const result = await mutate('rules/' + encodeURIComponent(name), 'PUT', { content: $('rules-content').value, revision: ruleUI.revision });
-    ruleUI.selected = result.name;
-    ruleUI.revision = result.revision;
-    ruleUI.dirty = false;
+    ruleUI.seq++;
+    Object.assign(ruleUI, { selected: result.name, revision: result.revision, dirty: false, hash: ruleHash(result.name) });
+    history.replaceState(null, '', ruleUI.hash);
     await refreshRuleLibrary();
-    $('analysis-rule').value = result.name;
-    ruleMessage(`已保存 ${result.name} · ${result.rule_count} 条自定义规则。需要重新分析会话才能更新告警。`, 'success');
+    renderRulePreview(result.rules || []);
+    ruleMessage(`已保存 ${result.name} · ${result.rule_count} 条自定义规则。重新分析会话后告警才会更新。`, 'success');
+    toast('规则文件已保存');
   } catch (error) { ruleMessage(error.message, 'error'); }
   finally { ruleUI.busy = false; renderRuleFiles(); updateRuleControls(); }
 }
+
 async function deleteRuleFile() {
-  if (!ruleUI.revision || !window.confirm(`删除 ${ruleUI.selected}？已有分析结果会保留。`)) return;
+  if (!ruleUI.revision || !window.confirm(`删除 ${ruleUI.selected}？已有的分析结果会保留。`)) return;
   ruleUI.busy = true;
   updateRuleControls();
   try {
     await mutate('rules/' + encodeURIComponent(ruleUI.selected), 'DELETE', { revision: ruleUI.revision });
     ruleUI.dirty = false;
-    ruleUI.selected = '';
-    ruleUI.revision = '';
-    await refreshRuleLibrary();
     ruleUI.busy = false;
-    await openRuleFile('', true);
+    await refreshRuleLibrary();
     toast('规则文件已删除');
-  } catch (error) { ruleMessage(error.message, 'error'); }
-  finally { ruleUI.busy = false; renderRuleFiles(); updateRuleControls(); }
+    location.hash = ruleHash('');
+  } catch (error) {
+    ruleMessage(error.message, 'error');
+    ruleUI.busy = false;
+    updateRuleControls();
+  }
 }
+
 function downloadRuleFile() {
   const blob = new Blob([$('rules-content').value], { type: 'application/yaml;charset=utf-8' });
   const url = URL.createObjectURL(blob);
@@ -1433,91 +1572,259 @@ function downloadRuleFile() {
   document.body.append(link); link.click(); link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
-function renderAnalysisJob() {
-  const job = ruleUI.job;
-  if (!job) return updateRuleControls();
-  const status = $('analysis-status');
-  const session = state.sessions.find((s) => s.id === job.session_id);
-  const prefix = (session ? session.name : job.session_id) + ' · ' + (job.rules_file || '仅内置规则') + '：';
-  status.className = 'rules-message ' + (job.state === 'failed' ? 'error' : job.state === 'succeeded' ? 'success' : '');
-  status.textContent = prefix + (job.state === 'running' ? '正在分析，页面可继续浏览。' : job.state === 'succeeded' ? `分析完成，${number(job.report.transactions)} 条事务，${number(job.report.alerts)} 条告警。` : job.state === 'cancelled' ? '已停止，保留上次完整分析结果。' : '分析失败：' + job.error);
-  updateRuleControls();
+
+function focusRule(id) {
+  const area = $('rules-content');
+  const found = new RegExp('^\\s*-?\\s*id:\\s*[\'"]?' + id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[\'"]?\\s*$', 'm').exec(area.value);
+  if (!found || ruleUI.selected === '') return;
+  const at = found.index + found[0].indexOf('id:');
+  area.focus();
+  area.setSelectionRange(at, found.index + found[0].length);
+  const line = area.value.slice(0, at).split('\n').length;
+  area.scrollTop = Math.max(0, (line - 4) * parseFloat(getComputedStyle(area).lineHeight || '19'));
+  renderGutter();
 }
-async function pollAnalysisJob() {
-  clearTimeout(ruleUI.poll);
-  if (!state.token) return;
-  try {
-    const data = await api('analysis');
-    ruleUI.job = data.job;
-    renderAnalysisJob();
-    if (data.job && data.job.state !== 'running' && data.job.id !== ruleUI.completed) {
-      ruleUI.completed = data.job.id;
-      await loadSessions();
-      if (state.sid === data.job.session_id) {
-        state.auxAt = 0;
-        state.summaryAt = 0;
-        state.known = null;
-        await refresh(false);
-        schedule();
-        if (state.selected) await showDetail(state.selected, true);
-      }
-    }
-  } catch (error) { if ($('rules-dialog').open) $('analysis-status').textContent = '获取分析状态失败：' + error.message; }
-  if (state.token && ruleUI.job && ruleUI.job.state === 'running') ruleUI.poll = setTimeout(pollAnalysisJob, 1000);
+
+function routeRules(page) {
+  const name = page.name;
+  // Keep unsaved work when the route already points at it (reload of the same hash, back to it).
+  if (ruleUI.dirty && location.hash === ruleUI.hash) return updateRuleControls();
+  if (name === NEW_RULE) return newRuleFile();
+  openRuleFile(name);
 }
-async function startRuleAnalysis() {
-  $('analysis-start').disabled = true;
-  try {
-    ruleUI.job = await mutate(`sessions/${$('analysis-session').value}/analyze`, 'POST', { rules_file: $('analysis-rule').value });
-    renderAnalysisJob();
-    pollAnalysisJob();
-  } catch (error) {
-    $('analysis-status').textContent = error.message;
-    $('analysis-status').className = 'rules-message error';
-    updateRuleControls();
-  }
-}
-async function openRuleManager() {
-  $('rules-dialog').showModal();
-  ruleMessage('正在读取规则目录…');
-  try {
-    await refreshRuleLibrary();
-    await loadSessions();
-    const selected = $('analysis-session').value || state.sid || '';
-    set($('analysis-session'), h('option', { value: '' }, '请选择会话'), state.sessions.filter((s) => !s.problem).map((s) => h('option', { value: s.id }, `${s.name} · ${stateLabel(s.state)}`)));
-    $('analysis-session').value = selected;
-    if (ruleUI.selected === null && !ruleUI.dirty) await openRuleFile('', true);
-    else if (!ruleUI.dirty) ruleMessage('选择文件编辑，或新建 / 导入规则。');
-    updateRuleControls();
-    pollAnalysisJob();
-  } catch (error) { ruleMessage(error.message, 'error'); }
-}
+
 function bindRules() {
-  $('rules-open').addEventListener('click', openRuleManager);
-  const close = () => { if (discardRuleEdits()) { ruleUI.dirty = false; ruleUI.selected = null; $('rules-dialog').close(); } };
-  $('rules-close').addEventListener('click', close);
-  $('rules-dialog').addEventListener('cancel', (event) => { event.preventDefault(); close(); });
-  $('rules-new').addEventListener('click', () => newRuleFile());
+  $('rules-search').addEventListener('input', renderRuleFiles);
+  $('rules-new').addEventListener('click', () => {
+    if (ruleUI.selected === null) { if (discardRuleEdits()) newRuleFile(); return; }
+    location.hash = ruleHash(NEW_RULE);
+  });
   $('rules-upload').addEventListener('click', () => $('rules-upload-input').click());
   $('rules-upload-input').addEventListener('change', async (event) => {
     const file = event.target.files[0];
     event.target.value = '';
     if (!file) return;
     if (file.size > 1048576) return ruleMessage('规则文件不能超过 1 MiB', 'error');
-    try { newRuleFile(file.name, new TextDecoder('utf-8', { fatal: true }).decode(await file.arrayBuffer())); }
-    catch (_) { ruleMessage('请选择 UTF-8 编码的 YAML 文件', 'error'); }
+    let content;
+    try { content = new TextDecoder('utf-8', { fatal: true }).decode(await file.arrayBuffer()); }
+    catch (_) { return ruleMessage('请选择 UTF-8 编码的 YAML 文件', 'error'); }
+    if (!discardRuleEdits()) return;
+    const taken = ruleUI.files.some((f) => f.name === file.name);
+    newRuleFile(taken ? file.name.replace(/(\.ya?ml)$/i, '-imported$1') : file.name, content);
+    if (taken) toast(`已有同名文件，导入为 ${$('rules-name').value}`);
   });
-  for (const id of ['rules-name', 'rules-content']) $(id).addEventListener('input', () => { ruleUI.dirty = true; ruleMessage('修改尚未保存。'); updateRuleControls(); });
-  $('rules-validate').addEventListener('click', validateRuleEditor);
+  const area = $('rules-content');
+  area.addEventListener('input', () => {
+    ruleUI.dirty = true;
+    renderGutter();
+    updateRuleControls();
+    checkRules();
+  });
+  $('rules-name').addEventListener('input', () => { ruleUI.dirty = true; updateRuleControls(); renderRuleFiles(); });
+  area.addEventListener('scroll', () => { $('rules-gutter').scrollTop = area.scrollTop; });
+  for (const type of ['click', 'keyup', 'select']) area.addEventListener(type, renderGutter);
+  area.addEventListener('keydown', (event) => {
+    if (event.key !== 'Tab' || event.ctrlKey || event.metaKey || event.altKey || area.readOnly) return;
+    event.preventDefault();
+    if (event.shiftKey) return;
+    // execCommand keeps the browser's undo history intact.
+    if (!document.execCommand('insertText', false, '  ')) area.setRangeText('  ', area.selectionStart, area.selectionEnd, 'end');
+  });
+  $('view-rules').addEventListener('keydown', (event) => {
+    if (!(event.ctrlKey || event.metaKey)) return;
+    if (event.key === 's') { event.preventDefault(); saveRuleFile(); }
+    else if (event.key === 'Enter' && !$('rules-validate').disabled) { event.preventDefault(); checkRules(0); }
+  });
+  $('rules-validate').addEventListener('click', () => checkRules(0));
   $('rules-save').addEventListener('click', saveRuleFile);
   $('rules-delete').addEventListener('click', deleteRuleFile);
   $('rules-download').addEventListener('click', downloadRuleFile);
-  $('analysis-session').addEventListener('change', updateRuleControls);
-  $('analysis-start').addEventListener('click', startRuleAnalysis);
-  $('analysis-cancel').addEventListener('click', async () => {
-    try { await mutate('analysis', 'DELETE', { id: ruleUI.job.id }); $('analysis-status').textContent = '正在停止分析，等待当前操作结束…'; }
-    catch (error) { $('analysis-status').textContent = error.message; }
+  $('rules-analyze').addEventListener('click', (event) => { if ($('rules-analyze').classList.contains('disabled')) event.preventDefault(); });
+  $('rules-table').addEventListener('click', (event) => {
+    const row = event.target.closest('tr[data-rule]');
+    if (row) focusRule(row.dataset.rule);
   });
+  window.addEventListener('beforeunload', (event) => {
+    if (ruleUI.dirty) { event.preventDefault(); event.returnValue = ''; }
+  });
+
+  $('analysis-search').addEventListener('input', renderAnalysisSessions);
+  $('analysis-rule').addEventListener('change', () => { save('analysis-rule', $('analysis-rule').value); renderAnalysisSessions(); });
+  $('analysis-sessions').addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-analyze]');
+    if (button) startRuleAnalysis(button.dataset.analyze);
+  });
+  $('job-card').addEventListener('click', async (event) => {
+    if (!event.target.closest('#job-cancel')) return;
+    event.target.disabled = true;
+    try { await mutate('analysis', 'DELETE', { id: jobUI.job.id }); toast('正在停止分析，等待当前操作结束'); }
+    catch (error) { toast(error.message, true); }
+  });
+}
+
+// A hash change that would leave unsaved rule edits asks first and otherwise restores the editor's URL.
+function guardRuleEdits() {
+  if (!ruleUI.dirty || location.hash === ruleUI.hash) return true;
+  if (window.confirm('当前规则修改尚未保存，确定离开？')) {
+    ruleUI.dirty = false;
+    return true;
+  }
+  history.replaceState(null, '', ruleUI.hash);
+  return false;
+}
+
+// ---- analysis page ----
+
+const sessionName = (id) => { const s = state.sessions.find((item) => item.id === id); return s ? s.name : id.slice(0, 12); };
+const jobRunning = () => Boolean(jobUI.job && jobUI.job.state === 'running');
+const JOB_STATES = { running: '分析中', succeeded: '已完成', failed: '失败', cancelled: '已停止' };
+
+function elapsed(job) {
+  const from = parseTime(job.started);
+  const to = job.state === 'running' ? new Date() : parseTime(job.finished);
+  if (!from || !to) return '—';
+  const seconds = Math.max(0, Math.round((to - from) / 1000));
+  return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+}
+
+function renderRuleOptions() {
+  const select = $('analysis-rule');
+  const wanted = (jobUI.page && jobUI.page.rules) || select.value || saved('analysis-rule', '');
+  set(select, h('option', { value: '' }, '仅内置规则'), ruleUI.files.map((file) => h('option', { value: file.name }, '内置 + ' + file.name)));
+  select.value = ruleUI.files.some((file) => file.name === wanted) ? wanted : '';
+}
+
+function renderJobCard() {
+  const job = jobUI.job;
+  const card = $('job-card');
+  card.className = 'card job ' + (job ? job.state : 'idle');
+  if (!job) {
+    return set(card, h('div', { class: 'job-line' }, h('b', {}, '没有正在运行的分析'), h('span', { class: 'muted' }, '在下方选择规则和已停止采集的会话开始分析。同一时间只运行一个任务。')));
+  }
+  const report = job.report;
+  set(card,
+    h('div', { class: 'job-line' },
+      h('span', { class: 'pill ' + job.state }, JOB_STATES[job.state] || job.state),
+      h('b', {}, sessionName(job.session_id)),
+      h('span', { class: 'muted' }, (job.rules_file ? '内置 + ' + job.rules_file : '仅内置规则') + ' · ' + formatTime(job.started) + ' 开始 · 用时 ' + elapsed(job)),
+      h('span', { class: 'spacer' }),
+      job.state === 'running' ? h('button', { type: 'button', id: 'job-cancel' }, '停止分析') : null,
+      job.state === 'succeeded' ? [h('a', { class: 'button', href: `#/s/${job.session_id}/overview` }, '查看概览'), h('a', { class: 'button primary', href: `#/s/${job.session_id}/alerts` }, '查看告警')] : null),
+    job.state === 'running' ? h('div', { class: 'progress', role: 'progressbar', 'aria-label': '分析进行中' }, h('i')) : null,
+    job.state === 'succeeded' && report ? h('div', { class: 'job-stats' },
+      h('div', {}, h('b', {}, number(report.transactions)), h('span', {}, '事务')),
+      h('div', { class: report.alerts ? 'hot' : '' }, h('b', {}, number(report.alerts)), h('span', {}, '告警命中')),
+      h('div', {}, h('b', {}, number((report.rules || []).length)), h('span', {}, '规则'))) : null,
+    job.state === 'failed' ? h('div', { class: 'rules-message error' }, job.error) : null,
+    job.state === 'cancelled' ? h('div', { class: 'rules-message' }, '已停止，会话保留上次完整的分析结果。') : null);
+}
+
+function renderAnalysisSessions() {
+  if ($('view-analysis').hidden) return;
+  const query = $('analysis-search').value.trim().toLowerCase();
+  const focus = jobUI.page && jobUI.page.session;
+  const list = state.sessions.filter((s) => !query || [s.name, s.host, s.dir].some((v) => String(v || '').toLowerCase().includes(query)));
+  const busy = jobRunning();
+  set($('analysis-sessions'), list.map((s) => {
+    const reason = s.problem ? '会话不可用：' + s.problem : s.state === 'running' ? '采集仍在进行，停止后再分析' : busy ? '已有分析任务在运行' : '';
+    const active = busy && jobUI.job.session_id === s.id;
+    return h('tr', { class: s.id === focus ? 'selected' : '', 'data-sid': s.id },
+      h('td', { title: s.dir }, h('a', { class: 'link', href: `#/s/${s.id}/overview` }, s.name)),
+      h('td', { class: 'extra' }, s.host || '—'),
+      h('td', {}, h('span', { class: 'state' }, h('span', { class: 'dot ' + (s.problem ? 'broken' : s.state) }), s.problem ? '不可用' : stateLabel(s.state))),
+      h('td', { class: 'num' }, s.counts_known ? number(s.transactions) : '—'),
+      h('td', { class: 'num' + (s.counts_known && s.alerts ? ' hot' : '') }, s.counts_known ? number(s.alerts) : '—'),
+      h('td', { class: 'extra time' }, formatTime(s.started, 'dayclock')),
+      h('td', { class: 'act' }, h('button', { type: 'button', class: s.id === focus ? 'primary' : '', 'data-analyze': s.id, disabled: Boolean(reason), title: reason || null }, active ? '分析中…' : '分析')));
+  }));
+  const empty = $('analysis-sessions-empty');
+  empty.hidden = list.length > 0;
+  empty.textContent = state.sessions.length ? '没有匹配的会话' : '采集根目录下还没有会话';
+  if (focus && !jobUI.scrolled) {
+    const row = $('analysis-sessions').querySelector(`tr[data-sid="${focus}"]`);
+    if (row) { row.scrollIntoView({ block: 'nearest' }); jobUI.scrolled = true; }
+  }
+}
+
+function renderAnalysisHistory() {
+  const list = jobUI.history || [];
+  set($('analysis-history'), list.map((job) => h('tr', {},
+    h('td', { class: 'time' }, formatTime(job.started, 'dayclock')),
+    h('td', {}, sessionName(job.session_id)),
+    h('td', {}, job.rules_file || '仅内置'),
+    h('td', {}, h('span', { class: 'pill ' + job.state, title: job.error || null }, JOB_STATES[job.state] || job.state)),
+    h('td', { class: 'num' }, job.report ? number(job.report.transactions) : '—'),
+    h('td', { class: 'num' + (job.report && job.report.alerts ? ' hot' : '') }, job.report ? number(job.report.alerts) : '—'),
+    h('td', { class: 'num' }, elapsed(job)),
+    h('td', { class: 'act' }, job.state === 'succeeded' ? h('a', { class: 'link', href: `#/s/${job.session_id}/alerts` }, '告警') : null))));
+  $('analysis-history-empty').hidden = list.length > 0;
+  $('analysis-history').closest('.table-wrap').hidden = !list.length;
+}
+
+function renderAnalysis() {
+  $('nav-job').hidden = !jobRunning();
+  if ($('view-analysis').hidden) return;
+  renderJobCard();
+  renderAnalysisSessions();
+  renderAnalysisHistory();
+}
+
+async function pollAnalysisJob() {
+  clearTimeout(jobUI.poll);
+  if (!state.token) return;
+  try {
+    const data = await api('analysis');
+    jobUI.job = data.job;
+    jobUI.history = data.history || [];
+    const job = data.job;
+    if (job && job.state === 'running') jobUI.watching = true;
+    if (job && job.state !== 'running' && job.id !== jobUI.completed) {
+      const first = !jobUI.completed && !jobUI.watching;
+      jobUI.completed = job.id;
+      jobUI.watching = false;
+      if (!first) {
+        if (job.state === 'succeeded') toast(`${sessionName(job.session_id)} 分析完成，${number(job.report.alerts)} 条告警`);
+        else if (job.state === 'failed') toast('分析失败：' + job.error, true);
+        await loadSessions();
+        if (state.sid === job.session_id) {
+          state.auxAt = 0;
+          state.summaryAt = 0;
+          state.known = null;
+          await refresh(false);
+          schedule();
+          if (state.selected) await showDetail(state.selected, true);
+        }
+      }
+    }
+    renderAnalysis();
+  } catch (error) {
+    if (!$('view-analysis').hidden && error.status) toast('获取分析状态失败：' + error.message, true);
+  }
+  if (state.token && jobRunning()) jobUI.poll = setTimeout(pollAnalysisJob, 1000);
+}
+
+async function startRuleAnalysis(sid) {
+  const rules = $('analysis-rule').value;
+  try {
+    jobUI.job = await mutate(`sessions/${sid}/analyze`, 'POST', { rules_file: rules });
+    jobUI.watching = true;
+    renderAnalysis();
+    pollAnalysisJob();
+    window.scrollTo({ top: 0 });
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function routeAnalysis(page) {
+  jobUI.page = page;
+  jobUI.scrolled = false;
+  renderAnalysis();
+  try {
+    await Promise.all([ruleUI.loaded ? null : refreshRuleLibrary(), loadSessions()]);
+    renderRuleOptions();
+  } catch (error) { fail(error, '读取规则目录失败'); }
+  await pollAnalysisJob();
 }
 
 async function boot() {
@@ -1542,6 +1849,7 @@ async function boot() {
     history.replaceState(null, '', `#/s/${usable[0].id}/overview`);
   }
   route();
+  if (state.token && $('view-analysis').hidden) pollAnalysisJob();
 }
 
 boot();

@@ -9,6 +9,10 @@ import (
 	"time"
 )
 
+// The web server keeps only the most recent runs in memory; the session's own
+// analysis report remains the durable record.
+const maxWebAnalysisHistory = 20
+
 type webAnalysisJob struct {
 	ID        string          `json:"id"`
 	SessionID string          `json:"session_id"`
@@ -78,6 +82,10 @@ func (w *webServer) handleAnalyze(rw http.ResponseWriter, r *http.Request) {
 	job := &webAnalysisJob{ID: hex.EncodeToString(random[:]), SessionID: r.PathValue("sid"), RulesFile: input.RulesFile, State: "running", Started: time.Now().UTC()}
 	ctx, cancel := context.WithCancel(w.ctx)
 	w.job, w.jobCancel = job, cancel
+	w.jobHistory = append([]*webAnalysisJob{job}, w.jobHistory...)
+	if len(w.jobHistory) > maxWebAnalysisHistory {
+		w.jobHistory = w.jobHistory[:maxWebAnalysisHistory]
+	}
 	w.jobs.Add(1)
 	go func() {
 		defer w.jobs.Done()
@@ -103,7 +111,11 @@ func (w *webServer) handleAnalyze(rw http.ResponseWriter, r *http.Request) {
 func (w *webServer) handleAnalysisStatus(rw http.ResponseWriter, r *http.Request) {
 	w.jobMu.Lock()
 	defer w.jobMu.Unlock()
-	webJSON(rw, 200, map[string]any{"job": w.job})
+	history := w.jobHistory
+	if history == nil {
+		history = []*webAnalysisJob{}
+	}
+	webJSON(rw, 200, map[string]any{"job": w.job, "history": history})
 }
 
 func (w *webServer) handleAnalysisCancel(rw http.ResponseWriter, r *http.Request) {

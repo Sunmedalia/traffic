@@ -11,10 +11,14 @@
 <body>
 <header class="top">
   <a class="brand" href="#/" title="会话列表"><span class="brand-mark" aria-hidden="true"></span>TRAFFIC</a>
+  <nav class="mainnav" id="mainnav" aria-label="主导航" hidden>
+    <a href="#/" data-nav="sessions">会话</a>
+    <a href="#/rules" data-nav="rules">规则</a>
+    <a href="#/analysis" data-nav="analysis">分析<span class="dot running" id="nav-job" hidden></span></a>
+  </nav>
   <nav class="crumb" id="crumb" aria-label="当前会话"></nav>
   <div class="spacer"></div>
   <span class="live" id="live" hidden></span>
-  <button type="button" id="rules-open" hidden>规则与分析</button>
   <button type="button" class="ghost" id="pause" hidden title="暂停或恢复自动刷新（空格）">暂停</button>
   <button type="button" class="ghost" id="tz" title="切换时间显示的时区"></button>
   <button type="button" class="ghost" id="theme" title="切换配色"></button>
@@ -52,6 +56,8 @@
       <button type="button" role="tab" data-tab="overview"><kbd>1</kbd>概览</button>
       <button type="button" role="tab" data-tab="requests"><kbd>2</kbd>请求<span class="badge" id="count-requests"></span></button>
       <button type="button" role="tab" data-tab="alerts"><kbd>3</kbd>告警<span class="badge alert" id="count-alerts"></span></button>
+      <span class="spacer"></span>
+      <a class="tab-action" id="session-analyze" title="用内置或自定义规则重新分析这个会话">重新分析</a>
     </nav>
 
     <div id="tab-overview" class="overview" hidden>
@@ -182,38 +188,95 @@
       </div>
     </div>
   </section>
+
+  <section id="view-rules" class="rules-view" hidden>
+    <aside class="rules-sidebar">
+      <div class="rules-side-head"><h1>规则</h1><span class="muted" id="rules-summary"></span></div>
+      <div class="rules-toolbar">
+        <button type="button" class="primary" id="rules-new">新建</button>
+        <button type="button" id="rules-upload">导入文件</button>
+        <input type="file" id="rules-upload-input" accept=".yaml,.yml" hidden>
+      </div>
+      <input type="search" id="rules-search" placeholder="查找规则文件" spellcheck="false" aria-label="查找规则文件">
+      <div id="rules-files" class="rules-files" aria-label="规则文件列表"></div>
+      <div class="rules-location"><span class="muted">规则目录</span><code id="rules-dir"></code></div>
+    </aside>
+    <section class="rules-main" aria-label="规则编辑">
+      <header class="rules-head">
+        <input id="rules-name" autocomplete="off" spellcheck="false" placeholder="custom.yaml" maxlength="128" aria-label="文件名">
+        <span class="pill" id="rules-state"></span>
+        <span class="spacer"></span>
+        <button type="button" id="rules-validate" title="校验（Ctrl+Enter）">校验</button>
+        <button type="button" class="primary" id="rules-save" title="保存（Ctrl+S）">保存</button>
+        <a class="button" id="rules-analyze" title="带着这份规则去选择会话">用此规则分析</a>
+        <button type="button" id="rules-download">下载</button>
+        <button type="button" class="danger" id="rules-delete">删除</button>
+      </header>
+      <div id="rules-validation" class="rules-message" role="status" aria-live="polite"></div>
+      <div class="rules-body" id="rules-body">
+        <div class="rules-editor" id="rules-editor-wrap">
+          <div class="editor">
+            <pre class="gutter" id="rules-gutter" aria-hidden="true"></pre>
+            <textarea id="rules-content" spellcheck="false" wrap="off" aria-label="YAML 规则内容"></textarea>
+          </div>
+          <div class="editor-foot"><span id="rules-cursor"></span><span class="spacer"></span><span class="muted"><kbd>Ctrl</kbd> <kbd>S</kbd> 保存 · <kbd>Tab</kbd> 缩进两格</span></div>
+        </div>
+        <aside class="rules-preview">
+          <header class="card-head"><h2>解析结果</h2><span class="muted" id="rules-preview-meta"></span></header>
+          <div class="table-wrap"><table class="data rules-table"><thead><tr><th>ID</th><th>级别</th><th>字段</th><th class="wide">正则</th></tr></thead><tbody id="rules-table"></tbody></table></div>
+          <div class="blank" id="rules-table-empty" hidden></div>
+          <details class="rules-ref">
+            <summary>字段与写法</summary>
+            <dl>
+              <dt><code>url</code></dt><dd>请求行中的 URL（含查询参数）</dd>
+              <dt><code>request</code> / <code>response</code></dt><dd>整个请求或响应（起始行、头部与正文）</dd>
+              <dt><code>request.headers</code></dt><dd>全部请求头；响应同理</dd>
+              <dt><code>request.header.User-Agent</code></dt><dd>指定名称的单个头部</dd>
+              <dt><code>request.body</code> / <code>response.body</code></dt><dd>正文；压缩或编码过的正文也会匹配解码后的内容</dd>
+              <dt><code>severity</code></dt><dd><code>low</code>、<code>medium</code> 或 <code>high</code></dd>
+              <dt><code>pattern</code></dt><dd>Go RE2 正则，用 <code>(?i)</code> 忽略大小写；不支持回溯引用</dd>
+            </dl>
+          </details>
+        </aside>
+      </div>
+    </section>
+  </section>
+
+  <section id="view-analysis" class="analysis-view" hidden>
+    <div class="page">
+      <div class="section-head">
+        <div>
+          <h1>分析</h1>
+          <p class="muted">在本地重新还原 TCP/HTTP 并匹配规则。原始流量只读，分析成功后替换该会话上次的告警结果；中途停止会保留上次完整结果。</p>
+        </div>
+      </div>
+      <section class="card job" id="job-card"></section>
+      <section class="card">
+        <header class="card-head wrap">
+          <h2>选择会话</h2>
+          <span class="spacer"></span>
+          <label class="inline">规则<select id="analysis-rule" aria-label="选择分析规则"></select></label>
+          <input type="search" id="analysis-search" placeholder="按名称、主机或目录查找" spellcheck="false" aria-label="查找会话">
+        </header>
+        <div class="table-wrap"><table class="data analysis-table">
+          <thead><tr><th>会话</th><th class="extra">主机</th><th>状态</th><th class="num">请求</th><th class="num">告警</th><th class="extra">开始</th><th></th></tr></thead>
+          <tbody id="analysis-sessions"></tbody>
+        </table></div>
+        <div class="blank" id="analysis-sessions-empty" hidden></div>
+      </section>
+      <section class="card">
+        <header class="card-head"><h2>最近任务</h2><span class="muted">本次服务运行期间最近 20 次</span></header>
+        <div class="table-wrap"><table class="data history-table">
+          <thead><tr><th>开始</th><th>会话</th><th>规则</th><th>结果</th><th class="num">事务</th><th class="num">告警</th><th class="num">耗时</th><th></th></tr></thead>
+          <tbody id="analysis-history"></tbody>
+        </table></div>
+        <div class="blank" id="analysis-history-empty" hidden>还没有分析任务。</div>
+      </section>
+    </div>
+  </section>
 </main>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
-
-<dialog id="rules-dialog" aria-labelledby="rules-title">
-  <header><h1 id="rules-title">规则文件</h1><button type="button" class="ghost icon" id="rules-close" aria-label="关闭规则管理">✕</button></header>
-  <div class="rules-location"><span class="muted">规则目录</span><code id="rules-dir"></code></div>
-  <div class="rules-workspace">
-    <aside class="rules-sidebar">
-      <div class="rules-toolbar"><button type="button" id="rules-new">新建</button><button type="button" id="rules-upload">导入文件</button><input type="file" id="rules-upload-input" accept=".yaml,.yml" hidden></div>
-      <div id="rules-files" class="rules-files" aria-label="规则文件列表"></div>
-    </aside>
-    <section class="rules-editor">
-      <label for="rules-name">文件名 <span class="muted">· .yaml / .yml</span></label>
-      <input id="rules-name" autocomplete="off" spellcheck="false" placeholder="custom.yaml" maxlength="128">
-      <label for="rules-content">YAML 规则 <span class="muted" id="rules-editor-note"></span></label>
-      <textarea id="rules-content" spellcheck="false" aria-label="YAML 规则内容"></textarea>
-      <div id="rules-validation" class="rules-message" role="status" aria-live="polite"></div>
-      <div class="rules-toolbar"><button type="button" id="rules-validate">校验</button><button type="button" class="primary" id="rules-save">保存文件</button><button type="button" id="rules-download">下载</button><span class="spacer"></span><button type="button" id="rules-delete" class="danger">删除文件</button></div>
-    </section>
-  </div>
-  <section class="rules-analysis" aria-labelledby="analysis-title">
-    <div><h2 id="analysis-title">本地分析</h2><span class="muted">保存规则后选择会话分析；只更新告警，原始流量保持只读。</span></div>
-    <div class="rules-toolbar">
-      <label>会话<select id="analysis-session" aria-label="选择分析会话"></select></label>
-      <label>规则<select id="analysis-rule" aria-label="选择分析规则文件"></select></label>
-      <button type="button" class="primary" id="analysis-start">开始分析</button>
-      <button type="button" id="analysis-cancel" hidden>停止分析</button>
-    </div>
-    <div class="rules-message" id="analysis-status" role="status" aria-live="polite">请选择已停止采集的会话。修改规则后需要重新分析。</div>
-  </section>
-</dialog>
 
 <dialog id="help">
   <header><h1>快捷键</h1><button type="button" class="ghost icon" id="help-close" aria-label="关闭">✕</button></header>
@@ -227,6 +290,8 @@
     <dt><kbd>空格</kbd></dt><dd>暂停或恢复自动刷新</dd>
     <dt><kbd>r</kbd></dt><dd>立即刷新</dd>
     <dt><kbd>Esc</kbd></dt><dd>关闭详情或离开输入框</dd>
+    <dt><kbd>Ctrl</kbd> <kbd>S</kbd></dt><dd>规则页：保存当前文件</dd>
+    <dt><kbd>Ctrl</kbd> <kbd>Enter</kbd></dt><dd>规则页：立即校验</dd>
     <dt><kbd>?</kbd></dt><dd>打开本帮助</dd>
   </dl>
   <p class="muted">在时间线上拖选可以把列表限定到一段时间，点击详情里的来源、Host、服务或规则可以直接按它筛选。</p>
