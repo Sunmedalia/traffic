@@ -128,7 +128,12 @@ func TestPreloadCredentialAndProcessIdentity(t *testing.T) {
 }
 
 func TestPreloadSocketCreatesMissingDirectory(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "run", "traffic", "events.sock")
+	directory, err := os.MkdirTemp("/tmp", "traffic-sock-dir-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	path := filepath.Join(directory, "run", "traffic", "events.sock")
 	connection, err := openPreloadSocket(path, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -143,5 +148,28 @@ func TestPreloadSocketCreatesMissingDirectory(t *testing.T) {
 	}
 	if directory, err := os.Stat(filepath.Dir(path)); err != nil || directory.Mode().Perm() != 0755 {
 		t.Fatalf("socket directory mode %v %v", directory, err)
+	}
+}
+
+func TestPreloadAllowUIDDoesNotChangeExistingParentMode(t *testing.T) {
+	directory, err := os.MkdirTemp("/tmp", "traffic-preload-mode-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	if err := os.Chmod(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	socket, err := openPreloadSocket(filepath.Join(directory, "events.sock"), []uint32{uint32(os.Geteuid())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	info, err := os.Stat(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0700 {
+		t.Fatalf("private parent directory was exposed: %o", info.Mode().Perm())
 	}
 }

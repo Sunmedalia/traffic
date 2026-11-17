@@ -69,6 +69,7 @@ func run(args []string) (runErr error) {
 	output := fs.String("output", "", "exact session directory; default is auto-created under --data-dir")
 	dataDir := fs.String("data-dir", "./sessions", "root directory for automatically named sessions")
 	name := fs.String("name", "", "session name; default capture or import")
+	fs.IntVar(&networkNamespacePID, "netns-pid", 0, "Linux target network namespace PID; open packet handles there without changing the target")
 	ports := fs.String("ports", "80,443", "TCP ports")
 	interfaces := fs.String("interfaces", "", "comma-separated interfaces")
 	fs.StringVar(&iisProbe, "iis-probe", "", "Windows IIS plaintext helper script; explicit opt-in")
@@ -91,6 +92,10 @@ func run(args []string) (runErr error) {
 	webhookURL := fs.String("alert-webhook", "", "POST alert JSON to HTTP(S) endpoint; optional TRAFFIC_WEBHOOK_TOKEN bearer token")
 	preloadSocket := fs.String("openssl-preload-socket", "", "Linux Unix datagram socket for LD_PRELOAD OpenSSL events")
 	preloadAllowUID := fs.String("openssl-preload-allow-uid", "", "comma-separated sender UIDs allowed to write preload events; opens the socket to their group")
+	requireTLS := fs.Bool("require-tls", false, "fail before capture if selected HTTPS targets fail read-only preflight")
+	fs.IntVar(&collectorMemoryMiB, "collector-memory-mib", 256, "collector and helper memory budget MiB; excludes in-process probes")
+	fs.IntVar(&collectorCPUPercent, "collector-cpu-percent", 50, "collector CPU budget as percent of one CPU")
+	fs.DurationVar(&drainTimeout, "drain-timeout", 5*time.Second, "maximum probe data drain time")
 	noTLS := fs.Bool("no-tls", false, "disable TLS probes")
 	duration := fs.Duration("duration", 0, "optional capture duration")
 	fs.IntVar(&requestLimit, "request-limit", requestLimit, "maximum saved request body bytes")
@@ -127,6 +132,9 @@ func run(args []string) (runErr error) {
 	}
 	if len(preloadUIDs) > 0 && *preloadSocket == "" {
 		return errors.New("--openssl-preload-allow-uid requires --openssl-preload-socket")
+	}
+	if networkNamespacePID < 0 || (networkNamespacePID != 0 && (runtime.GOOS != "linux" || cmd == "import")) {
+		return errors.New("--netns-pid requires Linux doctor or capture with a positive PID")
 	}
 	if *pid < 0 || *javaPID < 0 {
 		return errors.New("PID must not be negative")
@@ -180,6 +188,12 @@ func run(args []string) (runErr error) {
 	if *service == "openssl" && *pid <= 0 {
 		return errors.New("openssl service requires --pid")
 	}
+	if collectorMemoryMiB < 64 || collectorMemoryMiB > 65536 || collectorCPUPercent < 1 || collectorCPUPercent > 100 || drainTimeout <= 0 || drainTimeout > 15*time.Second {
+		return errors.New("invalid collector resource or drain limits")
+	}
+	if *requireTLS && (*noTLS || cmd != "capture") {
+		return errors.New("--require-tls requires capture with TLS enabled")
+	}
 	if requestLimit < 1 || requestLimit > 1<<20 || responseLimit < 1 || responseLimit > 1<<20 || diskLimitMiB < 64 || retention <= 0 || scanWindow <= 0 || scanThreshold < 1 {
 		return errors.New("invalid resource or result limits")
 	}
@@ -187,11 +201,22 @@ func run(args []string) (runErr error) {
 		return e
 	}
 	if cmd == "doctor" {
-		devices, e := pcap.FindAllDevs()
+		capturePorts = map[int]bool{}
+		for _, text := range strings.Split(*ports, ",") {
+			port, err := strconv.Atoi(text)
+			if err != nil || port < 1 || port > 65535 {
+				return fmt.Errorf("invalid port %q", text)
+			}
+			capturePorts[port] = true
+		}
+		var devices []pcap.Interface
+		e := inCaptureNamespace(func() error { var err error; devices, err = pcap.FindAllDevs(); return err })
 		if e != nil {
 			return e
 		}
-		emit(doctorReport(devices, *service, *pid, *lib, *ecapture))
+		report := doctorReport(devices, *service, *pid, *lib, *ecapture)
+		report["checks"] = captureChecks(*service, *pid, *lib, *ecapture, *javaAttach, *javaAgent, *preloadSocket, *javaPID)
+		emit(report)
 		return nil
 	}
 	if cmd == "capture" || cmd == "import" {
@@ -208,6 +233,15 @@ func run(args []string) (runErr error) {
 			}
 			capturePorts[number] = true
 			filterParts = append(filterParts, fmt.Sprintf("port %d", number))
+		}
+		var checks []captureCheck
+		if cmd == "capture" && !*noTLS {
+			checks = captureChecks(*service, *pid, *lib, *ecapture, *javaAttach, *javaAgent, *preloadSocket, *javaPID)
+		}
+		if *requireTLS {
+			if err := requireCaptureChecks(checks); err != nil {
+				return err
+			}
 		}
 		filter := "tcp and (" + strings.Join(filterParts, " or ") + ")"
 		names, err := captureInterfaces(*interfaces, cmd == "import")
@@ -244,7 +278,7 @@ func run(args []string) (runErr error) {
 			return err
 		}
 		*output = directory
-		debug.SetMemoryLimit(220 << 20)
+		debug.SetMemoryLimit(int64(collectorMemoryMiB) * 220 / 256 << 20)
 		lock, e := os.OpenFile(filepath.Join(*output, "capture.lock"), os.O_CREATE|os.O_RDWR, 0600)
 		if e != nil {
 			return e
@@ -262,6 +296,14 @@ func run(args []string) (runErr error) {
 			return e
 		}
 		defer s.db.Close()
+		s.probeCheck = func(target session.Target) captureCheck {
+			java := *javaAttach && (*javaPID == 0 || *javaPID == target.PID)
+			result := captureChecks(target.Service, target.PID, target.Library, *ecapture, java, *javaAgent, "", *javaPID)
+			if len(result) == 0 {
+				return captureCheck{Target: target.ID, Status: "unavailable", Reason: "target exited during preflight"}
+			}
+			return result[0]
+		}
 		if *webhookURL != "" {
 			s.webhook = newAlertWebhook(s, *webhookURL, os.Getenv("TRAFFIC_WEBHOOK_TOKEN"))
 			defer func() { s.webhook.close(); s.report() }()
@@ -279,6 +321,13 @@ func run(args []string) (runErr error) {
 			}
 		}()
 		s.stats.Started = started.UTC()
+		if cmd == "capture" {
+			s.stats.State = "starting"
+			s.stats.PacketInterfaces = map[string]string{}
+			for _, name := range names {
+				s.stats.PacketInterfaces[name] = "starting"
+			}
+		}
 		s.stats.TLSCoverage = "unverified"
 		s.problem(errors.New(session.CoverageWarning))
 		fmt.Fprintf(os.Stderr, "会话目录 %s\n", s.dir)
@@ -303,28 +352,35 @@ func run(args []string) (runErr error) {
 			defer stop()
 		}
 		manifest := map[string]any{
-			"schema_version":            1,
-			"layout_version":            2,
-			"hostname":                  host,
-			"os":                        runtime.GOOS,
-			"arch":                      runtime.GOARCH,
-			"name":                      *name,
-			"mode":                      cmd,
-			"started":                   s.stats.Started,
-			"filter":                    filter,
-			"interfaces":                names,
-			"service":                   *service,
-			"targets":                   discoverTargets("/proc", *service, *pid, *lib),
-			"tls_enabled":               cmd == "capture" && !*noTLS,
-			"rules":                     rules,
-			"trusted_proxies":           trustedProxies,
-			"openssl_preload_socket":    *preloadSocket,
-			"openssl_preload_allow_uid": preloadUIDs,
-			"tls_coverage":              "unverified",
-			"tls_missing_estimate":      nil,
-			"header_limit":              32768,
-			"request_limit":             requestLimit,
-			"response_limit":            responseLimit,
+			"schema_version":                   1,
+			"layout_version":                   2,
+			"hostname":                         host,
+			"os":                               runtime.GOOS,
+			"arch":                             runtime.GOARCH,
+			"name":                             *name,
+			"mode":                             cmd,
+			"started":                          s.stats.Started,
+			"filter":                           filter,
+			"interfaces":                       names,
+			"network_namespace_pid":            networkNamespacePID,
+			"service":                          *service,
+			"targets":                          discoverTargets("/proc", *service, *pid, *lib),
+			"tls_enabled":                      cmd == "capture" && !*noTLS,
+			"rules":                            rules,
+			"trusted_proxies":                  trustedProxies,
+			"openssl_preload_socket":           *preloadSocket,
+			"openssl_preload_allow_uid":        preloadUIDs,
+			"tls_coverage":                     "unverified",
+			"tls_missing_estimate":             nil,
+			"header_limit":                     32768,
+			"unsupported_content":              []string{"HTTP/3", "WebSocket payload", "Go TLS", "generic JSSE"},
+			"preflight":                        checks,
+			"collector_memory_mib":             collectorMemoryMiB,
+			"collector_cpu_percent":            collectorCPUPercent,
+			"probe_drain_timeout_ms":           drainTimeout.Milliseconds(),
+			"in_process_probe_budget_included": false,
+			"request_limit":                    requestLimit,
+			"response_limit":                   responseLimit,
 		}
 		if cmd == "import" {
 			manifest["input_pcap"] = id
@@ -347,6 +403,7 @@ func run(args []string) (runErr error) {
 		if cmd == "import" {
 			e = capturePackets(ctx, s, p, "offline", filter, id)
 			p.wg.Wait()
+			p.finish()
 			if e != nil {
 				return e
 			}
@@ -359,6 +416,13 @@ func run(args []string) (runErr error) {
 			s.report()
 			return nil
 		}
+		stopIndex := s.startIndexWriter(ctx)
+		defer func() {
+			if err := stopIndex(); err != nil {
+				s.fail(err)
+				s.report()
+			}
+		}()
 		var wg sync.WaitGroup
 		for _, name := range names {
 			wg.Add(1)
@@ -414,13 +478,39 @@ func run(args []string) (runErr error) {
 				}
 			}
 		}
+		s.mu.Lock()
+		s.stats.DrainState = "draining"
+		s.mu.Unlock()
+		s.report()
 		cancel()
 		wg.Wait()
 		p.wg.Wait()
+		p.finish()
+		if err := stopIndex(); err != nil {
+			s.fail(err)
+		}
 		s.mu.Lock()
+		s.stats.DrainState = "unverified"
+		if *noTLS {
+			s.stats.DrainState = "confirmed"
+		} else if len(s.stats.ProbeExits) > 0 {
+			confirmed := true
+			for _, exit := range s.stats.ProbeExits {
+				confirmed = confirmed && exit.DataDrained
+			}
+			if confirmed {
+				s.stats.DrainState = "confirmed"
+			}
+		}
+		s.stats.StopReason = "signal_or_duration"
 		s.stats.State = "stopped"
+		if s.stats.RawEvidenceWriters > 0 || s.stats.RawEvidencePendingBytes > 0 || s.stats.RawEvidenceDrainUnconfirmed {
+			s.stats.DrainState = "unverified"
+		}
 		if s.fatal != nil {
 			s.stats.State = "failed"
+			s.stats.StopReason = "fatal_error"
+			s.stats.DrainState = "unverified"
 		}
 		s.mu.Unlock()
 		if s.webhook != nil {
@@ -433,7 +523,7 @@ func run(args []string) (runErr error) {
 	return fmt.Errorf("unknown command %s", cmd)
 }
 func maintain(s *Store) error {
-	if _, e := s.db.Exec("DELETE FROM requests WHERE time < ?", time.Now().UTC().Add(-retention).Format(indexTimeFormat)); e != nil {
+	if e := s.pruneIndex(time.Now().UTC().Add(-retention)); e != nil {
 		return e
 	}
 	var total int64

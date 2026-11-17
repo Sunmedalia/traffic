@@ -21,6 +21,9 @@ import (
 // allowlist opens it to the service account (for example nginx workers running
 // as www-data) and keeps kernel credentials as the first identity check.
 func openPreloadSocket(path string, allowedUIDs []uint32) (*net.UnixConn, error) {
+	if len([]byte(path)) >= 108 {
+		return nil, fmt.Errorf("preload socket path must be shorter than 108 bytes")
+	}
 	if !filepath.IsAbs(path) {
 		return nil, fmt.Errorf("--openssl-preload-socket must be absolute")
 	}
@@ -40,11 +43,8 @@ func openPreloadSocket(path string, allowedUIDs []uint32) (*net.UnixConn, error)
 	} else if err != nil {
 		return nil, fmt.Errorf("preload socket directory: %w", err)
 	}
-	if len(allowedUIDs) > 0 {
-		if err := os.Chmod(directory, 0755); err != nil {
-			return nil, fmt.Errorf("preload socket directory mode: %w", err)
-		}
-	}
+	// Existing directory permissions belong to the operator. The UID opt-in
+	// grants access to the socket; it must not expose a private parent directory.
 	connection, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: path, Net: "unixgram"})
 	if err != nil {
 		return nil, err
@@ -114,8 +114,9 @@ func capturePreload(ctx context.Context, s *Store, p *HTTPProcessor, path string
 	if err != nil {
 		return err
 	}
-	defer evidence.Close()
-	encoder := json.NewEncoder(evidence)
+	raw := newEvidenceWriter(s, evidence, "openssl-preload")
+	defer raw.Close()
+	encoder := json.NewEncoder(raw)
 	assemblers := map[string]*opensslAssembler{}
 	defer func() {
 		for _, assembler := range assemblers {

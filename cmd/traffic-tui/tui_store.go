@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/Sunmedalia/traffic/internal/session"
 	"net"
 	"os"
 	"path/filepath"
@@ -104,6 +105,15 @@ func readTUIStatus(dir string) (Stats, string) {
 	}
 	if info, err := os.Stat(path); err == nil && status.State == "running" && time.Since(info.ModTime()) > 5*time.Second {
 		status.State = "stale"
+		if lock, err := os.Open(filepath.Join(dir, "capture.lock")); err == nil {
+			defer lock.Close()
+			if session.LockFile(lock, false) == nil {
+				session.UnlockFile(lock)
+				status.State = "interrupted"
+				status.DrainState = "unverified"
+				return status, "采集未正常结束，文件锁已释放，尾部数据及探针清理状态未知"
+			}
+		}
 		return status, "采集心跳超过 5 秒未更新，请检查采集进程"
 	}
 	return status, ""

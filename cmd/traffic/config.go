@@ -41,3 +41,9 @@ func parsePreloadUIDs(value string) ([]uint32, error) {
 	}
 	return uids, nil
 }
+
+var collectorMemoryMiB = 256
+var collectorCPUPercent = 50
+var drainTimeout = 5 * time.Second
+
+var networkNamespacePID int

@@ -59,7 +59,7 @@ func TestOpenSSLConnectionBoundaries(t *testing.T) {
 	if len(records) != 3 || records["/first"].Status != 200 || records["/first"].Incomplete || !records["/interrupted"].Incomplete || records["/interrupted"].Status != 0 || records["/after-loss"].Status != 201 || !records["/after-loss"].Incomplete {
 		t.Fatalf("lost stream boundaries: %+v", records)
 	}
-	if store.stats.TLSDropped < 2 || len(p.pending) != 0 || len(p.responses) != 0 {
+	if store.stats.TLSDropped != 2 || len(p.pending) != 0 || len(p.responses) != 0 {
 		t.Fatalf("missing loss accounting or stale correlation")
 	}
 }

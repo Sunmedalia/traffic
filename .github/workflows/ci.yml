@@ -29,10 +29,25 @@ jobs:
           go build -o bin/traffic ./cmd/traffic
           go build -o bin/traffic-tui ./cmd/traffic-tui
           bash scripts/build-openssl-preload.sh
+          bash scripts/test-openssl-preload.sh
       - name: Check validation scripts
         run: |
           python3 -m py_compile scripts/*.py scripts/linux/*.py
+          python3 -m unittest discover -s scripts -p 'test_*.py'
           bash -n scripts/*.sh
+
+  ecapture-patches:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install capture headers
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+      - name: Apply pinned patches and test output budgets
+        run: bash scripts/test-ecapture-patches.sh "$RUNNER_TEMP/ecapture-patch-tests"
 
   java-agent:
     runs-on: ubuntu-24.04

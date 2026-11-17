@@ -53,7 +53,7 @@ func TestJavaEventGapIsPreserved(t *testing.T) {
 	if err = json.Unmarshal(data, &record); err != nil {
 		t.Fatal(err)
 	}
-	if !record.Incomplete || record.LocalEndpoint != "127.0.0.1:8443" || s.stats.TLSDropped != 1 {
+	if !record.Incomplete || record.LocalEndpoint != "127.0.0.1:8443" || s.stats.TLSDropped != 0 {
 		t.Fatalf("lost gap metadata: %+v %+v", record, s.stats)
 	}
 }

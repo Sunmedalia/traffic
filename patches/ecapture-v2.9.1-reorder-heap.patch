@@ -1,0 +1,311 @@
+diff --git a/internal/probe/base/perf_reorder.go b/internal/probe/base/perf_reorder.go
+--- a/internal/probe/base/perf_reorder.go
++++ b/internal/probe/base/perf_reorder.go
+@@ -5,104 +5,109 @@
+ 
+ package base
+ 
+-import (
+-	"sort"
+-
+-	"github.com/gojue/ecapture/v2/internal/domain"
+-)
++import "github.com/gojue/ecapture/v2/internal/domain"
+ 
+ type perfReorderItem struct {
+-	ev   domain.Event
+-	mono uint64
++	ev            domain.Event
++	mono, arrival uint64
+ }
+ 
+ type perfLagReorder struct {
+-	lagNs      uint64
+-	maxPending int
+-	buf        []perfReorderItem
++	lagNs              uint64
++	maxPending         int
++	buf                []perfReorderItem
++	maxNs, nextArrival uint64
+ }
+ 
+ func newPerfLagReorder(lagNs uint64) *perfLagReorder {
+-	return &perfLagReorder{
+-		lagNs:      lagNs,
+-		maxPending: 1024,
+-	}
++	return &perfLagReorder{lagNs: lagNs, maxPending: 1024}
+ }
+ 
+ func (r *perfLagReorder) less(i, j int) bool {
+-	return r.buf[i].mono < r.buf[j].mono
+-}
+-
+-// flushAll emits the entire buffer in stable time order (e.g. on reader shutdown).
+-func (r *perfLagReorder) flushAll() []domain.Event {
+-	if len(r.buf) == 0 {
+-		return nil
+-	}
+-	sort.SliceStable(r.buf, r.less)
+-	out := make([]domain.Event, len(r.buf))
+-	for i := range r.buf {
+-		out[i] = r.buf[i].ev
+-	}
+-	r.buf = nil
+-	return out
++	a, b := r.buf[i], r.buf[j]
++	return a.mono < b.mono || (a.mono == b.mono && a.arrival < b.arrival)
+ }
+ 
+ func (r *perfLagReorder) push(mn domain.MonoNsEvent) []domain.Event {
+-	r.buf = append(r.buf, perfReorderItem{ev: mn, mono: mn.PerfMonoNs()})
++	mono := mn.PerfMonoNs()
++	if len(r.buf) == 0 || mono > r.maxNs {
++		r.maxNs = mono
++	}
++	r.buf = append(r.buf, perfReorderItem{ev: mn, mono: mono, arrival: r.nextArrival})
++	r.nextArrival++
++	for child := len(r.buf) - 1; child > 0; {
++		parent := (child - 1) / 2
++		if !r.less(child, parent) {
++			break
++		}
++		r.buf[child], r.buf[parent] = r.buf[parent], r.buf[child]
++		child = parent
++	}
+ 	if len(r.buf) >= r.maxPending {
+ 		return r.flushPressure()
+ 	}
+ 	return r.flushByLag()
+ }
+ 
++// pop releases the oldest item and clears its retained event reference. The
++// typed heap avoids boxing allocations and copying the whole remaining window.
++func (r *perfLagReorder) pop() domain.Event {
++	event := r.buf[0].ev
++	last := len(r.buf) - 1
++	r.buf[0] = r.buf[last]
++	r.buf[last] = perfReorderItem{}
++	r.buf = r.buf[:last]
++	for parent := 0; parent < len(r.buf)/2; {
++		child := 2*parent + 1
++		if child+1 < len(r.buf) && r.less(child+1, child) {
++			child++
++		}
++		if !r.less(child, parent) {
++			break
++		}
++		r.buf[parent], r.buf[child] = r.buf[child], r.buf[parent]
++		parent = child
++	}
++	if len(r.buf) == 0 {
++		r.maxNs = 0
++		r.nextArrival = 0
++	}
++	return event
++}
++
++// flushAll emits the entire buffer in stable time order, including idle/stop.
++func (r *perfLagReorder) flushAll() []domain.Event {
++	if len(r.buf) == 0 {
++		return nil
++	}
++	out := make([]domain.Event, 0, len(r.buf))
++	for len(r.buf) > 0 {
++		out = append(out, r.pop())
++	}
++	r.buf = nil
++	return out
++}
++
+ func (r *perfLagReorder) flushPressure() []domain.Event {
+-	sort.SliceStable(r.buf, r.less)
+-	n := len(r.buf) / 2
+-	if n == 0 {
+-		n = 1
++	if len(r.buf) == 0 {
++		return nil
+ 	}
+-	out := make([]domain.Event, n)
++	n := max(1, len(r.buf)/2)
++	out := make([]domain.Event, 0, n)
+ 	for i := 0; i < n; i++ {
+-		out[i] = r.buf[i].ev
++		out = append(out, r.pop())
+ 	}
+-	r.buf = append([]perfReorderItem(nil), r.buf[n:]...)
+ 	return out
+ }
+ 
+ func (r *perfLagReorder) flushByLag() []domain.Event {
+-	if len(r.buf) <= 1 {
++	if len(r.buf) <= 1 || r.maxNs-r.buf[0].mono < r.lagNs {
+ 		return nil
+ 	}
+-	var maxNs, minNs int64 = -1, -1
+-	for _, x := range r.buf {
+-		v := int64(x.mono)
+-		if maxNs < v {
+-			maxNs = v
+-		}
+-		if minNs < 0 || v < minNs {
+-			minNs = v
+-		}
+-	}
+-	if maxNs-minNs < int64(r.lagNs) {
+-		return nil
+-	}
+-	cutoff := maxNs - int64(r.lagNs)
+-	var flush []perfReorderItem
+-	var keep []perfReorderItem
+-	for _, x := range r.buf {
+-		if int64(x.mono) <= cutoff {
+-			flush = append(flush, x)
+-		} else {
+-			keep = append(keep, x)
+-		}
+-	}
+-	r.buf = keep
+-	sort.SliceStable(flush, func(i, j int) bool {
+-		return flush[i].mono < flush[j].mono
+-	})
+-	out := make([]domain.Event, len(flush))
+-	for i := range flush {
+-		out[i] = flush[i].ev
++	cutoff := r.maxNs - r.lagNs
++	var out []domain.Event
++	for len(r.buf) > 0 && r.buf[0].mono <= cutoff {
++		out = append(out, r.pop())
+ 	}
+ 	return out
+ }
+diff --git a/docs/agent/probe-development.md b/docs/agent/probe-development.md
+--- a/docs/agent/probe-development.md
++++ b/docs/agent/probe-development.md
+@@ -268,3 +268,10 @@
+ Validate rejects a length beyond that slice. Compact decode copies exactly its
+ validated length, and legacy decode still consumes the fixed 16 KiB body before
+ its trailing header. Clone preserves independent payload ownership.
++
++Perf timestamp reordering uses a typed min-heap keyed by monotonic timestamp
++and arrival order. Push/pop is logarithmic in the pending window, equal-time
++events remain stable, and pressure still flushes the oldest half at maxPending.
++Idle/shutdown flushes release every event reference; no pending window is copied
++on each input. Tests compare pressure, lag and idle behavior against a stable
++sorting reference.
+diff --git a/internal/probe/base/traffic_reorder_test.go b/internal/probe/base/traffic_reorder_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/probe/base/traffic_reorder_test.go
+@@ -0,0 +1,88 @@
++package base
++
++import (
++	"math/rand"
++	"sort"
++	"testing"
++
++	"github.com/gojue/ecapture/v2/internal/domain"
++)
++
++// Keep a sorting/partition reference independent of the heap implementation.
++type sortingReorder struct {
++	lag   uint64
++	limit int
++	buf   []perfReorderItem
++}
++
++func (r *sortingReorder) ordered(n int) []domain.Event {
++	sort.SliceStable(r.buf, func(i, j int) bool { return r.buf[i].mono < r.buf[j].mono })
++	out := make([]domain.Event, n)
++	for i := range out {
++		out[i] = r.buf[i].ev
++	}
++	r.buf = append([]perfReorderItem(nil), r.buf[n:]...)
++	return out
++}
++func (r *sortingReorder) push(event domain.MonoNsEvent) []domain.Event {
++	r.buf = append(r.buf, perfReorderItem{ev: event, mono: event.PerfMonoNs()})
++	if len(r.buf) >= r.limit {
++		return r.ordered(max(1, len(r.buf)/2))
++	}
++	if len(r.buf) <= 1 {
++		return nil
++	}
++	lo, hi := r.buf[0].mono, r.buf[0].mono
++	for _, item := range r.buf {
++		lo = min(lo, item.mono)
++		hi = max(hi, item.mono)
++	}
++	if hi-lo < r.lag {
++		return nil
++	}
++	cutoff := hi - r.lag
++	count := 0
++	for _, item := range r.buf {
++		if item.mono <= cutoff {
++			count++
++		}
++	}
++	return r.ordered(count)
++}
++func TestHeapReorderMatchesStableSortAcrossPressureAndIdle(t *testing.T) {
++	for _, lag := range []uint64{0, 1, 100, 10000} {
++		for _, limit := range []int{1, 2, 3, 17, 1024} {
++			heap := newPerfLagReorder(lag)
++			heap.maxPending = limit
++			reference := &sortingReorder{lag: lag, limit: limit}
++			rng := rand.New(rand.NewSource(19))
++			seen := map[domain.Event]bool{}
++			compare := func(actual, expected []domain.Event) {
++				t.Helper()
++				if len(actual) != len(expected) {
++					t.Fatalf("lag=%d limit=%d count %d != %d", lag, limit, len(actual), len(expected))
++				}
++				for i, event := range actual {
++					if event != expected[i] || seen[event] {
++						t.Fatalf("lag=%d limit=%d changed order or duplicated an event", lag, limit)
++					}
++					seen[event] = true
++				}
++			}
++			for i := 0; i < 4096; i++ {
++				event := ev(uint64(rng.Intn(2000)), byte(i))
++				compare(heap.push(event), reference.push(event))
++				if i%1321 == 0 {
++					compare(heap.flushAll(), reference.ordered(len(reference.buf)))
++				}
++				if len(heap.buf) >= limit {
++					t.Fatal("pending bound exceeded")
++				}
++			}
++			compare(heap.flushAll(), reference.ordered(len(reference.buf)))
++			if len(seen) != 4096 {
++				t.Fatal("missing events", len(seen))
++			}
++		}
++	}
++}
+diff --git a/internal/probe/base/traffic_reorder_benchmark_test.go b/internal/probe/base/traffic_reorder_benchmark_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/probe/base/traffic_reorder_benchmark_test.go
+@@ -0,0 +1,18 @@
++package base
++
++import "testing"
++
++func BenchmarkPerfReorderSteadyLag(b *testing.B) {
++	r := newPerfLagReorder(100_000_000)
++	flushed := 0
++	b.ReportAllocs()
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		flushed += len(r.push(ev(uint64(i)*200_000, 'x')))
++	}
++	b.StopTimer()
++	flushed += len(r.flushAll())
++	if flushed != b.N {
++		b.Fatal("reorder lost events", flushed, b.N)
++	}
++}

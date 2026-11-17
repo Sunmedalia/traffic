@@ -1,0 +1,114 @@
+diff --git a/docs/agent/output-pipeline.md b/docs/agent/output-pipeline.md
+index 9976d35..9f436c3 100644
+--- a/docs/agent/output-pipeline.md
++++ b/docs/agent/output-pipeline.md
+@@ -138,3 +138,7 @@ serialized handoff. Captured events are not retained in startup history.
+ Queue saturation returns an error and increments the observable dropped count.
+ Server close cancels the hub, unblocks clients, joins owned goroutines, and is
+ idempotent.
++
++When the text sink is the unrotated null device, TextHandler skips formatting
++and writing discarded text. Typed eCaptureQ events remain additive and retain
++their raw payloads; normal text destinations retain existing formatting.
+diff --git a/internal/output/writers/file_writer.go b/internal/output/writers/file_writer.go
+--- a/internal/output/writers/file_writer.go
++++ b/internal/output/writers/file_writer.go
+@@ -163,9 +163,12 @@
+ 		}
+ 	}
+ 
+-	if w.file != nil {
++	if w.file != nil && !w.DiscardsOutput() {
+ 		return w.file.Sync()
+ 	}
+ 
+ 	return nil
+ }
++
++// DiscardsOutput allows encoders to skip constructing bytes for the null device.
++func (w *FileWriter) DiscardsOutput() bool { return w.path == os.DevNull && !w.useRotate }
+diff --git a/internal/probe/base/handlers/text_handler.go b/internal/probe/base/handlers/text_handler.go
+index 7782afb..2d801f3 100644
+--- a/internal/probe/base/handlers/text_handler.go
++++ b/internal/probe/base/handlers/text_handler.go
+@@ -71,6 +71,12 @@ func (h *TextHandler) Handle(event domain.Event) error {
+ 		return errors.New(errors.ErrCodeEventDispatch, "text handler is closed")
+ 	}
+ 
++	// A typed publisher can carry the raw event while text is discarded.
++	// Avoid decoding/formatting the same payload merely to throw it away.
++	if sink, ok := h.writer.(interface{ DiscardsOutput() bool }); ok && sink.DiscardsOutput() {
++		return nil
++	}
++
+ 	// Let the event format itself based on hex mode
+ 	var output string
+ 	if h.useHex {
+diff --git a/internal/probe/base/handlers/text_handler_test.go b/internal/probe/base/handlers/text_handler_test.go
+index 5c8201b..2282ea9 100644
+--- a/internal/probe/base/handlers/text_handler_test.go
++++ b/internal/probe/base/handlers/text_handler_test.go
+@@ -279,3 +279,31 @@ func TestTextHandler_Close_ClosableWriter(t *testing.T) {
+ 		t.Error("Writer should be closed")
+ 	}
+ }
++
++type discardTextWriter struct{ *mockWriter }
++
++func (w discardTextWriter) DiscardsOutput() bool { return true }
++
++type noFormatEvent struct{ *mockTLSDataEvent }
++
++func (e noFormatEvent) String() string    { panic("discarded event must not be formatted") }
++func (e noFormatEvent) StringHex() string { panic("discarded event must not be hex formatted") }
++func TestDiscardedTextSkipsFormatting(t *testing.T) {
++	for _, hex := range []bool{false, true} {
++		writer := discardTextWriter{newMockWriter()}
++		handler := NewTextHandler(writer, hex)
++		event := noFormatEvent{&mockTLSDataEvent{data: []byte("plaintext retained by typed publisher"), dataLen: 37}}
++		if err := handler.Handle(event); err != nil {
++			t.Fatal(err)
++		}
++		if writer.Len() != 0 {
++			t.Fatal("discard writer unexpectedly received text")
++		}
++		if err := handler.Close(); err != nil {
++			t.Fatal(err)
++		}
++		if err := handler.Handle(event); err == nil {
++			t.Fatal("closed discard handler accepted event")
++		}
++	}
++}
+diff --git a/internal/output/writers/null_file_test.go b/internal/output/writers/null_file_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/output/writers/null_file_test.go
+@@ -0,0 +1,27 @@
++package writers
++
++import (
++	"os"
++	"testing"
++)
++
++func TestNullFileFlushAndClose(t *testing.T) {
++	for _, size := range []int{0, 4096} {
++		writer, err := NewFileWriter(FileWriterConfig{Path: os.DevNull, BufferSize: size})
++		if err != nil {
++			t.Fatal(err)
++		}
++		if _, err := writer.Write([]byte("discarded text")); err != nil {
++			t.Fatal(err)
++		}
++		if err := writer.Flush(); err != nil {
++			t.Fatal(err)
++		}
++		if err := writer.Close(); err != nil {
++			t.Fatal(err)
++		}
++		if err := writer.Close(); err != nil {
++			t.Fatal(err)
++		}
++	}
++}

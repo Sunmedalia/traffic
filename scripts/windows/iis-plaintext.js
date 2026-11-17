@@ -46,6 +46,7 @@ function enqueue(event, data = null) {
     eventBytes += size;
 }
 
+let transportSequence = 0;
 function flush() {
     for (const [id, state] of requests) {
         if (!state.known && Date.now() - state.created > 5000) discard(id);
@@ -54,10 +55,10 @@ function flush() {
     events = [];
     eventBytes = 0;
     if (dropped > 0) {
-        send({type: 'loss', count: dropped});
+        send({type: 'loss', count: dropped, sequence: ++transportSequence});
         dropped = 0;
     }
-    for (const item of batch) send(item.event, item.data);
+    for (const item of batch) { item.event.sequence = ++transportSequence; send(item.event, item.data); }
 }
 
 function stateFor(id) {
@@ -234,7 +235,7 @@ function receiveRequest(operation) {
     state.known = true;
     const verb = request.add(36).readU32();
     const method = verbs[verb] || text(request.add(48).readPointer(), request.add(40).readU16());
-    enqueue({type: 'request', id, connection: key(request.add(8).readU64()), method,
+    enqueue({type: 'request', http_version: 'HTTP/' + request.add(32).readU16() + '.' + request.add(34).readU16(), id, connection: key(request.add(8).readU64()), method,
         url: text(request.add(56).readPointer(), request.add(42).readU16()),
         headers: headers(request.add(120), requestHeaders),
         client: address(request.add(104).readPointer()).endpoint, local: local.endpoint});
@@ -424,6 +425,6 @@ rpc.exports = {
             if (state.known) gap(id, 'Capture stopped before response completed');
         }
         flush();
-        return {type: 'summary', completed, pending: pending.size, diagnostics, hooks_removed: restored, restored_sites: originalCode.size, plaintext_verified: false};
+        return {type: 'summary', last_sequence: transportSequence, completed, pending: pending.size, diagnostics, hooks_removed: restored, restored_sites: originalCode.size, plaintext_verified: false};
     }
 };

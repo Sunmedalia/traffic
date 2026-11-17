@@ -13,6 +13,10 @@ flowchart LR
   C --> D[traffic-tui<br/>TUI / Web / JSON]
 ```
 
+本轮采集完整性、低影响与 HTTP/2 代码改动及未完成项目见 [优化实施与验收](OPTIMIZATION.md)。HTTP/2 已加入有界解析和合成回归，实机后端覆盖尚未验收；以下表格保留既有实机结论。
+
+## 当前能力与验收范围
+
 ## 先跑起来（Linux）
 
 ```bash
@@ -390,11 +394,11 @@ targets=nginx,httpd,apache2
 # debug_file=/tmp/traffic-preload-debug.log
 ```
 
-`targets` 是逗号分隔的进程名，支持末尾 `*` 前缀匹配，`*` 表示全部；不匹配的进程保持惰性。采集器用 `--openssl-preload-allow-uid 33` 放行 www-data，socket 为 `0660` 并归属该 UID 的主组，父目录自动创建并保持可穿越。
+`targets` 是逗号分隔的进程名，支持末尾 `*` 前缀匹配，`*` 表示全部；不匹配的进程保持惰性。采集器用 `--openssl-preload-allow-uid 33` 放行 www-data，socket 为 `0660` 并归属该 UID 的主组，新建的父目录会设置为可穿越；已有父目录权限保持不变，需要操作者为服务账号配置访问权限。
 
 `ld.so.preload` 只影响之后 `exec` 的进程：`nginx -s reload` 不会重新加载 master 的库，必须重启 master。worker 由 master fork，master 启动时载入后即覆盖 worker。回滚时删除文件并重启服务，确认 `/proc/PID/maps` 不再包含该库。`debug_file` 每次进程首次初始化写一行，默认关闭。
 
-队列最多 128 条事件，单条约 19 KiB，发送线程有界重试。可上报缺口计入 `tls_dropped`；进程崩溃、`_exit`、采集器停机和最后未送出的事件仍是未知缺口。cgroup v1 上资源限制报告 `unavailable`。已测动态 OpenSSL 1.0.2k / TLS 1.2，以及 Debian 13 / OpenSSL 3.5 / nginx 1.26 的系统级预加载、TLS 1.2/1.3 和非 root worker；静态链接、绕过符号拦截、自定义无 socket BIO、Go TLS、HTTP/2 和长期性能未验证。
+队列最多 128 条事件，单条约 19 KiB，采用有界原子预留与独立后台消费。连接元数据分为 64 个分片，每片最多 64 项；满片或争用超过等待预算会报告缺口。发送线程有界重试，恢复时先发送缺口标记再发送后续正文。可上报缺口计入 `tls_dropped`；进程崩溃、`_exit`、采集器停机和最后未送出的事件仍是未知缺口。Linux cgroup v1/v2 在控制器可用且有权限时限制采集器，实际结果见 `resource_limits`，不改变目标服务的 cgroup。已测动态 OpenSSL 1.0.2k / TLS 1.2，以及 Debian 13 / OpenSSL 3.5 / nginx 1.26 的系统级预加载、TLS 1.2/1.3 和非 root worker；静态链接、绕过符号拦截、自定义无 socket BIO、Go TLS、HTTP/2 和长期性能未验证。
 
 ### Apache
 
@@ -503,6 +507,7 @@ python3 scripts/verify.py /tmp/traffic-functional --host 127.0.0.1
 python3 scripts/benchmark.py --output /tmp/traffic-performance --host 127.0.0.1
 ```
 
+脚本支持 `--binary` 和 `--config` 指定采集程序与 Nginx 配置。功能脚本另通过 `--analysis-binary` 指定证据导出所用的 `traffic-tui`，默认路径为 `/opt/traffic/bin/traffic-tui`。可用 `--ecapture` 指定探针路径、`--pid` 将 TLS 探针限定到实验进程。功能脚本检查 126 条请求及响应、已有 HTTPS 连接、TLS 版本、中文正文、五类规则、网站配置和 PID、证据校验。性能脚本默认 20/100 请求每秒、每组五分钟、重复三轮。
 ## 第三方组件
 
 依赖及版本见 `go.mod`、`go.sum`。eCapture 以独立子进程运行，固定源码、补丁和构建方式随仓库提供。版权与许可证说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

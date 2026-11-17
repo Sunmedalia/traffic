@@ -976,6 +976,9 @@ function renderDetail() {
     ['后端 / 本地端点', [t.backend, t.local_endpoint].filter(Boolean).join(' · ')],
     ['采集来源', [t.source, t.pid ? 'PID ' + t.pid : ''].filter(Boolean).join(' · ')],
     ['连接', t.connection],
+    ['协议', t.protocol || '未知'],
+    ['HTTP/2 stream ID', t.stream_id ? String(t.stream_id) : ''],
+    ['完整性原因', (t.integrity_reasons || []).join(', ')],
     ['记录 ID', t.id],
   ].filter(([, value]) => value);
   set($('detail-meta'), ...meta.map(([name, value]) => h('div', {}, h('dt', {}, name), h('dd', {}, value))));

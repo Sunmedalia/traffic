@@ -277,3 +277,34 @@ func TestTUILayoutAndDetailTabs(t *testing.T) {
 		t.Fatal("detail did not close")
 	}
 }
+
+func TestExpiredHeartbeatChecksCaptureLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "status.json")
+	if err := os.WriteFile(path, []byte(`{"state":"running"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(path, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(filepath.Join(dir, "capture.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := session.LockFile(lock, true); err != nil {
+		t.Fatal(err)
+	}
+	active, _ := readTUIStatus(dir)
+	if active.State != "stale" {
+		t.Fatalf("live lock treated as crash: %+v", active)
+	}
+	if err := session.UnlockFile(lock); err != nil {
+		t.Fatal(err)
+	}
+	stopped, warning := readTUIStatus(dir)
+	if stopped.State != "interrupted" || stopped.DrainState != "unverified" || warning == "" {
+		t.Fatalf("unconfirmed shutdown hidden: %+v %s", stopped, warning)
+	}
+}

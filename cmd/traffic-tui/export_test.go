@@ -206,3 +206,58 @@ func TestExportPacketScopeAndHashes(t *testing.T) {
 		})
 	}
 }
+
+func TestExportIncludesScopedIntegrityDiagnostics(t *testing.T) {
+	s := tuiTestStore(t)
+	if err := os.WriteFile(filepath.Join(s.dir, "capture.lock"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	status := []byte(`{"state":"stopped","drain_state":"unverified"}`)
+	if err := os.WriteFile(filepath.Join(s.dir, "status.json"), status, 0600); err != nil {
+		t.Fatal(err)
+	}
+	journal := []byte("{\"connection\":\"one\",\"reason\":\"keep\"}\n{\"connection\":\"other\",\"reason\":\"exclude\"}\n")
+	if err := os.WriteFile(filepath.Join(s.dir, "gaps.jsonl"), journal, 0600); err != nil {
+		t.Fatal(err)
+	}
+	record := Transaction{ID: "diagnostics", Connection: "tls:one", Protocol: "HTTP/2.0", StreamID: 3, Incomplete: true, IntegrityReasons: []string{"buffer_evicted"}}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "diagnostics.zip")
+	if err := exportEvidence(s, record, raw, path); err != nil {
+		t.Fatal(err)
+	}
+	archive, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+	contents := map[string][]byte{}
+	for _, entry := range archive.File {
+		file, err := entry.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(file)
+		file.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		contents[entry.Name] = data
+	}
+	if !bytes.Equal(contents["capture-status.json"], status) || !bytes.Contains(contents["capture-gaps.jsonl"], []byte("keep")) || bytes.Contains(contents["capture-gaps.jsonl"], []byte("exclude")) {
+		t.Fatal("missing or unscoped diagnostics")
+	}
+	var hashes map[string]string
+	if err := json.Unmarshal(contents["sha256.json"], &hashes); err != nil {
+		t.Fatal(err)
+	}
+	for name, digest := range hashes {
+		sum := sha256.Sum256(contents[name])
+		if hex.EncodeToString(sum[:]) != digest {
+			t.Fatal("diagnostics hash mismatch", name)
+		}
+	}
+}

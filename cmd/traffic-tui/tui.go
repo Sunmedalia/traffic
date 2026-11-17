@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -301,6 +302,17 @@ func (m tuiModel) overview() string {
 		"TLS   " + tuiLine(s.TLS),
 		"资源  " + tuiLine(s.ResourceLimits), "",
 	}
+	if s.DrainState != "" {
+		lines = append(lines, "数据排空  "+tuiLine(s.DrainState))
+	}
+	if len(s.GapCounts) > 0 {
+		data, _ := json.Marshal(s.GapCounts)
+		lines = append(lines, "采集缺口  "+tuiLine(string(data)))
+	}
+	if len(s.ProbeExits) > 0 {
+		data, _ := json.Marshal(s.ProbeExits)
+		lines = append(lines, "退出确认  "+tuiLine(string(data)))
+	}
 	for _, target := range s.Targets {
 		lines = append(lines, fmt.Sprintf("服务 %s · PID %d · %s", tuiLine(target.Service), target.PID, tuiLine(target.State)))
 	}
@@ -328,6 +340,7 @@ func (m tuiModel) detailContent() string {
 	fmt.Fprintf(&b, "%s\n%s  %s  %s\n客户端 %s\nHost %s\n来源 %s  PID %d\n连接 %s\n响应 %d  不完整 %t  截断 %t\n\n",
 		tuiLine(t.ID), tuiTime(t.Time.Format(time.RFC3339Nano)), tuiLine(t.Method), tuiLine(t.URL), tuiLine(t.Client), tuiLine(t.Host), tuiLine(t.Source), t.PID, tuiLine(t.Connection), t.Status, t.Incomplete, t.Truncated)
 	fmt.Fprintf(&b, "服务 %s  目标 %s\n后端 %s  本地 %s\n\n", tuiLine(t.Service), tuiLine(t.TargetID), tuiLine(t.Backend), tuiLine(t.LocalEndpoint))
+	fmt.Fprintf(&b, "协议 %s  stream ID %d\n完整性原因 %s\n", tuiLine(t.Protocol), t.StreamID, tuiLine(strings.Join(t.IntegrityReasons, ", ")))
 	if t.PeerClient != "" {
 		fmt.Fprintf(&b, "直连对端 %s  来源地址依据 %s\n\n", tuiLine(t.PeerClient), tuiLine(t.ClientSource))
 	}

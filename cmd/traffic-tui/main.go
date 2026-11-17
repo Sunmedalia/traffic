@@ -103,8 +103,9 @@ func run(args []string) error {
 		var status map[string]any
 		if json.Unmarshal(b, &status) == nil {
 			if info, e := os.Stat(filepath.Join(*dir, "status.json")); e == nil && time.Since(info.ModTime()) > 5*time.Second && status["state"] == "running" {
-				status["state"] = "stale"
-				status["note"] = "capture heartbeat missing; inspect process and logs"
+				checked, note := readTUIStatus(*dir)
+				status["state"] = checked.State
+				status["note"] = note
 			}
 			emit(status)
 		} else {
