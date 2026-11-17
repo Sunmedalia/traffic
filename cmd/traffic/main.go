@@ -92,6 +92,7 @@ func run(args []string) (runErr error) {
 	proxyList := fs.String("trusted-proxies", "", "comma-separated trusted proxy IPs or CIDRs for X-Forwarded-For / X-Real-IP")
 	preloadSocket := fs.String("openssl-preload-socket", "", "Linux Unix datagram socket for LD_PRELOAD OpenSSL events")
 	preloadAllowUID := fs.String("openssl-preload-allow-uid", "", "comma-separated sender UIDs allowed to write preload events; opens the socket to their group")
+	requirePlaintext := fs.Bool("require-plaintext", false, "fail unless an IIS probe records request-side plaintext; no HTTP reconstruction")
 	requireTLS := fs.Bool("require-tls", false, "fail before capture if selected HTTPS targets fail read-only preflight")
 	fs.IntVar(&collectorMemoryMiB, "collector-memory-mib", 256, "collector and helper memory budget MiB; excludes in-process probes")
 	fs.IntVar(&collectorCPUPercent, "collector-cpu-percent", 50, "collector CPU budget as percent of one CPU")
@@ -210,6 +211,9 @@ func run(args []string) (runErr error) {
 	}
 	if *requireTLS && (*noTLS || cmd != "capture") {
 		return errors.New("--require-tls requires capture with TLS enabled")
+	}
+	if *requirePlaintext && (*noTLS || cmd != "capture" || (*service != "iis" && *service != "auto")) {
+		return errors.New("--require-plaintext requires capture with IIS TLS enabled")
 	}
 	if diskLimitMiB < 64 {
 		return errors.New("invalid resource or result limits")
@@ -515,6 +519,7 @@ func run(args []string) (runErr error) {
 				s.stats.DrainState = "confirmed"
 			}
 		}
+		finishIISObservability(s, *requirePlaintext)
 		s.stats.StopReason = "signal_or_duration"
 		s.stats.State = "stopped"
 		if s.stats.RawEvidenceWriters > 0 || s.stats.RawEvidencePendingBytes > 0 || s.stats.RawEvidenceDrainUnconfirmed {

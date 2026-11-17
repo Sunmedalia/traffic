@@ -15,17 +15,19 @@ type Stats = session.Stats
 var serial atomic.Uint64
 
 type Store struct {
-	checkMu     sync.Mutex
-	checks      map[string]captureCheck
-	probeCheck  func(session.Target) captureCheck
-	gapMu       sync.Mutex
-	gapEvents   uint64
-	targetTimes map[string]session.Target
-	packetDrops map[string]uint64
-	fatal       error
-	dir         string
-	mu          sync.Mutex
-	stats       Stats
+	probeGapTotals map[string]uint64
+	iisAttached    bool
+	checkMu        sync.Mutex
+	checks         map[string]captureCheck
+	probeCheck     func(session.Target) captureCheck
+	gapMu          sync.Mutex
+	gapEvents      uint64
+	targetTimes    map[string]session.Target
+	packetDrops    map[string]uint64
+	fatal          error
+	dir            string
+	mu             sync.Mutex
+	stats          Stats
 }
 
 func openStore(dir string, _ bool) (*Store, error) {

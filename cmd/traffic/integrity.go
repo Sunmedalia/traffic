@@ -10,6 +10,24 @@ import (
 	"github.com/Sunmedalia/traffic/internal/session"
 )
 
+// noteProbeGap records the latest running total from the IIS probe.
+// The script re-emits the same counter, so adding each report would inflate the journal.
+func (s *Store) noteProbeGap(target, reason, kind string, total uint64) {
+	s.mu.Lock()
+	if s.probeGapTotals == nil {
+		s.probeGapTotals = map[string]uint64{}
+	}
+	key := target + "/" + reason + "/" + kind
+	previous := s.probeGapTotals[key]
+	if total <= previous {
+		s.mu.Unlock()
+		return
+	}
+	s.probeGapTotals[key] = total
+	s.mu.Unlock()
+	s.gap("iis-httpapi", target, reason+"_"+kind, "completions", total-previous)
+}
+
 // Gap units are explicit: an event or byte count is never a missing-request estimate.
 // Bound the journal during prolonged overload; aggregate counters remain exact.
 func (s *Store) gap(backend, connection, reason, unit string, count uint64) {

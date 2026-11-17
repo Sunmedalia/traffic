@@ -503,7 +503,13 @@ powershell -ExecutionPolicy Bypass -File scripts/windows/build.ps1
 .\traffic.exe capture --service iis --ports 8080,8443 --duration 60s
 ```
 
-IIS 探针动态附加 `w3wp.exe`，在 HTTP Server API 收发边界复制明文，无需安装模块或回收应用池。`probe-runtime` 目录必须允许目标应用池身份读取。已附加前投递的异步接收调用无法恢复，启动窗口可能漏采；停止时可能因未完成 I/O 导致运行时未完全卸载。采集器会在状态中写入这条限制。实测范围是 Windows 10 17763、HTTP/1.1、TLS 1.2。
+IIS 探针动态附加 `w3wp.exe`，在 HTTP Server API 收发边界复制明文，无需安装模块或回收应用池。`probe-runtime` 目录必须允许目标应用池身份读取。动态附加只能看到附加之后进入的调用。IIS 10 默认应用池在附加前已经向 HTTP.sys 预投递约 10 个 `HttpReceiveHttpRequest`，这 10 个请求的完成通知对不上探针登记表，明文必然丢失。请求数少于这个数时，`plaintext_observed` 可能为 false，这不表示该 IIS 版本不能解密。判定前先向本机端口连续发送多于预投递数的请求（实测先打 15 个以上），再看 `status.json`：
+
+- `probe_receive_matches > 0` 表示请求接收 hook 命中；`plaintext_observed=true` 表示请求侧原始事件已记录。这不代表还原、配对成功；停采后由 console 分析。
+- `probe_send_matches > 0` 但 `probe_receive_matches=0`：只命中了响应，请求侧仍在盲区。
+- `attach_window_suspect=true`：同时满足「响应命中、请求 0 条、完成通知有未命中」。单独的未命中不算，工作进程里还有探针没登记的其它 I/O。`gaps.jsonl` 在结束时记一条 `unmatched_completion_unknown`，不在收包路径上逐条写。
+
+`--require-plaintext` 在未附加 IIS 或未记录任何请求侧原始事件时以非 0 退出；写入/排空失败也会使采集失败。它不要求采集端进行 HTTP 还原。`--require-tls` 只检查附加前的预检，不保证采到明文。停止时可能因未完成 I/O 导致运行时未完全卸载。实测范围是 Windows 10 17763 与 19044、HTTP/1.1、TLS 1.2。
 
 ### Windows nginx / apache / 通用 OpenSSL
 
