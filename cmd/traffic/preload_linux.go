@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,22 +17,58 @@ import (
 	"github.com/Sunmedalia/traffic/internal/session"
 )
 
-// The socket is private to the collector UID. Kernel credentials identify every
-// sender, and /proc start time prevents PID reuse from merging TLS connections.
-func openPreloadSocket(path string) (*net.UnixConn, error) {
+// The socket is private to the collector UID by default. An explicit UID
+// allowlist opens it to the service account (for example nginx workers running
+// as www-data) and keeps kernel credentials as the first identity check.
+func openPreloadSocket(path string, allowedUIDs []uint32) (*net.UnixConn, error) {
+	if len([]byte(path)) >= 108 {
+		return nil, fmt.Errorf("preload socket path must be shorter than 108 bytes")
+	}
 	if !filepath.IsAbs(path) {
 		return nil, fmt.Errorf("--openssl-preload-socket must be absolute")
 	}
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		return nil, fmt.Errorf("preload socket path must not exist: %s", path)
 	}
+	directory := filepath.Dir(path)
+	if _, err := os.Stat(directory); os.IsNotExist(err) {
+		if err := os.MkdirAll(directory, 0755); err != nil {
+			return nil, fmt.Errorf("preload socket directory: %w", err)
+		}
+		// The collector runs with a private umask; the socket parent must stay
+		// traversable for the allowlisted service account.
+		if err := os.Chmod(directory, 0755); err != nil {
+			return nil, fmt.Errorf("preload socket directory mode: %w", err)
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("preload socket directory: %w", err)
+	}
+	// Existing directory permissions belong to the operator. The UID opt-in
+	// grants access to the socket; it must not expose a private parent directory.
 	connection, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: path, Net: "unixgram"})
 	if err != nil {
 		return nil, err
 	}
 	cleanup := func(err error) (*net.UnixConn, error) { connection.Close(); os.Remove(path); return nil, err }
-	if err := os.Chmod(path, 0600); err != nil {
+	mode := os.FileMode(0600)
+	if len(allowedUIDs) > 0 {
+		mode = 0660
+	}
+	if err := os.Chmod(path, mode); err != nil {
 		return cleanup(err)
+	}
+	if len(allowedUIDs) > 0 {
+		account, err := user.LookupId(strconv.FormatUint(uint64(allowedUIDs[0]), 10))
+		if err != nil {
+			return cleanup(fmt.Errorf("preload sender UID %d: %w", allowedUIDs[0], err))
+		}
+		group, err := strconv.Atoi(account.Gid)
+		if err != nil {
+			return cleanup(fmt.Errorf("preload sender group for UID %d: %w", allowedUIDs[0], err))
+		}
+		if err := os.Chown(path, -1, group); err != nil {
+			return cleanup(err)
+		}
 	}
 	raw, err := connection.SyscallConn()
 	if err != nil {
@@ -50,8 +87,20 @@ func openPreloadSocket(path string) (*net.UnixConn, error) {
 	return connection, nil
 }
 
-func capturePreload(ctx context.Context, s *Store, p *HTTPProcessor, path string) error {
-	connection, err := openPreloadSocket(path)
+func preloadUIDAllowed(uid uint32, allowedUIDs []uint32) bool {
+	if uid == uint32(os.Geteuid()) {
+		return true
+	}
+	for _, allowed := range allowedUIDs {
+		if uid == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func capturePreload(ctx context.Context, s *Store, p *HTTPProcessor, path string, allowedUIDs []uint32) error {
+	connection, err := openPreloadSocket(path, allowedUIDs)
 	if err != nil {
 		return err
 	}
@@ -65,8 +114,9 @@ func capturePreload(ctx context.Context, s *Store, p *HTTPProcessor, path string
 	if err != nil {
 		return err
 	}
-	defer evidence.Close()
-	encoder := json.NewEncoder(evidence)
+	raw := newEvidenceWriter(s, evidence, "openssl-preload")
+	defer raw.Close()
+	encoder := json.NewEncoder(raw)
 	assemblers := map[string]*opensslAssembler{}
 	defer func() {
 		for _, assembler := range assemblers {
@@ -103,7 +153,7 @@ func capturePreload(ctx context.Context, s *Store, p *HTTPProcessor, path string
 				credentials = credential
 			}
 		}
-		if credentials == nil || credentials.Uid != uint32(os.Geteuid()) {
+		if credentials == nil || !preloadUIDAllowed(credentials.Uid, allowedUIDs) {
 			continue
 		}
 		if flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 {

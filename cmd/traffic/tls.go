@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/Sunmedalia/traffic/internal/session"
 	"io"
 	"net"
 	"net/http"
@@ -53,14 +55,14 @@ func protoFields(b []byte) (map[int][]byte, map[int]uint64, error) {
 	}
 	return s, v, nil
 }
-func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string, pid, uid int, accepts func(int) bool, attached func()) error {
+func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string, pid, uid int, accepts func(int, string) string, snapshot kernelScopeSnapshot, attached func()) error {
 	listener, e := net.Listen("tcp", "127.0.0.1:0")
 	if e != nil {
 		return e
 	}
 	addr := listener.Addr().String()
 	listener.Close()
-	args := []string{"tls", "--libssl", lib, "--mapsize", "1024", "--perf-reorder", "--perf-reorder-lag-ms", "100", "--ecaptureq", "ws://" + addr + "/"}
+	args := []string{"tls", "--libssl", lib, "--mapsize", "1024", "--perf-reorder", "--perf-reorder-lag-ms", "100", "--eventaddr", os.DevNull, "--ecaptureq", "ws://" + addr + "/"}
 	if pid > 0 {
 		args = append(args, "-p", strconv.Itoa(pid))
 	} else {
@@ -71,6 +73,15 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 		if err := os.MkdirAll(filepath.Join(s.dir, name), 0700); err != nil {
 			return err
 		}
+	}
+	var scope *kernelScopeFile
+	if probeCapability(bin, "feature:pid_scope_v1") {
+		scope, e = newKernelScopeFile(filepath.Join(s.dir, "logs"), snapshot, capturePorts)
+		if e != nil {
+			return e
+		}
+		defer os.Remove(scope.path)
+		args = append(args, "--traffic-scope-file", scope.path)
 	}
 	log, e := os.OpenFile(filepath.Join(s.dir, "logs", "tls.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if e != nil {
@@ -115,7 +126,17 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 		return e
 	}
 	defer ws.Close()
+	if scope != nil {
+		stopScope := scope.watch(ctx, func(err error) {
+			s.gap("ecapture", lib, "scope_update_failed", "updates", 1)
+			s.problem(err)
+			ws.Close()
+		})
+		defer stopScope()
+	}
 	ws.SetReadLimit(2 << 20)
+	transport := startProbeTransport(ws)
+	defer transport.close()
 	watchDone := make(chan struct{})
 	defer close(watchDone)
 	go func() {
@@ -126,32 +147,60 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 		}
 	}()
 	s.mu.Lock()
-	s.stats.TLS = "attached"
+	s.stats.TLS = "starting"
 	s.mu.Unlock()
-	attached()
+	ready := false
+	markReady := func() {
+		if ready {
+			return
+		}
+		ready = true
+		s.mu.Lock()
+		s.stats.TLS = "attached"
+		s.mu.Unlock()
+		attached()
+	}
 	events, err := os.OpenFile(filepath.Join(s.dir, "tls", "events.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return err
 	}
-	defer events.Close()
-	enc := json.NewEncoder(events)
+	evidence := newEvidenceWriter(s, events, "ecapture")
+	defer evidence.Close()
+	enc := json.NewEncoder(evidence)
 	epoch := serial.Add(1)
+	var sequence probeSequence
+	transportUncertain := false
 	identityWarning := false
 	portWarning := false
 	frames := &Frames{}
 	stopExpiry := frames.startExpiry(ctx, p)
 	defer stopExpiry()
 	for {
-		_, b, e := ws.ReadMessage()
+		b, e := transport.next()
 		if e != nil {
 			if ctx.Err() != nil {
+				s.gap("ecapture", lib, "drain_unconfirmed", "shutdowns", 1)
+				s.recordProbeExit("ecapture/"+lib, session.ProbeExit{RuntimeState: "probe process stopped; transport drain not confirmed"})
 				return nil
 			}
+			reason := "transport_interrupted"
+			if errors.Is(e, errProbeTransportBackpressure) {
+				reason = "receive_queue_overflow"
+			}
+			s.gap("ecapture", lib, reason, "transports", 1)
 			return e
 		}
-		outer, _, e := protoFields(b)
+		outer, outerNumbers, e := protoFields(b)
 		if e != nil {
 			return e
+		}
+		if outerNumbers[1] == 1 && string(outer[4]) == "traffic-control-v1:ready" {
+			markReady()
+			continue
+		}
+		if outerNumbers[1] == 1 && string(outer[4]) == "traffic-control-v1:scope-error" {
+			s.gap("ecapture", lib, "kernel_scope_update_failed", "updates", 1)
+			return fmt.Errorf("kernel PID scope update failed; probe cleared its PID allowlist")
 		}
 		if outer[2] == nil {
 			continue
@@ -160,9 +209,32 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 		if e != nil {
 			return e
 		}
-		if (nums[6] != 0 && !capturePorts[int(nums[6])]) || !accepts(int(nums[7])) {
+		missing, reset := sequence.observe(nums[17])
+		if missing > 0 || reset {
+			transportUncertain = true
+			if missing > 0 {
+				s.gap("ecapture", lib, "sequence_gap", "published_events", missing)
+			}
+			if reset {
+				s.gap("ecapture", lib, "sequence_reset_or_reorder", "transitions", 1)
+			}
+			frames.expire(time.Now(), true, p, "")
+			p.invalidatePrefix(fmt.Sprintf("tls:probe-%d/", epoch), "probe_sequence_gap")
+		}
+		if nums[6] != 0 && !capturePorts[int(nums[6])] {
 			continue
 		}
+		reportedIdentity := ""
+		if scope != nil {
+			reportedIdentity = processStartIdentity(string(fields[16]), int(nums[7]))
+		}
+		identity := accepts(int(nums[7]), reportedIdentity)
+		if identity == "" {
+			continue
+		}
+		// A valid scoped event also proves readiness for older probes without
+		// the explicit control record. Opening their socket alone does not.
+		markReady()
 		if nums[6] == 0 {
 			s.mu.Lock()
 			s.stats.TLSDropped++
@@ -211,7 +283,7 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 		queue := p.pending["tls:"+key]
 		head := len(queue) > 0 && queue[0].Method == "HEAD"
 		p.mu.Unlock()
-		frames.ingest(key+string(fields[14]), payload, frameContext{connection: key, client: client, pid: int(nums[7]), local: net.JoinHostPort(string(fields[5]), strconv.Itoa(int(nums[6])))}, head, p)
+		frames.ingest(key+string(fields[14]), payload, frameContext{incomplete: transportUncertain, targetID: identity, connection: key, client: client, pid: int(nums[7]), local: net.JoinHostPort(string(fields[5]), strconv.Itoa(int(nums[6])))}, head, p)
 	}
 }
 

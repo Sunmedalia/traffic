@@ -11,17 +11,24 @@ import (
 var queuedBytes atomic.Int64
 
 type queuedStream struct {
-	server   string
-	chunks   chan []byte
-	current  []byte
-	failed   atomic.Bool
-	closed   bool
-	store    *Store
-	observed atomic.Int64
+	server     string
+	connection string
+	abort      *atomic.Bool
+	processor  *HTTPProcessor
+	chunks     chan []byte
+	current    []byte
+	failed     atomic.Bool
+	closed     bool
+	store      *Store
+	observed   atomic.Int64
 }
 
 func (s *queuedStream) Reassembled(rs []tcpassembly.Reassembly) {
 	if s.closed {
+		return
+	}
+	if s.abort != nil && s.abort.Load() {
+		s.ReassemblyComplete()
 		return
 	}
 	for _, r := range rs {
@@ -30,6 +37,13 @@ func (s *queuedStream) Reassembled(rs []tcpassembly.Reassembly) {
 		}
 		if r.Skip != 0 {
 			s.failed.Store(true)
+			s.store.gap("pcap", s.connection, "tcp_sequence_gap", "events", 1)
+			// Stop this direction at a gap rather than interpreting shifted bytes.
+			if r.Skip > 0 {
+				s.abortConnection()
+				s.ReassemblyComplete()
+				return
+			}
 		}
 		if len(r.Bytes) == 0 {
 			continue
@@ -51,6 +65,8 @@ func (s *queuedStream) Reassembled(rs []tcpassembly.Reassembly) {
 	}
 }
 func (s *queuedStream) drop() {
+	s.abortConnection()
+	s.store.gap("pcap", s.connection, "queue_overflow", "events", 1)
 	s.failed.Store(true)
 	s.store.mu.Lock()
 	s.store.stats.QueueDropped++
@@ -87,3 +103,13 @@ func (s *queuedStream) CaptureTime() time.Time {
 }
 
 func (s *queuedStream) LocalEndpoint() string { return s.server }
+
+func (s *queuedStream) Aborted() bool { return s.abort != nil && s.abort.Load() }
+func (s *queuedStream) abortConnection() {
+	if s.abort != nil {
+		s.abort.Store(true)
+	}
+	if s.processor != nil {
+		s.processor.invalidate(s.connection, "tcp_stream_gap")
+	}
+}

@@ -9,15 +9,20 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Sunmedalia/traffic/internal/session"
 )
 
 // tuiFilter applies to persisted transactions, including records written by v1.
 type tuiFilter struct {
 	Client, Rule, Severity, Since, Keyword, Service string
-	// Until is an inclusive upper bound in index time format; only the TUI sets it.
-	Until string
+	// Until is inclusive in the TUI and exclusive in the web interface.
+	// Method and Status are only set by the web interface.
+	Until, Method, Status string
+	UntilExclusive        bool
 }
 
 type tuiRow struct {
@@ -57,7 +62,11 @@ func (f tuiFilter) where(alertsOnly bool) (string, []any) {
 	clauses := []string{"time>=?"}
 	args := []any{f.Since}
 	if f.Until != "" {
-		clauses = append(clauses, "time<=?")
+		operator := "time<=?"
+		if f.UntilExclusive {
+			operator = "time<?"
+		}
+		clauses = append(clauses, operator)
 		args = append(args, f.Until)
 	}
 	if alertsOnly {
@@ -79,6 +88,23 @@ func (f tuiFilter) where(alertsOnly bool) (string, []any) {
 	if f.Service != "" {
 		clauses = append(clauses, "json_extract(CAST(data AS TEXT),'$.service')=?")
 		args = append(args, f.Service)
+	}
+	if f.Method != "" {
+		clauses = append(clauses, "json_extract(CAST(data AS TEXT),'$.method')=?")
+		args = append(args, f.Method)
+	}
+	if f.Status != "" {
+		// Status is "pending", a class such as "4xx", or an exact code; the web handler validates it.
+		low, high := 0, 0
+		if strings.HasSuffix(f.Status, "xx") {
+			low = int(f.Status[0]-'0') * 100
+			high = low + 99
+		} else if f.Status != "pending" {
+			low, _ = strconv.Atoi(f.Status)
+			high = low
+		}
+		clauses = append(clauses, "COALESCE(json_extract(CAST(data AS TEXT),'$.status'),0) BETWEEN ? AND ?")
+		args = append(args, low, high)
 	}
 	if f.Keyword != "" {
 		clauses = append(clauses, `(json_extract(CAST(data AS TEXT),'$.host') LIKE ? ESCAPE '\' OR json_extract(CAST(data AS TEXT),'$.url') LIKE ? ESCAPE '\')`)
@@ -104,6 +130,15 @@ func readTUIStatus(dir string) (Stats, string) {
 	}
 	if info, err := os.Stat(path); err == nil && status.State == "running" && time.Since(info.ModTime()) > 5*time.Second {
 		status.State = "stale"
+		if lock, err := os.Open(filepath.Join(dir, "capture.lock")); err == nil {
+			defer lock.Close()
+			if session.LockFile(lock, false) == nil {
+				session.UnlockFile(lock)
+				status.State = "interrupted"
+				status.DrainState = "unverified"
+				return status, "采集未正常结束，文件锁已释放，尾部数据及探针清理状态未知"
+			}
+		}
 		return status, "采集心跳超过 5 秒未更新，请检查采集进程"
 	}
 	return status, ""

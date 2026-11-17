@@ -2,6 +2,8 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Sunmedalia/traffic/internal/session"
@@ -53,7 +56,7 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 			return e
 		}
 	}
-	note := map[string]any{"schema_version": 1, "source": t.Source, "incomplete": t.Incomplete, "truncated": t.Truncated, "capture_coverage": session.CoverageWarning, "packet_scope": "transport peer endpoint and 120-second window; may include other requests on the same connection; original packets may have rotated", "tls_plaintext_source": "process hook; network PCAP remains encrypted"}
+	note := map[string]any{"schema_version": 1, "source": t.Source, "protocol": t.Protocol, "stream_id": t.StreamID, "integrity_reasons": t.IntegrityReasons, "incomplete": t.Incomplete, "truncated": t.Truncated, "capture_coverage": session.CoverageWarning, "packet_scope": "transport peer endpoint and 120-second window; may include other requests on the same connection; original packets may have rotated", "tls_plaintext_source": "process hook; network PCAP remains encrypted"}
 	info, _ := json.MarshalIndent(note, "", "  ")
 	if e = add("evidence.json", info); e != nil {
 		return e
@@ -67,6 +70,41 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 		return fmt.Errorf("%w: %w", errCaptureRunning, e)
 	}
 	defer session.UnlockFile(lock)
+	// Capture diagnostics describe the whole session; gap entries are limited
+	// to this connection / target or an unattributable backend discontinuity.
+	if status, err := os.ReadFile(filepath.Join(s.dir, "status.json")); err == nil {
+		if err := add("capture-status.json", status); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if file, err := os.Open(filepath.Join(s.dir, "gaps.jsonl")); err == nil {
+		var selected bytes.Buffer
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 4096), 1<<20)
+		for scanner.Scan() {
+			var gap session.GapEvent
+			if err := json.Unmarshal(scanner.Bytes(), &gap); err != nil {
+				file.Close()
+				return err
+			}
+			if gap.Connection == "" || strings.Contains(t.Connection, gap.Connection) || (t.TargetID != "" && gap.Connection == t.TargetID) {
+				selected.Write(scanner.Bytes())
+				selected.WriteByte('\n')
+			}
+		}
+		err = scanner.Err()
+		file.Close()
+		if err != nil {
+			return err
+		}
+		if err := add("capture-gaps.jsonl", selected.Bytes()); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	peer := t.Client
 	if t.PeerClient != "" {
 		peer = t.PeerClient

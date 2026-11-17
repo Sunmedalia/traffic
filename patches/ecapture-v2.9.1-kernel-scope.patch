@@ -1,0 +1,637 @@
+diff --git a/kern/openssl.h b/kern/openssl.h
+--- a/kern/openssl.h
++++ b/kern/openssl.h
+@@ -43,6 +43,67 @@
+     u64 inode;
+ } __attribute__((packed)); // NOTE: do not leave padding hole in this struct.
+ 
++// Opt-in host PID/start-time and port scope. Zero control preserves upstream
++// behavior; userspace seeds maps before attaching and updates them in place.
++struct {
++    __uint(type, BPF_MAP_TYPE_ARRAY);
++    __uint(max_entries, 1);
++    __type(key, u32);
++    __type(value, u32);
++} tr_scope_ctl SEC(".maps");
++struct {
++    __uint(type, BPF_MAP_TYPE_HASH);
++    __uint(max_entries, 4096);
++    __type(key, u32);
++    __type(value, u64);
++} tr_scope_pids SEC(".maps");
++struct {
++    __uint(type, BPF_MAP_TYPE_ARRAY);
++    __uint(max_entries, 65536);
++    __type(key, u32);
++    __type(value, u32);
++} tr_scope_ports SEC(".maps");
++
++static __always_inline int traffic_scope_enabled(void) {
++    u32 zero = 0;
++    u32 *enabled = bpf_map_lookup_elem(&tr_scope_ctl, &zero);
++    return enabled ? *enabled : 0;
++}
++static __always_inline u64 traffic_start_ticks(void) {
++#ifndef NOCORE
++    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
++    struct task_struct *leader = 0;
++    u64 started = 0;
++    if (!bpf_core_field_exists(task->start_boottime)) return 0;
++    bpf_core_read(&leader, sizeof(leader), &task->group_leader);
++    if (!leader) return 0;
++    bpf_core_read(&started, sizeof(started), &leader->start_boottime);
++    // /proc/PID/stat start time uses the Linux USER_HZ ABI (100 on both targets).
++    return started / 10000000ULL;
++#else
++    return 0;
++#endif
++}
++static __always_inline int traffic_pid_allowed(void) {
++    int mode = traffic_scope_enabled();
++    if (!mode) return 1;
++    if (mode != 1) return 0;
++    u32 pid = bpf_get_current_pid_tgid() >> 32;
++    u64 *expected = bpf_map_lookup_elem(&tr_scope_pids, &pid);
++    if (!expected || !*expected) return 0;
++    return *expected == traffic_start_ticks();
++}
++static __always_inline int traffic_ports_allowed(struct connect_event_t *connection) {
++    if (!traffic_scope_enabled()) return 1;
++    // Unknown endpoint records must still reach diagnostics, not disappear.
++    if (connection->family != AF_INET && connection->family != AF_INET6) return 1;
++    u32 source = connection->sport, destination = connection->dport;
++    u32 *allowed = bpf_map_lookup_elem(&tr_scope_ports, &source);
++    if (allowed && *allowed) return 1;
++    allowed = bpf_map_lookup_elem(&tr_scope_ports, &destination);
++    return allowed && *allowed;
++}
++
+ struct ssl_data_event_t {
+     u64 wire_magic;
+     u64 type;
+@@ -211,6 +272,11 @@
+         struct connect_event_t *cached = bpf_map_lookup_elem(&traffic_ssl_sockets, &key);
+         if (cached) __builtin_memcpy(&event->connection, cached, sizeof(*cached));
+         else {event->connection.sock=ssl;event->connection.pid=id >> 32;}
++    }
++    if (!traffic_ports_allowed(&event->connection)) return 0;
++    if (traffic_scope_enabled()) {
++        u64 ticks = traffic_start_ticks();
++        __builtin_memcpy(event->connection.identity_pad, &ticks, 6);
+     }
+     event->fd = (event->connection.inode || event->connection.fd==0xffffffff) ? event->connection.fd : fd;
+     event->bio_type = bio_type;
+@@ -393,7 +459,7 @@
+ }
+ 
+ static __always_inline int probe_entry_SSL(struct pt_regs* ctx, void *map, int bio_offset) {
+-    if (!passes_filter(ctx)) {
++    if (!passes_filter(ctx) || !traffic_pid_allowed()) {
+         return 0;
+     }
+ 
+@@ -438,7 +504,7 @@
+ }
+ 
+ static __always_inline int probe_ret_SSL(struct pt_regs* ctx, void *map, enum ssl_data_event_type type) {
+-    if (!passes_filter(ctx)) {
++    if (!passes_filter(ctx) || !traffic_pid_allowed()) {
+         return 0;
+     }
+     u64 current_pid_tgid = bpf_get_current_pid_tgid();
+@@ -540,7 +606,7 @@
+     unsigned __int128 daddr;
+     u32 ports;
+ 
+-    if (!passes_filter(ctx)) {
++    if (!passes_filter(ctx) || !traffic_pid_allowed()) {
+         return 0;
+     }
+ 
+diff --git a/internal/probe/openssl/config.go b/internal/probe/openssl/config.go
+--- a/internal/probe/openssl/config.go
++++ b/internal/probe/openssl/config.go
+@@ -42,7 +42,8 @@
+ // Config extends BaseConfig with OpenSSL-specific configuration.
+ type Config struct {
+ 	*config.BaseConfig
+-	OpensslPath string `json:"opensslpath"` // Path to libssl.so
++	TrafficScopeFile string `json:"traffic_scope_file,omitempty"`
++	OpensslPath      string `json:"opensslpath"` // Path to libssl.so
+ 
+ 	// Capture mode configuration
+ 	CaptureMode string `json:"capturemode"` // "text", "keylog", or "pcap"
+@@ -77,6 +78,9 @@
+ 
+ // Validate checks if the configuration is valid.
+ func (c *Config) Validate() error {
++	if c.TrafficScopeFile != "" && (c.CaptureMode != handlers.ModeText || (c.TextSource != "" && c.TextSource != handlers.TextSourceHook)) {
++		return fmt.Errorf("traffic scope supports hook text mode only")
++	}
+ 	if err := c.BaseConfig.Validate(); err != nil {
+ 		return errors.NewConfigurationError("openssl config validation failed", err)
+ 	}
+diff --git a/internal/probe/openssl/openssl_probe.go b/internal/probe/openssl/openssl_probe.go
+--- a/internal/probe/openssl/openssl_probe.go
++++ b/internal/probe/openssl/openssl_probe.go
+@@ -141,6 +141,17 @@
+ 		return errors.NewEBPFLoadError("openssl manager init", err)
+ 	}
+ 
++	var scope *trafficScopeMaps
++	if p.config.TrafficScopeFile != "" {
++		if !strings.HasSuffix(bpfFileName, "_core.o") {
++			return fmt.Errorf("traffic scope requires CO-RE bytecode")
++		}
++		var err error
++		scope, err = p.initializeTrafficScope()
++		if err != nil {
++			return err
++		}
++	}
+ 	// Start eBPF manager
+ 	if err := p.bpfManager.Start(); err != nil {
+ 		return errors.NewEBPFAttachError("openssl manager start", err)
+@@ -161,6 +172,9 @@
+ 			Msg("Started perf event reader")
+ 	}
+ 
++	if scope != nil {
++		go p.watchTrafficScope(ctx, scope)
++	}
+ 	p.Logger().Info().Msg("OpenSSL probe started successfully")
+ 	return nil
+ }
+@@ -247,6 +261,9 @@
+ 	// Base TLS events map (used by all modes for SSL_read/SSL_write data)
+ 	maps = append(maps, &manager.Map{Name: "tls_events"})
+ 	maps = append(maps, &manager.Map{Name: "connect_events"})
++	if p.config.TrafficScopeFile != "" {
++		maps = append(maps, &manager.Map{Name: "tr_scope_ctl"}, &manager.Map{Name: "tr_scope_pids"}, &manager.Map{Name: "tr_scope_ports"})
++	}
+ 	p.mapNameToDecoder["tls_events"] = &tlsEventDecoder{probe: p}
+ 	p.mapNameToDecoder["connect_events"] = &connectDecoder{probe: p}
+ 
+diff --git a/internal/probe/openssl/event.go b/internal/probe/openssl/event.go
+--- a/internal/probe/openssl/event.go
++++ b/internal/probe/openssl/event.go
+@@ -99,27 +99,35 @@
+ */
+ // Event represents an OpenSSL TLS data event from eBPF.
+ type Event struct {
+-	DataType        int64             `json:"dataType"`
+-	Timestamp       uint64            `json:"timestamp"` // Nanosecond timestamp
+-	Pid             uint32            `json:"pid"`       // Process ID
+-	Tid             uint32            `json:"tid"`       // Thread ID
+-	Data            [MaxDataSize]byte `json:"data"`      // TLS data payload
+-	DataLen         int32             `json:"dataLen"`   // Length of actual data
+-	Comm            [TaskCommLen]byte `json:"comm"`      // Process name
+-	Fd              uint32            `json:"fd"`
+-	Version         int32             `json:"version"` // TLS version (e.g., 771 for TLS 1.2)
+-	Tuple           string
+-	BioType         uint32
+-	connectionID    string
+-	Sock            uint64
+-	sourceIP        string
+-	destinationIP   string
+-	sourcePort      uint16
+-	destinationPort uint16
++	DataType          int64             `json:"dataType"`
++	Timestamp         uint64            `json:"timestamp"` // Nanosecond timestamp
++	Pid               uint32            `json:"pid"`       // Process ID
++	Tid               uint32            `json:"tid"`       // Thread ID
++	Data              [MaxDataSize]byte `json:"data"`      // TLS data payload
++	DataLen           int32             `json:"dataLen"`   // Length of actual data
++	Comm              [TaskCommLen]byte `json:"comm"`      // Process name
++	Fd                uint32            `json:"fd"`
++	Version           int32             `json:"version"` // TLS version (e.g., 771 for TLS 1.2)
++	Tuple             string
++	BioType           uint32
++	processStartTicks uint64
++	connectionID      string
++	Sock              uint64
++	sourceIP          string
++	destinationIP     string
++	sourcePort        uint16
++	destinationPort   uint16
+ }
+ 
+ // DecodeFromBytes deserializes the event from raw eBPF data.
+ func (e *Event) DecodeFromBytes(data []byte) error {
++	e.processStartTicks = 0
++	e.connectionID = ""
++	e.Tuple = ""
++	e.sourceIP = ""
++	e.destinationIP = ""
++	e.sourcePort = 0
++	e.destinationPort = 0
+ 	compact := len(data) >= 8 && binary.LittleEndian.Uint64(data[:8]) == 0x5452414643544c32
+ 	if compact {
+ 		data = data[8:]
+@@ -185,6 +193,11 @@
+ 				e.connectionID = fmt.Sprintf("%d_apache_%d", e.Pid, metadata.Sock)
+ 			}
+ 		}
++		if metadata.Pid == e.Pid {
++			for i, value := range metadata.IdentityPad {
++				e.processStartTicks |= uint64(value) << (8 * i)
++			}
++		}
+ 		if e.connectionID == "" && metadata.Pid == e.Pid && metadata.Sock != 0 {
+ 			e.connectionID = fmt.Sprintf("%d_ssl_%d", e.Pid, metadata.Sock)
+ 		}
+@@ -195,6 +208,10 @@
+ 			return errors.NewEventDecodeError("openssl.CompactData", err)
+ 		}
+ 		clear(e.Data[int(e.DataLen):])
++	}
++
++	if e.connectionID != "" && e.processStartTicks != 0 {
++		e.connectionID = fmt.Sprintf("%d:%d/%s", e.Pid, e.processStartTicks, e.connectionID)
+ 	}
+ 
+ 	return nil
+diff --git a/internal/probe/openssl/event_test.go b/internal/probe/openssl/event_test.go
+--- a/internal/probe/openssl/event_test.go
++++ b/internal/probe/openssl/event_test.go
+@@ -417,3 +417,21 @@
+ 		t.Fatal("reused event retained stale plaintext beyond its payload")
+ 	}
+ }
++
++func TestCompactEventCarriesKernelProcessIdentity(t *testing.T) {
++	wire := compactEventBytes(t, []byte("x"), 1)
++	copy(wire[162:168], []byte{0xd2, 0x04, 0, 0, 0, 0})
++	e := &Event{}
++	if err := e.DecodeFromBytes(wire); err != nil {
++		t.Fatal(err)
++	}
++	if e.connectionID != "42:1234/42_inode_987" {
++		t.Fatal("kernel start identity missing", e.connectionID)
++	}
++	if err := e.DecodeFromBytes(compactEventBytes(t, []byte("y"), 1)); err != nil {
++		t.Fatal(err)
++	}
++	if e.connectionID != "42_inode_987" {
++		t.Fatal("legacy event retained the previous start identity", e.connectionID)
++	}
++}
+diff --git a/cli/cmd/tls.go b/cli/cmd/tls.go
+--- a/cli/cmd/tls.go
++++ b/cli/cmd/tls.go
+@@ -48,6 +48,7 @@
+ }
+ 
+ func init() {
++	opensslCmd.PersistentFlags().StringVar(&opensslConfig.TrafficScopeFile, "traffic-scope-file", "", "private JSON file with dynamic host PID/start-time and port scope (CO-RE only)")
+ 	opensslCmd.PersistentFlags().StringVar(&opensslConfig.OpensslPath, "libssl", "", "libssl.so file path, will automatically find it from curl default.")
+ 	opensslCmd.PersistentFlags().StringVar(&globalConf.CGroupPath, "cgroup_path", "", "cgroup v2 path for container/process filtering. Empty disables cgroup filtering.")
+ 	opensslCmd.PersistentFlags().StringVarP(&opensslConfig.CaptureMode, "model", "m", "text", "capture mode: text, pcap/pcapng, key/keylog")
+diff --git a/docs/agent/probe-development.md b/docs/agent/probe-development.md
+--- a/docs/agent/probe-development.md
++++ b/docs/agent/probe-development.md
+@@ -252,3 +252,13 @@
+ Connection metadata precedes payload; perf alignment padding is accepted.
+ The Go decoder continues accepting the legacy fixed-array record. Rebuild
+ bytecode and userspace together when enabling compact emission.
++
++The traffic scope opt-in (`--traffic-scope-file`) requires CO-RE and task BTF
++start_boottime/group_leader. It compares host TGID and the group leader start
++time in Linux USER_HZ ticks before OpenSSL event work; known endpoints are port
++filtered before plaintext copy. The bounded JSON snapshot is applied before
++attachment and watched for atomic replacements. Invalid updates clear the PID
++allowlist and publish a scope-error control record. Scope is disabled by default.
++The six previously reserved identity_pad bytes carry the low 48 bits of process
++start ticks; nonzero values prefix StreamID with PID:start_ticks/ without
++changing the compact record header size or legacy decoding.
+diff --git a/internal/probe/openssl/traffic_scope.go b/internal/probe/openssl/traffic_scope.go
+new file mode 100644
+--- /dev/null
++++ b/internal/probe/openssl/traffic_scope.go
+@@ -0,0 +1,231 @@
++package openssl
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"time"
++
++	"github.com/cilium/ebpf"
++	"github.com/cilium/ebpf/btf"
++	"github.com/gojue/ecapture/v2/internal/domain"
++)
++
++type trafficScopePID struct {
++	PID        uint32 `json:"pid"`
++	StartTicks uint64 `json:"start_ticks"`
++}
++type trafficScopeConfig struct {
++	Version  int               `json:"schema_version"`
++	Revision uint64            `json:"revision,omitempty"`
++	PIDs     []trafficScopePID `json:"pids"`
++	Ports    []uint32          `json:"ports"`
++}
++type trafficScopeMap interface {
++	Put(interface{}, interface{}) error
++	Delete(interface{}) error
++}
++type trafficScopeMaps struct {
++	pids, ports trafficScopeMap
++	control     trafficScopeMap
++	current     trafficScopeConfig
++}
++
++func readTrafficScope(path string) (trafficScopeConfig, error) {
++	var cfg trafficScopeConfig
++	f, err := os.Open(path)
++	if err != nil {
++		return cfg, err
++	}
++	defer f.Close()
++	info, err := f.Stat()
++	if err != nil {
++		return cfg, err
++	}
++	if !info.Mode().IsRegular() || info.Size() > 256<<10 {
++		return cfg, fmt.Errorf("traffic scope must be a regular file of at most 256 KiB")
++	}
++	// The collector atomically replaces a private, bounded file.
++	decoder := json.NewDecoder(io.LimitReader(f, (256<<10)+1))
++	decoder.DisallowUnknownFields()
++	if err := decoder.Decode(&cfg); err != nil {
++		return cfg, err
++	}
++	var extra any
++	if err := decoder.Decode(&extra); err != io.EOF {
++		return cfg, fmt.Errorf("traffic scope has trailing data")
++	}
++	if cfg.Version != 1 || len(cfg.PIDs) > 4096 || len(cfg.Ports) == 0 || len(cfg.Ports) > 65535 {
++		return cfg, fmt.Errorf("invalid traffic scope bounds")
++	}
++	seen := map[uint32]bool{}
++	for _, entry := range cfg.PIDs {
++		if entry.PID == 0 || entry.StartTicks == 0 || seen[entry.PID] {
++			return cfg, fmt.Errorf("invalid or duplicate traffic scope PID")
++		}
++		seen[entry.PID] = true
++	}
++	seen = map[uint32]bool{}
++	for _, port := range cfg.Ports {
++		if port == 0 || port > 65535 || seen[port] {
++			return cfg, fmt.Errorf("invalid or duplicate traffic scope port")
++		}
++		seen[port] = true
++	}
++	return cfg, nil
++}
++
++func (s *trafficScopeMaps) clear(extra trafficScopeConfig) {
++	if s.control != nil {
++		_ = s.control.Put(uint32(0), uint32(2))
++	}
++	for _, list := range [][]trafficScopePID{s.current.PIDs, extra.PIDs} {
++		for _, entry := range list {
++			_ = s.pids.Delete(entry.PID)
++		}
++	}
++	s.current.PIDs = nil
++}
++func (s *trafficScopeMaps) apply(next trafficScopeConfig) error {
++	wanted := map[uint32]bool{}
++	for _, entry := range next.PIDs {
++		wanted[entry.PID] = true
++	}
++	fail := func(err error) error { s.clear(next); return fmt.Errorf("apply traffic scope: %w", err) }
++	for _, old := range s.current.PIDs {
++		if !wanted[old.PID] {
++			if err := s.pids.Delete(old.PID); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
++				return fail(err)
++			}
++		}
++	}
++	wantedPorts := map[uint32]bool{}
++	for _, port := range next.Ports {
++		wantedPorts[port] = true
++	}
++	for _, port := range s.current.Ports {
++		if !wantedPorts[port] {
++			if err := s.ports.Put(port, uint32(0)); err != nil {
++				return fail(err)
++			}
++		}
++	}
++	for _, port := range next.Ports {
++		if err := s.ports.Put(port, uint32(1)); err != nil {
++			return fail(err)
++		}
++	}
++	for _, entry := range next.PIDs {
++		if err := s.pids.Put(entry.PID, entry.StartTicks); err != nil {
++			return fail(err)
++		}
++	}
++	if s.control != nil {
++		if err := s.control.Put(uint32(0), uint32(1)); err != nil {
++			return fail(err)
++		}
++	}
++	s.current = next
++	return nil
++}
++
++func (p *Probe) initializeTrafficScope() (*trafficScopeMaps, error) {
++	spec, err := btf.LoadKernelSpec()
++	if err != nil {
++		return nil, fmt.Errorf("traffic scope requires kernel BTF: %w", err)
++	}
++	var task *btf.Struct
++	if err := spec.TypeByName("task_struct", &task); err != nil {
++		return nil, err
++	}
++	members := map[string]bool{}
++	for _, member := range task.Members {
++		members[member.Name] = true
++	}
++	if !members["start_boottime"] || !members["group_leader"] {
++		return nil, fmt.Errorf("traffic scope requires task start_boottime and group_leader")
++	}
++	cfg, err := readTrafficScope(p.config.TrafficScopeFile)
++	if err != nil {
++		return nil, err
++	}
++	lookup := func(name string) (*ebpf.Map, error) {
++		m, ok, err := p.bpfManager.GetMap(name)
++		if err != nil {
++			return nil, err
++		}
++		if !ok {
++			return nil, fmt.Errorf("missing traffic scope map %s", name)
++		}
++		return m, nil
++	}
++	pidMap, err := lookup("tr_scope_pids")
++	if err != nil {
++		return nil, err
++	}
++	portMap, err := lookup("tr_scope_ports")
++	if err != nil {
++		return nil, err
++	}
++	control, err := lookup("tr_scope_ctl")
++	if err != nil {
++		return nil, err
++	}
++	scope := &trafficScopeMaps{pids: pidMap, ports: portMap, control: control}
++	if err := scope.apply(cfg); err != nil {
++		return nil, err
++	}
++	return scope, nil
++}
++
++func (p *Probe) watchTrafficScope(ctx context.Context, scope *trafficScopeMaps) {
++	ticker := time.NewTicker(200 * time.Millisecond)
++	defer ticker.Stop()
++	var previous os.FileInfo
++	failed := false
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++			info, err := os.Stat(p.config.TrafficScopeFile)
++			if err == nil && !failed && previous != nil && os.SameFile(info, previous) && info.ModTime() == previous.ModTime() && info.Size() == previous.Size() {
++				continue
++			}
++			cfg, readErr := readTrafficScope(p.config.TrafficScopeFile)
++			if err == nil {
++				err = readErr
++			}
++			if err == nil {
++				err = scope.apply(cfg)
++			}
++			if err != nil {
++				scope.clear(cfg)
++				if !failed {
++					p.Logger().Error().Err(err).Msg("traffic scope update failed; PID scope cleared")
++					if output := p.config.GetRuntimeOutput(); output != nil {
++						for _, sink := range output.EventSinks {
++							if logs, ok := sink.(domain.OperationalLogSink); ok {
++								_ = logs.PublishLog(ctx, domain.OperationalLogRecord{Message: "traffic-control-v1:scope-error"})
++							}
++						}
++					}
++				}
++				failed = true
++				continue
++			}
++			if output := p.config.GetRuntimeOutput(); output != nil {
++				for _, sink := range output.EventSinks {
++					if logs, ok := sink.(domain.OperationalLogSink); ok {
++						_ = logs.PublishLog(ctx, domain.OperationalLogRecord{Message: fmt.Sprintf("traffic-control-v1:scope-applied:%d", cfg.Revision)})
++					}
++				}
++			}
++			previous = info
++			failed = false
++		}
++	}
++}
+diff --git a/internal/probe/openssl/traffic_scope_test.go b/internal/probe/openssl/traffic_scope_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/probe/openssl/traffic_scope_test.go
+@@ -0,0 +1,90 @@
++package openssl
++
++import (
++	"errors"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/cilium/ebpf"
++)
++
++type fakeScopeMap struct {
++	values map[uint32]uint64
++	fail   bool
++}
++
++func (m *fakeScopeMap) Put(key, value interface{}) error {
++	if m.fail {
++		return errors.New("injected map update failure")
++	}
++	if m.values == nil {
++		m.values = map[uint32]uint64{}
++	}
++	var v uint64
++	switch x := value.(type) {
++	case uint32:
++		v = uint64(x)
++	case uint64:
++		v = x
++	default:
++		panic("wrong map value type")
++	}
++	m.values[key.(uint32)] = v
++	return nil
++}
++func (m *fakeScopeMap) Delete(key interface{}) error {
++	k := key.(uint32)
++	if _, ok := m.values[k]; !ok {
++		return ebpf.ErrKeyNotExist
++	}
++	delete(m.values, k)
++	return nil
++}
++func TestTrafficScopeUpdatesIdentityAndRemovesRetiredTargets(t *testing.T) {
++	pids, ports := &fakeScopeMap{}, &fakeScopeMap{}
++	control := &fakeScopeMap{}
++	scope := &trafficScopeMaps{pids: pids, ports: ports, control: control}
++	if err := scope.apply(trafficScopeConfig{Version: 1, PIDs: []trafficScopePID{{42, 100}, {43, 200}}, Ports: []uint32{443, 8443}}); err != nil {
++		t.Fatal(err)
++	}
++	if err := scope.apply(trafficScopeConfig{Version: 1, PIDs: []trafficScopePID{{42, 300}}, Ports: []uint32{443}}); err != nil {
++		t.Fatal(err)
++	}
++	if pids.values[42] != 300 || len(pids.values) != 1 || ports.values[8443] != 0 || ports.values[443] != 1 {
++		t.Fatal("stale PID identity or port remained", pids.values, ports.values)
++	}
++	ports.fail = true
++	if err := scope.apply(trafficScopeConfig{Version: 1, PIDs: []trafficScopePID{{44, 400}}, Ports: []uint32{443}}); err == nil {
++		t.Fatal("map update failure was hidden")
++	}
++	if control.values[0] != 2 {
++		t.Fatal("failed map update did not enable deny-all mode", control.values)
++	}
++	if len(pids.values) != 0 {
++		t.Fatal("failed update left an active PID allowlist", pids.values)
++	}
++}
++func TestTrafficScopeRejectsMalformedConfiguration(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "scope.json")
++	for _, data := range []string{
++		`{}`, `{"schema_version":2,"ports":[443]}`, `{"schema_version":1,"ports":[0]}`,
++		`{"schema_version":1,"ports":[65536]}`, `{"schema_version":1,"ports":[443,443]}`,
++		`{"schema_version":1,"ports":[443],"pids":[{"pid":42,"start_ticks":0}]}`,
++		`{"schema_version":1,"ports":[443],"pids":[{"pid":42,"start_ticks":1},{"pid":42,"start_ticks":2}]}`,
++		`{"schema_version":1,"ports":[443]} {}`, `{"schema_version":1,"ports":[443],"extra":1}`,
++	} {
++		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
++			t.Fatal(err)
++		}
++		if _, err := readTrafficScope(path); err == nil {
++			t.Fatal("invalid scope accepted", data)
++		}
++	}
++	if err := os.WriteFile(path, []byte(`{"schema_version":1,"ports":[443],"pids":[]}`), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := readTrafficScope(path); err != nil {
++		t.Fatal("empty PID scope must be a valid deny-all update", err)
++	}
++}

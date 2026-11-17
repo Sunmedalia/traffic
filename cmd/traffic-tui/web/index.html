@@ -5,117 +5,202 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <title>Traffic 流量分析</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%230b0e13'/%3E%3Cpath d='M2 9h3l1.5-5 3 9L11 7h3' fill='none' stroke='%233dd6c4' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
 <header class="top">
-  <a class="brand" href="#/">TRAFFIC</a>
-  <div class="crumb" id="crumb"></div>
+  <a class="brand" href="#/" title="会话列表"><span class="brand-mark" aria-hidden="true"></span>TRAFFIC</a>
+  <nav class="crumb" id="crumb" aria-label="当前会话"></nav>
   <div class="spacer"></div>
-  <span class="zone" id="zone"></span>
   <span class="live" id="live" hidden></span>
-  <button type="button" id="pause" hidden>暂停刷新</button>
+  <button type="button" class="ghost" id="pause" hidden title="暂停或恢复自动刷新（空格）">暂停</button>
+  <button type="button" class="ghost" id="tz" title="切换时间显示的时区"></button>
+  <button type="button" class="ghost" id="theme" title="切换配色"></button>
+  <button type="button" class="ghost icon" id="help-open" title="快捷键（?）" aria-label="快捷键">?</button>
 </header>
-<div class="notice" id="notice" role="status" hidden></div>
+<div class="banner" id="banner" role="status" hidden></div>
 
 <main>
   <section id="view-gate" class="gate" hidden>
     <form id="gate-form">
       <h1>输入访问令牌</h1>
-      <p>令牌在启动 <code>traffic-tui web</code> 时输出到终端，也可以直接打开终端里带令牌的完整地址。</p>
+      <p>令牌在启动 <code>traffic-tui web</code> 时输出到终端。也可以直接打开终端里带令牌的完整地址。</p>
       <input id="gate-token" type="password" autocomplete="off" spellcheck="false" placeholder="访问令牌" aria-label="访问令牌">
       <button type="submit" class="primary">进入</button>
     </form>
   </section>
 
   <section id="view-sessions" class="sessions" hidden>
-    <div class="section-head">
-      <div>
-        <h1>选择会话</h1>
-        <p class="muted" id="sessions-meta"></p>
+    <div class="page">
+      <div class="section-head">
+        <div>
+          <h1>会话</h1>
+          <p class="muted" id="sessions-meta"></p>
+        </div>
+        <input id="sessions-search" type="search" placeholder="按名称、主机或目录查找" spellcheck="false" aria-label="查找会话">
+        <button type="button" id="rescan">重新扫描</button>
       </div>
-      <button type="button" id="rescan">重新扫描</button>
-    </div>
-    <div class="table-wrap">
-      <table class="data sessions-table">
-        <thead><tr><th>开始时间</th><th>名称</th><th>主机</th><th>状态</th><th class="num">请求</th><th class="num">告警</th><th>目录</th></tr></thead>
-        <tbody id="sessions-body"></tbody>
-      </table>
-      <p class="empty" id="sessions-empty" hidden>暂无会话。使用 <code>--data-dir</code> 指定采集根目录，或用 <code>--session</code> 指定会话目录后重新启动。</p>
+      <div class="session-list" id="session-list"></div>
+      <p class="empty" id="sessions-empty" hidden></p>
     </div>
   </section>
 
   <section id="view-session" class="session" hidden>
     <nav class="tabs" role="tablist">
-      <button type="button" role="tab" data-tab="overview">概览</button>
-      <button type="button" role="tab" data-tab="requests">请求 <span class="badge" id="count-requests"></span></button>
-      <button type="button" role="tab" data-tab="alerts">告警 <span class="badge alert" id="count-alerts"></span></button>
+      <button type="button" role="tab" data-tab="overview"><kbd>1</kbd>概览</button>
+      <button type="button" role="tab" data-tab="requests"><kbd>2</kbd>请求<span class="badge" id="count-requests"></span></button>
+      <button type="button" role="tab" data-tab="alerts"><kbd>3</kbd>告警<span class="badge alert" id="count-alerts"></span></button>
     </nav>
 
     <div id="tab-overview" class="overview" hidden>
-      <div class="tiles" id="tiles"></div>
-      <dl class="facts" id="facts"></dl>
-      <h2>服务探针</h2>
-      <div class="table-wrap flat">
-        <table class="data">
-          <thead><tr><th>服务</th><th class="num">PID</th><th class="num">UID</th><th>端口</th><th>TLS 库</th><th>状态</th></tr></thead>
-          <tbody id="targets-body"></tbody>
-        </table>
-        <p class="empty" id="targets-empty" hidden>暂无服务探针记录</p>
+      <div class="page">
+        <div id="health"></div>
+        <div class="tiles" id="tiles"></div>
+        <section class="card">
+          <header class="card-head">
+            <h2>请求与告警时间线</h2>
+            <span class="legend"><i class="swatch req"></i>请求<i class="swatch alert"></i>含告警</span>
+            <span class="muted" id="ov-timeline-meta"></span>
+            <span class="spacer"></span>
+            <span class="muted hint-drag">拖选一段时间查看对应请求</span>
+          </header>
+          <div class="timeline tall" id="ov-timeline"></div>
+        </section>
+        <div class="grid three">
+          <section class="card">
+            <header class="card-head"><h2>命中规则</h2><span class="muted">按请求数</span></header>
+            <div class="barlist" id="ov-rules"></div>
+          </section>
+          <section class="card">
+            <header class="card-head"><h2>来源地址</h2><span class="muted">告警优先</span></header>
+            <div class="barlist" id="ov-clients"></div>
+          </section>
+          <section class="card">
+            <header class="card-head"><h2>告警级别</h2></header>
+            <div id="ov-severity"></div>
+            <header class="card-head sub"><h2>响应状态</h2></header>
+            <div id="ov-status"></div>
+          </section>
+        </div>
+        <div class="grid two">
+          <section class="card">
+            <header class="card-head"><h2>最近告警</h2><span class="spacer"></span><a class="link" id="ov-alerts-more">查看全部</a></header>
+            <div class="recent" id="ov-recent"></div>
+          </section>
+          <section class="card">
+            <header class="card-head"><h2>采集状态</h2></header>
+            <dl class="facts" id="facts"></dl>
+            <header class="card-head sub"><h2>服务探针</h2></header>
+            <div id="targets"></div>
+            <header class="card-head sub"><h2>采集错误</h2></header>
+            <ul class="errors" id="errors"></ul>
+          </section>
+        </div>
       </div>
-      <h2>采集错误</h2>
-      <ul class="errors" id="errors"></ul>
     </div>
 
     <div id="tab-list" class="list" hidden>
-      <form class="filters" id="filters">
-        <label>客户端<input name="client" placeholder="IP 或 IP:端口" spellcheck="false"></label>
-        <label>关键词<input name="keyword" placeholder="Host / URL" spellcheck="false"></label>
-        <label>规则<input name="rule" placeholder="规则 ID" spellcheck="false"></label>
-        <label>级别<select name="severity"><option value="">全部</option><option value="high">仅高</option><option value="medium">中及以上</option><option value="low">低及以上</option></select></label>
-        <label>服务<input name="service" placeholder="nginx / apache / tomcat" spellcheck="false"></label>
-        <label>起始时间<input name="since" type="datetime-local" step="1"></label>
-        <div class="filter-actions">
-          <button type="submit" class="primary">筛选</button>
-          <button type="button" id="filters-clear">清空</button>
+      <form class="filterbar" id="filters" autocomplete="off">
+        <div class="search">
+          <input name="keyword" type="search" placeholder="搜索 Host 或 URL" spellcheck="false" aria-label="Host 或 URL 关键词">
+          <kbd>/</kbd>
+        </div>
+        <div class="seg" role="group" aria-label="告警级别">
+          <button type="button" data-filter="severity" data-value="high" class="sev-high">仅高</button>
+          <button type="button" data-filter="severity" data-value="medium" class="sev-medium">中及以上</button>
+          <button type="button" data-filter="severity" data-value="low" class="sev-low">低及以上</button>
+        </div>
+        <div class="seg" role="group" aria-label="响应状态">
+          <button type="button" data-filter="status" data-value="2xx">2xx</button>
+          <button type="button" data-filter="status" data-value="3xx">3xx</button>
+          <button type="button" data-filter="status" data-value="4xx">4xx</button>
+          <button type="button" data-filter="status" data-value="5xx">5xx</button>
+          <button type="button" data-filter="status" data-value="pending">待响应</button>
+        </div>
+        <select name="method" aria-label="请求方法">
+          <option value="">全部方法</option>
+          <option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option><option>PATCH</option><option>HEAD</option><option>OPTIONS</option>
+        </select>
+        <button type="button" id="more-toggle" aria-expanded="false">更多条件</button>
+        <button type="button" class="ghost" id="filters-clear" hidden>清空</button>
+        <div class="more" id="more" hidden>
+          <label>来源地址<input name="client" placeholder="IP 或 IP:端口" spellcheck="false"></label>
+          <label>规则 ID<input name="rule" placeholder="例如 SQLI-001" spellcheck="false"></label>
+          <label>服务<input name="service" placeholder="nginx / apache / tomcat" spellcheck="false"></label>
+          <label>开始时间<input name="since" type="datetime-local" step="1"></label>
+          <label>结束时间<input name="until" type="datetime-local" step="1"></label>
         </div>
       </form>
+      <div class="strip">
+        <div class="chips" id="chips"></div>
+        <div class="timeline" id="list-timeline"></div>
+      </div>
       <div class="split" id="split">
         <div class="pane rows">
-          <div class="table-wrap">
+          <button type="button" class="newpill" id="newpill" hidden></button>
+          <div class="table-wrap" id="rows-wrap">
             <table class="data rows-table">
-              <thead><tr><th>时间</th><th>方法</th><th class="num">状态</th><th>级别</th><th>客户端</th><th>Host</th><th class="wide">URL</th></tr></thead>
+              <thead><tr><th>时间</th><th>级别</th><th>方法</th><th class="num">状态</th><th class="extra">来源</th><th class="extra">Host</th><th class="wide">URL</th></tr></thead>
               <tbody id="rows-body"></tbody>
             </table>
-            <p class="empty" id="rows-empty" hidden>暂无匹配请求</p>
+            <div class="empty" id="rows-empty" hidden></div>
           </div>
           <div class="pager">
             <span id="pager-info"></span>
             <div class="spacer"></div>
-            <button type="button" id="page-first">首页</button>
-            <button type="button" id="page-prev">上一页</button>
-            <button type="button" id="page-next">下一页</button>
+            <button type="button" id="page-first">最新</button>
+            <button type="button" id="page-prev" title="上一页（p）">上一页</button>
+            <button type="button" id="page-next" title="下一页（n）">下一页</button>
           </div>
         </div>
-        <aside class="pane detail" id="detail" hidden>
-          <div class="detail-head">
-            <div class="detail-title" id="detail-title"></div>
-            <button type="button" id="detail-export">导出证据</button>
-            <button type="button" id="detail-close" aria-label="关闭详情">关闭</button>
+        <div class="splitter" id="splitter" role="separator" aria-orientation="vertical" title="拖动调整宽度" hidden></div>
+        <aside class="detail" id="detail" hidden>
+          <header class="detail-head">
+            <div class="detail-line">
+              <span id="detail-pills"></span>
+              <span class="spacer"></span>
+              <button type="button" class="ghost icon" id="detail-prev" title="上一条（k）" aria-label="上一条">↑</button>
+              <button type="button" class="ghost icon" id="detail-next" title="下一条（j）" aria-label="下一条">↓</button>
+              <button type="button" id="detail-curl" title="复制为 cURL 命令">复制 cURL</button>
+              <button type="button" id="detail-export" title="下载请求、响应与关联网络包">导出证据</button>
+              <button type="button" class="ghost icon" id="detail-close" title="关闭（Esc）" aria-label="关闭详情">✕</button>
+            </div>
+            <div class="detail-url" id="detail-url"></div>
+            <div class="detail-decoded" id="detail-decoded" hidden></div>
+          </header>
+          <dl class="meta" id="detail-meta"></dl>
+          <div class="detail-tabs">
+            <nav class="tabs small" role="tablist" id="detail-tabs"></nav>
+            <span class="spacer"></span>
+            <label class="check" id="pretty-wrap"><input type="checkbox" id="pretty" checked>格式化正文</label>
+            <button type="button" class="ghost" id="detail-copy">复制</button>
           </div>
-          <dl class="facts compact" id="detail-facts"></dl>
-          <nav class="tabs small" role="tablist">
-            <button type="button" role="tab" data-detail="request">请求</button>
-            <button type="button" role="tab" data-detail="response">响应</button>
-            <button type="button" role="tab" data-detail="decoded">解码正文</button>
-            <button type="button" role="tab" data-detail="alerts">检测依据 <span class="badge alert" id="detail-alert-count"></span></button>
-          </nav>
-          <div class="detail-body" id="detail-body"></div>
+          <div class="detail-body" id="detail-body" tabindex="-1"></div>
         </aside>
       </div>
     </div>
   </section>
 </main>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<dialog id="help">
+  <header><h1>快捷键</h1><button type="button" class="ghost icon" id="help-close" aria-label="关闭">✕</button></header>
+  <dl class="keys">
+    <dt><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></dt><dd>概览、请求、告警</dd>
+    <dt><kbd>j</kbd> <kbd>k</kbd> 或 <kbd>↓</kbd> <kbd>↑</kbd></dt><dd>下一条、上一条请求</dd>
+    <dt><kbd>g</kbd> <kbd>G</kbd></dt><dd>本页第一条、最后一条</dd>
+    <dt><kbd>n</kbd> <kbd>p</kbd></dt><dd>下一页、上一页</dd>
+    <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>切换详情标签</dd>
+    <dt><kbd>/</kbd></dt><dd>聚焦搜索框</dd>
+    <dt><kbd>空格</kbd></dt><dd>暂停或恢复自动刷新</dd>
+    <dt><kbd>r</kbd></dt><dd>立即刷新</dd>
+    <dt><kbd>Esc</kbd></dt><dd>关闭详情或离开输入框</dd>
+    <dt><kbd>?</kbd></dt><dd>打开本帮助</dd>
+  </dl>
+  <p class="muted">在时间线上拖选可以把列表限定到一段时间，点击详情里的来源、Host、服务或规则可以直接按它筛选。</p>
+</dialog>
 <script src="app.js"></script>
 </body>
 </html>

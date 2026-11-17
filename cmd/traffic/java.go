@@ -14,7 +14,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -87,7 +90,12 @@ func captureJava(ctx context.Context, s *Store, p *HTTPProcessor, t session.Targ
 		config.Close()
 		return err
 	}
-	_, err = fmt.Fprintf(config, "port=%d\ntoken=%s\n", listener.Addr().(*net.TCPAddr).Port, token)
+	var ports []string
+	for port := range capturePorts {
+		ports = append(ports, strconv.Itoa(port))
+	}
+	sort.Strings(ports)
+	_, err = fmt.Fprintf(config, "port=%d\ntoken=%s\nprotocol=traffic-java-v2\nports=%s\n", listener.Addr().(*net.TCPAddr).Port, token, strings.Join(ports, ","))
 	config.Close()
 	if err != nil {
 		return err
@@ -120,17 +128,19 @@ func captureJava(ctx context.Context, s *Store, p *HTTPProcessor, t session.Targ
 		}
 	}
 	defer conn.Close()
+	var stopping atomic.Bool
 	go func() {
 		select {
 		case <-ctx.Done():
-			conn.Close()
+			stopping.Store(true)
+			conn.SetDeadline(time.Now().Add(drainTimeout))
 		case <-done:
 		}
 	}()
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 4096), 128<<10)
-	if !scanner.Scan() || scanner.Text() != token+"|traffic-java-v1" {
+	if !scanner.Scan() || (scanner.Text() != token+"|traffic-java-v1" && scanner.Text() != token+"|traffic-java-v2") {
 		return fmt.Errorf("Java probe authentication or protocol version mismatch")
 	}
 	if _, err = conn.Write([]byte{1}); err != nil {
@@ -140,6 +150,9 @@ func captureJava(ctx context.Context, s *Store, p *HTTPProcessor, t session.Targ
 		return err
 	}
 	conn.SetDeadline(time.Time{})
+	if ctx.Err() != nil {
+		conn.SetDeadline(time.Now().Add(drainTimeout))
+	}
 	attached()
 	s.mu.Lock()
 	s.stats.TLS = "attached"
@@ -152,12 +165,16 @@ func captureJava(ctx context.Context, s *Store, p *HTTPProcessor, t session.Targ
 	if err != nil {
 		return err
 	}
-	defer evidence.Close()
+	raw := newEvidenceWriter(s, evidence, "java-agent")
+	defer raw.Close()
 	frames := &Frames{}
 	stop := frames.startExpiry(ctx, p)
 	defer stop()
+	var lastSequence, lastDropped uint64
 	for scanner.Scan() {
 		var event struct {
+			Sequence   uint64
+			Dropped    uint64
 			Local      string
 			Port       int
 			Type       string
@@ -170,8 +187,29 @@ func captureJava(ctx context.Context, s *Store, p *HTTPProcessor, t session.Targ
 		if err = json.Unmarshal(scanner.Bytes(), &event); err != nil {
 			return err
 		}
+		if event.Dropped > lastDropped {
+			s.gap("java-agent", t.ID, "probe_queue_loss", "events", event.Dropped-lastDropped)
+			lastDropped = event.Dropped
+			frames.expire(time.Now(), true, p, "")
+			p.invalidatePrefix("tls:java:"+t.ID+":", "probe_queue_loss")
+		}
+		if event.Type == "drained" {
+			confirmed := event.Sequence == lastSequence
+			if !confirmed {
+				s.gap("java-agent", t.ID, "drain_sequence_mismatch", "shutdowns", 1)
+			}
+			s.recordProbeExit(t.ID, session.ProbeExit{DataDrained: confirmed, RuntimeState: "agent classes may remain loaded"})
+			return nil
+		}
+		if event.Sequence > 0 {
+			if lastSequence > 0 && event.Sequence != lastSequence+1 {
+				s.gap("java-agent", t.ID, "transport_sequence_gap", "events", 1)
+				p.invalidatePrefix("tls:java:"+t.ID+":", "transport_sequence_gap")
+			}
+			lastSequence = event.Sequence
+		}
 		if event.Type != "heartbeat" && capturePorts[event.Port] {
-			if _, err = evidence.Write(append(append([]byte{}, scanner.Bytes()...), '\n')); err != nil {
+			if _, err = raw.Write(append(append([]byte{}, scanner.Bytes()...), '\n')); err != nil {
 				return err
 			}
 			key := "java:" + t.ID + ":" + event.Connection
@@ -180,6 +218,12 @@ func captureJava(ctx context.Context, s *Store, p *HTTPProcessor, t session.Targ
 				direction = "read"
 			}
 			if event.Incomplete {
+				if event.Sequence == 0 && event.Dropped == 0 {
+					s.mu.Lock()
+					s.stats.TLSDropped++
+					s.mu.Unlock()
+					s.gap("java-agent", key, "legacy_gap_marker", "events", 1)
+				}
 				frames.expire(time.Now(), true, p, key)
 			}
 			p.mu.Lock()
@@ -188,11 +232,16 @@ func captureJava(ctx context.Context, s *Store, p *HTTPProcessor, t session.Targ
 			p.mu.Unlock()
 			frames.ingest(key+direction, event.Payload, frameContext{connection: key, client: event.Client, pid: t.PID, incomplete: event.Incomplete, local: event.Local}, head, p)
 		}
-		if _, err = conn.Write([]byte{1}); err != nil {
+		control := byte(1)
+		if stopping.Load() {
+			control = 2
+		}
+		if _, err = conn.Write([]byte{control}); err != nil {
 			return err
 		}
 	}
 	if ctx.Err() != nil {
+		s.gap("java-agent", t.ID, "drain_unconfirmed", "shutdowns", 1)
 		return nil
 	}
 	if scanner.Err() != nil {

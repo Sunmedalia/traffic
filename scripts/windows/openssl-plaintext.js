@@ -23,12 +23,13 @@ function enqueue(event, data = null) {
     events.push({event, data});
     queuedBytes += size;
 }
+let transportSequence = 0;
 function flush() {
-    if (dropped) { send({type: 'loss', count: dropped}); dropped = 0; }
+    if (dropped) { send({type: 'loss', count: dropped, sequence: ++transportSequence}); dropped = 0; }
     const batch = events;
     events = [];
     queuedBytes = 0;
-    for (const item of batch) send(item.event, item.data);
+    for (const item of batch) { item.event.sequence = ++transportSequence; send(item.event, item.data); }
 }
 function hook(address, callbacks) {
     if (!originals.has(address.toString())) originals.set(address.toString(), new Uint8Array(address.readByteArray(16)));
@@ -185,6 +186,6 @@ rpc.exports = {
             if (original.some((value, index) => value !== actual[index])) restored = false;
         }
         flush();
-        return {type: 'summary', captured, hooks_removed: restored, restored_sites: originals.size, modules: installed};
+        return {type: 'summary', last_sequence: transportSequence, captured, hooks_removed: restored, restored_sites: originals.size, modules: installed};
     }
 };

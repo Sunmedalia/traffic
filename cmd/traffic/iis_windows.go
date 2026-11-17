@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 
 	"fmt"
+	"golang.org/x/sys/windows"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/Sunmedalia/traffic/internal/session"
@@ -34,7 +36,8 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *HTTPProcessor, target
 	if err != nil {
 		return err
 	}
-	defer raw.Close()
+	evidence := newEvidenceWriter(s, raw, backend)
+	defer evidence.Close()
 	log, err := os.OpenFile(filepath.Join(s.dir, "logs", backend+"-"+tag+".log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
@@ -57,6 +60,7 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *HTTPProcessor, target
 		}
 	}
 	command := exec.Command(iisPython, args...)
+	command.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NEW_PROCESS_GROUP}
 	command.Stderr = log
 	stdout, err := command.StdoutPipe()
 	if err != nil {
@@ -116,22 +120,34 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *HTTPProcessor, target
 			result = err
 		}
 	}()
+	var lastSequence uint64
+	var probeDrain bool
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 4096), 2<<20)
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		if _, err := raw.Write(append(append([]byte(nil), line...), '\n')); err != nil {
+		if _, err := evidence.Write(append(append([]byte(nil), line...), '\n')); err != nil {
 			return err
 		}
 		var message struct {
-			Type         string          `json:"type"`
-			Message      string          `json:"message"`
-			Description  string          `json:"description"`
-			HooksRemoved bool            `json:"hooks_removed"`
-			Payload      json.RawMessage `json:"payload"`
+			Type              string          `json:"type"`
+			Message           string          `json:"message"`
+			Description       string          `json:"description"`
+			HooksRemoved      bool            `json:"hooks_removed"`
+			LastSequence      *uint64         `json:"last_sequence"`
+			QueueDropped      uint64          `json:"queue_dropped"`
+			ScriptUnloaded    bool            `json:"script_unloaded"`
+			TransportDetached bool            `json:"transport_detached"`
+			Payload           json.RawMessage `json:"payload"`
 		}
 		if err := json.Unmarshal(line, &message); err != nil {
 			return fmt.Errorf("Windows TLS helper protocol: %w", err)
+		}
+		if message.Type == "summary" && message.LastSequence != nil {
+			probeDrain = lastSequence == *message.LastSequence
+		}
+		if message.Type == "host_summary" {
+			s.recordProbeExit(target.ID, session.ProbeExit{DataDrained: probeDrain && message.QueueDropped == 0, HooksRemoved: message.HooksRemoved, ScriptUnloaded: message.ScriptUnloaded, TransportDetached: message.TransportDetached, RuntimeState: "inspect hooks, script and transport separately"})
 		}
 		if message.Type == "attach_error" || message.Type == "error" {
 			return fmt.Errorf("Windows TLS helper: %s %s", message.Message, message.Description)
@@ -145,6 +161,23 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *HTTPProcessor, target
 		var event opensslEvent
 		if err := json.Unmarshal(message.Payload, &event); err != nil {
 			return err
+		}
+		if event.Sequence > 0 {
+			if lastSequence > 0 && event.Sequence != lastSequence+1 {
+				s.gap(backend, target.ID, "transport_sequence_gap", "events", 1)
+				if backend == "openssl" {
+					if err := openssl.close(""); err != nil {
+						return err
+					}
+					openssl.generation++
+					openssl.uncertain = true
+				} else {
+					if err := assembler.ingest(iisEvent{Type: "loss", Count: 0}); err != nil {
+						return err
+					}
+				}
+			}
+			lastSequence = event.Sequence
 		}
 		if event.Type == "error" {
 			return fmt.Errorf("Windows TLS probe: %s", event.Message)
@@ -229,13 +262,34 @@ func captureWindowsServices(ctx context.Context, s *Store, p *HTTPProcessor, ser
 				workers[target.ID] = &worker{cancel: func() {}, state: "http-only"}
 				continue
 			}
+			if s.checkTarget(target).Status != "candidate" {
+				workers[target.ID] = &worker{cancel: func() {}, state: "unavailable"}
+				continue
+			}
 			child, cancel := context.WithCancel(ctx)
 			worker := &worker{cancel: cancel, state: "starting"}
 			workers[target.ID] = worker
 			running.Add(1)
 			go func(target session.Target) {
 				defer running.Done()
-				err := captureWindowsProbe(child, s, p, target, func() { mu.Lock(); worker.state = "attached"; mu.Unlock() })
+				var err error
+				for attempt := 0; attempt < 3; attempt++ {
+					if attempt > 0 {
+						select {
+						case <-child.Done():
+							return
+						case <-time.After(time.Second << (attempt - 1)):
+						}
+					}
+					mu.Lock()
+					worker.state = "starting"
+					mu.Unlock()
+					err = captureWindowsProbe(child, s, p, target, func() { mu.Lock(); worker.state = "attached"; mu.Unlock() })
+					if child.Err() != nil || err == nil {
+						break
+					}
+					s.gap("windows-probe", target.ID, "probe_restart", "attempts", 1)
+				}
 				mu.Lock()
 				worker.state = "stopped"
 				if err != nil {
@@ -260,8 +314,14 @@ func captureWindowsServices(ctx context.Context, s *Store, p *HTTPProcessor, ser
 		}
 		mu.Unlock()
 		state := "starting"
+		if len(targets) == 0 {
+			state = "no-targets"
+		}
 		if attached > 0 {
 			state = "attached"
+			if attached < len(targets) {
+				state = "partial"
+			}
 		}
 		if unavailable > 0 {
 			state = "unavailable"

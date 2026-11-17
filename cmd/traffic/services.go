@@ -132,6 +132,7 @@ func discoverTargets(root, service string, pid int, library string) []session.Ta
 type probeGroup struct {
 	UID, PID int
 	Library  string
+	Identity string
 }
 
 func groupFor(t session.Target) probeGroup {
@@ -143,6 +144,7 @@ func groupFor(t session.Target) probeGroup {
 	// Never trace every root-owned process implicitly.
 	if t.UID == 0 {
 		g.PID = t.PID
+		g.Identity = t.ID
 	}
 	return g
 }
@@ -150,6 +152,7 @@ func groupFor(t session.Target) probeGroup {
 func captureServices(ctx context.Context, s *Store, p *HTTPProcessor, bin, library, service string, pid int, javaAttach bool, javaAgent, javaHelper string, javaPID int) {
 	var mu sync.RWMutex
 	targets := map[int]session.Target{}
+	targetGroups := map[int]probeGroup{}
 	states := map[probeGroup]string{}
 	started := map[probeGroup]context.CancelFunc{}
 	javaStates := map[string]string{}
@@ -170,18 +173,45 @@ func captureServices(ctx context.Context, s *Store, p *HTTPProcessor, bin, libra
 			}
 		}
 		current = selected
+		liveJava := map[string]bool{}
+		for _, target := range current {
+			liveJava[target.ID] = true
+		}
 		mu.Lock()
-		targets = map[int]session.Target{}
-		for _, t := range current {
-			targets[t.PID] = t
+		for id := range javaStates {
+			if !liveJava[id] {
+				delete(javaStates, id)
+			}
 		}
 		mu.Unlock()
+		mu.Lock()
+		targets = map[int]session.Target{}
+		targetGroups = map[int]probeGroup{}
+		for _, t := range current {
+			targets[t.PID] = t
+			targetGroups[t.PID] = groupFor(t)
+		}
+		mu.Unlock()
+		eligible := map[string]bool{}
+		for i := range current {
+			eligible[current[i].ID] = s.checkTarget(current[i]).Status == "candidate"
+			if !eligible[current[i].ID] {
+				current[i].State = "unavailable"
+			}
+		}
 		wanted := map[probeGroup]bool{}
 		for _, t := range current {
-			if t.Library != "" {
+			if eligible[t.ID] && t.Library != "" {
 				wanted[groupFor(t)] = true
 			}
 		}
+		mu.Lock()
+		for group := range states {
+			if !wanted[group] {
+				delete(states, group)
+			}
+		}
+		mu.Unlock()
 		for group, cancel := range started {
 			if !wanted[group] {
 				cancel()
@@ -189,6 +219,9 @@ func captureServices(ctx context.Context, s *Store, p *HTTPProcessor, bin, libra
 			}
 		}
 		for _, t := range current {
+			if !eligible[t.ID] {
+				continue
+			}
 			if t.Service == "tomcat" && javaAttach && (javaPID == 0 || t.PID == javaPID) && t.Library == "" {
 				mu.Lock()
 				_, launched := javaStates[t.ID]
@@ -200,7 +233,21 @@ func captureServices(ctx context.Context, s *Store, p *HTTPProcessor, bin, libra
 					wg.Add(1)
 					go func(target session.Target) {
 						defer wg.Done()
-						err := captureJava(ctx, s, p, target, javaAgent, javaHelper, func() { mu.Lock(); javaStates[target.ID] = "attached"; mu.Unlock() })
+						var err error
+						for attempt := 0; attempt < 3; attempt++ {
+							if attempt > 0 {
+								select {
+								case <-ctx.Done():
+									return
+								case <-time.After(time.Second << (attempt - 1)):
+								}
+							}
+							err = captureJava(ctx, s, p, target, javaAgent, javaHelper, func() { mu.Lock(); javaStates[target.ID] = "attached"; mu.Unlock() })
+							if ctx.Err() != nil || err == nil {
+								break
+							}
+							s.gap("java-agent", target.ID, "probe_restart", "attempts", 1)
+						}
 						state := "stopped"
 						if err != nil {
 							state = "unavailable"
@@ -225,21 +272,49 @@ func captureServices(ctx context.Context, s *Store, p *HTTPProcessor, bin, libra
 			wg.Add(1)
 			go func(groupCtx context.Context, g probeGroup) {
 				defer wg.Done()
-				accepts := func(eventPID int) bool {
+				accepts := func(eventPID int, reportedIdentity string) string {
 					mu.RLock()
 					candidate, ok := targets[eventPID]
+					candidateGroup := targetGroups[eventPID]
 					mu.RUnlock()
-					if !ok || groupFor(candidate) != g {
-						return false
+					if !ok || candidateGroup != g {
+						return ""
+					}
+					if reportedIdentity != "" {
+						if reportedIdentity == candidate.ID {
+							return candidate.ID
+						}
+						return ""
 					}
 					live, err := processIdentity("/proc", eventPID)
-					return err == nil && live == candidate.ID
+					if err == nil && live == candidate.ID {
+						return candidate.ID
+					}
+					return ""
 				}
-				for attempt := 0; attempt < 2; attempt++ {
+				snapshot := func() map[int]string {
+					mu.RLock()
+					defer mu.RUnlock()
+					selected := map[int]string{}
+					for id, target := range targets {
+						if targetGroups[id] == g {
+							selected[id] = target.ID
+						}
+					}
+					return selected
+				}
+				for attempt := 0; attempt < 3; attempt++ {
+					if attempt > 0 {
+						select {
+						case <-groupCtx.Done():
+							return
+						case <-time.After(time.Second << (attempt - 1)):
+						}
+					}
 					mu.Lock()
 					states[g] = "starting"
 					mu.Unlock()
-					err := captureTLS(groupCtx, s, p, bin, g.Library, g.PID, g.UID, accepts, func() { mu.Lock(); states[g] = "attached"; mu.Unlock() })
+					err := captureTLS(groupCtx, s, p, bin, g.Library, g.PID, g.UID, accepts, snapshot, func() { mu.Lock(); states[g] = "attached"; mu.Unlock() })
 					if groupCtx.Err() != nil {
 						return
 					}
@@ -255,6 +330,9 @@ func captureServices(ctx context.Context, s *Store, p *HTTPProcessor, bin, libra
 		}
 		mu.RLock()
 		for i := range current {
+			if !eligible[current[i].ID] {
+				continue
+			}
 			if current[i].Library != "" {
 				state := states[groupFor(current[i])]
 				if state == "" {
@@ -285,6 +363,14 @@ func captureServices(ctx context.Context, s *Store, p *HTTPProcessor, bin, libra
 			s.stats.TLS = "attached"
 		} else if unavailable > 0 {
 			s.stats.TLS = "unavailable"
+		} else {
+			s.stats.TLS = "starting"
+			if len(current) == 0 {
+				s.stats.TLS = "no-targets"
+			}
+		}
+		if attached > 0 && attached < len(current) {
+			s.stats.TLS = "partial"
 		}
 		s.stats.Targets = current
 		s.mu.Unlock()

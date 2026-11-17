@@ -62,10 +62,7 @@ func packetInterfaceName(name string) string {
 }
 
 func captureSnapshotLength() int32 {
-	// Npcap loopback frames include a four-byte link header in addition to a
-	// full-size IP packet. A 65535-byte snapshot silently loses the final bytes.
-	if runtime.GOOS == "windows" {
-		return 256 << 10
-	}
-	return 65535
+	// Loopback and offloaded packets can contain a full-size IP packet plus
+	// link headers on Linux as well as Npcap. Preserve those trailing bytes.
+	return 256 << 10
 }

@@ -14,21 +14,22 @@ import (
 )
 
 type iisEvent struct {
-	Protocol   string      `json:"protocol"`
-	Type       string      `json:"type"`
-	ID         string      `json:"id"`
-	Connection string      `json:"connection"`
-	Time       time.Time   `json:"time"`
-	Method     string      `json:"method"`
-	URL        string      `json:"url"`
-	Headers    [][2]string `json:"headers"`
-	Client     string      `json:"client"`
-	Local      string      `json:"local"`
-	Status     int         `json:"status"`
-	Data       []byte      `json:"data_b64"`
-	Count      uint64      `json:"count"`
-	Length     int64       `json:"length"`
-	Reason     string      `json:"reason"`
+	HTTPVersion string      `json:"http_version,omitempty"`
+	Protocol    string      `json:"protocol"`
+	Type        string      `json:"type"`
+	ID          string      `json:"id"`
+	Connection  string      `json:"connection"`
+	Time        time.Time   `json:"time"`
+	Method      string      `json:"method"`
+	URL         string      `json:"url"`
+	Headers     [][2]string `json:"headers"`
+	Client      string      `json:"client"`
+	Local       string      `json:"local"`
+	Status      int         `json:"status"`
+	Data        []byte      `json:"data_b64"`
+	Count       uint64      `json:"count"`
+	Length      int64       `json:"length"`
+	Reason      string      `json:"reason"`
 }
 
 type iisRequest struct {
@@ -74,7 +75,11 @@ func iisMessage(firstLine string, headers http.Header, body []byte) []byte {
 
 func (a *iisAssembler) save(request *iisRequest, responseComplete bool) error {
 	t := &request.transaction
-	t.Request = iisMessage(t.Method+" "+t.URL+" HTTP/1.1", request.requestHeaders, request.requestBody)
+	version := t.Protocol
+	if version == "" {
+		version = "HTTP/1.1"
+	}
+	t.Request = iisMessage(t.Method+" "+t.URL+" "+version, request.requestHeaders, request.requestBody)
 	if t.Status > 0 {
 		body := request.responseBody
 		if strings.Contains(strings.ToLower(request.responseHeaders.Get("Transfer-Encoding")), "chunked") {
@@ -92,7 +97,7 @@ func (a *iisAssembler) save(request *iisRequest, responseComplete bool) error {
 				a.store.problem(fmt.Errorf("IIS chunked response: %w", err))
 			}
 		}
-		t.Response = iisMessage(fmt.Sprintf("HTTP/1.1 %d %s", t.Status, http.StatusText(t.Status)), request.responseHeaders, body)
+		t.Response = iisMessage(fmt.Sprintf("%s %d %s", version, t.Status, http.StatusText(t.Status)), request.responseHeaders, body)
 	}
 	complete := request.requestComplete
 	if length := request.requestHeaders.Get("Content-Length"); length != "" {
@@ -108,6 +113,7 @@ func (a *iisAssembler) ingest(event iisEvent) error {
 		a.pending = make(map[string]*iisRequest)
 	}
 	if event.Type == "loss" {
+		a.store.gap("iis-httpapi", a.target.ID, "probe_queue_loss", "events", event.Count)
 		a.store.mu.Lock()
 		a.store.stats.TLSDropped += event.Count
 		a.store.mu.Unlock()
@@ -140,7 +146,7 @@ func (a *iisAssembler) ingest(event iisEvent) error {
 			PID: a.target.PID, TargetID: a.target.ID, Service: "iis", Backend: "iis-httpapi",
 			Connection: "tls:iis:" + a.target.ID + ":" + event.Connection + ":" + event.ID,
 			Source:     "tls:iis-httpapi", Client: event.Client, LocalEndpoint: event.Local,
-			Method: event.Method, URL: event.URL, Host: headers.Get("Host"),
+			Method: event.Method, URL: event.URL, Host: headers.Get("Host"), Protocol: event.HTTPVersion,
 		}}
 		a.pending[event.ID] = request
 		return a.save(request, false)

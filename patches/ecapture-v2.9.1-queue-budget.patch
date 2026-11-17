@@ -1,0 +1,303 @@
+diff --git a/pkg/ecaptureq/client.go b/pkg/ecaptureq/client.go
+index d5dfb58..bace2c0 100644
+--- a/pkg/ecaptureq/client.go
++++ b/pkg/ecaptureq/client.go
+@@ -18,6 +18,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	pb "github.com/gojue/ecapture/v2/protobuf/gen/v1"
+@@ -34,6 +35,7 @@ type Client struct {
+ 	heartBeatCount int64
+ 	done           chan struct{}
+ 	stopOnce       sync.Once
++	pendingBytes   atomic.Int64
+ }
+ 
+ func (c *Client) readPump() {
+@@ -60,6 +62,7 @@ func (c *Client) writePump() {
+ 			if !ok {
+ 				return
+ 			}
++			c.release(message)
+ 			if err := websocket.Message.Send(c.conn, message); err != nil {
+ 				c.logf("writePump: error sending message: %v", err)
+ 				return
+@@ -110,3 +113,21 @@ func (c *Client) logf(format string, args ...any) {
+ 	}
+ 	_, _ = fmt.Fprintf(c.logger, format+"\n", args...)
+ }
++
++func (c *Client) release(message []byte) {
++	n := int64(len(message))
++	c.pendingBytes.Add(-n)
++	c.hub.queuedBytes.Add(-n)
++}
++
++// Called only by the hub after removing the client. A concurrent writer may
++// consume messages too; each channel receive releases exactly one reservation.
++func (c *Client) closeQueue() {
++	close(c.send)
++	for message := range c.send {
++		c.release(message)
++	}
++	if c.conn != nil {
++		_ = c.conn.Close()
++	}
++}
+diff --git a/pkg/ecaptureq/hub.go b/pkg/ecaptureq/hub.go
+index 9ad295b..70d8472 100644
+--- a/pkg/ecaptureq/hub.go
++++ b/pkg/ecaptureq/hub.go
+@@ -38,15 +38,16 @@ type registerRequest struct {
+ // Hub serializes publish, history, and client registration so a new client gets
+ // a stable bounded history followed by live messages without a handoff race.
+ type Hub struct {
+-	ctx        context.Context
+-	broadcast  chan publishRequest
+-	register   chan registerRequest
+-	unregister chan *Client
+-	clients    map[*Client]struct{}
+-	history    [][]byte
+-	done       chan struct{}
+-	closeOnce  sync.Once
+-	dropped    atomic.Uint64
++	ctx         context.Context
++	broadcast   chan publishRequest
++	register    chan registerRequest
++	unregister  chan *Client
++	clients     map[*Client]struct{}
++	history     [][]byte
++	done        chan struct{}
++	closeOnce   sync.Once
++	dropped     atomic.Uint64
++	queuedBytes atomic.Int64
+ }
+ 
+ func newHub(ctx context.Context) *Hub {
+@@ -70,22 +71,22 @@ func (h *Hub) run() {
+ 		case <-h.ctx.Done():
+ 			for client := range h.clients {
+ 				delete(h.clients, client)
+-				close(client.send)
++				client.closeQueue()
+ 			}
+ 			return
+ 		case request := <-h.register:
+ 			var err error
+ 			for _, message := range h.history {
+-				select {
+-				case request.client.send <- append([]byte(nil), message...):
+-				default:
+-					err = fmt.Errorf("%w: startup history exceeds client queue", ErrBackpressure)
++				if !h.enqueue(request.client, message) {
++					err = fmt.Errorf("%w: startup history exceeds client queue budget", ErrBackpressure)
+ 					h.dropped.Add(1)
+-				}
+-				if err != nil {
+ 					break
+ 				}
+ 			}
++			if err != nil {
++				request.client.closeQueue()
++			}
++
+ 			if err == nil {
+ 				h.clients[request.client] = struct{}{}
+ 			}
+@@ -93,7 +94,7 @@ func (h *Hub) run() {
+ 		case client := <-h.unregister:
+ 			if _, ok := h.clients[client]; ok {
+ 				delete(h.clients, client)
+-				close(client.send)
++				client.closeQueue()
+ 			}
+ 		case request := <-h.broadcast:
+ 			if request.processLog {
+@@ -101,13 +102,12 @@ func (h *Hub) run() {
+ 			}
+ 			var deliveryErr error
+ 			for client := range h.clients {
+-				select {
+-				case client.send <- append([]byte(nil), request.message...):
+-				default:
++				if !h.enqueue(client, request.message) {
++					queued := client.pendingBytes.Load()
+ 					delete(h.clients, client)
+-					close(client.send)
++					client.closeQueue()
+ 					h.dropped.Add(1)
+-					deliveryErr = fmt.Errorf("%w: client queue full", ErrBackpressure)
++					deliveryErr = fmt.Errorf("%w: client queue budget exhausted (pending_bytes=%d)", ErrBackpressure, queued)
+ 				}
+ 			}
+ 			request.result <- deliveryErr
+@@ -180,3 +180,29 @@ func (h *Hub) unregisterClient(client *Client) {
+ func (h *Hub) wait() { <-h.done }
+ 
+ func (h *Hub) droppedCount() uint64 { return h.dropped.Load() }
++
++const clientQueueBytes = 8 << 20
++const serverQueueBytes = 32 << 20
++const clientQueueMessages = 16 << 10
++
++// The hub is the only producer and owns closing client queues. The writer
++// releases reservations as it consumes messages, independent of network I/O.
++func (h *Hub) enqueue(client *Client, message []byte) bool {
++	n := int64(len(message))
++	if client.pendingBytes.Add(n) > clientQueueBytes {
++		client.pendingBytes.Add(-n)
++		return false
++	}
++	if h.queuedBytes.Add(n) > serverQueueBytes {
++		h.queuedBytes.Add(-n)
++		client.pendingBytes.Add(-n)
++		return false
++	}
++	select {
++	case client.send <- append([]byte(nil), message...):
++		return true
++	default:
++		client.release(message)
++		return false
++	}
++}
+diff --git a/pkg/ecaptureq/server.go b/pkg/ecaptureq/server.go
+index bd27426..208763d 100644
+--- a/pkg/ecaptureq/server.go
++++ b/pkg/ecaptureq/server.go
+@@ -122,7 +122,7 @@ func (s *Server) handleWebSocket(conn *websocket.Conn) {
+ 	client := &Client{
+ 		hub:    s.hub,
+ 		conn:   conn,
+-		send:   make(chan []byte, 256),
++		send:   make(chan []byte, clientQueueMessages),
+ 		logger: s.logger,
+ 		done:   make(chan struct{}),
+ 	}
+diff --git a/pkg/ecaptureq/server_test.go b/pkg/ecaptureq/server_test.go
+index 4a34dbf..eb165da 100644
+--- a/pkg/ecaptureq/server_test.go
++++ b/pkg/ecaptureq/server_test.go
+@@ -58,7 +58,7 @@ func TestTypedPublishersKeepProcessLogsAndEventsSeparate(t *testing.T) {
+ 	if err := server.PublishLog(context.Background(), domain.OperationalLogRecord{Message: "probe initialized"}); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	logEntry := decodeEntry(t, <-client.send)
++	logEntry := decodeEntry(t, receiveQueueMessage(client))
+ 	if logEntry.GetLogType() != pb.LogType_LOG_TYPE_PROCESS_LOG || logEntry.GetRunLog() != "probe initialized" {
+ 		t.Fatalf("process log entry = %#v", logEntry)
+ 	}
+@@ -84,7 +84,7 @@ func TestTypedPublishersKeepProcessLogsAndEventsSeparate(t *testing.T) {
+ 	}); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	eventEntry := decodeEntry(t, <-client.send)
++	eventEntry := decodeEntry(t, receiveQueueMessage(client))
+ 	if eventEntry.GetLogType() != pb.LogType_LOG_TYPE_EVENT {
+ 		t.Fatalf("event log type = %v", eventEntry.GetLogType())
+ 	}
+@@ -115,7 +115,7 @@ func TestOperationalHistoryIsBoundedAndExcludesEvents(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 	for i := 0; i < LogBuffLen; i++ {
+-		entry := decodeEntry(t, <-client.send)
++		entry := decodeEntry(t, receiveQueueMessage(client))
+ 		if entry.GetLogType() != pb.LogType_LOG_TYPE_PROCESS_LOG {
+ 			t.Fatalf("history entry %d type = %v", i, entry.GetLogType())
+ 		}
+@@ -222,3 +222,79 @@ func TestConcurrentPublishAndShutdown(t *testing.T) {
+ 	}
+ 	closeWG.Wait()
+ }
++
++func receiveQueueMessage(client *Client) []byte {
++	message := <-client.send
++	client.release(message)
++	return message
++}
++
++func TestClientQueueAcceptsBurstAndRetainsOrder(t *testing.T) {
++	server := NewServer("127.0.0.1:0", io.Discard)
++	defer server.Close()
++	client := newQueueClient(server, clientQueueMessages)
++	if err := server.hub.registerClient(context.Background(), client); err != nil {
++		t.Fatal(err)
++	}
++	for i := 0; i < 2048; i++ {
++		if err := server.hub.publish(context.Background(), []byte(fmt.Sprintf("event-%d", i)), false); err != nil {
++			t.Fatal(i, err)
++		}
++	}
++	for i := 0; i < 2048; i++ {
++		if got := string(receiveQueueMessage(client)); got != fmt.Sprintf("event-%d", i) {
++			t.Fatal("FIFO violated", i, got)
++		}
++	}
++	if client.pendingBytes.Load() != 0 || server.hub.queuedBytes.Load() != 0 {
++		t.Fatal("consumed messages leaked byte reservations")
++	}
++}
++
++func TestClientQueueByteLimitReleasesAbandonedTail(t *testing.T) {
++	server := NewServer("127.0.0.1:0", io.Discard)
++	defer server.Close()
++	client := newQueueClient(server, clientQueueMessages)
++	if err := server.hub.registerClient(context.Background(), client); err != nil {
++		t.Fatal(err)
++	}
++	payload := make([]byte, 1<<20)
++	for i := 0; i < 8; i++ {
++		if err := server.hub.publish(context.Background(), payload, false); err != nil {
++			t.Fatal(i, err)
++		}
++	}
++	if err := server.hub.publish(context.Background(), payload, false); !errors.Is(err, ErrBackpressure) {
++		t.Fatal("byte budget not enforced", err)
++	}
++	if client.pendingBytes.Load() != 0 || server.hub.queuedBytes.Load() != 0 {
++		t.Fatal("disconnected client's tail leaked budget")
++	}
++}
++
++func TestServerQueueBudgetAcrossClients(t *testing.T) {
++	server := NewServer("127.0.0.1:0", io.Discard)
++	defer server.Close()
++	// Exercise the same reservation method without a running network writer.
++	clients := make([]*Client, 5)
++	for i := range clients {
++		clients[i] = newQueueClient(server, clientQueueMessages)
++	}
++	defer func() {
++		for _, client := range clients {
++			client.closeQueue()
++		}
++		if server.hub.queuedBytes.Load() != 0 {
++			t.Error("closed client queues leaked server budget")
++		}
++	}()
++	payload := make([]byte, clientQueueBytes)
++	for _, client := range clients[:4] {
++		if !server.hub.enqueue(client, payload) {
++			t.Fatal("premature server budget rejection")
++		}
++	}
++	if server.hub.enqueue(clients[4], []byte("overflow")) {
++		t.Fatal("server byte budget not enforced")
++	}
++}
+diff --git a/docs/agent/output-pipeline.md b/docs/agent/output-pipeline.md
+--- a/docs/agent/output-pipeline.md
++++ b/docs/agent/output-pipeline.md
+@@ -142,3 +142,8 @@
+ When the text sink is the unrotated null device, TextHandler skips formatting
+ and writing discarded text. Typed eCaptureQ events remain additive and retain
+ their raw payloads; normal text destinations retain existing formatting.
++
++The eCaptureQ client queue holds at most 16384 messages or 8 MiB, with a
++32 MiB aggregate client queue budget per server. Consumption releases byte
++reservations; queue exhaustion closes that client and releases its unsent tail.
++Normal stop still does not provide a final-event acknowledgement to clients.

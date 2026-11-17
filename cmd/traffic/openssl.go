@@ -9,6 +9,7 @@ import (
 )
 
 type opensslEvent struct {
+	Sequence   uint64 `json:"sequence,omitempty"`
 	Type       string `json:"type"`
 	Protocol   string `json:"protocol"`
 	Message    string `json:"message"`
@@ -75,6 +76,7 @@ func (a *opensslAssembler) ingest(event opensslEvent) error {
 	connection := fmt.Sprintf("%s%d/%s", a.prefix, a.generation, event.Connection)
 	switch event.Type {
 	case "loss":
+		p.s.gap("openssl", a.prefix, "probe_queue_loss", "events", event.Count)
 		p.s.mu.Lock()
 		p.s.stats.TLSDropped += event.Count
 		p.s.mu.Unlock()

@@ -3,11 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 type frameContext struct {
+	targetID   string
 	incomplete bool
 	local      string
 	connection string
@@ -21,7 +25,11 @@ type capturedReader struct {
 	*bytes.Reader
 	captured time.Time
 	local    string
+	complete bool
+	targetID string
 }
+
+func (r capturedReader) FramingComplete() bool { return r.complete }
 
 func (r capturedReader) CaptureTime() time.Time { return r.captured }
 
@@ -39,26 +47,72 @@ func (f *Frames) ingest(key string, payload []byte, meta frameContext, head bool
 		meta.first = now
 	}
 	meta.updated = now
-	chunks, gap := f.feed(key, payload, head)
+	heads := []bool{head}
+	p.mu.Lock()
+	if queue := p.pending["tls:"+meta.connection]; len(queue) > 0 {
+		heads = nil
+		for _, record := range queue {
+			heads = append(heads, record.Method == "HEAD")
+		}
+	}
+	p.mu.Unlock()
+	chunks, gap := f.feed(key, payload, heads...)
+	for _, item := range f.evicted {
+		if item.key == key || (item.meta.connection != "" && item.meta.connection == meta.connection) {
+			gap = true
+		}
+	}
+	frameGap := gap
 	gap = gap || meta.incomplete
-	if len(f.buffers[key]) > 0 {
+	if len(f.buffers[key]) > 0 || f.http2[key] {
 		f.contexts[key] = meta
 	} else {
 		delete(f.contexts, key)
 	}
 	for existing := range f.contexts {
-		if len(f.buffers[existing]) == 0 {
+		if len(f.buffers[existing]) == 0 && !f.http2[existing] {
 			delete(f.contexts, existing)
 		}
 	}
+	isHTTP2 := f.http2[key]
+	evicted := f.evicted
+	f.evicted = nil
 	f.mu.Unlock()
-	if gap {
+	for _, item := range evicted {
+		connection := item.meta.connection
+		if connection == "" {
+			connection = meta.connection
+		}
+		p.s.gap("tls", connection, "buffer_evicted", "connections", 1)
+		p.invalidate("tls:"+connection, "buffer_evicted")
+		if len(item.data) > 0 {
+			record := Transaction{Time: item.meta.first, Source: "tls-hook-fragment", Client: item.meta.client, Connection: "tls:" + connection, PID: item.meta.pid, TargetID: item.meta.targetID, LocalEndpoint: item.meta.local, Request: item.data, Incomplete: true, IntegrityReasons: []string{"buffer_evicted"}}
+			if err := p.s.save(record); err != nil {
+				p.s.fail(err)
+			}
+		}
+	}
+	if frameGap {
 		p.s.mu.Lock()
 		p.s.stats.TLSDropped++
 		p.s.mu.Unlock()
+		p.s.gap("tls", meta.connection, "frame_gap", "events", 1)
+		if frameGap {
+			p.invalidate("tls:"+meta.connection, "frame_gap")
+		}
 	}
 	for _, chunk := range chunks {
-		p.process(capturedReader{bytes.NewReader(chunk), meta.first, meta.local}, "tls:"+meta.connection, meta.client, "tls-hook", meta.pid, gap)
+		if isHTTP2 {
+			_, portText, _ := net.SplitHostPort(meta.local)
+			port, _ := strconv.Atoi(portText)
+			request := strings.HasSuffix(key, "read")
+			if !capturePorts[port] {
+				request = !request
+			}
+			p.ingestHTTP2("tls:"+meta.connection, request, chunk, meta, "tls-hook")
+			continue
+		}
+		p.process(capturedReader{bytes.NewReader(chunk), meta.first, meta.local, true, meta.targetID}, "tls:"+meta.connection, meta.client, "tls-hook", meta.pid, gap)
 	}
 }
 
@@ -72,23 +126,27 @@ func (f *Frames) expire(now time.Time, all bool, p *HTTPProcessor, connection st
 	for key, meta := range f.contexts {
 		if (connection == "" || meta.connection == connection) && (all || now.Sub(meta.updated) >= time.Minute) {
 			expired = append(expired, partial{f.buffers[key], meta})
-			delete(f.buffers, key)
-			delete(f.contexts, key)
+			f.remove(key)
+			delete(f.http2, key)
 		}
 	}
 	f.mu.Unlock()
 	for _, item := range expired {
 		if len(item.data) == 0 {
+			p.closeHTTP2("tls:"+item.meta.connection, "http2_connection_closed")
 			continue
 		}
 		if !bytes.Contains(item.data, []byte("\r\n\r\n")) && !bytes.Contains(item.data, []byte("\n\n")) {
-			record := Transaction{LocalEndpoint: item.meta.local, Time: item.meta.first, Source: "tls-hook-fragment", Client: item.meta.client, Connection: "tls:" + item.meta.connection, PID: item.meta.pid, Request: item.data, Incomplete: true}
+			record := Transaction{LocalEndpoint: item.meta.local, Time: item.meta.first, Source: "tls-hook-fragment", Client: item.meta.client, Connection: "tls:" + item.meta.connection, PID: item.meta.pid, TargetID: item.meta.targetID, Request: item.data, Incomplete: true}
 			if err := p.s.save(record); err != nil {
 				p.s.fail(err)
 			}
+			p.invalidate("tls:"+item.meta.connection, "partial_frame_closed")
 			continue
 		}
-		p.process(capturedReader{bytes.NewReader(item.data), item.meta.first, item.meta.local}, "tls:"+item.meta.connection, item.meta.client, "tls-hook", item.meta.pid, true)
+		p.process(capturedReader{bytes.NewReader(item.data), item.meta.first, item.meta.local, false, item.meta.targetID}, "tls:"+item.meta.connection, item.meta.client, "tls-hook", item.meta.pid, true)
+		p.s.gap("tls", item.meta.connection, "partial_frame_closed", "fragments", 1)
+		p.invalidate("tls:"+item.meta.connection, "partial_frame_closed")
 	}
 }
 
@@ -113,3 +171,5 @@ func (f *Frames) startExpiry(ctx context.Context, p *HTTPProcessor) func() {
 }
 
 func (r capturedReader) LocalEndpoint() string { return r.local }
+
+func (r capturedReader) TargetIdentity() string { return r.targetID }

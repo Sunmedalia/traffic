@@ -1,0 +1,175 @@
+diff --git a/kern/openssl.h b/kern/openssl.h
+--- a/kern/openssl.h
++++ b/kern/openssl.h
+@@ -44,11 +44,11 @@
+ } __attribute__((packed)); // NOTE: do not leave padding hole in this struct.
+ 
+ struct ssl_data_event_t {
+-    enum ssl_data_event_type type;
++    u64 wire_magic;
++    u64 type;
+     u64 timestamp_ns;
+     u32 pid;
+     u32 tid;
+-    char data[MAX_DATA_SIZE_OPENSSL];
+     s32 data_len;
+     char comm[TASK_COMM_LEN];
+     u32 fd;
+@@ -56,6 +56,7 @@
+     u32 bio_type;
+     u64 connection_magic;
+     struct connect_event_t connection;
++    char data[MAX_DATA_SIZE_OPENSSL];
+ };
+ 
+ struct active_ssl_buf {
+@@ -164,6 +165,7 @@
+         return NULL;
+     }
+ 
++    event->wire_magic = 0x5452414643544c32ULL;
+     event->timestamp_ns = bpf_ktime_get_ns();
+     event->pid = current_pid_tgid >> 32;
+     event->tid = current_pid_tgid & 0xffffffff;
+@@ -224,8 +226,10 @@
+         return 0;
+     }
+     bpf_get_current_comm(&event->comm, sizeof(event->comm));
++    u32 payload_size = event->data_len;
++    if (payload_size > MAX_DATA_SIZE_OPENSSL) return 0;
+     bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event,
+-                          sizeof(struct ssl_data_event_t));
++        __builtin_offsetof(struct ssl_data_event_t, data) + payload_size);
+     return 0;
+ }
+ 
+diff --git a/internal/probe/openssl/event.go b/internal/probe/openssl/event.go
+--- a/internal/probe/openssl/event.go
++++ b/internal/probe/openssl/event.go
+@@ -120,6 +120,10 @@
+ 
+ // DecodeFromBytes deserializes the event from raw eBPF data.
+ func (e *Event) DecodeFromBytes(data []byte) error {
++	compact := len(data) >= 8 && binary.LittleEndian.Uint64(data[:8]) == 0x5452414643544c32
++	if compact {
++		data = data[8:]
++	}
+ 	buf := bytes.NewBuffer(data)
+ 	if err := binary.Read(buf, binary.LittleEndian, &e.DataType); err != nil {
+ 		return errors.NewEventDecodeError("openssl.DataType", err)
+@@ -134,8 +138,10 @@
+ 	if err := binary.Read(buf, binary.LittleEndian, &e.Tid); err != nil {
+ 		return errors.NewEventDecodeError("openssl.Tid", err)
+ 	}
+-	if _, err := io.ReadFull(buf, e.Data[:]); err != nil {
+-		return errors.NewEventDecodeError("openssl.Data", err)
++	if !compact {
++		if _, err := io.ReadFull(buf, e.Data[:]); err != nil {
++			return errors.NewEventDecodeError("openssl.Data", err)
++		}
+ 	}
+ 	if err := binary.Read(buf, binary.LittleEndian, &e.DataLen); err != nil {
+ 		return errors.NewEventDecodeError("openssl.DataLen", err)
+@@ -153,6 +159,12 @@
+ 		return errors.NewEventDecodeError("openssl.BioType", err)
+ 	}
+ 
++	if compact && (e.DataLen < 0 || e.DataLen > MaxDataSize) {
++		return errors.NewEventDecodeError("openssl.CompactLength", fmt.Errorf("invalid data length %d", e.DataLen))
++	}
++	if compact && (buf.Len() < 8 || binary.LittleEndian.Uint64(buf.Bytes()[:8]) != 0x54524146434f4e31) {
++		return errors.NewEventDecodeError("openssl.CompactConnection", io.ErrUnexpectedEOF)
++	}
+ 	metadataSize := binary.Size(connDataEvent{})
+ 	if buf.Len() >= 8 && binary.LittleEndian.Uint64(buf.Bytes()[:8]) == 0x54524146434f4e31 {
+ 		if buf.Len() < 8+metadataSize {
+@@ -178,6 +190,13 @@
+ 		}
+ 	}
+ 
++	if compact {
++		if _, err := io.ReadFull(buf, e.Data[:int(e.DataLen)]); err != nil {
++			return errors.NewEventDecodeError("openssl.CompactData", err)
++		}
++		clear(e.Data[int(e.DataLen):])
++	}
++
+ 	return nil
+ }
+ 
+diff --git a/internal/probe/openssl/event_test.go b/internal/probe/openssl/event_test.go
+--- a/internal/probe/openssl/event_test.go
++++ b/internal/probe/openssl/event_test.go
+@@ -361,3 +361,59 @@
+ 		})
+ 	}
+ }
++
++func compactEventBytes(t *testing.T, payload []byte, length int32) []byte {
++	t.Helper()
++	b := new(bytes.Buffer)
++	// Match the compact C header: data begins at offset 176.
++	fields := []any{uint64(0x5452414643544c32), int64(DataTypeRead), uint64(12345), uint32(42), uint32(43), length, [16]byte{}, uint32(7), int32(Tls13Version), uint32(0), uint64(0x54524146434f4e31), connDataEvent{Pid: 42, Fd: 7, Family: 2, Sport: 12345, Dport: 443, Inode: 987}}
++	for _, f := range fields {
++		if err := binary.Write(b, binary.LittleEndian, f); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if b.Len() != 176 {
++		t.Fatal("compact C/Go header offset mismatch", b.Len())
++	}
++	b.Write(payload)
++	return b.Bytes()
++}
++
++func TestCompactEventLengthsAndPadding(t *testing.T) {
++	for _, n := range []int{0, 1, 1024, MaxDataSize} {
++		payload := bytes.Repeat([]byte{0x41}, n)
++		wire := compactEventBytes(t, payload, int32(n))
++		wire = append(wire, 0, 0, 0, 0) // perf samples can carry alignment padding
++		e := &Event{}
++		if err := e.DecodeFromBytes(wire); err != nil {
++			t.Fatal(n, err)
++		}
++		if e.DataLen != int32(n) || !bytes.Equal(e.Data[:n], payload) || e.Pid != 42 || e.Timestamp != 12345 || e.connectionID != "42_inode_987" {
++			t.Fatal("compact event changed fields", n, e.DataLen, e.connectionID)
++		}
++	}
++}
++
++func TestCompactEventRejectsTruncationAndInvalidLength(t *testing.T) {
++	wire := compactEventBytes(t, []byte("payload"), 7)
++	for _, cut := range []int{8, 24, 36, 72, 175, 176, len(wire) - 1} {
++		if err := (&Event{}).DecodeFromBytes(wire[:cut]); err == nil {
++			t.Fatal("truncated compact event accepted", cut)
++		}
++	}
++	for _, n := range []int32{-1, MaxDataSize + 1} {
++		if err := (&Event{}).DecodeFromBytes(compactEventBytes(t, nil, n)); err == nil {
++			t.Fatal("invalid compact payload length accepted", n)
++		}
++	}
++	e := &Event{}
++	if err := e.DecodeFromBytes(compactEventBytes(t, []byte("secret"), 6)); err != nil {
++		t.Fatal(err)
++	}
++	if err := e.DecodeFromBytes(compactEventBytes(t, []byte("x"), 1)); err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(e.Data[1:6], make([]byte, 5)) {
++		t.Fatal("reused event retained stale plaintext beyond its payload")
++	}
++}
+diff --git a/docs/agent/probe-development.md b/docs/agent/probe-development.md
+--- a/docs/agent/probe-development.md
++++ b/docs/agent/probe-development.md
+@@ -246,3 +246,9 @@
+ Do not weaken validation or silently ignore one of these failures to make a
+ test pass. Follow `build-test.md` for clean builds and the required evidence
+ for the affected change.
++
++The traffic OpenSSL patch emits compact TLS records with magic
++0x5452414643544c32, a 176-byte header and only data_len payload bytes.
++Connection metadata precedes payload; perf alignment padding is accepted.
++The Go decoder continues accepting the legacy fixed-array record. Rebuild
++bytecode and userspace together when enabling compact emission.

@@ -96,13 +96,71 @@ func TestWebServesSessionsOverTokenProtectedAPI(t *testing.T) {
 			t.Fatalf("query %q: status %d body %s", query, status, body)
 		}
 	}
-	for _, query := range []string{"?severity=critical", "?since=yesterday"} {
+	for query, want := range map[string]int{"?status=2xx": 1, "?status=200": 1, "?status=pending": 1, "?status=4xx": 0, "?method=POST": 1, "?method=PUT": 0,
+		"?until=" + url.QueryEscape(now.Add(-time.Second).Format(time.RFC3339Nano)): 1} {
+		status, body, _ = webGet(t, server, token, base+query)
+		list.Rows = nil
+		if err := json.Unmarshal(body, &list); err != nil || status != http.StatusOK || list.Count != want || len(list.Rows) != want {
+			t.Fatalf("web filter %q: status %d body %s", query, status, body)
+		}
+	}
+	for _, query := range []string{"?severity=critical", "?since=yesterday", "?until=tomorrow", "?status=9xx", "?status=ok", "?status=42"} {
 		if status, _, _ = webGet(t, server, token, base+query); status != http.StatusBadRequest {
 			t.Fatalf("query %q got status %d", query, status)
 		}
 	}
 	if status, _, _ = webGet(t, server, token, "/api/sessions/ffffffffffffffff/requests"); status != http.StatusNotFound {
 		t.Fatalf("unknown session status %d", status)
+	}
+
+	var timeline struct {
+		Total       int         `json:"total"`
+		Granularity int         `json:"granularity"`
+		Buckets     []webBucket `json:"buckets"`
+	}
+	sessionBase := "/api/sessions/" + found.ID
+	status, body, _ = webGet(t, server, token, sessionBase+"/timeline")
+	if err := json.Unmarshal(body, &timeline); err != nil || status != http.StatusOK {
+		t.Fatalf("timeline %d %s", status, body)
+	}
+	requests, alerts := 0, 0
+	for _, bucket := range timeline.Buckets {
+		if _, err := time.Parse(time.RFC3339, bucket.Time); err != nil {
+			t.Fatalf("bucket time %q: %v", bucket.Time, err)
+		}
+		requests, alerts = requests+bucket.Requests, alerts+bucket.Alerts
+	}
+	if timeline.Total != 2 || timeline.Granularity != 1 || len(timeline.Buckets) != 2 || requests != 2 || alerts != 1 {
+		t.Fatalf("timeline %+v", timeline)
+	}
+	status, body, _ = webGet(t, server, token, sessionBase+"/timeline?alerts=1&keyword=plain")
+	if err := json.Unmarshal(body, &timeline); err != nil || status != http.StatusOK || timeline.Total != 0 || len(timeline.Buckets) != 0 {
+		t.Fatalf("empty timeline %d %s", status, body)
+	}
+	if status, _, _ = webGet(t, server, token, sessionBase+"/timeline?status=nope"); status != http.StatusBadRequest {
+		t.Fatalf("timeline accepted an invalid filter: %d", status)
+	}
+
+	var summary struct {
+		Total      int        `json:"total"`
+		Alerted    int        `json:"alerted"`
+		Clients    []webCount `json:"clients"`
+		Rules      []webCount `json:"rules"`
+		Severities []webCount `json:"severities"`
+		Statuses   []webCount `json:"statuses"`
+	}
+	status, body, _ = webGet(t, server, token, sessionBase+"/summary")
+	if err := json.Unmarshal(body, &summary); err != nil || status != http.StatusOK {
+		t.Fatalf("summary %d %s", status, body)
+	}
+	if summary.Total != 2 || summary.Alerted != 1 || len(summary.Clients) != 2 || summary.Clients[0] != (webCount{Name: "192.0.2.1", Count: 1, Alerts: 1}) {
+		t.Fatalf("summary clients %+v", summary)
+	}
+	if len(summary.Rules) != 1 || summary.Rules[0] != (webCount{Name: "RULE-A", Severity: "high", Count: 1}) || len(summary.Severities) != 1 || summary.Severities[0].Name != "high" {
+		t.Fatalf("summary alerts %+v", summary)
+	}
+	if len(summary.Statuses) != 2 || summary.Statuses[0] != (webCount{Name: "pending", Count: 1}) || summary.Statuses[1] != (webCount{Name: "2xx", Count: 1}) {
+		t.Fatalf("summary statuses %+v", summary.Statuses)
 	}
 
 	var detail struct {

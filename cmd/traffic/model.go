@@ -29,14 +29,25 @@ const indexTimeFormat = session.IndexTimeFormat
 var serial atomic.Uint64
 
 type Store struct {
-	webhook        *alertWebhook
-	localAddresses map[string]bool
-	packetDrops    map[string]uint64
-	fatal          error
-	db             *sql.DB
-	dir            string
-	mu             sync.Mutex
-	stats          Stats
+	indexMu               sync.Mutex
+	indexTx               *sql.Tx
+	indexRead, indexWrite *sql.Stmt
+	indexBatching         bool
+	indexOps, indexBytes  int
+	checkMu               sync.Mutex
+	checks                map[string]captureCheck
+	probeCheck            func(session.Target) captureCheck
+	gapMu                 sync.Mutex
+	gapEvents             uint64
+	targetTimes           map[string]session.Target
+	webhook               *alertWebhook
+	localAddresses        map[string]bool
+	packetDrops           map[string]uint64
+	fatal                 error
+	db                    *sql.DB
+	dir                   string
+	mu                    sync.Mutex
+	stats                 Stats
 }
 
 func openStore(dir string, write bool) (*Store, error) {
@@ -45,43 +56,51 @@ func openStore(dir string, write bool) (*Store, error) {
 		return nil, err
 	}
 	addresses := map[string]bool{}
-	interfaces, _ := net.InterfaceAddrs()
+	var interfaces []net.Addr
+	_ = inCaptureNamespace(func() error { var err error; interfaces, err = net.InterfaceAddrs(); return err })
 	for _, address := range interfaces {
 		ip, _, err := net.ParseCIDR(address.String())
 		if err == nil {
 			addresses[ip.String()] = true
 		}
 	}
-	return &Store{db: db, dir: dir, localAddresses: addresses, stats: Stats{Started: time.Now().UTC(), State: "running", TLS: "disabled"}}, nil
+	return &Store{db: db, dir: dir, localAddresses: addresses, stats: Stats{DiagnosticsVersion: 1, Started: time.Now().UTC(), State: "running", TLS: "disabled"}}, nil
 }
 func (s *Store) save(t Transaction) error {
 	if t.PID > 0 {
-		if target, err := processTarget("/proc", t.PID); err == nil {
-			t.Service = target.Service
-			t.TargetID = target.ID
-			s.mu.Lock()
-			for _, selected := range s.stats.Targets {
-				if selected.ID == target.ID {
-					_, portText, _ := net.SplitHostPort(t.LocalEndpoint)
-					port, _ := strconv.Atoi(portText)
-					serverLocal := false
-					for _, listeningPort := range selected.Ports {
-						if port == listeningPort {
-							serverLocal = true
-							break
-						}
-					}
-					if !serverLocal && runtime.GOOS != "windows" {
-						t.LocalEndpoint = t.Client
-						if t.PeerClient != "" {
-							t.LocalEndpoint = t.PeerClient
-						}
-					}
-					t.Service = selected.Service
-					break
+		// Once a request has a start identity, keep it when its response is
+		// restored. Looking up the PID again could reassign old evidence to a
+		// different process after PID reuse.
+		identity := t.TargetID
+		if identity == "" {
+			identity, _ = processIdentity("/proc", t.PID)
+		}
+		matched := false
+		s.mu.Lock()
+		for _, selected := range s.stats.Targets {
+			if identity == "" || selected.ID != identity || selected.PID != t.PID {
+				continue
+			}
+			matched = true
+			t.TargetID = identity
+			t.Service = selected.Service
+			_, portText, _ := net.SplitHostPort(t.LocalEndpoint)
+			port, _ := strconv.Atoi(portText)
+			serverLocal := slices.Contains(selected.Ports, port)
+			if !serverLocal && runtime.GOOS != "windows" {
+				t.LocalEndpoint = t.Client
+				if t.PeerClient != "" {
+					t.LocalEndpoint = t.PeerClient
 				}
 			}
-			s.mu.Unlock()
+			break
+		}
+		s.mu.Unlock()
+		if !matched && t.TargetID == "" {
+			if target, err := processTarget("/proc", t.PID); err == nil {
+				t.Service = target.Service
+				t.TargetID = target.ID
+			}
 		}
 	}
 	if t.PID > 0 {
@@ -117,6 +136,15 @@ func (s *Store) save(t Transaction) error {
 	}
 	resolveClient(&t)
 	t.SchemaVersion = 1
+	if t.Protocol == "" && t.Method != "" {
+		t.Protocol = "HTTP/1.1"
+	}
+	if t.Truncated && !slices.Contains(t.IntegrityReasons, "body_truncated") {
+		t.IntegrityReasons = append(t.IntegrityReasons, "body_truncated")
+	}
+	if t.Incomplete && len(t.IntegrityReasons) == 0 {
+		t.IntegrityReasons = []string{"stream_incomplete"}
+	}
 	if t.ID == "" {
 		h := sha256.Sum256([]byte(fmt.Sprintf("%s/%s/%d/%s", t.Connection, t.Source, time.Now().UnixNano(), t.URL)))
 		t.ID = hex.EncodeToString(h[:12])
@@ -125,52 +153,10 @@ func (s *Store) save(t Transaction) error {
 	if a := scan(t); a != nil {
 		t.Alerts = append(t.Alerts, *a)
 	}
-	var previousData []byte
-	e := s.db.QueryRow("SELECT data FROM requests WHERE id=?", t.ID).Scan(&previousData)
-	fresh := e == sql.ErrNoRows
-	if e != nil && !fresh {
-		return e
-	}
-	previous := Transaction{}
-	if !fresh {
-		if err := json.Unmarshal(previousData, &previous); err != nil {
-			return err
-		}
-	}
-	known := make(map[Alert]bool, len(previous.Alerts))
-	for _, alert := range previous.Alerts {
-		known[alert] = true
-	}
-	var newAlerts []Alert
-	for _, alert := range t.Alerts {
-		if !known[alert] {
-			newAlerts = append(newAlerts, alert)
-		}
-	}
-	// Scan aggregation is emitted once per window. Keep its evidence on later
-	// response/body updates, where scan() may suppress a repeated emission.
-	for _, alert := range previous.Alerts {
-		if alert.Rule == "SCAN-001" && !slices.Contains(t.Alerts, alert) {
-			t.Alerts = append(t.Alerts, alert)
-		}
-	}
-	b, err := json.Marshal(t)
+	newAlerts, err := s.persist(t)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec("INSERT OR REPLACE INTO requests VALUES(?,?,?,?,?)", t.ID, t.Time.UTC().Format(indexTimeFormat), t.Client, len(t.Alerts), b)
-	if err != nil {
-		return err
-	}
-	s.mu.Lock()
-	if fresh {
-		s.stats.Transactions++
-		if t.Backend != "pcap" && t.Method != "" {
-			s.stats.TLSRequests++
-		}
-	}
-	s.stats.Alerts += uint64(len(newAlerts))
-	s.mu.Unlock()
 	for _, a := range newAlerts {
 		out, _ := json.Marshal(map[string]any{"id": t.ID, "url": t.URL, "client": t.Client, "peer_client": t.PeerClient, "client_source": t.ClientSource, "time": t.Time, "alert": a})
 		fmt.Println(string(out))
@@ -183,6 +169,28 @@ func (s *Store) save(t Transaction) error {
 func (s *Store) report() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.targetTimes == nil {
+		s.targetTimes = map[string]session.Target{}
+	}
+	live := map[string]session.Target{}
+	now := time.Now().UTC()
+	for i := range s.stats.Targets {
+		target := &s.stats.Targets[i]
+		key := target.ID + "|" + target.Library
+		previous := s.targetTimes[key]
+		target.DiscoveredAt, target.StartingAt, target.ReadyAt = previous.DiscoveredAt, previous.StartingAt, previous.ReadyAt
+		if target.DiscoveredAt.IsZero() {
+			target.DiscoveredAt = now
+		}
+		if target.State == "starting" && target.StartingAt.IsZero() {
+			target.StartingAt = now
+		}
+		if target.State == "attached" && target.ReadyAt.IsZero() {
+			target.ReadyAt = now
+		}
+		live[key] = *target
+	}
+	s.targetTimes = live
 	b, _ := json.MarshalIndent(s.stats, "", "  ")
 	tmp := filepath.Join(s.dir, "status.tmp")
 	if os.WriteFile(tmp, b, 0600) == nil {
@@ -221,8 +229,14 @@ func (s *Store) recordPacketDrops(iface string, drops uint64) {
 
 // Restore a persisted request when its response arrives, keeping pending queues small.
 func (s *Store) restore(record *Transaction) error {
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+	var reader indexExecutor = s.db
+	if s.indexTx != nil {
+		reader = s.indexTx
+	}
 	var data []byte
-	if err := s.db.QueryRow("SELECT data FROM requests WHERE id=?", record.ID).Scan(&data); err != nil {
+	if err := s.indexReadRowLocked(reader, record.ID).Scan(&data); err != nil {
 		return err
 	}
 	return json.Unmarshal(data, record)

@@ -746,6 +746,8 @@ func (m tuiModel) tuiHealth() (int, []string) {
 	switch s.State {
 	case "failed":
 		warn(2, "采集失败")
+	case "interrupted":
+		warn(2, "采集未正常结束")
 	case "stale":
 		warn(2, "采集心跳过期")
 	}
@@ -818,6 +820,17 @@ func (m tuiModel) healthContent() string {
 		label("告警推送")+fmt.Sprintf("已送达 %s    失败 %s    队列丢弃 %s", tuiCount(s.AlertDelivered), level(s.AlertDeliveryFailed), level(s.AlertDeliveryDropped)),
 		"", tuiAccent.Render("服务探针"),
 	)
+	if s.DrainState != "" {
+		lines = append(lines, "数据排空  "+tuiLine(s.DrainState))
+	}
+	if len(s.GapCounts) > 0 {
+		data, _ := json.Marshal(s.GapCounts)
+		lines = append(lines, "采集缺口  "+tuiLine(string(data)))
+	}
+	if len(s.ProbeExits) > 0 {
+		data, _ := json.Marshal(s.ProbeExits)
+		lines = append(lines, "退出确认  "+tuiLine(string(data)))
+	}
 	if len(s.Targets) == 0 {
 		lines = append(lines, "暂无服务探针记录")
 	} else {
@@ -884,6 +897,8 @@ func (m tuiModel) detailContent() string {
 		}
 		fmt.Fprintf(&b, "%s%s\n", label("连接"), strings.TrimSpace(connection))
 	}
+	fmt.Fprintf(&b, "%s%s  stream ID %d\n", label("协议"), tuiLine(t.Protocol), t.StreamID)
+	fmt.Fprintf(&b, "%s%s\n", label("完整性原因"), tuiLine(strings.Join(t.IntegrityReasons, ", ")))
 	fmt.Fprintf(&b, "%s%s\n\n", label("ID"), tuiLine(t.ID))
 	labels := []string{"请求", "响应", "解码正文", "检测依据"}
 	if len(t.Alerts) > 0 {

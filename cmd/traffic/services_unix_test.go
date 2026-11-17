@@ -50,7 +50,7 @@ func TestServiceDiscoveryAndPIDIdentity(t *testing.T) {
 		t.Fatalf("generic %+v", generic)
 	}
 	if groupFor(apache[0]).PID != 0 {
-		t.Fatal("non-root workers should share probe")
+		t.Fatal("non-root workers should share one library probe")
 	}
 	apache[0].UID = 0
 	if groupFor(apache[0]).PID != 12 {

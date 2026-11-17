@@ -13,6 +13,10 @@ import (
 )
 
 type HTTPProcessor struct {
+	h2mu           sync.Mutex
+	h2             map[string]*h2Connection
+	h2bytes        int
+	h2lastSweep    time.Time
 	s              *Store
 	mu             sync.Mutex
 	pending        map[string][]Transaction
@@ -36,10 +40,29 @@ func newHTTP(s *Store) *HTTPProcessor {
 	return &HTTPProcessor{s: s, requestMethods: map[string][]string{}, requestReady: make(chan struct{}), pending: map[string][]Transaction{}, responses: map[string][]responseData{}, slots: make(chan struct{}, 2000)}
 }
 func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int, incomplete bool) {
-	br := bufio.NewReaderSize(r, 32768)
+	bufferSize := 32768
+	if frame, ok := r.(interface{ FramingComplete() bool }); ok && frame.FramingComplete() {
+		if sized, ok := r.(interface{ Len() int }); ok && sized.Len() > 0 {
+			// A complete TLS message already has all its bytes in memory. A
+			// fresh 32 KiB buffer for every small request/response creates avoidable
+			// allocation pressure; large messages retain the existing header limit.
+			bufferSize = min(bufferSize, sized.Len())
+		}
+	}
+	br := bufio.NewReaderSize(r, bufferSize)
 	for {
+		if state, ok := r.(interface{ Aborted() bool }); ok && state.Aborted() {
+			return
+		}
 		prefix, e := br.Peek(5)
 		if e != nil {
+			if len(prefix) > 0 {
+				p.s.gap("http1", key, "partial_message_start", "fragments", 1)
+			}
+			return
+		}
+		if string(prefix) == "PRI *" || (prefix[0] == 0 && prefix[3] == 4) {
+			p.processHTTP2Reader(br, key, client, source, pid, string(prefix) == "PRI *", r)
 			return
 		}
 		if prefix[0] >= 20 && prefix[0] <= 23 && prefix[1] == 3 && prefix[2] <= 3 {
@@ -47,15 +70,27 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			return
 		}
 		if prefix[0] < 65 || prefix[0] > 90 {
+			p.s.gap("protocol", key, "unsupported_or_midstream", "directions", 1)
 			return
 		}
 		if !boundedHeader(br) {
+			p.s.gap("http1", key, "header_limit_or_partial", "directions", 1)
+			p.invalidate(key, "header_limit_or_partial")
 			return
 		}
 		if strings.HasPrefix(string(prefix), "HTTP/") {
-			request := p.responseRequest(key)
+			var request *http.Request
+			if _, serial := r.(interface{ FramingComplete() bool }); serial {
+				// TLS frames are consumed by one event loop. Waiting here for a
+				// request in the same queue prevents that request from arriving.
+				request = p.responseRequestNow(key)
+			} else {
+				request = p.responseRequest(key)
+			}
 			resp, e := http.ReadResponse(br, request)
 			if e != nil {
+				p.s.gap("http1", key, "response_parse_failure", "directions", 1)
+				p.invalidate(key, "response_parse_failure")
 				return
 			}
 			if resp.StatusCode >= 100 && resp.StatusCode < 200 && resp.StatusCode != 101 {
@@ -72,6 +107,9 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			if closeErr := resp.Body.Close(); e == nil {
 				e = closeErr
 			}
+			if state, ok := r.(interface{ FramingComplete() bool }); ok && state.FramingComplete() && len(body) > responseLimit {
+				e = nil
+			}
 			truncated := len(body) > responseLimit
 			if truncated {
 				body = body[:responseLimit]
@@ -83,6 +121,10 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				raw = append(headers, body...)
 			}
 			p.mu.Lock()
+			if state, ok := r.(interface{ Aborted() bool }); ok && state.Aborted() {
+				p.mu.Unlock()
+				return
+			}
 			queue := p.pending[key]
 			if len(queue) > 0 {
 				t := queue[0]
@@ -122,6 +164,8 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 		} else {
 			req, e := http.ReadRequest(br)
 			if e != nil {
+				p.s.gap("http1", key, "request_parse_failure", "directions", 1)
+				p.invalidate(key, "request_parse_failure")
 				return
 			}
 			if req.ProtoMajor != 1 {
@@ -131,8 +175,12 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			// Publish the method before reading the request body. Responses can
 			// run on another packet stream, and HEAD framing needs this method.
 			p.mu.Lock()
-			if len(p.requestMethods) >= 2000 {
-				p.requestMethods = map[string][]string{}
+			if len(p.requestMethods) >= 2000 && len(p.requestMethods[key]) == 0 {
+				for old := range p.requestMethods {
+					p.s.gap("http1", old, "method_queue_limit", "connections", 1)
+					p.invalidateLocked(old, "method_queue_limit")
+					break
+				}
 			}
 			methods := p.requestMethods[key]
 			if len(methods) >= 100 {
@@ -147,6 +195,9 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			body, e := io.ReadAll(io.LimitReader(req.Body, int64(requestLimit)+1))
 			if closeErr := req.Body.Close(); e == nil {
 				e = closeErr
+			}
+			if state, ok := r.(interface{ FramingComplete() bool }); ok && state.FramingComplete() && len(body) > requestLimit {
+				e = nil
 			}
 			truncated := len(body) > requestLimit
 			if truncated {
@@ -168,27 +219,44 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				}
 			}
 			t := Transaction{ID: fmt.Sprintf("%x-%x", time.Now().UnixNano(), serial.Add(1)), Time: captured, Source: source, Host: req.Host, Client: client, Connection: key, Method: req.Method, URL: req.RequestURI, Request: raw, Incomplete: incomplete || e != nil, Truncated: truncated, PID: pid}
+			if identity, ok := r.(interface{ TargetIdentity() string }); ok {
+				t.TargetID = identity.TargetIdentity()
+			}
 			if endpoint, ok := r.(interface{ LocalEndpoint() string }); ok {
 				t.LocalEndpoint = endpoint.LocalEndpoint()
 			}
 			p.mu.Lock()
+			if state, ok := r.(interface{ Aborted() bool }); ok && state.Aborted() {
+				t.Incomplete = true
+				t.IntegrityReasons = []string{"tcp_stream_gap"}
+				if err := p.s.save(t); err != nil {
+					p.s.fail(err)
+				}
+				p.mu.Unlock()
+				return
+			}
 			for k, items := range p.pending {
 				if len(items) > 0 && captured.Sub(items[len(items)-1].Time) > time.Minute {
-					delete(p.pending, k)
-					delete(p.requestMethods, k)
-					for _, orphan := range p.responses[k] {
-						p.responseBytes -= int64(len(orphan.raw))
-						p.responseCount--
-					}
-					delete(p.responses, k)
+					p.s.gap("http1", k, "response_timeout", "connections", 1)
+					p.invalidateLocked(k, "response_timeout")
 				}
 			}
-			if len(p.pending) > 2000 {
-				p.pending = map[string][]Transaction{}
+			if len(p.pending) >= 2000 {
+				oldest := ""
+				var stamp time.Time
+				for candidate, items := range p.pending {
+					if len(items) > 0 && (oldest == "" || items[0].Time.Before(stamp)) {
+						oldest, stamp = candidate, items[0].Time
+					}
+				}
+				p.s.gap("http1", oldest, "pending_connection_limit", "connections", 1)
+				p.invalidateLocked(oldest, "pending_connection_limit")
 			}
 			q := p.pending[key]
 			if len(q) >= 100 {
-				q = q[1:]
+				p.s.gap("http1", key, "pipeline_limit", "connections", 1)
+				p.invalidateLocked(key, "pipeline_limit")
+				q = nil
 			}
 			if rs := p.responses[key]; len(rs) > 0 {
 				rd := rs[0]
@@ -271,4 +339,13 @@ func (p *HTTPProcessor) responseRequest(key string) *http.Request {
 			return nil
 		}
 	}
+}
+
+func (p *HTTPProcessor) responseRequestNow(key string) *http.Request {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if methods := p.requestMethods[key]; len(methods) > 0 {
+		return &http.Request{Method: methods[0]}
+	}
+	return nil
 }

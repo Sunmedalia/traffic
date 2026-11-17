@@ -143,6 +143,8 @@ func (w *webServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/sessions", w.handleSessions)
 	mux.HandleFunc("GET /api/sessions/{sid}/requests", w.handleRequests)
+	mux.HandleFunc("GET /api/sessions/{sid}/timeline", w.handleTimeline)
+	mux.HandleFunc("GET /api/sessions/{sid}/summary", w.handleSummary)
 	mux.HandleFunc("GET /api/sessions/{sid}/requests/{rid}", w.handleDetail)
 	mux.HandleFunc("GET /api/sessions/{sid}/requests/{rid}/export", w.handleExport)
 	static, _ := fs.Sub(webAssets, "web")
@@ -201,21 +203,39 @@ func (w *webServer) sessionStore(rw http.ResponseWriter, r *http.Request) *Store
 	return s
 }
 
-func (w *webServer) handleRequests(rw http.ResponseWriter, r *http.Request) {
+// webFilter validates the query parameters shared by the list, timeline and summary endpoints.
+func webFilter(r *http.Request) (tuiFilter, func(string) string, error) {
 	q := r.URL.Query()
 	get := func(name string) string { return strings.TrimSpace(q.Get(name)) }
-	filter := tuiFilter{Client: get("client"), Rule: get("rule"), Severity: get("severity"), Keyword: get("keyword"), Service: get("service")}
+	filter := tuiFilter{UntilExclusive: true, Client: get("client"), Rule: get("rule"), Severity: get("severity"), Keyword: get("keyword"), Service: get("service"), Method: get("method"), Status: get("status")}
 	if filter.Severity != "" && filter.Severity != "low" && filter.Severity != "medium" && filter.Severity != "high" {
-		webError(rw, http.StatusBadRequest, errors.New("级别必须是 low、medium 或 high"))
-		return
+		return filter, get, errors.New("级别必须是 low、medium 或 high")
 	}
-	if since := get("since"); since != "" {
-		stamp, err := time.Parse(time.RFC3339, since)
-		if err != nil {
-			webError(rw, http.StatusBadRequest, errors.New("起始时间需要 RFC3339 格式"))
-			return
+	if filter.Status != "" && filter.Status != "pending" {
+		class := len(filter.Status) == 3 && filter.Status[0] >= '1' && filter.Status[0] <= '5' && filter.Status[1:] == "xx"
+		if code, err := strconv.Atoi(filter.Status); !class && (err != nil || code < 100 || code > 999) {
+			return filter, get, errors.New("状态必须是 pending、2xx 这样的类别或具体状态码")
 		}
-		filter.Since = stamp.UTC().Format(indexTimeFormat)
+	}
+	for name, target := range map[string]*string{"since": &filter.Since, "until": &filter.Until} {
+		value := get(name)
+		if value == "" {
+			continue
+		}
+		stamp, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			return filter, get, errors.New("时间范围需要 RFC3339 格式")
+		}
+		*target = stamp.UTC().Format(indexTimeFormat)
+	}
+	return filter, get, nil
+}
+
+func (w *webServer) handleRequests(rw http.ResponseWriter, r *http.Request) {
+	filter, get, err := webFilter(r)
+	if err != nil {
+		webError(rw, http.StatusBadRequest, err)
+		return
 	}
 	page, _ := strconv.Atoi(get("page"))
 	page = max(0, page)
@@ -240,7 +260,7 @@ func (w *webServer) handleRequests(rw http.ResponseWriter, r *http.Request) {
 	}
 	webJSON(rw, http.StatusOK, map[string]any{
 		"rows": rows, "count": snapshot.Count, "page": snapshot.Page, "page_size": 100,
-		"stats": snapshot.Stats, "status_warning": snapshot.StatusWarning, "dir": s.dir,
+		"stats": snapshot.Stats, "status_warning": snapshot.StatusWarning, "dir": s.dir, "coverage_warning": session.CoverageWarning,
 	})
 }
 
@@ -274,7 +294,12 @@ func (w *webServer) handleDetail(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	decoded, view := session.DecodedBody(t.Request, 1<<20)
-	result := map[string]any{"request_text": session.SafeText(t.Request), "response_text": session.SafeText(t.Response), "decoded_body": strings.ToValidUTF8(decoded, "�"), "decoded_view": view}
+	responseDecoded, responseView := session.DecodedBody(t.Response, 1<<20)
+	result := map[string]any{
+		"request_text": session.SafeText(t.Request), "response_text": session.SafeText(t.Response),
+		"decoded_body": strings.ToValidUTF8(decoded, "�"), "decoded_view": view,
+		"response_decoded_body": strings.ToValidUTF8(responseDecoded, "�"), "response_decoded_view": responseView,
+	}
 	// The texts above replace the base64 byte fields.
 	t.Request, t.Response = nil, nil
 	result["transaction"] = t

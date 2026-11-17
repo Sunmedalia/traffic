@@ -1,0 +1,15 @@
+diff --git a/cli/cmd/root.go b/cli/cmd/root.go
+--- a/cli/cmd/root.go
++++ b/cli/cmd/root.go
+@@ -450,6 +450,11 @@
+ 	if err != nil {
+ 		return err
+ 	}
++	if eqServer != nil {
++		if err := eqServer.PublishLog(ctx, domain.OperationalLogRecord{Message: "traffic-control-v1:ready"}); err != nil {
++			return errors.Join(err, active.close())
++		}
++	}
+ 	for {
+ 		select {
+ 		case _, ok := <-stopper:

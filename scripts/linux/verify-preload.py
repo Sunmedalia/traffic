@@ -117,7 +117,12 @@ def verify(args):
                    '--output', str(root / 'session'), '--request-limit', '1048576',
                    '--response-limit', '1048576', '--trusted-proxies', '127.0.0.1']
         collector = subprocess.Popen(command, stdout=collector_log, stderr=collector_log)
-        wait_for(lambda: Path(sock).is_socket(), [service, collector])
+        def capture_ready():
+            status_path=root / 'session' / 'status.json'
+            if not Path(sock).is_socket() or not status_path.exists():return False
+            try:return json.loads(status_path.read_text()).get('state')=='running'
+            except ValueError:return False
+        wait_for(capture_ready,[service,collector])
         context = ssl._create_unverified_context()  # isolated generated test certificate
 
         def connection():

@@ -76,6 +76,11 @@ def collect_rss(process, stop, peak):
         try:
             pids = [process.pid]
             group = Path(f"/sys/fs/cgroup/traffic-{process.pid}")
+            for line in Path(f"/proc/{process.pid}/cgroup").read_text().splitlines():
+                if line.startswith("0::"):
+                    candidate = Path("/sys/fs/cgroup") / line.split(":", 2)[2].lstrip("/")
+                    if candidate.name == f"traffic-{process.pid}":
+                        group = candidate
             if (group / "cgroup.procs").exists():
                 pids = list(map(int, (group / "cgroup.procs").read_text().split()))
                 peak[1] = max(peak[1], int((group / "memory.peak").read_text()))
