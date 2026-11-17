@@ -69,7 +69,11 @@ def main():
     parser.add_argument("--runtime-dir", type=Path, default=Path("C:/traffic-lab/probe-runtime"))
     parser.add_argument("--root", type=Path, default=Path("C:/traffic-lab"))
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--startup-warmups", type=int, default=0,
+                        help="explicit pre-matrix warmups (default: none; must not hide startup loss)")
     args = parser.parse_args()
+    if not 0 <= args.startup_warmups <= 256:
+        parser.error("--startup-warmups must be between 0 and 256")
     args.output.mkdir(parents=True, exist_ok=False)
     expected = []
     warmups = []
@@ -111,7 +115,7 @@ def main():
             if args.iis_probe:
                 deadline = time.monotonic() + 15
                 while time.monotonic() < deadline:
-                    state = json.loads((session / "status.json").read_text())
+                    state = json.loads((session / "status.json").read_text(encoding="utf-8"))
                     if state["tls"] == "attached":
                         break
                     if state["tls"] == "unavailable":
@@ -120,7 +124,7 @@ def main():
                 else:
                     raise RuntimeError("IIS helper did not attach")
                 # Report startup receives separately from the acceptance matrix.
-                for index in range(24):
+                for index in range(args.startup_warmups):
                     warmups.append(run_case(True, f"warmup-{index}", "/api/health"))
                     time.sleep(0.02)
                 time.sleep(0.5)
@@ -163,7 +167,7 @@ def main():
     if (session / "index.sqlite").exists():
         raise AssertionError("collector unexpectedly wrote an index")
     subprocess.run([str(args.analysis_binary), "analyze", "--session", str(session)], check=True)
-    pointer = json.loads((session / "analysis-current.json").read_text())
+    pointer = json.loads((session / "analysis-current.json").read_text(encoding="utf-8"))
     with sqlite3.connect(session / pointer["file"]) as analysis:
         rows = [json.loads(row[0]) for row in analysis.execute("SELECT json_set(CAST(r.data AS TEXT),'$.alerts',json(a.alerts)) FROM requests r JOIN results a ON a.id=r.id")]
     for sample in expected:
@@ -184,7 +188,7 @@ def main():
                   "backend": row.get("backend") == ("iis-httpapi" if sample["secure"] else "pcap")}
         if not all(checks.values()):
             failures.append({"url": sample["url"], "secure": sample["secure"], "checks": checks})
-    status = json.loads((session / "status.json").read_text())
+    status = json.loads((session / "status.json").read_text(encoding="utf-8"))
     if before != after:
         failures.append({"configuration_or_worker_changed": {"before": before, "after": after}})
     if process.returncode or any(status[k] for k in ("queue_dropped", "dropped", "tls_dropped")):

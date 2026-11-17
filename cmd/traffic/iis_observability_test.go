@@ -30,7 +30,10 @@ func TestAttachWindowBecomesVisible(t *testing.T) {
 
 func TestReceiveHookDoesNotProveRecordedPlaintext(t *testing.T) {
 	s := &Store{iisAttached: true}
-	applyIISProbeSummary(s, map[string]any{"receive_matches": 12, "send_matches": 12})
+	applyIISProbeSummary(s, map[string]any{"receive_matches": 12, "send_matches": 12, "recovered_receives": 10})
+	if s.stats.ProbeRecoveredReceives != 10 {
+		t.Fatalf("recovered receive count missing: %+v", s.stats)
+	}
 	finishIISObservability(s, true)
 	if s.fatal == nil || s.stats.PlaintextObserved {
 		t.Fatal("hook matches accepted without recorded plaintext")

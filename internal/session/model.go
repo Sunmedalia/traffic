@@ -112,6 +112,7 @@ type Stats struct {
 	PlaintextObserved           bool                           `json:"plaintext_observed"`
 	AttachWindowSuspect         bool                           `json:"attach_window_suspect"`
 	ProbeReceiveMatches         uint64                         `json:"probe_receive_matches"`
+	ProbeRecoveredReceives      uint64                         `json:"probe_recovered_receives"`
 	ProbeBodyMatches            uint64                         `json:"probe_body_matches"`
 	ProbeSendMatches            uint64                         `json:"probe_send_matches"`
 	ProbeUnmatchedCompletions   uint64                         `json:"probe_unmatched_completions"`
