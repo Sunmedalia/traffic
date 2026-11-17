@@ -49,9 +49,9 @@ flowchart LR
 
 | 平台 | 采集器 | 分析器 |
 | :--- | :--- | :--- |
-| Ubuntu x64 / ARM64 | `traffic-v0.2.0-ubuntu-{amd64,arm64}.tar.gz` | `traffic-console-v0.2.0-ubuntu-{amd64,arm64}.tar.gz` |
-| CentOS 7+ x64 / ARM64 | `traffic-v0.2.0-centos7-{amd64,arm64}.tar.gz` | `traffic-console-v0.2.0-centos7-{amd64,arm64}.tar.gz` |
-| Windows x64 | `traffic-v0.2.0-windows-amd64.zip` | `traffic-console-v0.2.0-windows-amd64.zip` |
+| Ubuntu x64 / ARM64 | `traffic-v0.1.2-ubuntu-{amd64,arm64}.tar.gz` | `traffic-console-v0.1.2-ubuntu-{amd64,arm64}.tar.gz` |
+| CentOS 7+ x64 / ARM64 | `traffic-v0.1.2-centos7-{amd64,arm64}.tar.gz` | `traffic-console-v0.1.2-centos7-{amd64,arm64}.tar.gz` |
+| Windows x64 | `traffic-v0.1.2-windows-amd64.zip` | `traffic-console-v0.1.2-windows-amd64.zip` |
 
 Linux 主程序静态链接 libpcap，无需安装运行库；采集包内置配套 eCapture、Java Agent 和 glibc 2.17 基线的 OpenSSL 预加载库。CentOS 提供可直接运行的包。Ubuntu/CentOS 包使用同一兼容构建基线，并分别在干净的发行版容器中检查。
 
@@ -59,8 +59,8 @@ Windows 采集包内置 WinDivert 签名驱动、Python、Frida 和探针脚本�
 
 ```bash
 # Ubuntu x64；CentOS 改用 centos7-amd64 文件名
- tar -xzf traffic-v0.2.0-ubuntu-amd64.tar.gz
- cd traffic-v0.2.0-ubuntu-amd64
+ tar -xzf traffic-v0.1.2-ubuntu-amd64.tar.gz
+ cd traffic-v0.1.2-ubuntu-amd64
  ./traffic --cn-help
  ./traffic doctor --cn-help
  sudo ./traffic doctor
@@ -76,7 +76,7 @@ Windows 采集包内置 WinDivert 签名驱动、Python、Frida 和探针脚本�
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential libpcap-dev git
-git clone --branch v0.2.0 https://github.com/Sunmedalia/traffic.git
+git clone --branch v0.1.2 https://github.com/Sunmedalia/traffic.git
 cd traffic
 ./scripts/build-linux.sh
 ```
@@ -193,7 +193,7 @@ sessions/<host>/<date>/<session>/
 | [使用手册](docs/guide.md) | 后端、规则、Windows、参数、停止与回滚、故障排查 |
 | [验证记录](VALIDATION.md) | 实机环境、构建哈希、成功与失败样本 |
 | [优化进度](OPTIMIZATION.md) | 已实现机制、性能门槛与待完成项目 |
-| [v0.2.0 发布说明](docs/releases/v0.2.0.md) | 下载包、升级变化和已知限制 |
+| [v0.1.2 发布说明](docs/releases/v0.1.2.md) | 下载包、升级变化和已知限制 |
 | [第三方组件](THIRD_PARTY_NOTICES.md) | 依赖、探针与许可证说明 |
 
 ```bash

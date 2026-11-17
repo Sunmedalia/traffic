@@ -1,6 +1,6 @@
 # Windows 随包依赖
 
-从 v0.2.0 起，`traffic` 与 `traffic-console` 分开打包。采集器完整 ZIP 已包含运行依赖，不需要 Npcap、在线 pip 或系统 Python。请保留解压目录结构：
+从 v0.1.2 起，`traffic` 与 `traffic-console` 分开打包。采集器完整 ZIP 已包含运行依赖，不需要 Npcap、在线 pip 或系统 Python。请保留解压目录结构：
 
 ```text
 traffic.exe

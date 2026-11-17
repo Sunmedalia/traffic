@@ -59,8 +59,8 @@ def main():
                 shutil.copy2(ROOT / 'bin/libtraffic-openssl.so', package / 'libtraffic-openssl.so')
                 probe = deps / 'ecapture'
                 probe.mkdir()
-                for name in ('ecapture', 'ecapture.traffic.json', 'ecapture.LICENSE', 'ecapture-source.tar.gz', 'libpcap.LICENSE'):
-                    shutil.copy2(ROOT / 'bin' / name, probe / name)
+                for dependency in ('ecapture', 'ecapture.traffic.json', 'ecapture.LICENSE', 'ecapture-source.tar.gz', 'libpcap.LICENSE'):
+                    shutil.copy2(ROOT / 'bin' / dependency, probe / dependency)
             java = deps / 'java'
             java.mkdir()
             shutil.copy2(ROOT / 'java-agent/target/traffic-java-agent.jar', java / 'traffic-java-agent.jar')
