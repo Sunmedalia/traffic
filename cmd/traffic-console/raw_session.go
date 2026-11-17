@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"github.com/Sunmedalia/traffic/internal/index"
 )
 
 func rawSession(dir string) bool {
@@ -30,7 +32,7 @@ func openRawStore(dir string) (*Store, error) {
 		}
 		db.Close()
 	}
-	db, err := sql.Open("sqlite3", ":memory:")
+	db, err := sql.Open(index.Driver, ":memory:")
 	if err != nil {
 		return nil, err
 	}
@@ -39,7 +41,7 @@ func openRawStore(dir string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, dir: dir, analysisNote: "原始采集会话尚未还原或输入已变化；请运行 traffic-console analyze，或在 Web「规则与分析」中开始分析"}, nil
+	return &Store{db: db, dir: dir, analysisNote: "原始采集会话尚未还原或输入已变化；请运行 traffic-console analyze，或在 Web「分析」页中开始分析"}, nil
 }
 
 func (s *Store) useAnalysis(schema string) error {

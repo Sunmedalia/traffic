@@ -321,8 +321,6 @@ table.data td.url { max-width: 0; }
 .rule { cursor: pointer; padding: 0 7px; border-radius: 4px; border: 0; min-height: 20px; font: 600 11px/20px var(--mono); }
 .detail-url { margin-top: 8px; font: 12.5px/1.5 var(--mono); overflow-wrap: anywhere; max-height: 7.5em; overflow: auto; }
 .detail-url .host { color: var(--muted); }
-.detail-decoded { margin-top: 6px; padding: 6px 9px; border-radius: 6px; background: var(--panel-2); font: 12px/1.5 var(--mono); overflow-wrap: anywhere; max-height: 6em; overflow: auto; }
-.detail-decoded::before { content: "解码后 "; font-family: var(--sans); color: var(--faint); }
 mark { background: var(--mark); color: inherit; border-radius: 2px; box-shadow: 0 0 0 1px color-mix(in srgb, var(--high) 55%, transparent); }
 .meta { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 6px 16px; margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line); max-height: 30%; overflow: auto; }
 .meta div { min-width: 0; }
@@ -365,6 +363,32 @@ dialog h1 { font-size: 15px; }
 dialog p { padding: 0 18px 16px; font-size: 12px; }
 .keys { display: grid; grid-template-columns: max-content 1fr; gap: 9px 18px; margin: 0; padding: 16px 18px; }
 .keys dd { margin: 0; color: var(--muted); }
+
+/* ---- filters and decoder ---- */
+.filterbar select.active { border-color: var(--accent); color: var(--accent); }
+.filterbar button.toggle[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+button.mini { min-height: 0; padding: 0 6px; margin-left: 6px; font: 500 11px/18px var(--sans); color: var(--muted); vertical-align: 1px; }
+button.mini:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+.params dd { display: flex; align-items: baseline; gap: 6px; }
+.params dd .value { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.params dd .acts { flex: none; opacity: .55; }
+.params dd:hover .acts, .params dd .acts:focus-within { opacity: 1; }
+.alert-card button.mini { margin: 6px 0 0; }
+.decoder { display: grid; gap: 10px; }
+.decoder-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.decoder-source { max-width: min(100%, 360px); }
+.decoder-input { width: 100%; resize: vertical; min-height: 58px; font: 12px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.decoder-chain { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+.decoder-chain .arrow { color: var(--faint); }
+.decoder-chain .step { min-height: 0; padding: 1px 8px; border-radius: 999px; font-size: 12px; color: var(--muted); }
+.decoder-chain .step[aria-current="step"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.decoder-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.decoder-actions button { min-height: 26px; padding: 2px 9px; font-size: 12px; color: var(--muted); }
+.decoder-actions button.fits { color: var(--text); border-color: var(--accent); }
+.decoder-error { color: var(--high); font-size: 12px; }
+.decoder-out-head { display: flex; align-items: center; gap: 8px; }
+.decoder-out-head h3 { margin: 0; }
+.decoder-out { padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); max-height: 60vh; overflow: auto; }
 
 /* ---- main navigation ---- */
 .mainnav { display: flex; gap: 2px; margin-right: 10px; }

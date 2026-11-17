@@ -337,6 +337,21 @@ func webFilter(r *http.Request) (tuiFilter, func(string) string, error) {
 	q := r.URL.Query()
 	get := func(name string) string { return strings.TrimSpace(q.Get(name)) }
 	filter := tuiFilter{UntilExclusive: true, Client: get("client"), Rule: get("rule"), Severity: get("severity"), Keyword: get("keyword"), Service: get("service"), Method: get("method"), Status: get("status")}
+	filter.Param, filter.HideStatic = get("param"), get("static") == "hide"
+	if value := get("decode"); value != "" {
+		rounds, err := strconv.Atoi(value)
+		if err != nil || rounds < 0 || rounds > maxFilterDecodeRounds {
+			return filter, get, fmt.Errorf("解码次数必须是 0 到 %d", maxFilterDecodeRounds)
+		}
+		filter.Decode = rounds
+	}
+	filter.Exclude = get("exclude")
+	if len(excludeTerms(filter.Exclude)) > 20 {
+		return filter, get, errors.New("排除关键词最多 20 个")
+	}
+	if strings.ContainsAny(filter.Param, "=&?#") {
+		return filter, get, errors.New("参数名不能包含 = & ? #")
+	}
 	if filter.Severity != "" && filter.Severity != "low" && filter.Severity != "medium" && filter.Severity != "high" {
 		return filter, get, errors.New("级别必须是 low、medium 或 high")
 	}

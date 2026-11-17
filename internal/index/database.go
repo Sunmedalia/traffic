@@ -7,8 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
 // OpenDB opens the v1 session index. Readers always use SQLite mode=ro.
@@ -38,7 +36,7 @@ func OpenDB(dir string, write bool) (*sql.DB, error) {
 	query.Set("mode", mode)
 	query.Set("_busy_timeout", "5000")
 	databaseURL.RawQuery = query.Encode()
-	db, err := sql.Open("sqlite3", databaseURL.String())
+	db, err := sql.Open(Driver, databaseURL.String())
 	if err != nil {
 		return nil, err
 	}

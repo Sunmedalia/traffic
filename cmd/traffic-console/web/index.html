@@ -113,6 +113,12 @@
           <input name="keyword" type="search" placeholder="搜索 Host 或 URL" spellcheck="false" aria-label="Host 或 URL 关键词">
           <kbd>/</kbd>
         </div>
+        <select name="decode" aria-label="关键词匹配方式" title="关键词和排除词按原文匹配，或先对 URL 解码若干次再匹配">
+          <option value="">匹配原文</option>
+          <option value="1">URL 解码 1 次后匹配</option>
+          <option value="2">解码 2 次后匹配</option>
+          <option value="3">解码 3 次后匹配</option>
+        </select>
         <div class="seg" role="group" aria-label="告警级别">
           <button type="button" data-filter="severity" data-value="high" class="sev-high">仅高</button>
           <button type="button" data-filter="severity" data-value="medium" class="sev-medium">中及以上</button>
@@ -129,9 +135,13 @@
           <option value="">全部方法</option>
           <option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option><option>PATCH</option><option>HEAD</option><option>OPTIONS</option>
         </select>
+        <button type="button" class="toggle" data-filter="static" data-value="hide" title="隐藏 js、css、图片、字体等静态资源请求">隐藏静态资源</button>
         <button type="button" id="more-toggle" aria-expanded="false">更多条件</button>
         <button type="button" class="ghost" id="filters-clear" hidden>清空</button>
         <div class="more" id="more" hidden>
+          <label>排除关键词<input name="exclude" placeholder="空格或逗号分隔，如 healthz .png" spellcheck="false"></label>
+          <label>包含参数<input name="param" placeholder="参数名，如 cmd" spellcheck="false"></label>
+          <label>状态码<input name="status" placeholder="如 403 或 5xx" spellcheck="false" inputmode="numeric"></label>
           <label>来源地址<input name="client" placeholder="IP 或 IP:端口" spellcheck="false"></label>
           <label>规则 ID<input name="rule" placeholder="例如 SQLI-001" spellcheck="false"></label>
           <label>服务<input name="service" placeholder="nginx / apache / tomcat" spellcheck="false"></label>
@@ -175,12 +185,12 @@
               <button type="button" class="ghost icon" id="detail-close" title="关闭（Esc）" aria-label="关闭详情">✕</button>
             </div>
             <div class="detail-url" id="detail-url"></div>
-            <div class="detail-decoded" id="detail-decoded" hidden></div>
           </header>
           <dl class="meta" id="detail-meta"></dl>
           <div class="detail-tabs">
             <nav class="tabs small" role="tablist" id="detail-tabs"></nav>
             <span class="spacer"></span>
+            <button type="button" class="ghost" id="decode-selection" title="解码选中的文本，未选中时解码 URL（d）" hidden>解码 URL</button>
             <label class="check" id="pretty-wrap"><input type="checkbox" id="pretty" checked>格式化正文</label>
             <button type="button" class="ghost" id="detail-copy">复制</button>
           </div>
@@ -322,6 +332,7 @@
     <dt><kbd>n</kbd> <kbd>p</kbd></dt><dd>下一页、上一页</dd>
     <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>切换详情标签</dd>
     <dt><kbd>/</kbd></dt><dd>聚焦搜索框</dd>
+    <dt><kbd>d</kbd></dt><dd>详情：解码选中文本，未选中时解码 URL</dd>
     <dt><kbd>空格</kbd></dt><dd>暂停或恢复自动刷新</dd>
     <dt><kbd>r</kbd></dt><dd>立即刷新</dd>
     <dt><kbd>Esc</kbd></dt><dd>关闭详情或离开输入框</dd>
