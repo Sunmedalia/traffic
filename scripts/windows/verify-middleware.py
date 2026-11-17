@@ -32,7 +32,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     binary = str(args.binary.resolve())
     def targets():
-        return json.loads(subprocess.check_output([binary, "doctor", "--service", args.service], encoding="utf-8"))["targets"]
+        return json.loads(subprocess.check_output([binary, "doctor", "--json", "--service", args.service], encoding="utf-8"))["targets"]
     before = targets()
     hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in args.config}
     selected = [("nginx", 18080, 18443), ("apache", 18081, 18444)]

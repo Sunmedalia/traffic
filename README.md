@@ -67,7 +67,7 @@ Windows 采集包内置 WinDivert 签名驱动、Python、Frida 和探针脚本�
  sudo ./traffic capture --ports 80,443 --duration 60s
 ```
 
-依赖路径自动按程序所在目录解析，帮助页面包含每个命令的专属参数和示例。HTTPS 能力仍取决于目标与内核：CentOS 7 原生内核不具备 CO-RE BTF，需要服务启动时加载随包预加载库；程序不会重启业务服务。Java attach 依赖目标 JVM 自身的 attach 能力。
+依赖路径自动按程序所在目录解析，帮助页面包含每个命令的专属参数和示例。`traffic doctor` 默认显示中文分区自检报告；脚本读取使用 `traffic doctor --json`，保持原有 JSON 字段。HTTPS 能力仍取决于目标与内核：CentOS 7 原生内核不具备 CO-RE BTF，需要服务启动时加载随包预加载库；程序不会重启业务服务。Java attach 依赖目标 JVM 自身的 attach 能力。
 
 首次启动任一程序会自动在程序旁创建 `sessions/` 和 `exports/`，从其他目录启动也会使用同一默认数据目录。源码构建位于 `bin/` 时，目录创建在项目根目录；显式 `--data-dir` / `--output` 仍按指定路径处理。请将程序解压到可写目录。
 

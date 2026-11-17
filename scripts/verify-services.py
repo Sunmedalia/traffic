@@ -26,7 +26,7 @@ parser.add_argument("--new-connections-only", action="store_true", help="record 
 parser.add_argument("--config", type=Path, required=True)
 args = parser.parse_args()
 before = hashlib.sha256(args.config.read_bytes()).hexdigest()
-doctor_command = [args.binary, "doctor", "--service", args.service]
+doctor_command = [args.binary, "doctor", "--json", "--service", args.service]
 if args.pid:
     doctor_command += ["--pid", str(args.pid)]
 before_targets = json.loads(subprocess.check_output(doctor_command))["targets"]

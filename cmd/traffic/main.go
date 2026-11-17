@@ -118,7 +118,11 @@ func run(args []string) (runErr error) {
 	fs.DurationVar(&scanWindow, "scan-window", scanWindow, "scan aggregation window")
 	fs.IntVar(&scanThreshold, "scan-paths", scanThreshold, "distinct paths for scan detection")
 	fs.BoolVar(&noDetect, "no-detect", false, "capture without attack detection")
-	fs.Bool("json", false, "JSON output (default)")
+	jsonUsage := "JSON output (default)"
+	if cmd == "doctor" {
+		jsonUsage = "print raw JSON instead of the readable diagnostic report"
+	}
+	jsonOutput := fs.Bool("json", false, jsonUsage)
 	if wantsHelp {
 		printCollectorHelp(os.Stdout, cmd, cnHelp, fs)
 		return nil
@@ -250,8 +254,7 @@ func run(args []string) (runErr error) {
 		}
 		report := doctorReport(devices, *service, *pid, *lib, *ecapture)
 		report["checks"] = captureChecks(*service, *pid, *lib, *ecapture, *javaAttach, *javaAgent, *preloadSocket, *javaPID)
-		emit(report)
-		return nil
+		return writeDoctorOutput(os.Stdout, report, *ports, *jsonOutput)
 	}
 	if cmd == "capture" || cmd == "import" {
 		if cmd == "import" && id == "" {

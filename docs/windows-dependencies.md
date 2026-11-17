@@ -23,7 +23,7 @@ deps/
 .\traffic.exe capture --no-tls --ports 8080 --duration 60s
 ```
 
-`doctor` 枚举系统网络接口并检查依赖，不加载驱动或附加进程。`capture` 使用 WinDivert 的 SNIFF + RECV_ONLY 模式复制网络包，默认覆盖本机接口及回环；驱动在首次采集时自动注册并加载。管理员权限及允许加载签名驱动的系统策略仍是必要条件。驱动不可用时会返回明确错误，不会静默切换为无网络采集。
+`doctor` 默认显示中文分区自检报告，脚本读取原始字段请使用 `doctor --json`。它枚举系统网络接口并检查依赖，不加载驱动或附加进程。`capture` 使用 WinDivert 的 SNIFF + RECV_ONLY 模式复制网络包，默认覆盖本机接口及回环；驱动在首次采集时自动注册并加载。管理员权限及允许加载签名驱动的系统策略仍是必要条件。驱动不可用时会返回明确错误，不会静默切换为无网络采集。
 
 IIS / OpenSSL 探针默认从随包路径配置，只在采集选中的目标时附加。`--no-tls` 禁用附加。自定义部署仍可用 `--iis-probe`、`--openssl-probe`、`--probe-python`、`--probe-runtime-dir` 覆盖路径。程序自动创建 `runtime/frida`；检测到 IIS 时授予 IIS_IUSRS 对该临时子目录的读取权限，不放宽会话数据目录权限。
 

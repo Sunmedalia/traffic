@@ -3,8 +3,12 @@ $ErrorActionPreference = 'Stop'
 $App = (Resolve-Path $App).Path
 $Console = (Resolve-Path $Console).Path
 function Check-Exit { if ($LASTEXITCODE) { throw "Command failed: $LASTEXITCODE" } }
+# Default output is a readable report; automation requests JSON explicitly.
+$human = & "$App/traffic.exe" doctor
+Check-Exit
+if (($human -join "`n") -notmatch "环境自检") { throw 'Missing readable doctor report' }
 # This test runs on a clean hosted runner with no Npcap installation.
-& "$App/traffic.exe" doctor | Tee-Object -FilePath "$App/doctor.json"
+& "$App/traffic.exe" doctor --json | Tee-Object -FilePath "$App/doctor.json"
 Check-Exit
 $doctor = Get-Content "$App/doctor.json" -Raw | ConvertFrom-Json
 if ($doctor.packet_backend -ne 'windivert-sniff') { throw 'Bundled capture backend was not selected' }

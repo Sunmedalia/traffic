@@ -331,7 +331,7 @@ IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集]
 | `--drain-timeout` | 5s | 部分后端的数据排空预算，最大 15s |
 | `--netns-pid` | 0 | Linux 显式选择抓包网络命名空间 |
 
-`traffic capture --help`、`traffic doctor`、`traffic rules check FILE` 可随时查看。分析器参数用 `traffic-console --help`。
+`traffic capture --help`、`traffic doctor`、`traffic rules check FILE` 可随时查看。`doctor` 默认显示中文自检报告，网卡掩码转为 CIDR；自动化读取请使用 `traffic doctor --json`，原始 JSON 字段保持兼容。分析器参数用 `traffic-console --help`。
 
 ## 会话目录与完整性
 
@@ -359,7 +359,7 @@ sessions/web-01/2026-11-11/15-04-05-nginx/
 
 | 症状 | 常见原因 | 处理 |
 | --- | --- | --- |
-| `doctor` 报 `ecapture_installed: false` | 未构建或路径不对 | 跑 `scripts/build-ecapture.sh`，或用 `--ecapture` 指定 |
+| `doctor --json` 报 `ecapture_installed: false` | 未构建或路径不对 | 跑 `scripts/build-ecapture.sh`，或用 `--ecapture` 指定 |
 | 抓不到任何请求 | 网卡或端口不对 | `ip -br addr` 选接口；确认 `--ports` 含实际监听端口 |
 | 只有密文、`tls=unavailable` | 未发现服务、库路径错、后端不支持 | 看 `doctor` 的 targets；指定 `--service` / `--pid` / `--libssl` |
 | nginx 采集到了但部分请求缺失 | 附加前已进入的调用、HTTP/2、突发缺口 | 用预加载路径或降低速率；完整性按 `unverified` 处理 |

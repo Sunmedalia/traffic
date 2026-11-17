@@ -20,7 +20,7 @@ from pathlib import Path
 def snapshot(root, binary):
     paths = [root / "site/web.config", root / "site/App_Code/TrafficLab.cs", root / "site/static.txt",
              Path("C:/Windows/System32/inetsrv/config/applicationHost.config")]
-    doctor = json.loads(subprocess.check_output([str(binary), "doctor", "--service", "iis"], encoding="utf-8"))
+    doctor = json.loads(subprocess.check_output([str(binary), "doctor", "--json", "--service", "iis"], encoding="utf-8"))
     workers = sorted(target["id"] for target in doctor.get("targets") or [])
     return {"configuration": {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths},
             "workers": workers}
