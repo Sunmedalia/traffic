@@ -312,3 +312,14 @@ README 发布前审核还修复了证据写入错误处理、离线 PCAP 时间�
 审核修复了 TLS 事件持久化错误处理、WebSocket 取消监听的 goroutine 生命周期、队列槽位释放顺序、离线抓包时间戳、索引时间排序、特殊字符路径和导出错误处理。新增对应回归测试，验证脚本的目标主机和工具路径改为参数。
 
 升级 SQLite 驱动、Protobuf 和传递依赖后，执行 Linux 竞态测试、静态检查和构建。最终依赖以 Go 1.26.11 构建，`govulncheck v1.9.0` 输出 `No vulnerabilities found.`。扫描结果反映执行时的漏洞数据库，SQLite 内嵌 C 代码和内核探针仍需各自的审查与测试。
+
+## v0.1.2 便携发行包验证（2026-11-17）
+
+构建候选提交 `75cd748` 的 [完整发行包验证](https://github.com/Sunmedalia/traffic/actions/runs/44041121589) 通过：
+
+- Windows x64：原生竞态测试、静态检查；完整 ZIP 解压到含空格目录，在无 Npcap、无系统 Python 的环境运行 doctor、随包 Python/Frida 和两个探针的帮助。从其他工作目录启动 WinDivert 只读采集，回环 HTTP 的 4 次请求实际写入 SQLite，并由独立 traffic-console 读取状态。
+- Ubuntu / CentOS 7：x64、ARM64 各自在干净发行版容器运行主程序、doctor、独立 console 和 eCapture，加载预加载库并保存 HTTP 采集会话；容器中不安装额外 libpcap 或编译器。主程序静态链接 libpcap，预加载库使用 glibc 2.17 基线。
+- 实机 CentOS 7.9：glibc 2.17、原生 3.10.0-1160.119.1.el7.x86_64 内核。直接上传候选 tar.gz 解压，未编译或安装依赖；doctor、eCapture 帮助、LD_PRELOAD 加载通过。独立测试监听器接收 4 次回环 HTTP 请求，采集记录 72 个包、4 条事务，traffic-console 正常打开；使用 cgroup v1 资源预算，停止状态为 stopped。
+- 本地 Go 全量竞态测试、分包内容回归测试、帮助分命令回归测试及工作流静态检查通过。
+
+这组检查验证发行包的运行依赖、旧 glibc 兼容性和基本 HTTP 路径。未扩展为 Windows WinDivert 高负载完整性或旧内核 TLS 的正式验收。WinDivert 无每句柄队列丢弃计数，健康状态记录 drop_counter_unavailable；旧内核 TLS 的预加载要求仍适用。既有 Npcap 路径的历史验收不自动适用于 WinDivert。
