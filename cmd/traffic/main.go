@@ -93,6 +93,7 @@ func run(args []string) (runErr error) {
 	preloadSocket := fs.String("openssl-preload-socket", "", "Linux Unix datagram socket for LD_PRELOAD OpenSSL events")
 	preloadAllowUID := fs.String("openssl-preload-allow-uid", "", "comma-separated sender UIDs allowed to write preload events; opens the socket to their group")
 	requireTLS := fs.Bool("require-tls", false, "fail before capture if selected HTTPS targets fail read-only preflight")
+	requirePlaintext := fs.Bool("require-plaintext", false, "exit non-zero when an attached IIS probe saved no plaintext request")
 	fs.IntVar(&collectorMemoryMiB, "collector-memory-mib", 256, "collector and helper memory budget MiB; excludes in-process probes")
 	fs.IntVar(&collectorCPUPercent, "collector-cpu-percent", 50, "collector CPU budget as percent of one CPU")
 	fs.DurationVar(&drainTimeout, "drain-timeout", 5*time.Second, "maximum probe data drain time")
@@ -213,6 +214,9 @@ func run(args []string) (runErr error) {
 	}
 	if *requireTLS && (*noTLS || cmd != "capture") {
 		return errors.New("--require-tls requires capture with TLS enabled")
+	}
+	if *requirePlaintext && (*noTLS || cmd != "capture") {
+		return errors.New("--require-plaintext requires capture with TLS enabled")
 	}
 	if requestLimit < 1 || requestLimit > 1<<20 || responseLimit < 1 || responseLimit > 1<<20 || diskLimitMiB < 64 || retention <= 0 {
 		return errors.New("invalid resource or result limits")
@@ -516,6 +520,7 @@ func run(args []string) (runErr error) {
 				s.stats.DrainState = "confirmed"
 			}
 		}
+		finishIISObservability(s, *requirePlaintext)
 		s.stats.StopReason = "signal_or_duration"
 		s.stats.State = "stopped"
 		if s.stats.RawEvidenceWriters > 0 || s.stats.RawEvidencePendingBytes > 0 || s.stats.RawEvidenceDrainUnconfirmed {

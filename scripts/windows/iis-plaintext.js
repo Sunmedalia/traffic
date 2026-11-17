@@ -21,7 +21,11 @@ let events = [];
 let eventBytes = 0;
 let dropped = 0;
 let completed = 0;
-const diagnostics = {completion_entries: 0, matches: 0, remove_calls: 0, remove_ex_calls: 0, worker_calls: 0, samples: []};
+const diagnostics = {completion_entries: 0, matches: 0,
+    receive_matches: 0, body_matches: 0, send_matches: 0, interim_matches: 0,
+    unmatched_completions: 0, unmatched_receive: 0, unmatched_body: 0, unmatched_send: 0, unmatched_unknown: 0,
+    remove_calls: 0, remove_ex_calls: 0, worker_calls: 0, samples: []};
+let unmatchedReported = {receive: 0, body: 0, send: 0, unknown: 0};
 const verbs = ['', '', '', 'OPTIONS', 'GET', 'HEAD', 'POST', 'PUT', 'DELETE',
     'TRACE', 'CONNECT', 'TRACK', 'MOVE', 'COPY', 'PROPFIND', 'PROPPATCH', 'MKCOL', 'LOCK', 'UNLOCK', 'SEARCH'];
 const commonHeaders = ['Cache-Control', 'Connection', 'Date', 'Keep-Alive', 'Pragma',
@@ -280,14 +284,31 @@ function complete(operation, status, length) {
     }
 }
 
+function noteUnmatched(kind) {
+    diagnostics.unmatched_completions++;
+    const key = kind === 'receive' || kind === 'body' || kind === 'send' ? kind : 'unknown';
+    diagnostics['unmatched_' + key]++;
+    unmatchedReported[key]++;
+    // Do not enqueue here. This hook sees every I/O completion in the process.
+    // A gap event every few misses would fill the 512-event queue and drop HTTP.
+}
+
+// Completions posted before attach never entered pending. Their buffer is
+// unknowable, so they stay unmatched_unknown. The collector treats
+// "send matched, receive never matched, unmatched > 0" as the attach window.
 function completion(overlapped, status, length) {
     diagnostics.completion_entries++;
     const operation = pending.get(overlapped.toString());
     if (operation === undefined) {
         if (diagnostics.samples.length < 8) diagnostics.samples.push({overlapped: overlapped.toString(), pending: Array.from(pending.keys()).slice(0, 8)});
+        noteUnmatched('unknown');
         return;
     }
     diagnostics.matches++;
+    if (operation.kind === 'receive') diagnostics.receive_matches++;
+    else if (operation.kind === 'body') diagnostics.body_matches++;
+    else if (operation.kind === 'send') diagnostics.send_matches++;
+    else if (operation.kind === 'interim') diagnostics.interim_matches++;
     pending.delete(overlapped.toString());
     complete(operation, status, length);
 }
@@ -424,7 +445,17 @@ rpc.exports = {
         for (const [id, state] of requests) {
             if (state.known) gap(id, 'Capture stopped before response completed');
         }
+        // One record at stop. The completion has no operation kind, so the
+        // reason stays unmatched_completion. The collector decides the attach
+        // window from receive_matches versus send_matches.
+        if (unmatchedReported.unknown > 0) {
+            send({type: 'probe-gap', reason: 'unmatched_completion', kind: 'unknown', count: unmatchedReported.unknown, time: new Date().toISOString(), sequence: ++transportSequence, final: true});
+        }
         flush();
-        return {type: 'summary', last_sequence: transportSequence, completed, pending: pending.size, diagnostics, hooks_removed: restored, restored_sites: originalCode.size, plaintext_verified: false};
+        const plaintextObserved = diagnostics.receive_matches > 0;
+        return {type: 'summary', last_sequence: transportSequence, completed, pending: pending.size, diagnostics,
+            plaintext_observed: plaintextObserved,
+            attach_window_suspect: !plaintextObserved && diagnostics.unmatched_completions > 0 && diagnostics.send_matches > 0,
+            hooks_removed: restored, restored_sites: originalCode.size, plaintext_verified: false};
     }
 };

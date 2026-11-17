@@ -43,6 +43,8 @@ type Store struct {
 	targetTimes                        map[string]session.Target
 	localAddresses                     map[string]bool
 	packetDrops                        map[string]uint64
+	probeGapTotals                     map[string]uint64
+	iisAttached                        bool
 	fatal                              error
 	db                                 *sql.DB
 	dir                                string
