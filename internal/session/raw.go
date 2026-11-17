@@ -38,6 +38,7 @@ type OpenSSLEvent struct {
 }
 
 type IISEvent struct {
+	Kind        string      `json:"kind,omitempty"`
 	HTTPVersion string      `json:"http_version,omitempty"`
 	Protocol    string      `json:"protocol"`
 	Type        string      `json:"type"`

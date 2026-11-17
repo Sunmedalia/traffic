@@ -95,6 +95,9 @@ func (a *iisAssembler) ingest(event iisEvent) error {
 	if a.pending == nil {
 		a.pending = make(map[string]*iisRequest)
 	}
+	if event.Type == "probe-gap" {
+		return nil
+	}
 	if event.Type == "loss" {
 		a.store.gap("iis-httpapi", a.target.ID, "probe_queue_loss", "events", event.Count)
 		a.store.mu.Lock()

@@ -109,6 +109,12 @@ type Stats struct {
 	TLSWireRecords              uint64                         `json:"tls_wire_records"`
 	TLSRequests                 uint64                         `json:"tls_requests"`
 	TLSCoverage                 string                         `json:"tls_coverage,omitempty"`
+	PlaintextObserved           bool                           `json:"plaintext_observed"`
+	AttachWindowSuspect         bool                           `json:"attach_window_suspect"`
+	ProbeReceiveMatches         uint64                         `json:"probe_receive_matches"`
+	ProbeBodyMatches            uint64                         `json:"probe_body_matches"`
+	ProbeSendMatches            uint64                         `json:"probe_send_matches"`
+	ProbeUnmatchedCompletions   uint64                         `json:"probe_unmatched_completions"`
 	TLSMissingEstimate          *uint64                        `json:"tls_missing_estimate"`
 	Targets                     []Target                       `json:"targets,omitempty"`
 	ResourceLimits              string                         `json:"resource_limits"`

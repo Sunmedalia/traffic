@@ -114,7 +114,7 @@ func TestRawIISAPIEventsArePairedOnlyLocally(t *testing.T) {
 	now := time.Now().UTC()
 	target := &session.Target{PID: 77, ID: "77:start", Service: "iis", Ports: []int{443}}
 	events := []session.RawEvent{{Version: 1, Source: "iis-1", Type: "source", Backend: "iis", Target: target, Time: now}}
-	for _, event := range []session.IISEvent{{Type: "request", ID: "a", Connection: "c", Method: "GET", URL: "/.env", Client: "192.0.2.1:80", Local: "127.0.0.1:443", Time: now}, {Type: "request-end", ID: "a"}, {Type: "response", ID: "a", Status: 200}, {Type: "response-body", ID: "a", Data: []byte("ok")}, {Type: "response-end", ID: "a"}} {
+	for _, event := range []session.IISEvent{{Type: "probe-gap", Reason: "unmatched_completion", Kind: "unknown", Count: 10}, {Type: "request", ID: "a", Connection: "c", Method: "GET", URL: "/.env", Client: "192.0.2.1:80", Local: "127.0.0.1:443", Time: now}, {Type: "request-end", ID: "a"}, {Type: "response", ID: "a", Status: 200}, {Type: "response-body", ID: "a", Data: []byte("ok")}, {Type: "response-end", ID: "a"}} {
 		copy := event
 		events = append(events, session.RawEvent{Version: 1, Source: "iis-1", Type: "iis", Time: now, IIS: &copy})
 	}

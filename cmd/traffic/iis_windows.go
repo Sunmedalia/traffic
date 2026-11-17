@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-
 	"fmt"
 	"golang.org/x/sys/windows"
 	"os"
@@ -120,6 +119,7 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 			QueueDropped      uint64          `json:"queue_dropped"`
 			ScriptUnloaded    bool            `json:"script_unloaded"`
 			TransportDetached bool            `json:"transport_detached"`
+			Diagnostics       map[string]any  `json:"diagnostics"`
 			Payload           json.RawMessage `json:"payload"`
 		}
 		if err := json.Unmarshal(line, &message); err != nil {
@@ -127,6 +127,9 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 		}
 		if message.Type == "summary" && message.LastSequence != nil {
 			probeDrain = lastSequence == *message.LastSequence
+		}
+		if message.Type == "summary" && backend == "iis" {
+			applyIISProbeSummary(s, message.Diagnostics)
 		}
 		if message.Type == "host_summary" {
 			s.recordProbeExit(target.ID, session.ProbeExit{DataDrained: probeDrain && message.QueueDropped == 0, HooksRemoved: message.HooksRemoved, ScriptUnloaded: message.ScriptUnloaded, TransportDetached: message.TransportDetached, RuntimeState: "inspect hooks, script and transport separately"})
@@ -163,7 +166,11 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 			}
 			attached()
 			if backend == "iis" {
-				s.problem(fmt.Errorf("IIS dynamic attach cannot recover receive calls posted before attachment; startup requests may be missed"))
+				s.mu.Lock()
+				s.iisAttached = true
+				s.mu.Unlock()
+				fmt.Fprintf(os.Stderr, "IIS 探针已附加。附加前已投递的 HttpReceiveHttpRequest 无法补抓，默认应用池实测约 10 个。请先向本机端口打过这个数的热身请求，采集结束时检查 plaintext_observed。probe_receive_matches 在结束时写入 status.json，它表示接收 hook 命中，plaintext_observed 表示请求侧事件已记录。\n")
+				s.problem(fmt.Errorf("IIS dynamic attach cannot recover receive calls posted before attachment; default application pool pre-posts about 10 receives, so the first requests are missed until workers post new ones"))
 			}
 			continue
 		}
@@ -179,9 +186,10 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 			if err := json.Unmarshal(message.Payload, &apiEvent); err != nil {
 				return err
 			}
-			if err := p.record(source, backend, target, session.RawEvent{Type: "iis", Time: apiEvent.Time, IIS: &apiEvent}); err != nil {
+			if err := p.iis(source, target, apiEvent); err != nil {
 				return err
 			}
+
 			continue
 		}
 		if err := p.openssl(source, backend, target, event); err != nil {

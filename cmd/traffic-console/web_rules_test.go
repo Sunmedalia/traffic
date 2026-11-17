@@ -76,8 +76,15 @@ func TestWebRuleLibraryCRUDValidationAndBoundaries(t *testing.T) {
 	if status, data = call("GET", "/api/rules/local.yaml", nil); status != 200 || !bytes.Contains(data, []byte("local-marker")) {
 		t.Fatalf("read failed: %d %s", status, data)
 	}
-	if status, data = call("GET", "/api/rules", nil); status != 200 || !bytes.Contains(data, []byte(web.ruleLibrary.dir)) || !bytes.Contains(data, []byte("local.yaml")) {
+	var listing struct {
+		Dir   string     `json:"dir"`
+		Files []ruleFile `json:"files"`
+	}
+	if status, data = call("GET", "/api/rules", nil); status != 200 {
 		t.Fatalf("listing failed: %d %s", status, data)
+	}
+	if err = json.Unmarshal(data, &listing); err != nil || listing.Dir != web.ruleLibrary.dir || len(listing.Files) != 1 || listing.Files[0].Name != "local.yaml" {
+		t.Fatalf("listing contents: %v %s", err, data)
 	}
 	for _, revision := range []string{"", "stale"} {
 		if status, _ = call("PUT", "/api/rules/local.yaml", map[string]string{"content": testManagedRules, "revision": revision}); status != 409 {

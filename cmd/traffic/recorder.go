@@ -161,3 +161,25 @@ func (r *eventRecorder) boundary(prefix, kind, reason string) error {
 	}
 	return nil
 }
+
+// Observe only successfully queued raw requests. Final writer failures remain
+// fatal, so hook diagnostics alone can never satisfy --require-plaintext.
+func (r *eventRecorder) iis(source string, target session.Target, event iisEvent) error {
+	if err := r.record(source, "iis", target, session.RawEvent{Type: "iis", Time: event.Time, IIS: &event}); err != nil {
+		return err
+	}
+	if event.Type == "request" {
+		r.store.mu.Lock()
+		r.store.stats.PlaintextObserved = true
+		r.store.stats.AttachWindowSuspect = false
+		r.store.mu.Unlock()
+	}
+	if event.Type == "probe-gap" {
+		kind := event.Kind
+		if kind == "" {
+			kind = "unknown"
+		}
+		r.store.noteProbeGap(source, event.Reason, kind, event.Count)
+	}
+	return nil
+}
