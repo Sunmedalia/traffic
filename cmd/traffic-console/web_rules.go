@@ -217,6 +217,9 @@ func (l *ruleLibrary) write(name, content, revision string) (ruleFile, int, erro
 }
 
 func decodeWebJSON(rw http.ResponseWriter, r *http.Request, target any) error {
+	controller := http.NewResponseController(rw)
+	_ = controller.SetReadDeadline(time.Now().Add(15 * time.Second))
+	defer controller.SetReadDeadline(time.Time{})
 	r.Body = http.MaxBytesReader(rw, r.Body, 8*maxRuleBytes)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()

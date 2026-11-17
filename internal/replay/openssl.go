@@ -1,26 +1,15 @@
-package main
+package replay
 
 import (
 	"fmt"
+	"github.com/Sunmedalia/traffic/internal/session"
 	"net"
 	"strconv"
 	"strings"
 	"time"
 )
 
-type opensslEvent struct {
-	Sequence   uint64 `json:"sequence,omitempty"`
-	Type       string `json:"type"`
-	Protocol   string `json:"protocol"`
-	Message    string `json:"message"`
-	Connection string `json:"connection"`
-	Direction  string `json:"direction"`
-	Local      string `json:"local"`
-	Client     string `json:"client"`
-	Data       []byte `json:"data_b64"`
-	Incomplete bool   `json:"incomplete"`
-	Count      uint64 `json:"count"`
-}
+type opensslEvent = session.OpenSSLEvent
 
 type opensslAssembler struct {
 	processor  *HTTPProcessor

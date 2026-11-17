@@ -1,7 +1,8 @@
-package session
+package index
 
 import (
 	"database/sql"
+	"github.com/Sunmedalia/traffic/internal/session"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -16,7 +17,7 @@ func OpenDB(dir string, write bool) (*sql.DB, error) {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return nil, err
 		}
-		if err := RestrictDirectory(dir); err != nil {
+		if err := session.RestrictDirectory(dir); err != nil {
 			return nil, err
 		}
 	}

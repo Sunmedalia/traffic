@@ -28,6 +28,7 @@ parser.add_argument(
     "--config", type=Path, default=Path("/etc/nginx/sites-available/traffic-lab")
 )
 parser.add_argument("--binary", default="/opt/traffic/bin/traffic")
+parser.add_argument("--analysis-binary", default="/opt/traffic/bin/traffic-console")
 parser.add_argument("--output", required=True)
 parser.add_argument("--seconds", type=int, default=300)
 parser.add_argument("--rounds", type=int, default=3)
@@ -218,7 +219,9 @@ for rate in args.rates:
                 row["exit_code"] = process.returncode
                 row["capture"] = json.loads((session / "status.json").read_text())
                 if mode == "tls":
-                    database = sqlite3.connect(session / "index.sqlite")
+                    subprocess.run([args.analysis_binary, "analyze", "--session", str(session)], check=True, stdout=subprocess.DEVNULL)
+                    pointer = json.loads((session / "analysis-current.json").read_text())
+                    database = sqlite3.connect(session / pointer["file"])
                     paired = 0
                     markers = set()
                     duplicates = 0

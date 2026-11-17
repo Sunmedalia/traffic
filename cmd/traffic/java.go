@@ -24,7 +24,7 @@ import (
 	"github.com/Sunmedalia/traffic/internal/session"
 )
 
-func captureJava(ctx context.Context, s *Store, p *HTTPProcessor, t session.Target, jar, helper string, attached func()) error {
+func captureJava(ctx context.Context, s *Store, p *eventRecorder, t session.Target, jar, helper string, attached func()) error {
 	jar, err := filepath.Abs(jar)
 	if err != nil {
 		return err
@@ -157,19 +157,12 @@ func captureJava(ctx context.Context, s *Store, p *HTTPProcessor, t session.Targ
 	s.mu.Lock()
 	s.stats.TLS = "attached"
 	s.mu.Unlock()
-	dir := filepath.Join(s.dir, "tls")
-	if err = os.MkdirAll(dir, 0700); err != nil {
-		return err
-	}
-	evidence, err := os.OpenFile(filepath.Join(dir, fmt.Sprintf("java-%d.jsonl", t.PID)), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	raw := newEvidenceWriter(s, evidence, "java-agent")
-	defer raw.Close()
-	frames := &Frames{}
-	stop := frames.startExpiry(ctx, p)
-	defer stop()
+	source := fmt.Sprintf("java-%d/%s", serial.Add(1), t.ID)
+	defer func() {
+		if err := p.record(source, "java-agent", t, session.RawEvent{Type: "end"}); err != nil {
+			s.fail(err)
+		}
+	}()
 	var lastSequence, lastDropped uint64
 	for scanner.Scan() {
 		var event struct {
@@ -190,8 +183,9 @@ func captureJava(ctx context.Context, s *Store, p *HTTPProcessor, t session.Targ
 		if event.Dropped > lastDropped {
 			s.gap("java-agent", t.ID, "probe_queue_loss", "events", event.Dropped-lastDropped)
 			lastDropped = event.Dropped
-			frames.expire(time.Now(), true, p, "")
-			p.invalidatePrefix("tls:java:"+t.ID+":", "probe_queue_loss")
+			if err := p.record(source, "java-agent", t, session.RawEvent{Type: "loss", Reason: "probe_queue_loss"}); err != nil {
+				return err
+			}
 		}
 		if event.Type == "drained" {
 			confirmed := event.Sequence == lastSequence
@@ -204,14 +198,13 @@ func captureJava(ctx context.Context, s *Store, p *HTTPProcessor, t session.Targ
 		if event.Sequence > 0 {
 			if lastSequence > 0 && event.Sequence != lastSequence+1 {
 				s.gap("java-agent", t.ID, "transport_sequence_gap", "events", 1)
-				p.invalidatePrefix("tls:java:"+t.ID+":", "transport_sequence_gap")
+				if err := p.record(source, "java-agent", t, session.RawEvent{Type: "loss", Reason: "transport_sequence_gap"}); err != nil {
+					return err
+				}
 			}
 			lastSequence = event.Sequence
 		}
 		if event.Type != "heartbeat" && capturePorts[event.Port] {
-			if _, err = raw.Write(append(append([]byte{}, scanner.Bytes()...), '\n')); err != nil {
-				return err
-			}
 			key := "java:" + t.ID + ":" + event.Connection
 			direction := "write"
 			if event.Read {
@@ -224,13 +217,11 @@ func captureJava(ctx context.Context, s *Store, p *HTTPProcessor, t session.Targ
 					s.mu.Unlock()
 					s.gap("java-agent", key, "legacy_gap_marker", "events", 1)
 				}
-				frames.expire(time.Now(), true, p, key)
 			}
-			p.mu.Lock()
-			q := p.pending["tls:"+key]
-			head := len(q) > 0 && q[0].Method == "HEAD"
-			p.mu.Unlock()
-			frames.ingest(key+direction, event.Payload, frameContext{connection: key, client: event.Client, pid: t.PID, incomplete: event.Incomplete, local: event.Local}, head, p)
+			if err := p.record(source, "java-agent", t, session.RawEvent{Type: "data", Connection: key, Direction: direction, Data: event.Payload, Client: event.Client, Local: event.Local, Incomplete: event.Incomplete}); err != nil {
+				return err
+			}
+
 		}
 		control := byte(1)
 		if stopping.Load() {

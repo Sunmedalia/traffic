@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"github.com/Sunmedalia/traffic/internal/index"
 	"os"
 	"path/filepath"
 
@@ -24,20 +25,51 @@ type Store struct {
 }
 
 func openStore(dir string) (*Store, error) {
-	db, err := session.OpenDB(dir, false)
+	before, _ := analysisDatabasePath(dir)
+	s, err := openStoreOnce(dir)
+	if err != nil {
+		after, pathErr := analysisDatabasePath(dir)
+		if pathErr == nil && before != after {
+			return openStoreOnce(dir)
+		}
+	}
+	return s, err
+}
+
+func openStoreOnce(dir string) (*Store, error) {
+	if rawSession(dir) {
+		return openRawStore(dir)
+	}
+	db, err := index.OpenDB(dir, false)
 	if err != nil {
 		return nil, err
 	}
 	s := &Store{db: db, dir: dir}
-	if _, err := os.Stat(filepath.Join(dir, "analysis.sqlite")); err == nil {
-		report, err := readAnalysisReport(dir)
-		if err != nil {
-			s.analysisNote = "本地分析结果不可用：" + err.Error()
-			return s, nil
-		}
-		if _, err = db.Exec("ATTACH DATABASE ? AS analysis", analysisURL(filepath.Join(dir, "analysis.sqlite"), "ro")); err != nil {
+	if analysisExists(dir) {
+		if err := validateAnalysisDestination(dir); err != nil {
 			db.Close()
 			return nil, err
+		}
+		path, err := analysisDatabasePath(dir)
+		if err != nil {
+			db.Close()
+			return nil, err
+		}
+		if _, err = db.Exec("ATTACH DATABASE ? AS analysis", analysisURL(path, "ro")); err != nil {
+			db.Close()
+			return nil, err
+		}
+		var raw []byte
+		var report analysisReport
+		err = db.QueryRow("SELECT data FROM analysis.metadata WHERE id=1").Scan(&raw)
+		if err == nil {
+			err = json.Unmarshal(raw, &report)
+		}
+		signature, sigErr := sourceSignature(dir)
+		if err != nil || sigErr != nil || report.Source != signature {
+			db.Exec("DETACH DATABASE analysis")
+			s.analysisNote = "本地分析结果不可用：采集索引已变化或分析库无效，请重新运行 traffic-console analyze"
+			return s, nil
 		}
 		// The temporary view shadows main.requests only on this read connection.
 		// Results contain alerts only; bodies always come from collected evidence.
@@ -50,10 +82,7 @@ FROM main.requests r LEFT JOIN analysis.results a ON a.id=r.id`)
 			db.Close()
 			return nil, err
 		}
-		s.analysis = report
-	} else if !os.IsNotExist(err) {
-		db.Close()
-		return nil, err
+		s.analysis = &report
 	} else {
 		// Without the analysis temp view, independent read connections are safe.
 		// Analysis stores keep one connection because the view is connection-local.

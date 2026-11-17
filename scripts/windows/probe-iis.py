@@ -27,8 +27,8 @@ def main():
     parser.add_argument("--runtime-dir", type=Path, help="existing temporary directory readable by the target process identity")
     parser.add_argument("--plaintext", action="store_true", help="experimental asynchronous HTTP Server API body capture")
     parser.add_argument("--ports", default="8443")
-    parser.add_argument("--request-limit", type=int, default=256 << 10)
-    parser.add_argument("--response-limit", type=int, default=64 << 10)
+    parser.add_argument("--request-limit", type=int, default=0)
+    parser.add_argument("--response-limit", type=int, default=0)
     parser.add_argument("--control-stdin", action="store_true")
     args = parser.parse_args()
     if args.pid <= 0 or args.duration < 0:
@@ -36,8 +36,8 @@ def main():
     ports = [int(port) for port in args.ports.split(",")]
     if not all(1 <= port <= 65535 for port in ports):
         parser.error("ports must be between 1 and 65535")
-    if not (1 <= args.request_limit <= 1 << 20 and 1 <= args.response_limit <= 1 << 20):
-        parser.error("body limits must be between 1 byte and 1 MiB")
+    if not (0 <= args.request_limit <= 1 << 20 and 0 <= args.response_limit <= 1 << 20):
+        parser.error("body limits must be 0 (unlimited) or between 1 byte and 1 MiB")
     if args.runtime_dir is not None:
         runtime_dir = args.runtime_dir.resolve(strict=True)
         if not runtime_dir.is_dir():

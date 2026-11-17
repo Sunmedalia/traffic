@@ -35,10 +35,11 @@ type sessionsFound struct {
 // index or analysis file changes, so periodic discovery does not reopen every
 // session database.
 type sessionCheck struct {
-	indexMod, analysisMod   time.Time
-	indexSize, analysisSize int64
-	analysisPresent         bool
-	alerts                  uint64
+	revision        string
+	analysisPresent bool
+	alerts          uint64
+	transactions    uint64
+	reconstructed   bool
 }
 
 type discoveryCache struct {
@@ -50,37 +51,42 @@ func newDiscoveryCache() *discoveryCache {
 	return &discoveryCache{entries: map[string]sessionCheck{}}
 }
 
-func (c *discoveryCache) get(dir string, index, analysis fs.FileInfo) (sessionCheck, bool) {
-	if c == nil || index == nil {
-		return sessionCheck{}, false
+func sessionRevision(dir string) (string, error) {
+	source, err := sourceSignature(dir)
+	if err != nil {
+		return "", err
 	}
-	want := sessionCheck{indexMod: index.ModTime(), indexSize: index.Size()}
-	if analysis != nil {
-		want.analysisPresent = true
-		want.analysisMod, want.analysisSize = analysis.ModTime(), analysis.Size()
+	path, err := analysisDatabasePath(dir)
+	if err != nil {
+		return "", err
+	}
+	revision := source + "|" + path
+	for _, name := range []string{path, filepath.Join(dir, "status.json")} {
+		info, err := os.Stat(name)
+		if err == nil {
+			revision += fmt.Sprintf("|%s:%d:%d", name, info.Size(), info.ModTime().UnixNano())
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+	}
+	return revision, nil
+}
+func (c *discoveryCache) get(dir, revision string) (sessionCheck, bool) {
+	if c == nil || revision == "" {
+		return sessionCheck{}, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	got, ok := c.entries[dir]
-	if !ok || got.indexMod != want.indexMod || got.indexSize != want.indexSize ||
-		got.analysisPresent != want.analysisPresent || got.analysisMod != want.analysisMod || got.analysisSize != want.analysisSize {
-		return sessionCheck{}, false
-	}
-	return got, true
+	return got, ok && got.revision == revision
 }
-
-func (c *discoveryCache) put(dir string, index, analysis fs.FileInfo, alerts uint64) {
-	if c == nil || index == nil {
+func (c *discoveryCache) put(dir string, entry sessionCheck) {
+	if c == nil || entry.revision == "" {
 		return
 	}
-	entry := sessionCheck{indexMod: index.ModTime(), indexSize: index.Size(), alerts: alerts}
-	if analysis != nil {
-		entry.analysisPresent = true
-		entry.analysisMod, entry.analysisSize = analysis.ModTime(), analysis.Size()
-	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.entries[dir] = entry
-	c.mu.Unlock()
 }
 
 func (c *discoveryCache) clear() {
@@ -162,7 +168,7 @@ func sessionRoots(root string) []string {
 		}
 	}
 	// Also recognize a session when started inside its directory.
-	if info, err := os.Stat("index.sqlite"); err == nil && info.Mode().IsRegular() {
+	if info, err := os.Stat("index.sqlite"); (err == nil && info.Mode().IsRegular()) || rawSession(".") {
 		roots = append(roots, sessionPath("."))
 	}
 	return roots
@@ -204,23 +210,35 @@ func discoverSessions(ctx context.Context, roots []string, caches ...*discoveryC
 		if item.Started.IsZero() {
 			item.Started = indexInfo.ModTime()
 		}
-		var analysisInfo fs.FileInfo
-		if info, err := os.Stat(filepath.Join(dir, "analysis.sqlite")); err == nil && info.Mode().IsRegular() {
-			analysisInfo = info
-		}
-		cached, ok := cache.get(dir, indexInfo, analysisInfo)
+		revision, _ := sessionRevision(dir)
+		cached, ok := cache.get(dir, revision)
 		if ok {
 			if cached.analysisPresent {
 				item.Stats.Alerts = cached.alerts
+				if cached.reconstructed {
+					item.Stats.Transactions = cached.transactions
+					item.CountsKnown = true
+				}
+			} else if rawSession(dir) {
+				item.CountsKnown = false
 			}
 		} else {
 			var problem string
-			var alerts uint64
+			check := sessionCheck{revision: revision}
 			s, err := openStore(dir)
 			if err == nil {
 				if s.analysis != nil {
-					alerts = s.analysis.Alerts
-					item.Stats.Alerts = alerts
+					check.analysisPresent = true
+					check.alerts = s.analysis.Alerts
+					check.reconstructed = s.analysis.Reconstructed
+					check.transactions = s.analysis.Transactions
+					item.Stats.Alerts = check.alerts
+					if check.reconstructed {
+						item.Stats.Transactions = check.transactions
+						item.CountsKnown = true
+					}
+				} else if rawSession(dir) {
+					item.CountsKnown = false
 				}
 				checkCtx, cancel := context.WithTimeout(ctx, time.Second)
 				// Validate the schema, even for an empty or legacy session without a manifest.
@@ -239,7 +257,7 @@ func discoverSessions(ctx context.Context, roots []string, caches ...*discoveryC
 			// Only cache successful validation. A transient lock or timeout must
 			// not make a session look broken until its index changes.
 			if problem == "" {
-				cache.put(dir, indexInfo, analysisInfo, alerts)
+				cache.put(dir, check)
 			}
 		}
 		result.Entries = append(result.Entries, item)
@@ -262,6 +280,12 @@ func discoverSessions(ctx context.Context, roots []string, caches ...*discoveryC
 					// A session's packets and exports live below it; they cannot
 					// contain another session index.
 					return fs.SkipDir
+				}
+				if rawSession(path) {
+					if info, err := os.Stat(filepath.Join(path, "manifest.json")); err == nil {
+						add(path, info)
+						return fs.SkipDir
+					}
 				}
 				return nil
 			}

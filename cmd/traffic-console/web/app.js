@@ -676,7 +676,7 @@ function drawTimeline(host, data, height) {
     bars, svg('line', { class: 'base', x1: 0, x2: width, y1: height - 0.5, y2: height - 0.5 }), hover, brush);
   const tip = h('div', { class: 'tip', hidden: true });
   const firstDay = parts(new Date(start)).slice(0, 3).join('-');
-  const lastDay = parts(new Date(start + (count - 1) * step)).slice(0, 3).join('-');
+  const lastDay = parts(new Date(start + count * step)).slice(0, 3).join('-');
   const crossesDay = firstDay !== lastDay;
   const axisStyle = data.granularity >= 86400 ? 'full' : crossesDay ? 'dayclock' : 'clock';
   const labels = [0, 0.5, 1].map((at) => formatTime(new Date(start + Math.round((count - 1) * at) * step + (at === 1 ? step : 0)), axisStyle));
@@ -881,7 +881,7 @@ async function showDetail(id, quiet) {
     state.detail = data;
     renderDetail();
   } catch (error) {
-    if (state.selected !== id || quiet) return;
+    if (state.selected !== id || state.sid !== sid || quiet) return;
     state.detailError = error.status === 404 ? '这条记录已被保留期清理，无法再查看。' : error.message;
     renderDetail();
   }
@@ -1109,7 +1109,7 @@ async function tick() {
     return;
   }
   if (state.paused || state.busy) return;
-  if (state.stats && state.stats.state !== 'running' && state.stats.state !== 'stale') return;
+  if (state.stats && state.stats.state !== 'running' && state.stats.state !== 'starting' && state.stats.state !== 'stale') return;
   await refresh(true);
   const t = state.detail && state.detail.transaction;
   // A response can arrive after the request was first shown.
@@ -1126,7 +1126,7 @@ function schedule() {
   if (state.offline) delay = 3000;
   else if (!state.sid) delay = 10000;
   else if (!state.stats) delay = Math.max(500, state.refreshMs);
-  else if (state.stats.state === 'running') delay = state.refreshMs;
+  else if ((state.stats.state === 'running' || state.stats.state === 'starting')) delay = state.refreshMs;
   else if (state.stats.state === 'stale') delay = Math.max(5000, state.refreshMs);
   else return; // Stopped and finished sessions only refresh on demand.
   refreshTimer = setTimeout(async () => {

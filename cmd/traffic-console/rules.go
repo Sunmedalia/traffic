@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	yaml "gopkg.in/yaml.v3"
 	"io"
 	"net"
 	"net/http"
@@ -15,8 +16,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"gopkg.in/yaml.v3"
 
 	"github.com/Sunmedalia/traffic/internal/session"
 )
@@ -126,6 +125,10 @@ func loadRules(path string) error {
 func detect(t Transaction) []Alert { return detectWithRules(t, rules) }
 
 func detectWithRules(t Transaction, rs []Rule) []Alert {
+	return detectWithLimits(t, rs, requestLimit, responseLimit)
+}
+
+func detectWithLimits(t Transaction, rs []Rule, requestLimit, responseLimit int) []Alert {
 	var out []Alert
 	var request, response *detectionHTTP
 	type fieldView struct{ field, view string }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	lipgloss "charm.land/lipgloss/v2"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -17,7 +18,6 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 	termansi "github.com/charmbracelet/x/ansi"
 
 	"github.com/Sunmedalia/traffic/internal/session"

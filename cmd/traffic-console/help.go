@@ -24,7 +24,7 @@ func consoleHelpOptions(cmd string) map[string]bool {
 	case "web":
 		names = "session data-dir rules-dir listen allow-remote refresh"
 	case "analyze":
-		names = "session rules scan-window scan-paths alert-webhook json"
+		names = "session rules scan-window scan-paths alert-webhook request-limit response-limit json"
 	case "requests", "events":
 		names = "session limit service client rule severity since json"
 	case "export":
@@ -45,7 +45,7 @@ func printConsoleHelp(w io.Writer, cmd string, cn bool, fs *flag.FlagSet) {
 用法：traffic-console <命令> [参数]
   view       中文终端会话浏览（默认命令）
   web        浏览器分析、规则文件管理与后台分析
-  analyze    停采后在本地执行规则匹配并保存分析结果
+  analyze    停采后还原、配对、索引并执行规则匹配
   rules      校验自定义 YAML 规则：rules check FILE
   status     查看采集状态及已有分析信息
   requests   查询请求（JSON）
@@ -53,7 +53,7 @@ func printConsoleHelp(w io.Writer, cmd string, cn bool, fs *flag.FlagSet) {
   show ID    查看请求、响应及检测依据
   export ID  导出证据 ZIP
 
-采集由 traffic 完成，不执行规则匹配。分析只读取已保存的流量。
+traffic 只保存原始流量；console 在本地完成还原、配对、索引和规则匹配。
 Web 顶部「规则与分析」支持新建、导入、编辑、校验、下载及删除规则文件。
 
 示例：
@@ -70,7 +70,7 @@ Web 顶部「规则与分析」支持新建、导入、编辑、校验、下载�
 Usage: traffic-console <command> [options]
   view        Browse sessions in the terminal (default)
   web         Browse evidence, manage YAML rules and run local analysis
-  analyze     Match rules against a stopped session
+  analyze     Reconstruct, pair, index and match a stopped session
   rules       Validate custom rules: rules check FILE
   status      Show capture status and saved analysis metadata
   requests    Query requests as JSON
@@ -84,7 +84,7 @@ Examples:
   traffic-console --session ./sessions/case
   traffic-console rules check ./rules/custom.yaml
 
-Collection never matches rules. Local analysis reads saved traffic only.
+Collection saves raw traffic. Local analysis reconstructs TCP/HTTP, pairs messages, indexes and matches rules.
 Use traffic-console <command> --help for command-specific help.
 中文帮助：traffic-console --cn-help / web --cn-help / analyze --cn-help`)
 		}
@@ -106,8 +106,10 @@ Use traffic-console <command> --help for command-specific help.
 		"session": "已有会话目录（原始采集数据保持只读）", "data-dir": "会话搜索根目录，默认程序旁的 sessions",
 		"rules-dir": "Web 规则存放目录，默认程序旁的 rules；源码 bin 构建使用项目根目录",
 		"rules":     "追加 YAML 规则文件；不指定时仅使用内置规则", "scan-window": "扫描行为关联窗口，默认 1m", "scan-paths": "扫描行为不同路径阈值，默认 20",
-		"alert-webhook": "本地分析成功后投递告警；令牌从 TRAFFIC_WEBHOOK_TOKEN 读取",
-		"listen":        "Web 监听地址，默认 127.0.0.1:8080", "allow-remote": "允许非回环地址上的明文 HTTP 访问", "refresh": "界面刷新间隔，默认 1s；Web 最小 500ms",
+		"request-limit":  "本地还原及检测的请求正文上限，默认 1 MiB，最大 16 MiB",
+		"response-limit": "本地还原及检测的响应正文上限，默认 1 MiB，最大 16 MiB",
+		"alert-webhook":  "本地分析成功后投递告警；令牌从 TRAFFIC_WEBHOOK_TOKEN 读取",
+		"listen":         "Web 监听地址，默认 127.0.0.1:8080", "allow-remote": "允许非回环地址上的明文 HTTP 访问", "refresh": "界面刷新间隔，默认 1s；Web 最小 500ms",
 		"out": "证据 ZIP 路径，不覆盖已有文件", "limit": "最多返回的查询结果数，默认 100", "service": "按服务筛选", "client": "按来源 IP 或 IP:端口筛选",
 		"rule": "按规则 ID 筛选", "severity": "最低告警级别：low / medium / high", "since": "RFC3339 起始时间", "json": "查询默认输出 JSON",
 	}
@@ -156,9 +158,9 @@ Use traffic-console <command> --help for command-specific help.
 	}
 	if cmd == "analyze" {
 		if cn {
-			fmt.Fprintln(w, "\n先停止采集，再把完整会话复制到本地分析。结果单独写入 analysis.sqlite；重跑会替换上次结果。\n规则只匹配已保存内容，不能恢复截断或缺失流量。")
+			fmt.Fprintln(w, "\n先停止采集，再把完整会话复制到本地分析。原始会话先还原再匹配；结果写入 analysis-*.sqlite，由 analysis-current.json 原子选择。\n失败或取消保留上次结果；请求/响应正文默认各 1 MiB，可调至 16 MiB 后重跑。\n原始流量保持只读；缺失的原始流量无法恢复。")
 		} else {
-			fmt.Fprintln(w, "\nStop capture first and copy the complete session locally. Results go to analysis.sqlite; rerunning replaces previous results.\nRules only inspect saved content and cannot recover missing or truncated traffic.")
+			fmt.Fprintln(w, "\nStop capture first and copy the complete session locally. Raw sessions are reconstructed before matching. Results go to analysis-*.sqlite, selected atomically by analysis-current.json.\nFailure or cancellation keeps the last result. Body limits default to 1 MiB each, maximum 16 MiB; raise them and rerun.\nOriginal evidence stays read-only. Missing raw traffic cannot be recovered.")
 		}
 	}
 	if !cn {

@@ -89,10 +89,12 @@ def verify(args):
             return json.loads(subprocess.check_output([str(Path(args.analysis_binary).resolve()),
                                                        "requests", "--session", str(session)]))
 
-        # libpcap delivery and the bounded SQLite batch are asynchronous.
-        wait_for(lambda: len(records()) == 1, [service, capture])
+        # Allow the packet backend to deliver its buffered raw packets.
+        time.sleep(2)
         stop(capture)
         assert capture.returncode == 0, "capture failed"
+        assert not (session / "index.sqlite").exists(), "collector unexpectedly indexed traffic"
+        subprocess.check_call([str(Path(args.analysis_binary).resolve()), "analyze", "--session", str(session)])
         rows = records()
         assert len(rows) == 1 and rows[0]["url"] == "/netns-proof" and rows[0]["status"] == 200, rows
         assert not rows[0]["incomplete"] and not rows[0]["truncated"], rows

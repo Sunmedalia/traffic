@@ -41,11 +41,11 @@ flowchart LR
     D --> F[证据 ZIP + SHA-256]
 ```
 
-> **当前发布边界**：HTTP/2 已有有界解析和自动化回归，完整后端实机矩阵仍待验收。持续高负载仍有接收队列溢出样本，低影响门槛、八小时长压和部分后端排空确认尚未完成。已知缺口见 [优化进度](OPTIMIZATION.md)，实测结果见 [验证记录](VALIDATION.md)。
+> **当前发布边界**：HTTP/2 已有有界解析和自动化回归，完整后端实机矩阵仍待验收。持续高负载仍有接收队列溢出样本，低影响门槛、八小时长压和部分后端排空确认尚未完成。已知缺口见 [优化进度](OPTIMIZATION.md)，实测结果见 [验证记录](VALIDATION.md)，本轮修复见 [边界审核](docs/boundary-review-2026-11-17.md)。
 
 ## 采集与本地分析分离（当前源码）
 
-当前源码中的 `traffic capture` / `traffic import` 只还原并保存流量，不执行规则匹配、扫描检测或告警外送。停止采集后，将整个会话目录复制到本地，运行：
+当前源码中的 `traffic capture` / `traffic import` 只保存原始网络包、探针明文事件和元数据，不执行 TCP/HTTP 还原、配对、索引、规则匹配或告警外送。停止采集后，将整个会话目录复制到本地，运行：
 
 ```bash
 ./traffic-console analyze --session ./sessions/first-capture
@@ -56,11 +56,13 @@ flowchart LR
 ./traffic-console web --session ./sessions/first-capture
 ```
 
-分析结果单独保存在会话旁的 `analysis.sqlite`，只包含告警和规则信息，不复制正文、不改写 `index.sqlite`、PCAP、TLS 明文或采集状态。查询和导出自动读取这份结果；未分析会话仍可浏览流量。旧会话原有告警可继续查看，执行 `analyze` 后采用本次规则结果。分析依据是已保存的流量，无法找回采集时截断或遗漏的内容。
+`traffic-console analyze` 在本地完成 TCP/HTTP 还原、请求响应配对、索引和规则匹配。新会话使用布局 v3，采集阶段没有 `index.sqlite`；未分析时只能查看采集状态，需先执行分析才能浏览请求。旧版带 `index.sqlite` 的会话仍可打开和重新匹配规则。
+
+本地结果写入不可变的 `analysis-*.sqlite`，由 `analysis-current.json` 原子选择当前版本。新会话的本地结果包括还原正文、索引、告警和规则快照；旧会话仅追加告警分析，不改原索引。失败或取消保留上次完整结果；PCAP、TLS 原始事件及采集状态保持只读。请求与响应正文的本地还原、检测上限默认各 1 MiB，可用 `analyze --request-limit 2097152 --response-limit 2097152` 调大后重跑，最大各 16 MiB。提高上限可重新读取原始流量，无法补回实际漏采的字节。
 
 Web 顶部的「规则与分析」支持新建、导入、编辑、校验、保存、下载和删除 YAML 文件，并选择会话及规则执行 / 停止后台分析；完成后页面自动更新告警。规则默认存放在程序旁的 `rules/`（源码 `bin/` 构建使用项目根目录），可用 `traffic-console web --rules-dir /path/to/rules` 指定。内置规则只读，自定义文件按需追加，修改文件后需重新分析。[规则目录说明](rules/README.md)
 
-`--rules`、`--scan-window`、`--scan-paths`、`--alert-webhook` 已移到 `traffic-console analyze`；规则校验改用 `traffic-console rules check FILE`。`--no-detect` 仅保留为采集器兼容参数。**此变更尚未发布，下面列出的 v0.1.2 发行包仍采用旧检测流程。**
+`--request-limit`、`--response-limit`、`--rules`、`--scan-window`、`--scan-paths`、`--alert-webhook` 已移到 `traffic-console analyze`；规则校验改用 `traffic-console rules check FILE`。`--retention` 已删除；`--no-detect` 仅保留为采集器兼容参数。**此变更尚未发布，下面列出的 v0.1.2 发行包仍采用旧检测流程。**
 
 ## 下载与安装
 
@@ -196,9 +198,10 @@ sessions/<host>/<date>/<session>/
 ├── manifest.json    构建、主机与采集条件
 ├── status.json      心跳、计数、资源及退出状态
 ├── gaps.jsonl       已知缺口及计量单位
-├── index.sqlite     请求、响应与告警
-├── packets/         循环 PCAP，HTTPS 仍是密文
-├── tls/             探针明文事件
+├── analysis-current.json  本地分析成功后创建的结果指针
+├── analysis-*.sqlite      本地还原、索引、告警与规则快照
+├── packets/         顺序分段 PCAP，HTTPS 仍是密文
+├── tls/stream.jsonl 探针明文原始事件（按需创建）
 └── logs/            诊断日志
 ```
 
@@ -206,7 +209,7 @@ sessions/<host>/<date>/<session>/
 - **未知覆盖**：`tls_coverage=unverified` 与 `tls_missing_estimate=null` 表示启动窗口和探针盲区未量化。零观测丢弃不能证明完整。
 - **退出确认**：`drain_state` 与 `probe_exits` 区分数据排空、hook 恢复及运行时状态；停止辅助进程不代表目标内探针完全卸载。
 
-请求/响应正文默认保存 256/64 KiB；会话磁盘预算 2 GiB，索引保留 24 小时。采集器及子进程默认限制 256 MiB、单核 50%，不包含目标进程内探针开销。完整参数见 [资源与证据限制](docs/guide.md#资源与证据限制)。
+采集端不按 HTTP 正文截断，也不清理索引；PCAP 分段顺序保留，达到会话磁盘预算（默认 2 GiB）时停止。磁盘检查有间隔，预算不是硬字节上限；剩余空间低于 512 MiB 也会停止。探针仍有单事件、队列和附加覆盖限制。采集器及子进程默认限制 256 MiB、单核 50%，不包含目标进程内探针开销。完整参数见 [资源与证据限制](docs/guide.md#资源与证据限制)。
 
 ## 文档与开发
 

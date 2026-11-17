@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -46,6 +45,7 @@ func (w *webServer) handleTimeline(rw http.ResponseWriter, r *http.Request) {
 	if s == nil {
 		return
 	}
+	defer s.db.Close()
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	where, args := filter.where(get("alerts") == "1")
@@ -115,16 +115,18 @@ func webCounts(ctx context.Context, db *sql.DB, query string, args []any, scan f
 	return result, rows.Err()
 }
 
-func summaryRevision(dir string) string {
-	parts := make([]string, 0, 4)
-	for _, name := range []string{"index.sqlite", "index.sqlite-wal", "analysis.sqlite", "analysis.sqlite-wal"} {
-		if info, err := os.Stat(filepath.Join(dir, name)); err == nil {
-			parts = append(parts, fmt.Sprintf("%s:%d:%d", name, info.ModTime().UnixNano(), info.Size()))
-		} else {
-			parts = append(parts, name+":-")
-		}
+func summaryRevision(s *Store) string {
+	signature, err := sourceSignature(s.dir)
+	if err != nil {
+		return ""
 	}
-	return strings.Join(parts, "|")
+	if s.analysis != nil {
+		signature += fmt.Sprintf("|%s|%s", s.analysis.Completed.Format(time.RFC3339Nano), s.analysis.RulesSHA256)
+	}
+	if info, err := os.Stat(filepath.Join(s.dir, "status.json")); err == nil {
+		signature += fmt.Sprintf("|%d:%d", info.Size(), info.ModTime().UnixNano())
+	}
+	return signature
 }
 
 func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
@@ -137,13 +139,14 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 	if s == nil {
 		return
 	}
+	defer s.db.Close()
 	// Finished sessions cannot change until their index or analysis file does.
 	// Cache those summaries; running captures are re-scanned on every request.
 	status, _ := readTUIStatus(s.dir)
-	finished := status.State != "" && status.State != "running" && status.State != "stale"
-	revision := summaryRevision(s.dir)
+	finished := status.State != "" && status.State != "running" && status.State != "starting" && status.State != "stale"
+	revision := summaryRevision(s)
 	key := s.dir + "|" + r.URL.RawQuery
-	if finished {
+	if finished && revision != "" {
 		w.summaryMu.Lock()
 		entry, ok := w.summaries[key]
 		w.summaryMu.Unlock()
@@ -219,7 +222,7 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 		webError(rw, http.StatusInternalServerError, err)
 		return
 	}
-	if finished {
+	if finished && revision != "" {
 		w.summaryMu.Lock()
 		if len(w.summaries) > 128 {
 			w.summaries = map[string]summaryCacheEntry{}

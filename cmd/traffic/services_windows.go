@@ -228,7 +228,7 @@ func discoverTargets(root, service string, selectedPID int, library string) []se
 	return targets
 }
 
-func captureServices(ctx context.Context, s *Store, p *HTTPProcessor, _, library, service string, pid int, _ bool, _, _ string, _ int) {
+func captureServices(ctx context.Context, s *Store, p *eventRecorder, _, library, service string, pid int, _ bool, _, _ string, _ int) {
 	if iisProbe != "" || opensslProbe != "" {
 		captureWindowsServices(ctx, s, p, service, pid, library)
 		return

@@ -114,8 +114,7 @@ def verify(args):
         port = int((root / 'port').read_text())
         command = [str(Path(args.binary).resolve()), 'capture', '--interfaces', 'lo',
                    '--ports', str(port), '--openssl-preload-socket', sock,
-                   '--output', str(root / 'session'), '--request-limit', '1048576',
-                   '--response-limit', '1048576', '--trusted-proxies', '127.0.0.1']
+                   '--output', str(root / 'session'), '--trusted-proxies', '127.0.0.1']
         collector = subprocess.Popen(command, stdout=collector_log, stderr=collector_log)
         def capture_ready():
             status_path=root / 'session' / 'status.json'
@@ -166,10 +165,10 @@ def verify(args):
                                               '--session', str(root / 'session'), '--limit', '1000'])
             return json.loads(output)
 
-        def complete():
-            captured = records()
-            return len(captured) == len(expected) and all(record['status'] == 200 for record in captured)
-        wait_for(complete, [service, collector])
+        # Only raw evidence is available until capture stops and console rebuilds it.
+        time.sleep(1)
+        if (root / 'session' / 'index.sqlite').exists():
+            raise AssertionError('collector unexpectedly indexed traffic')
         stop(collector)
         if collector.returncode != 0:
             raise RuntimeError('collector failed: {}'.format(collector.returncode))
@@ -183,6 +182,8 @@ def verify(args):
         records = [json.loads(subprocess.check_output([
             str(Path(args.analysis_binary).resolve()), 'show', record['id'],
             '--session', str(root / 'session')]))['transaction'] for record in records()]
+        if len(records) != len(expected):
+            raise AssertionError("reconstructed request count mismatch")
         for record in records:
             case = expected[record['url']]
             if record['backend'] != 'openssl-preload' or record['incomplete'] or record['truncated']:
