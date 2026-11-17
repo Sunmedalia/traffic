@@ -1,0 +1,131 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  linux:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install capture headers
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+      - name: Test and build
+        run: |
+          bash scripts/build-linux.sh
+          bash scripts/build-openssl-preload.sh
+          bash scripts/test-openssl-preload.sh
+          ./bin/traffic --help
+          ./bin/traffic-tui --help
+          ldd bin/traffic
+      - name: Package
+        run: python3 scripts/package-release.py --version "$GITHUB_REF_NAME" --platform "${{ matrix.platform }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2022
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+      - name: Configure CGO
+        shell: pwsh
+        run: |
+          $root = '${{ steps.msys2.outputs.msys2-location }}'
+          "CC=$root\mingw64\bin\gcc.exe" >> $env:GITHUB_ENV
+          "$root\mingw64\bin" >> $env:GITHUB_PATH
+      - name: Test and build
+        shell: pwsh
+        run: |
+          go test -race ./... -skip '^(TestOfflineReassemblyOutOfOrderAndRetransmission|TestImportCreatesOrganizedSession)$'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          go vet ./...
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force bin | Out-Null
+          go build -trimpath -o bin/traffic.exe ./cmd/traffic
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          go build -trimpath -o bin/traffic-tui.exe ./cmd/traffic-tui
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./bin/traffic.exe --help
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./bin/traffic-tui.exe --help
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Package
+        run: python scripts/package-release.py --version "$env:GITHUB_REF_NAME" --platform windows-amd64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-windows-amd64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  java:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Test and package
+        run: |
+          mvn -B -f java-agent/pom.xml verify
+          python3 scripts/package-release.py --version "$GITHUB_REF_NAME" --platform java
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-java
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [linux, windows, java]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Verify and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -f "docs/releases/$GITHUB_REF_NAME.md"
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 4
+          (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag --draft --title "traffic $GITHUB_REF_NAME" \
+            --notes-file "docs/releases/$GITHUB_REF_NAME.md"
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
