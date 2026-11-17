@@ -38,3 +38,12 @@ func initRuntimeAt(root string) error {
 	}
 	return nil
 }
+
+// BundleFile resolves release dependencies beside the executable, independent of CWD.
+func BundleFile(relative, fallback string) string {
+	candidate := filepath.Join(RuntimeRoot(), filepath.FromSlash(relative))
+	if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
+		return candidate
+	}
+	return fallback
+}

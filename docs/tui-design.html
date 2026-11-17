@@ -1,4 +1,4 @@
-<title>traffic-tui 界面设计</title>
+<title>traffic-console 界面设计</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap">
 <style>
@@ -61,9 +61,9 @@ td:first-child{white-space:nowrap}
 
 <main>
 <header style="display:flex;flex-direction:column;gap:12px">
-  <div class="eyebrow">traffic-tui · 终端界面设计稿</div>
+  <div class="eyebrow">traffic-console · 终端界面设计稿</div>
   <h1>应急响应分析终端：页面与使用逻辑</h1>
-  <p class="lead">基于现有 <code>cmd/traffic-tui</code> 的会话选择、三标签页和详情视图重新规划。目标是让值守人员在一屏内回答三个问题：现在有没有人在打、打的是什么、采到的数据可不可信。</p>
+  <p class="lead">基于现有 <code>cmd/traffic-console</code> 的会话选择、三标签页和详情视图重新规划。目标是让值守人员在一屏内回答三个问题：现在有没有人在打、打的是什么、采到的数据可不可信。</p>
   <div class="cols">
     <div><h4>原则一 · 告警先于流量</h4><p>进入会话先看到攻击态势，再按需下钻到单条请求，不让人从上万行请求里找告警。</p></div>
     <div><h4>原则二 · 一个键一个意思</h4><p>同一按键在所有页面含义一致。<kbd>Enter</kbd> 永远是进入，<kbd>Esc</kbd> 永远是退一层，<kbd>/</kbd> 永远是在当前位置查找。</p></div>

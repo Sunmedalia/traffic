@@ -233,7 +233,7 @@ function setOffline(value) {
 
 function renderBanner() {
   const node = $('banner');
-  const text = state.offline ? '无法连接分析服务，恢复后会自动重试。请确认 traffic-tui web 仍在运行。' : state.error || state.warning;
+  const text = state.offline ? '无法连接分析服务，恢复后会自动重试。请确认 traffic-console web 仍在运行。' : state.error || state.warning;
   node.hidden = !text;
   node.textContent = text;
   node.className = 'banner' + (state.offline || state.error ? ' error' : '');

@@ -96,7 +96,7 @@ func captureChecks(service string, pid int, library, probe string, java bool, ja
 				c.Reason = "probe helper files are not readable"
 			} else if pythonErr != nil {
 				c.Reason = "Python executable is unavailable"
-			} else if st, e := os.Stat(iisRuntime); e != nil || !st.IsDir() {
+			} else if st, e := os.Stat(iisRuntime); (e != nil || !st.IsDir()) && !isPortableProbeRuntime(iisRuntime) {
 				c.Reason = "probe runtime directory is unavailable"
 			} else if reason := windowsProbeDependencyReason(helper); reason != "" {
 				c.Reason = reason

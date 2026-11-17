@@ -13,8 +13,8 @@ if ($LASTEXITCODE) { throw 'go vet failed' }
 New-Item -ItemType Directory -Force bin/windows | Out-Null
 go build -trimpath -o bin/windows/traffic.exe ./cmd/traffic
 if ($LASTEXITCODE) { throw 'Collector build failed' }
-go build -trimpath -o bin/windows/traffic-tui.exe ./cmd/traffic-tui
+go build -trimpath -o bin/windows/traffic-console.exe ./cmd/traffic-console
 if ($LASTEXITCODE) { throw 'Analysis build failed' }
-Get-FileHash bin/windows/traffic.exe,bin/windows/traffic-tui.exe -Algorithm SHA256 |
+Get-FileHash bin/windows/traffic.exe,bin/windows/traffic-console.exe -Algorithm SHA256 |
     ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))" } |
     Set-Content bin/windows/SHA256SUMS -Encoding ASCII

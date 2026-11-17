@@ -27,7 +27,7 @@ jobs:
       - name: Build
         run: |
           go build -o bin/traffic ./cmd/traffic
-          go build -o bin/traffic-tui ./cmd/traffic-tui
+          go build -o bin/traffic-console ./cmd/traffic-console
           bash scripts/build-openssl-preload.sh
           bash scripts/test-openssl-preload.sh
       - name: Check validation scripts
@@ -85,15 +85,13 @@ jobs:
           $root = '${{ steps.msys2.outputs.msys2-location }}'
           "CC=$root\mingw64\bin\gcc.exe" >> $env:GITHUB_ENV
           "$root\mingw64\bin" >> $env:GITHUB_PATH
-      # Hosted runners have no Npcap driver or DLL. The two offline libpcap
-      # integration tests run in Linux jobs. All other tests run natively here.
       - name: Windows native race tests
-        run: go test -race ./... -skip '^(TestOfflineReassemblyOutOfOrderAndRetransmission|TestImportCreatesOrganizedSession)$'
+        run: go test -race ./...
       - name: Windows static checks
         run: go vet ./...
       - name: Windows builds
         run: |
           go build -o bin/traffic.exe ./cmd/traffic
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          go build -o bin/traffic-tui.exe ./cmd/traffic-tui
+          go build -o bin/traffic-console.exe ./cmd/traffic-console
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

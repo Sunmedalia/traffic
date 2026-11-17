@@ -21,11 +21,19 @@ func doctorReport(devices []pcap.Interface, service string, pid int, library, _ 
 		}
 	}
 	return map[string]any{
-		"os": runtime.GOOS, "arch": runtime.GOARCH,
+		"packet_backend": func() string {
+			if winDivertPath() != "" {
+				return "windivert-sniff"
+			}
+			return "npcap"
+		}(),
+		"bundled_packet_driver": winDivertPath(),
+		"packet_drop_counter":   "WinDivert queue drops are not exposed; completeness remains unverified",
+		"os":                    runtime.GOOS, "arch": runtime.GOARCH,
 		"administrator":   windows.GetCurrentProcessToken().IsElevated(),
 		"npcap_installed": npcap == nil, "iis_installed": iis == nil,
 		"interfaces": devices, "targets": discoverTargets("", service, pid, library),
 		"tls_verified": false, "tls_backend": backend, "tls_backends": []string{"iis-httpapi", "openssl"}, "tls_configured": iisProbe != "" || opensslProbe != "",
-		"tls_state": "opt-in with --iis-probe / --openssl-probe and --probe-runtime-dir; verify with real requests",
+		"tls_state": "bundled probes are configured automatically; capture attaches to selected services, doctor does not attach",
 	}
 }

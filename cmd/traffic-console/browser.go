@@ -177,7 +177,7 @@ func runSessionBrowser(dir, root string, refresh time.Duration, filter tuiFilter
 		return fmt.Errorf("--refresh 必须大于 0")
 	}
 	if !term.IsTerminal(os.Stdin.Fd()) || !term.IsTerminal(os.Stdout.Fd()) {
-		return fmt.Errorf("TUI 需要交互式终端，请在终端运行 traffic-tui")
+		return fmt.Errorf("TUI 需要交互式终端，请在终端运行 traffic-console")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

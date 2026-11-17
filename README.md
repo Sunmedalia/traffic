@@ -36,7 +36,7 @@
 flowchart LR
     A[目标服务] -->|网络包 / 明文探针| B[traffic capture]
     B --> C[(会话目录)]
-    C --> D[traffic-tui]
+    C --> D[traffic-console]
     D --> E[终端 · Web · JSON]
     D --> F[证据 ZIP + SHA-256]
 ```
@@ -45,25 +45,29 @@ flowchart LR
 
 ## 下载与安装
 
-从 [Releases](https://github.com/Sunmedalia/traffic/releases) 下载对应架构的包，使用同一版本的 `SHA256SUMS` 核对。基础包只含可执行文件、Linux 可选预加载库与必要许可证；不再包含测试脚本、构建工具或验证记录。使用手册保留在仓库中。
+从 [Releases](https://github.com/Sunmedalia/traffic/releases) 下载对应系统、架构与组件的包，用同版本 `SHA256SUMS` 核对。**采集器和分析器分开下载**：只采集时下载 `traffic`，查看会话时下载 `traffic-console`（原 `traffic-tui`）。
 
-| 发布包 | 内容 | 运行依赖 |
+| 平台 | 采集器 | 分析器 |
 | :--- | :--- | :--- |
-| `traffic-v0.1.1-linux-amd64.tar.gz` | 采集器、分析器、OpenSSL 预加载库 | Ubuntu 24.04 / glibc 2.39 或兼容环境、libpcap |
-| `traffic-v0.1.1-linux-arm64.tar.gz` | 同上，ARM64 | 同上，ARM64 |
-| `traffic-v0.1.1-windows-amd64.zip` | 采集器、分析器 | Windows x64；采集需单独安装 Npcap |
-| `traffic-v0.1.1-java.zip` | Java Agent | JDK 17/21，Tomcat NIO 场景 |
-| `traffic-v0.1.1-windows-amd64-deps.zip` | 可选：便携 Python、Frida、运行探针 | 解压到 Windows 程序所在目录 |
+| Ubuntu x64 / ARM64 | `traffic-v0.2.0-ubuntu-{amd64,arm64}.tar.gz` | `traffic-console-v0.2.0-ubuntu-{amd64,arm64}.tar.gz` |
+| CentOS 7+ x64 / ARM64 | `traffic-v0.2.0-centos7-{amd64,arm64}.tar.gz` | `traffic-console-v0.2.0-centos7-{amd64,arm64}.tar.gz` |
+| Windows x64 | `traffic-v0.2.0-windows-amd64.zip` | `traffic-console-v0.2.0-windows-amd64.zip` |
 
-Linux 二进制在 Ubuntu 24.04 构建；**CentOS 7 等旧 glibc 环境请在目标系统从源码构建**。Windows 抓包需从 [Npcap 官方](https://npcap.com/#download) 安装驱动；IIS/OpenSSL 明文探针可下载独立依赖包，无需安装系统 Python。详细操作见 [Windows 依赖说明](docs/windows-dependencies.md)。eCapture 单独构建。
+Linux 主程序静态链接 libpcap，无需安装运行库；采集包内置配套 eCapture、Java Agent 和 glibc 2.17 基线的 OpenSSL 预加载库。CentOS 提供可直接运行的包。Ubuntu/CentOS 包使用同一兼容构建基线，并分别在干净的发行版容器中检查。
+
+Windows 采集包内置 WinDivert 签名驱动、Python、Frida 和探针脚本。**无需安装 Npcap、系统 Python 或下载独立依赖包**。完整解压后直接运行 `doctor`；管理员终端执行 `capture` 时按需加载随包驱动。不要只复制 exe。详见 [Windows 随包依赖](docs/windows-dependencies.md)。
 
 ```bash
-# 示例：Linux x64，先下载对应压缩包与 SHA256SUMS
-sha256sum --ignore-missing -c SHA256SUMS
-tar -xzf traffic-v0.1.1-linux-amd64.tar.gz
-cd traffic-v0.1.1-linux-amd64
-./traffic doctor
+# Ubuntu x64；CentOS 改用 centos7-amd64 文件名
+ tar -xzf traffic-v0.2.0-ubuntu-amd64.tar.gz
+ cd traffic-v0.2.0-ubuntu-amd64
+ ./traffic --cn-help
+ ./traffic doctor --cn-help
+ sudo ./traffic doctor
+ sudo ./traffic capture --ports 80,443 --duration 60s
 ```
+
+依赖路径自动按程序所在目录解析，帮助页面包含每个命令的专属参数和示例。HTTPS 能力仍取决于目标与内核：CentOS 7 原生内核不具备 CO-RE BTF，需要服务启动时加载随包预加载库；程序不会重启业务服务。Java attach 依赖目标 JVM 自身的 attach 能力。
 
 首次启动任一程序会自动在程序旁创建 `sessions/` 和 `exports/`，从其他目录启动也会使用同一默认数据目录。源码构建位于 `bin/` 时，目录创建在项目根目录；显式 `--data-dir` / `--output` 仍按指定路径处理。请将程序解压到可写目录。
 
@@ -72,12 +76,12 @@ cd traffic-v0.1.1-linux-amd64
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential libpcap-dev git
-git clone --branch v0.1.1 https://github.com/Sunmedalia/traffic.git
+git clone --branch v0.2.0 https://github.com/Sunmedalia/traffic.git
 cd traffic
 ./scripts/build-linux.sh
 ```
 
-macOS 可从源码构建分析器：`go build -o bin/traffic-tui ./cmd/traffic-tui`。其他构建方式见 [分平台构建](docs/guide.md#构建分平台)。
+macOS 可从源码构建分析器：`go build -o bin/traffic-console ./cmd/traffic-console`。其他构建方式见 [分平台构建](docs/guide.md#构建分平台)。
 
 ## 快速开始
 
@@ -95,24 +99,22 @@ sudo ./traffic capture --no-tls --ports 80,8080 \
 
 ```bash
 # 中文终端界面；无参数时进入会话选择页
-./traffic-tui --session ./sessions/first-capture
+./traffic-console --session ./sessions/first-capture
 
 # 浏览器界面；打开启动时打印的完整令牌地址
-./traffic-tui web --session ./sessions/first-capture
+./traffic-console web --session ./sessions/first-capture
 ```
 
 ### 3 · 按需启用 HTTPS 明文采集
 
-现代 Linux 的 OpenSSL 服务可使用配套 eCapture。以下构建命令在源码仓库执行（构建目录必须不存在），生成的 `bin/ecapture` 可复制到程序目录；使用二进制包时直接执行后面的采集命令：
+现代 Linux 的 OpenSSL 服务默认使用采集包中的配套 eCapture，无需额外下载或指定路径：
 
 ```bash
-sudo apt-get install -y clang llvm bpftool libelf-dev libssl-dev \
-  flex bison make file pkg-config
-./scripts/build-ecapture.sh /tmp/traffic-ecapture-build
-
-sudo ./traffic capture --ports 80,443 \
-  --ecapture "$PWD/ecapture" --output ./sessions/https-capture
+sudo ./traffic doctor --service nginx --ports 443
+sudo ./traffic capture --service nginx --ports 443 --duration 60s --output ./sessions/https-capture
 ```
+
+自行开发探针时仍可使用仓库中的 `scripts/build-ecapture.sh`，或通过 `--ecapture` 覆盖默认路径。
 
 eCapture 走进程明文读取路径，无需安装 CA 或解密 PCAP。附加存在启动窗口；用已知请求的唯一编号逐条核对请求、响应和正文，不能只根据 `attached` 或零丢弃判定采全。
 
@@ -125,8 +127,8 @@ eCapture 走进程明文读取路径，无需安装 CA 或解密 PCAP。附加�
 | 通用 OpenSSL | `--service openssl --pid N` | 否 | 指定进程；自定义 BIO 需逐项验证 |
 | 旧内核 / 无 BTF | OpenSSL 预加载库 | 是 | 显式启动加载；队列丢弃和退出尾部仍有边界 |
 | Tomcat NIO | `--java-attach` | 否 | JDK 17/21；目标需允许动态附加 |
-| Windows IIS | Npcap + IIS 探针 | 否 | 显式启用 Frida；已有异步接收可能漏采 |
-| Windows nginx / Apache | Npcap + OpenSSL 探针 | 否 | 静态 OpenSSL 按二进制哈希匹配 profile |
+| Windows IIS | WinDivert + IIS 探针 | 否 | 随包自动配置 Frida；已有异步接收可能漏采 |
+| Windows nginx / Apache | WinDivert + OpenSSL 探针 | 否 | 静态 OpenSSL 按二进制哈希匹配 profile |
 | 已有明文 HTTP PCAP | `traffic import` | 不涉及 | 加密 PCAP 本身不能还原 HTTPS 明文 |
 
 Linux ARM64/x64、CentOS 7、Windows 的实机样本覆盖范围各不相同；完整矩阵见 [验证范围](docs/guide.md#验证范围)。[后端参数与操作步骤 →](docs/guide.md#常见场景复制即用)
@@ -157,10 +159,10 @@ ssh -L 8080:127.0.0.1:8080 user@capture-host
 ### JSON：查询与证据导出
 
 ```bash
-./traffic-tui status --session ./sessions/https-capture
-./traffic-tui events --session ./sessions/https-capture --severity medium
-./traffic-tui show REQUEST_ID --session ./sessions/https-capture
-./traffic-tui export REQUEST_ID --session ./sessions/https-capture --out ./evidence.zip
+./traffic-console status --session ./sessions/https-capture
+./traffic-console events --session ./sessions/https-capture --severity medium
+./traffic-console show REQUEST_ID --session ./sessions/https-capture
+./traffic-console export REQUEST_ID --session ./sessions/https-capture --out ./evidence.zip
 ```
 
 `--severity medium` 表示中危及以上。**导出前需要停止采集**，同名 ZIP 不覆盖。
@@ -191,7 +193,7 @@ sessions/<host>/<date>/<session>/
 | [使用手册](docs/guide.md) | 后端、规则、Windows、参数、停止与回滚、故障排查 |
 | [验证记录](VALIDATION.md) | 实机环境、构建哈希、成功与失败样本 |
 | [优化进度](OPTIMIZATION.md) | 已实现机制、性能门槛与待完成项目 |
-| [v0.1.1 发布说明](docs/releases/v0.1.1.md) | 下载包、升级变化和已知限制 |
+| [v0.2.0 发布说明](docs/releases/v0.2.0.md) | 下载包、升级变化和已知限制 |
 | [第三方组件](THIRD_PARTY_NOTICES.md) | 依赖、探针与许可证说明 |
 
 ```bash
@@ -199,4 +201,4 @@ go test -race ./...
 go vet ./...
 ```
 
-CI 覆盖 Linux ARM64/x64、Windows 原生测试与构建、Java 17/21，以及固定版本 eCapture 补丁回归。CI 通过不替代实际服务的完整性和性能验收。发布包附带依赖许可证；Npcap、Frida 和 eCapture 的许可及安装要求分别适用。
+CI 覆盖 Linux ARM64/x64、Windows 原生测试与构建、Java 17/21，以及固定版本 eCapture 补丁回归。CI 通过不替代实际服务的完整性和性能验收。发布包附带依赖许可证；WinDivert、Frida 和 eCapture 的许可分别适用。

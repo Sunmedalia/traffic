@@ -120,7 +120,7 @@ Ubuntu x64 SSH 重连成功，竞态测试及静态检查通过，但 `preload-a
 
 ## 2026-11-16 Debian 13 / nginx 系统级预加载与漏洞靶场
 
-在用户提供的 `192.168.1.7` 搭建并验证。目标机为 Debian 13 (trixie)、Linux `6.12.107+deb13-arm64`、2 核 2 GiB、nginx 1.26.3、OpenSSL 3.5.7、glibc 2.41，使用 Go 1.26.11 在目标机原生构建 `traffic`、`traffic-tui` 和 `libtraffic-openssl.so`。既有 `traffic-lab` 站点和 18080 服务保持运行，仅新增独立站点和配置。
+在用户提供的 `192.168.1.7` 搭建并验证。目标机为 Debian 13 (trixie)、Linux `6.12.107+deb13-arm64`、2 核 2 GiB、nginx 1.26.3、OpenSSL 3.5.7、glibc 2.41，使用 Go 1.26.11 在目标机原生构建 `traffic`、`traffic-console` 和 `libtraffic-openssl.so`。既有 `traffic-lab` 站点和 18080 服务保持运行，仅新增独立站点和配置。
 
 新增内部 CA 与服务器证书，SAN 为 `traffic-lab.local`、`acme-lab.local`、`192.168.1.7`、`127.0.0.1`，CA 安装到系统信任库。nginx 以 TLS 1.2 和 TLS 1.3 提供 443，证书链校验 `ssl_verify_result=0`。新增 `acme-lab.service`（www-data，127.0.0.1:18081）和 `/acme/` 反向代理，站点包含真实可利用的 SQL 注入、命令注入、路径穿越、SSRF、反射 XSS、任意文件上传和敏感文件暴露；原有 18080 测试站未修改。
 
@@ -151,7 +151,7 @@ eBPF 路径使用固定版本 eCapture 与项目补丁。外部客户端经 `enp
 
 CentOS 7 全仓库 `go test -race ./...`、`go vet ./...` 通过。新增回归验证 socket 路径保护、内核发送凭据、伪造进程身份拒绝、响应规则与 socket 清理。macOS 全仓库竞态测试、静态检查及 Windows x64 交叉构建和静态检查通过。Linux CI 新增采集库编译及测试脚本语法检查。
 
-首轮直接 datagram 发送在大正文与并发下出现丢弃，改为有界异步发送后重测通过。测试脚本改用 `traffic-tui requests/show/export` 读取和核对索引，兼容 CentOS 7 自带 Python SQLite 无法识别部分索引的问题，并显式使用 UTF-8 读取状态报告。
+首轮直接 datagram 发送在大正文与并发下出现丢弃，改为有界异步发送后重测通过。测试脚本改用 `traffic-console requests/show/export` 读取和核对索引，兼容 CentOS 7 自带 Python SQLite 无法识别部分索引的问题，并显式使用 UTF-8 读取状态报告。
 
 该方案要求在目标服务启动时设置 `LD_PRELOAD`，库驻留于服务进程直到退出。socket 限制为采集器相同 UID。现有 cgroup v2 资源限制在该 cgroup v1 主机报告 `unavailable`。测试期间安装了 libpcap-devel，工具链、源码和测试产物存放于 `/opt/traffic-centos7-test`，使用独立目录中的临时 Vault 仓库配置安装依赖。目标机系统服务配置保持原有值。
 

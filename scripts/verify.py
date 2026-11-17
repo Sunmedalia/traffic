@@ -25,7 +25,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("output", type=Path)
 parser.add_argument("--host", default="127.0.0.1")
 parser.add_argument("--binary", default="/opt/traffic/bin/traffic")
-parser.add_argument("--analysis-binary", default="/opt/traffic/bin/traffic-tui")
+parser.add_argument("--analysis-binary", default="/opt/traffic/bin/traffic-console")
 parser.add_argument("--ecapture", help="path to the TLS probe executable")
 parser.add_argument("--pid", type=int, help="restrict TLS probes to this lab process")
 parser.add_argument(

@@ -32,9 +32,11 @@ func emit(v any) {
 	fmt.Println(string(b))
 }
 func main() {
-	if err := session.InitRuntime(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	if _, _, help := helpRequest(os.Args[1:]); !help {
+		if err := session.InitRuntime(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	}
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -43,13 +45,13 @@ func main() {
 }
 func run(args []string) (runErr error) {
 	session.PrivateUmask()
-	if len(args) == 0 {
-		fmt.Printf("traffic doctor|capture|import|rules; use COMMAND --help for flags\nData: %s\n", session.DefaultDataDir())
+	helpCommand, cnHelp, wantsHelp := helpRequest(args)
+	if len(args) == 0 || (wantsHelp && helpCommand == "") {
+		printCollectorHelp(os.Stdout, "", cnHelp, nil)
 		return nil
 	}
-	if args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
-		fmt.Println("traffic doctor|capture|import|rules; use COMMAND --help for flags")
-		return nil
+	if wantsHelp {
+		args = []string{helpCommand}
 	}
 	cmd, args := args[0], args[1:]
 	id := ""
@@ -58,7 +60,11 @@ func run(args []string) (runErr error) {
 		args = args[1:]
 	}
 	if cmd != "doctor" && cmd != "capture" && cmd != "import" && cmd != "rules" {
-		return fmt.Errorf("unknown collector command %q; use traffic-tui for session analysis", cmd)
+		return fmt.Errorf("unknown collector command %q; use traffic-console for session analysis", cmd)
+	}
+	if cmd == "rules" && wantsHelp {
+		printCollectorHelp(os.Stdout, cmd, cnHelp, nil)
+		return nil
 	}
 	if cmd == "rules" {
 		if len(args) != 2 || args[0] != "check" {
@@ -70,27 +76,29 @@ func run(args []string) (runErr error) {
 		emit(map[string]any{"valid": true, "rules": len(rules)})
 		return nil
 	}
+	defaults := portableDefaults()
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	fs.Usage = func() { printCollectorHelp(fs.Output(), cmd, false, fs) }
 	output := fs.String("output", "", "exact session directory; default is auto-created under --data-dir")
 	dataDir := fs.String("data-dir", session.DefaultDataDir(), "root directory for automatically named sessions")
 	name := fs.String("name", "", "session name; default capture or import")
 	fs.IntVar(&networkNamespacePID, "netns-pid", 0, "Linux target network namespace PID; open packet handles there without changing the target")
 	ports := fs.String("ports", "80,443", "TCP ports")
 	interfaces := fs.String("interfaces", "", "comma-separated interfaces")
-	fs.StringVar(&iisProbe, "iis-probe", "", "Windows IIS plaintext helper script; explicit opt-in")
-	fs.StringVar(&iisPython, "iis-python", "python", "Python executable with Frida installed")
-	fs.StringVar(&iisRuntime, "iis-runtime-dir", "", "probe runtime directory readable by the target process identity")
-	fs.StringVar(&iisPython, "probe-python", "python", "Python executable for Windows plaintext helpers (alias of --iis-python)")
-	fs.StringVar(&iisRuntime, "probe-runtime-dir", "", "temporary directory readable by Windows probe targets (alias of --iis-runtime-dir)")
-	fs.StringVar(&opensslProbe, "openssl-probe", "", "Windows OpenSSL plaintext helper script; explicit opt-in")
+	fs.StringVar(&iisProbe, "iis-probe", defaults.iis, "Windows IIS plaintext helper; bundled by default")
+	fs.StringVar(&iisPython, "iis-python", defaults.python, "Python executable with Frida installed")
+	fs.StringVar(&iisRuntime, "iis-runtime-dir", defaults.runtime, "probe runtime directory readable by the target process identity")
+	fs.StringVar(&iisPython, "probe-python", defaults.python, "Python executable for Windows plaintext helpers (alias of --iis-python)")
+	fs.StringVar(&iisRuntime, "probe-runtime-dir", defaults.runtime, "temporary directory readable by Windows probe targets (alias of --iis-runtime-dir)")
+	fs.StringVar(&opensslProbe, "openssl-probe", defaults.openssl, "Windows OpenSSL plaintext helper; bundled by default")
 	fs.StringVar(&opensslProfile, "openssl-profile", "", "Windows static OpenSSL binary profile JSON; default bundled profiles")
 	javaAttach := fs.Bool("java-attach", false, "explicitly attach Java agent to --pid")
 	javaPID := fs.Int("java-pid", 0, "explicit JVM PID for Java attach while auto-discovering other services")
 	javaHelper := fs.String("java-helper", "", "Java executable with jdk.attach; default target executable")
-	javaAgent := fs.String("java-agent", "/opt/traffic/bin/traffic-java-agent.jar", "Java agent archive")
+	javaAgent := fs.String("java-agent", session.BundleFile("deps/java/traffic-java-agent.jar", "/opt/traffic/bin/traffic-java-agent.jar"), "Java agent archive")
 	service := fs.String("service", "auto", "service: auto, iis (Windows), nginx, apache, tomcat, openssl")
 	pid := fs.Int("pid", 0, "target process PID; default discover service processes")
-	ecapture := fs.String("ecapture", "/opt/traffic/bin/ecapture", "eCapture v2.9.1 binary")
+	ecapture := fs.String("ecapture", session.BundleFile("deps/ecapture/ecapture", "/opt/traffic/bin/ecapture"), "eCapture v2.9.1 binary")
 	lib := fs.String("libssl", "", "TLS library override; Windows module name or Linux library path")
 	ruleFile := fs.String("rules", "", "additional YAML rules")
 	proxyList := fs.String("trusted-proxies", "", "comma-separated trusted proxy IPs or CIDRs for X-Forwarded-For / X-Real-IP")
@@ -111,6 +119,10 @@ func run(args []string) (runErr error) {
 	fs.IntVar(&scanThreshold, "scan-paths", scanThreshold, "distinct paths for scan detection")
 	fs.BoolVar(&noDetect, "no-detect", false, "capture without attack detection")
 	fs.Bool("json", false, "JSON output (default)")
+	if wantsHelp {
+		printCollectorHelp(os.Stdout, cmd, cnHelp, fs)
+		return nil
+	}
 	if e := fs.Parse(args); e != nil {
 		if e == flag.ErrHelp {
 			return nil
@@ -119,6 +131,23 @@ func run(args []string) (runErr error) {
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	if cmd == "doctor" {
+		for name := range explicit {
+			if !doctorHelpFlags[name] {
+				return fmt.Errorf("--%s is not a doctor option; see traffic doctor --help", name)
+			}
+		}
+	}
+	if *noTLS {
+		if !explicit["iis-probe"] {
+			iisProbe = ""
+		}
+		if !explicit["openssl-probe"] {
+			opensslProbe = ""
+		}
 	}
 	var proxyErr error
 	trustedProxies, proxyErr = parseTrustedProxies(*proxyList)
@@ -215,7 +244,7 @@ func run(args []string) (runErr error) {
 			capturePorts[port] = true
 		}
 		var devices []pcap.Interface
-		e := inCaptureNamespace(func() error { var err error; devices, err = pcap.FindAllDevs(); return err })
+		e := inCaptureNamespace(func() error { var err error; devices, err = listCaptureDevices(); return err })
 		if e != nil {
 			return e
 		}
@@ -239,6 +268,11 @@ func run(args []string) (runErr error) {
 			capturePorts[number] = true
 			filterParts = append(filterParts, fmt.Sprintf("port %d", number))
 		}
+		if cmd == "capture" && !*noTLS {
+			if err := preparePortableProbeRuntime(); err != nil {
+				return err
+			}
+		}
 		var checks []captureCheck
 		if cmd == "capture" && !*noTLS {
 			checks = captureChecks(*service, *pid, *lib, *ecapture, *javaAttach, *javaAgent, *preloadSocket, *javaPID)
@@ -255,7 +289,7 @@ func run(args []string) (runErr error) {
 		}
 
 		if cmd == "import" {
-			handle, err := pcap.OpenOffline(id)
+			handle, err := openOfflinePacket(id)
 			if err != nil {
 				return err
 			}

@@ -2,20 +2,47 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version for build verification (no publication)'
+        default: v0.2.0
+        required: true
 permissions:
   contents: read
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
+env:
+  RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
 jobs:
+  java:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Test and package Java Agent
+        run: mvn -B -f java-agent/pom.xml verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: internal-java-agent
+          path: java-agent/target/traffic-java-agent.jar
+          if-no-files-found: error
+
   linux:
+    needs: java
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: ubuntu-24.04
-            platform: linux-amd64
+            arch: amd64
           - runner: ubuntu-24.04-arm
-            platform: linux-arm64
+            arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -23,35 +50,38 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Install capture headers
-        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
-      - name: Test and build
+      - uses: actions/download-artifact@v4
+        with:
+          name: internal-java-agent
+          path: java-agent/target
+      - name: Install native build tools
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev clang llvm libelf-dev libssl-dev zlib1g-dev flex bison linux-tools-common linux-tools-generic
+      - name: Test source and build pinned offline dependencies
         run: |
-          bash scripts/build-linux.sh
-          bash scripts/build-openssl-preload.sh
+          go test -race ./...
+          go vet ./...
+          export PATH="$(dirname "$(find /usr/lib/linux-tools -name bpftool -type f | head -n 1)"):$PATH"
+          bash scripts/build-ecapture.sh "$RUNNER_TEMP/ecapture"
+          bash scripts/build-portable-linux.sh "$RUNNER_TEMP/ecapture"
           bash scripts/test-openssl-preload.sh
-          ./bin/traffic --help
-          ./bin/traffic-tui --help
-          ldd bin/traffic
-      - name: Package
-        run: python3 scripts/package-release.py --version "$GITHUB_REF_NAME" --platform "${{ matrix.platform }}"
-      - name: Smoke test extracted Linux package
+      - name: Package collector and console separately for each distro
         run: |
-          set -euo pipefail
-          tar -xzf "dist/traffic-$GITHUB_REF_NAME-${{ matrix.platform }}.tar.gz" -C "$RUNNER_TEMP"
-          app="$RUNNER_TEMP/traffic-$GITHUB_REF_NAME-${{ matrix.platform }}"
-          cd /tmp
-          "$app/traffic"
-          "$app/traffic-tui" --help
-          test -d "$app/sessions"
-          test -d "$app/exports"
+          for distro in ubuntu centos7; do
+            for component in traffic traffic-console; do
+              python3 scripts/package-release.py --version "$RELEASE_VERSION" --platform "$distro-${{ matrix.arch }}" --component "$component"
+            done
+          done
+      - name: Smoke test packages in clean Ubuntu and CentOS 7
+        run: |
+          bash scripts/smoke-linux-release.sh "$RELEASE_VERSION" '${{ matrix.arch }}'
       - uses: actions/upload-artifact@v4
         with:
-          name: package-${{ matrix.platform }}
+          name: package-linux-${{ matrix.arch }}
           path: dist/*.tar.gz
           if-no-files-found: error
 
   windows:
+    needs: java
     runs-on: windows-2022
     env:
       CGO_ENABLED: '1'
@@ -61,6 +91,10 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: internal-java-agent
+          path: java-agent/target
       - uses: msys2/setup-msys2@v2
         id: msys2
         with:
@@ -75,69 +109,42 @@ jobs:
       - name: Test and build
         shell: pwsh
         run: |
-          go test -race ./... -skip '^(TestOfflineReassemblyOutOfOrderAndRetransmission|TestImportCreatesOrganizedSession)$'
+          go test -race ./...
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           go vet ./...
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force bin | Out-Null
-          go build -trimpath -ldflags="-s -w -linkmode external -extldflags '-static'" -o bin/traffic.exe ./cmd/traffic
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          go build -trimpath -ldflags="-s -w -linkmode external -extldflags '-static'" -o bin/traffic-tui.exe ./cmd/traffic-tui
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          ./bin/traffic.exe --help
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          ./bin/traffic-tui.exe --help
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Package
-        run: python scripts/package-release.py --version "$env:GITHUB_REF_NAME" --platform windows-amd64
-      - name: Package optional Windows dependencies
-        run: python scripts/package-windows-deps.py --version "$env:GITHUB_REF_NAME"
-      - name: Smoke test portable binaries and dependencies
+          foreach ($component in @('traffic', 'traffic-console')) {
+            go build -trimpath -ldflags="-s -w -linkmode external -extldflags '-static'" -o "bin/$component.exe" "./cmd/$component"
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+      - name: Bundle all Windows dependencies and split components
         shell: pwsh
         run: |
-          $testRoot = Join-Path $env:RUNNER_TEMP 'traffic-portable'
-          New-Item -ItemType Directory -Force $testRoot | Out-Null
-          Expand-Archive "dist/traffic-$env:GITHUB_REF_NAME-windows-amd64.zip" $testRoot
-          $app = Join-Path $testRoot "traffic-$env:GITHUB_REF_NAME-windows-amd64"
-          Expand-Archive "dist/traffic-$env:GITHUB_REF_NAME-windows-amd64-deps.zip" $app
-          & "$app/deps/python/python.exe" -c "import frida; assert frida.__version__ == '17.5.1'"
+          python scripts/package-windows-deps.py
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & "$app/deps/python/python.exe" "$app/deps/probes/probe-iis.py" --help
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & "$app/deps/python/python.exe" "$app/deps/probes/probe-openssl.py" --help
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & "$app/traffic.exe"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & "$app/traffic-tui.exe" --help
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          if (!(Test-Path "$app/sessions") -or !(Test-Path "$app/exports")) { throw 'Missing runtime directories' }
+          foreach ($component in @('traffic', 'traffic-console')) {
+            python scripts/package-release.py --version "$env:RELEASE_VERSION" --platform windows-amd64 --component $component
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+      - name: Verify extracted package without Npcap or system Python
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'traffic portable test'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          foreach ($component in @('traffic', 'traffic-console')) {
+            Expand-Archive "dist/$component-$env:RELEASE_VERSION-windows-amd64.zip" $root
+          }
+          ./scripts/windows/smoke-release.ps1 -App "$root/traffic-$env:RELEASE_VERSION-windows-amd64" -Console "$root/traffic-console-$env:RELEASE_VERSION-windows-amd64"
       - uses: actions/upload-artifact@v4
         with:
           name: package-windows-amd64
           path: dist/*.zip
           if-no-files-found: error
 
-  java:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-          cache: maven
-      - name: Test and package
-        run: |
-          mvn -B -f java-agent/pom.xml verify
-          python3 scripts/package-release.py --version "$GITHUB_REF_NAME" --platform java
-      - uses: actions/upload-artifact@v4
-        with:
-          name: package-java
-          path: dist/*.zip
-          if-no-files-found: error
-
   publish:
-    needs: [linux, windows, java]
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, windows]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -153,10 +160,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test -f "docs/releases/$GITHUB_REF_NAME.md"
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 5
+          test -f "docs/releases/$RELEASE_VERSION.md"
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 10
           (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS)
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --verify-tag --draft --title "traffic $GITHUB_REF_NAME" \
-            --notes-file "docs/releases/$GITHUB_REF_NAME.md"
-          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+          gh release create "$RELEASE_VERSION" dist/* \
+            --verify-tag --draft --title "traffic $RELEASE_VERSION" \
+            --notes-file "docs/releases/$RELEASE_VERSION.md"
+          gh release edit "$RELEASE_VERSION" --draft=false --latest

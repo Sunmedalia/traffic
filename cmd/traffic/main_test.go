@@ -8,7 +8,7 @@ import (
 func TestCollectorCommandBoundary(t *testing.T) {
 	for _, command := range []string{"tui", "status", "requests", "events", "show", "export", "analyze"} {
 		err := run([]string{command})
-		if err == nil || !strings.Contains(err.Error(), "traffic-tui") {
+		if err == nil || !strings.Contains(err.Error(), "traffic-console") {
 			t.Fatalf("collector accepted analysis command %q: %v", command, err)
 		}
 	}

@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
-
-	"github.com/google/gopacket/pcap"
 )
 
 func captureInterfaces(input string, offline bool) ([]string, error) {
@@ -25,7 +23,10 @@ func captureInterfaces(input string, offline bool) ([]string, error) {
 		}
 		return names, nil
 	}
-	devices, err := pcap.FindAllDevs()
+	if names, handled, err := bundledPacketInterfaces(input); handled {
+		return names, err
+	}
+	devices, err := listCaptureDevices()
 	if err != nil {
 		return nil, fmt.Errorf("Npcap interfaces: %w", err)
 	}

@@ -127,16 +127,12 @@ func (r *packetRing) close() error {
 	return err
 }
 func capturePackets(ctx context.Context, s *Store, p *HTTPProcessor, iface, filter, input string) error {
-	var h *pcap.Handle
+	var h packetHandle
 	var e error
 	if input != "" {
-		h, e = pcap.OpenOffline(input)
+		h, e = openOfflinePacket(input)
 	} else {
-		e = inCaptureNamespace(func() error {
-			var err error
-			h, err = pcap.OpenLive(iface, captureSnapshotLength(), false, 100*time.Millisecond)
-			return err
-		})
+		h, e = openLivePacket(ctx, iface)
 	}
 	if e != nil {
 		return e
@@ -162,6 +158,9 @@ func capturePackets(ctx context.Context, s *Store, p *HTTPProcessor, iface, filt
 		return err
 	}
 	if input == "" {
+		if _, err := h.Stats(); err != nil {
+			s.gap("pcap", iface, "drop_counter_unavailable", "sources", 1)
+		}
 		s.packetSourceState(iface, "ready")
 		defer s.packetSourceState(iface, "stopped")
 	}
@@ -194,6 +193,9 @@ func capturePackets(ctx context.Context, s *Store, p *HTTPProcessor, iface, filt
 			continue
 		}
 		if e != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			if input != "" && e.Error() == "EOF" {
 				return nil
 			}

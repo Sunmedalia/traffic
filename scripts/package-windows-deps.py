@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Build the optional, offline Windows x64 plaintext-probe runtime."""
+"""Stage the complete offline Windows capture runtime inside the collector package."""
 import argparse
 import hashlib
 import io
 from pathlib import Path
-import re
 import shutil
-import tempfile
 import urllib.request
 import zipfile
 
@@ -21,43 +19,53 @@ HELPERS = ('probe-iis.py', 'probe-iis.js', 'iis-plaintext.js', 'probe-openssl.py
            'openssl-plaintext.js', 'openssl-profiles.json')
 
 
+WINDIVERT = ('https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip',
+             '63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15')
+WINDIVERT_SOURCE = ('https://github.com/basil00/WinDivert/archive/refs/tags/v2.2.2.tar.gz',
+                    '300c1b14e08652e0f8647bf06e9b212f924af76cb2459bd0f88da481c9b08336')
+
+
+def download(url, digest):
+    request = urllib.request.Request(url, headers={'User-Agent': 'traffic-release-builder'})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        data = response.read()
+    if hashlib.sha256(data).hexdigest() != digest:
+        raise RuntimeError('checksum mismatch: ' + url)
+    return data
+
+
+def stage_dependencies(package):
+    runtime = package / 'python'
+    runtime.mkdir(parents=True)
+    sources = []
+    for index, (url, digest) in enumerate(DOWNLOADS):
+        data = download(url, digest)
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            archive.extractall(runtime if index == 0 else runtime / 'Lib/site-packages')
+        sources.append(digest + '  ' + url)
+    (runtime / 'python313._pth').write_text('python313.zip\n.\nLib/site-packages\nimport site\n', encoding='ascii')
+    helpers = package / 'probes'
+    helpers.mkdir()
+    for name in HELPERS:
+        shutil.copy2(ROOT / 'scripts/windows' / name, helpers / name)
+    driver = package / 'windivert'
+    driver.mkdir()
+    with zipfile.ZipFile(io.BytesIO(download(*WINDIVERT))) as archive:
+        prefix = 'WinDivert-2.2.2-A/'
+        for name in ('x64/WinDivert.dll', 'x64/WinDivert64.sys', 'LICENSE', 'README'):
+            (driver / Path(name).name).write_bytes(archive.read(prefix + name))
+    # Corresponding unmodified driver/library source accompanies the LGPL binary.
+    (driver / 'WinDivert-2.2.2-source.tar.gz').write_bytes(download(*WINDIVERT_SOURCE))
+    sources.extend(digest + '  ' + url for url, digest in (WINDIVERT, WINDIVERT_SOURCE))
+    shutil.copy2(ROOT / 'docs/windows-dependencies.md', package / 'README.md')
+    (package / 'SOURCES.sha256').write_text('\n'.join(sources) + '\n', encoding='utf-8')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--version', required=True)
-    parser.add_argument('--output', default='dist')
+    parser.add_argument('--output', default='bin/windows-deps')
     args = parser.parse_args()
-    if not re.fullmatch(r'v\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?', args.version):
-        parser.error('version must be a v-prefixed semantic version')
-    output = Path(args.output).resolve()
-    output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='traffic-windows-deps-') as temporary:
-        # Extract alongside traffic.exe; the deps directory is optional.
-        package = Path(temporary) / 'deps'
-        runtime = package / 'python'
-        runtime.mkdir(parents=True)
-        sources = []
-        for index, (url, digest) in enumerate(DOWNLOADS):
-            with urllib.request.urlopen(url, timeout=120) as response:
-                data = response.read()
-            if hashlib.sha256(data).hexdigest() != digest:
-                raise RuntimeError('checksum mismatch: ' + url)
-            with zipfile.ZipFile(io.BytesIO(data)) as archive:
-                archive.extractall(runtime if index == 0 else runtime / 'Lib/site-packages')
-            sources.append(digest + '  ' + url)
-        (runtime / 'python313._pth').write_text('python313.zip\n.\nLib/site-packages\nimport site\n', encoding='ascii')
-        helpers = package / 'probes'
-        helpers.mkdir()
-        for name in HELPERS:
-            shutil.copy2(ROOT / 'scripts/windows' / name, helpers / name)
-        shutil.copy2(ROOT / 'docs/windows-dependencies.md', package / 'README.md')
-        shutil.copy2(ROOT / 'THIRD_PARTY_NOTICES.md', package / 'THIRD_PARTY_NOTICES.md')
-        (package / 'SOURCES.sha256').write_text('\n'.join(sources) + '\n', encoding='utf-8')
-        archive = output / f'traffic-{args.version}-windows-amd64-deps.zip'
-        with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as bundle:
-            for file in sorted(package.rglob('*')):
-                if file.is_file():
-                    bundle.write(file, file.relative_to(package.parent).as_posix())
-        print(archive)
+    stage_dependencies(Path(args.output).resolve())
 
 
 if __name__ == '__main__':

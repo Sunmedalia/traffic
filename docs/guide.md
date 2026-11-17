@@ -4,7 +4,7 @@
 
 面向网站应急响应的流量采集与分析工具。在 Linux / Windows 目标机上采集 HTTP/HTTPS 请求、响应、检测依据和网络证据，用中文 TUI、浏览器或 JSON 命令回看，并导出可校验的证据包。
 
-- **不装 CA、不改业务代码**：Linux 用 eCapture/eBPF 在 OpenSSL 读写处取明文，Windows 用 Npcap 加动态探针。
+- **不装 CA、不改业务代码**：Linux 用 eCapture/eBPF 在 OpenSSL 读写处取明文，Windows 用随包 WinDivert 加动态探针。
 - **采集与分析分离**：采集器只写会话目录，分析器可在另一台机器打开。
 - **完整性显式**：状态文件记录网卡、队列、TLS 丢弃和未知缺口，不把“0 丢弃”说成“采全”。
 
@@ -12,7 +12,7 @@
 flowchart LR
   A[目标服务<br/>nginx / apache / tomcat / IIS] -->|网卡 + TLS 探针| B[traffic capture]
   B --> C[会话目录<br/>SQLite + PCAP + JSONL]
-  C --> D[traffic-tui<br/>TUI / Web / JSON]
+  C --> D[traffic-console<br/>TUI / Web / JSON]
 ```
 
 本轮采集完整性、低影响与 HTTP/2 代码改动及未完成项目见 [优化实施与验收](../OPTIMIZATION.md)。HTTP/2 已加入有界解析和合成回归，实机后端覆盖尚未验收；以下表格保留既有实机结论。
@@ -33,7 +33,7 @@ git clone https://github.com/Sunmedalia/traffic.git && cd traffic
 sudo ./bin/traffic capture --ports 80,443 --no-tls
 
 # 4. 另开终端分析；无参数会列出会话
-./bin/traffic-tui
+./bin/traffic-console
 ```
 
 HTTP 链路确认后，再构建 eCapture 采集 HTTPS 明文：
@@ -48,7 +48,7 @@ sudo ./bin/traffic capture --ports 80,443 --ecapture "$PWD/bin/ecapture"
 采集器启动时在 stderr 打印会话绝对路径，停止时写入摘要。先确认这三件事再继续：
 
 1. `status.json` 的 `tls` 为 `attached`（eBPF）或 `active-preload`（预加载），不是 `unavailable`。
-2. 从客户端发一条已知请求，`traffic-tui requests` 能看到对应记录。
+2. 从客户端发一条已知请求，`traffic-console requests` 能看到对应记录。
 3. 用唯一编号逐条核对请求、响应及正文；`tls_coverage` 仍是 `unverified` 表示启动窗口和探针盲区无法自动量化，不是错误。
 
 > 只做 HTTP 时始终加 `--no-tls`。HTTPS 明文的依赖、探针版本和边界见 [Linux HTTPS 依赖](#linux-https-依赖与-ecapture)。
@@ -62,9 +62,9 @@ sudo ./bin/traffic capture --ports 80,443 --ecapture "$PWD/bin/ecapture"
 | HAProxy / 其他通用 OpenSSL 程序 | eBPF + `--service openssl --pid N` | 否 | 需要显式指定 PID |
 | 内核太旧、无 BTF，或选择启动时符号拦截 | `LD_PRELOAD` / `ld.so.preload` | 是 | 启动时加载库；系统级预加载支持白名单 |
 | Tomcat / JVM HTTPS | `--java-attach` | 否 | 动态附加 Java Agent |
-| Windows IIS / nginx / apache | Npcap + 显式启用探针 | 否 | IIS 用 Frida，nginx/apache 用 OpenSSL 探针 |
+| Windows IIS / nginx / apache | 随包 WinDivert + 自动配置探针 | 否 | IIS 用 Frida，nginx/apache 用 OpenSSL 探针 |
 | 已有 PCAP | `traffic import` | 不涉及 | 离线还原为会话 |
-| 在分析机上看别人采的会话 | `traffic-tui` | 不涉及 | 支持 Linux / macOS / Windows |
+| 在分析机上看别人采的会话 | `traffic-console` | 不涉及 | 支持 Linux / macOS / Windows |
 
 ## 常见场景（复制即用）
 
@@ -166,7 +166,7 @@ sudo ./bin/traffic capture --ports 80,443 --ecapture "$PWD/bin/ecapture" --durat
 powershell -ExecutionPolicy Bypass -File scripts/windows/build.ps1
 .\bin\windows\traffic.exe doctor
 .\bin\windows\traffic.exe capture --no-tls --ports 80,443 --duration 60s --name windows-http
-.\bin\windows\traffic-tui.exe
+.\bin\windows\traffic-console.exe
 ```
 
 IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集](#windows-采集)。
@@ -179,16 +179,16 @@ IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集]
 
 ```bash
 # 无参数启动，在界面选择会话
-./bin/traffic-tui
+./bin/traffic-console
 
 # 从其他采集根目录选择会话
-./bin/traffic-tui --data-dir /var/lib/traffic/sessions
+./bin/traffic-console --data-dir /var/lib/traffic/sessions
 
 # 直接打开指定会话
-./bin/traffic-tui --session ./sessions/incident-001
+./bin/traffic-console --session ./sessions/incident-001
 
 # 每两秒刷新，并预设筛选条件
-./bin/traffic-tui --session ./sessions/incident-001 \
+./bin/traffic-console --session ./sessions/incident-001 \
   --refresh 2s --client 192.0.2.10 --severity high
 ```
 
@@ -240,8 +240,8 @@ IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集]
 ### 浏览器界面
 
 ```bash
-./bin/traffic-tui web --session ./sessions/incident-001
-./bin/traffic-tui web --data-dir /var/lib/traffic/sessions --listen 127.0.0.1:9000
+./bin/traffic-console web --session ./sessions/incident-001
+./bin/traffic-console web --data-dir /var/lib/traffic/sessions --listen 127.0.0.1:9000
 ```
 
 启动后 stderr 会打印带访问令牌的地址，直接打开即可。默认只监听回环，远程分析建议用 `ssh -L 8080:127.0.0.1:8080 user@host` 转发；`--allow-remote` 会让令牌和正文以明文过网，只用于隔离网络。
@@ -251,7 +251,7 @@ IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集]
 - **会话选择**按日期分组，显示状态、主机、请求数和告警数，可按名称、主机或目录查找。
 - **概览**显示累计计数、数据缺口提示、请求与告警时间线、命中规则、来源地址、告警级别和响应状态分布、最近告警以及采集状态。点击规则、来源或分布项会跳到对应的筛选结果，在时间线上拖选会把列表限定到这段时间。
 - **请求 / 告警列表**每页 100 条，支持 Host/URL 关键词、级别、响应状态、请求方法、来源地址、规则、服务和起止时间组合筛选，输入后即时生效。列表上方的时间线随筛选条件变化，同样可以拖选缩小范围。翻到历史页时保持当前位置，并提示新到达的请求数。
-- **详情**显示解码后的 URL、查询参数和表单参数，在请求内容里标出规则命中的片段，JSON 正文可格式化显示。gzip 请求和响应正文在“解码正文”中查看。来源、Host、服务和规则可以直接点击作为筛选条件。“复制 cURL”生成可复现请求的命令，“导出证据”下载与 `traffic-tui export` 相同的 ZIP，采集进行中时导出会被拒绝。
+- **详情**显示解码后的 URL、查询参数和表单参数，在请求内容里标出规则命中的片段，JSON 正文可格式化显示。gzip 请求和响应正文在“解码正文”中查看。来源、Host、服务和规则可以直接点击作为筛选条件。“复制 cURL”生成可复现请求的命令，“导出证据”下载与 `traffic-console export` 相同的 ZIP，采集进行中时导出会被拒绝。
 
 采集中的会话按 `--refresh` 间隔自动刷新，默认每秒一次，最小 500 毫秒。已结束的会话降为每 5 秒检查一次，时间线和统计的刷新间隔不低于 5 秒。索引较大时，响应状态分布超过 1.5 秒会被跳过并在页面上说明。右上角可以切换本地时间与 UTC、深色与浅色配色，详情栏宽度可拖动调整。
 
@@ -270,12 +270,12 @@ IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集]
 ### 命令行查询
 
 ```bash
-./bin/traffic-tui status   --session SESSION
-./bin/traffic-tui requests --session SESSION --limit 100
-./bin/traffic-tui requests --session SESSION --client 192.0.2.10 --rule SQLI-001
-./bin/traffic-tui events   --session SESSION --severity high
-./bin/traffic-tui show EVENT_ID --session SESSION
-./bin/traffic-tui export EVENT_ID --session SESSION --out ./evidence.zip
+./bin/traffic-console status   --session SESSION
+./bin/traffic-console requests --session SESSION --limit 100
+./bin/traffic-console requests --session SESSION --client 192.0.2.10 --rule SQLI-001
+./bin/traffic-console events   --session SESSION --severity high
+./bin/traffic-console show EVENT_ID --session SESSION
+./bin/traffic-console export EVENT_ID --session SESSION --out ./evidence.zip
 ```
 
 筛选参数：`--since`（RFC3339）、`--client`、`--rule`、`--severity`、`--service`、`--limit`。TUI/Web 另有 Host/URL 关键词。`show` 含可读正文和 base64 字节；原始网络字节在 PCAP 里。采集中不能导出，先停止采集。分析程序以只读方式打开索引，运行用户需要会话目录和文件的读取权限，普通查询不需要 root。
@@ -289,14 +289,14 @@ IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集]
 | 预加载回滚 | 只移除本工具对应的预加载条目，再重启目标服务；保留其他库条目 |
 | 确认库已卸载 | `grep libtraffic /proc/PID/maps` 应无输出 |
 | 删除测试产物 | 直接删除会话目录；证据 ZIP 与会话目录分开保存 |
-| Web 令牌失效 | 重启 `traffic-tui web`，或用 `TRAFFIC_WEB_TOKEN` 固定 |
+| Web 令牌失效 | 重启 `traffic-console web`，或用 `TRAFFIC_WEB_TOKEN` 固定 |
 
 采集程序不会自动注册系统服务或修改站点配置。动态探针须按后端显式启用；预加载须在目标进程启动时加载。实验环境搭建脚本会创建相应测试服务，勿与采集命令混淆。
 
 ### 从旧版本升级
 
-- `traffic tui` 改为独立程序 `traffic-tui`。
-- `traffic status/requests/events/show/export` 改为 `traffic-tui ...`。
+- `traffic tui` 改为独立程序 `traffic-console`。
+- `traffic status/requests/events/show/export` 改为 `traffic-console ...`。
 - 原来的 `traffic analyze` 改名为 `traffic import`，用于离线 PCAP。
 - 会话格式保持兼容：分析器可读旧版平铺目录和新版分层目录，证据导出同样支持。
 
@@ -331,7 +331,7 @@ IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集]
 | `--drain-timeout` | 5s | 部分后端的数据排空预算，最大 15s |
 | `--netns-pid` | 0 | Linux 显式选择抓包网络命名空间 |
 
-`traffic capture --help`、`traffic doctor`、`traffic rules check FILE` 可随时查看。分析器参数用 `traffic-tui --help`。
+`traffic capture --help`、`traffic doctor`、`traffic rules check FILE` 可随时查看。分析器参数用 `traffic-console --help`。
 
 ## 会话目录与完整性
 
@@ -464,7 +464,7 @@ targets=nginx,httpd,apache2
 
 ## Windows 采集
 
-构建需要 Go 1.26.7+、x64 MinGW GCC 和 Npcap。
+从源码构建需要 Go 1.26.7+ 和 x64 MinGW GCC；正式发行包已包含 WinDivert、Python、Frida 和探针，无需安装 Npcap。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/windows/build.ps1
@@ -472,17 +472,14 @@ powershell -ExecutionPolicy Bypass -File scripts/windows/build.ps1
 .\bin\windows\traffic.exe capture --no-tls --ports 8080,8443 --duration 60s --name windows-http
 ```
 
-默认枚举可用适配器和回环，跳过断开设备；也可用 `doctor` 返回的完整 Npcap 设备名。抓包快照上限 256 KiB，避免回环大帧截断。证据目录使用继承 ACL；Job Object 限制 256 MiB 内存和单核 50% CPU。
+完整发行包默认使用 WinDivert 覆盖本机接口和回环；也可用 `doctor` 返回的 `windivert:接口索引` 或系统接口名。旧的 Npcap 回退仅适用于自行构建。抓包快照上限 256 KiB，避免回环大帧截断。证据目录使用继承 ACL；Job Object 限制 256 MiB 内存和单核 50% CPU。
 
 ### IIS
 
 ```powershell
-python -m pip install frida==17.5.1
-powershell -ExecutionPolicy Bypass -File scripts/windows/setup-iis.ps1
-# 首次安装要求重启时，重启后加 -Resume
-.\bin\windows\traffic.exe capture --service iis --ports 8080,8443 `
-  --iis-probe .\scripts\windows\probe-iis.py `
-  --iis-runtime-dir C:\traffic-lab\probe-runtime --duration 60s
+# 完整发行包已包含 Python / Frida；在管理员 PowerShell 运行
+.\traffic.exe doctor --service iis
+.\traffic.exe capture --service iis --ports 8080,8443 --duration 60s
 ```
 
 IIS 探针动态附加 `w3wp.exe`，在 HTTP Server API 收发边界复制明文，无需安装模块或回收应用池。`probe-runtime` 目录必须允许目标应用池身份读取。已附加前投递的异步接收调用无法恢复，启动窗口可能漏采；停止时可能因未完成 I/O 导致运行时未完全卸载。采集器会在状态中写入这条限制。实测范围是 Windows 10 17763、HTTP/1.1、TLS 1.2。
@@ -490,16 +487,9 @@ IIS 探针动态附加 `w3wp.exe`，在 HTTP Server API 收发边界复制明文
 ### Windows nginx / apache / 通用 OpenSSL
 
 ```powershell
-.\bin\windows\traffic.exe capture --service nginx --ports 80,443 `
-  --openssl-probe .\scripts\windows\probe-openssl.py `
-  --probe-runtime-dir C:\traffic-lab\probe-runtime
-.\bin\windows\traffic.exe capture --service apache --ports 80,443 `
-  --openssl-probe .\scripts\windows\probe-openssl.py `
-  --probe-runtime-dir C:\traffic-lab\probe-runtime
-.\bin\windows\traffic.exe capture --service openssl --pid 1234 --ports 9443 `
-  --libssl libssl-3-x64.dll `
-  --openssl-probe .\scripts\windows\probe-openssl.py `
-  --probe-runtime-dir C:\traffic-lab\probe-runtime
+.\traffic.exe capture --service nginx --ports 80,443
+.\traffic.exe capture --service apache --ports 80,443
+.\traffic.exe capture --service openssl --pid 1234 --ports 9443 --libssl libssl-3-x64.dll
 ```
 
 官方 Windows nginx 静态链接 OpenSSL，内置 profile 按二进制 SHA-256 和函数入口匹配；其他静态版本需要 `--openssl-profile`。辅助脚本目录需同时保留 `probe-openssl.py`、`probe-iis.py`、`openssl-plaintext.js` 和 `openssl-profiles.json`。动态附加只覆盖附加后进入的调用，附加前已阻塞的读取和半截消息可能漏采。Windows 的完整验收脚本为 `scripts/windows/verify-iis.py` 和 `scripts/windows/verify-middleware.py`。
@@ -512,7 +502,7 @@ IIS 探针动态附加 `w3wp.exe`，在 HTTP Server API 收发边界复制明文
 
 # 也可以分别构建
 go build -o bin/traffic ./cmd/traffic
-go build -o bin/traffic-tui ./cmd/traffic-tui
+go build -o bin/traffic-console ./cmd/traffic-console
 ```
 
 分析程序可在 Linux、macOS 或 Windows 构建；Linux eBPF 和 Windows IIS 后端必须运行在对应目标系统。构建出的采集器、分析器和 eCapture 必须同架构。
@@ -549,7 +539,7 @@ go test -race ./...
 go vet ./...
 ```
 
-CI 在 ARM64 / x86_64 Linux 执行格式检查、竞态测试、静态检查和构建，Windows x64 执行原生测试与构建，Java 17/21 执行 Maven 测试与打包。Windows 托管 runner 缺少 Npcap，两个依赖 libpcap DLL 的离线集成测试在 Linux 任务中运行。
+CI 在 ARM64 / x86_64 Linux 执行格式检查、竞态测试、静态检查和构建，Windows x64 执行原生测试与构建，Java 17/21 执行 Maven 测试与打包。PCAP/PCAPNG 离线导入使用纯 Go 读取器，Windows 无需 Npcap 即可运行离线集成测试；发布流程另验证随包 WinDivert 的回环 HTTP 实际采集。
 
 实机脚本需要兼容的测试站接口（`/api/health`、`/api/echo`、`/search`、未知路径 404），串行发送请求，输出目录必须为新目录：
 
@@ -558,7 +548,7 @@ python3 scripts/verify.py /tmp/traffic-functional --host 127.0.0.1
 python3 scripts/benchmark.py --output /tmp/traffic-performance --host 127.0.0.1
 ```
 
-脚本支持 `--binary` 和 `--config` 指定采集程序与 Nginx 配置。功能脚本另通过 `--analysis-binary` 指定证据导出所用的 `traffic-tui`，默认路径为 `/opt/traffic/bin/traffic-tui`。可用 `--ecapture` 指定探针路径、`--pid` 将 TLS 探针限定到实验进程。功能脚本检查 126 条请求及响应、已有 HTTPS 连接、TLS 版本、中文正文、五类规则、网站配置和 PID、证据校验。性能脚本默认 20/100 请求每秒、每组五分钟、重复三轮。
+脚本支持 `--binary` 和 `--config` 指定采集程序与 Nginx 配置。功能脚本另通过 `--analysis-binary` 指定证据导出所用的 `traffic-console`，默认路径为 `/opt/traffic/bin/traffic-console`。可用 `--ecapture` 指定探针路径、`--pid` 将 TLS 探针限定到实验进程。功能脚本检查 126 条请求及响应、已有 HTTPS 连接、TLS 版本、中文正文、五类规则、网站配置和 PID、证据校验。性能脚本默认 20/100 请求每秒、每组五分钟、重复三轮。
 
 ## 第三方组件
 

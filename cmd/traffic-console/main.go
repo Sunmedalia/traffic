@@ -46,9 +46,9 @@ func run(args []string) error {
 	if (cmd == "show" || cmd == "export") && len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		id, args = args[0], args[1:]
 	}
-	fs := flag.NewFlagSet("traffic-tui "+cmd, flag.ContinueOnError)
+	fs := flag.NewFlagSet("traffic-console "+cmd, flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "traffic-tui [--data-dir ROOT | --session DIR]\ntraffic-tui web [--listen ADDR] [--data-dir ROOT | --session DIR]\ntraffic-tui <status|requests|events|show ID|export ID> --session DIR")
+		fmt.Fprintln(fs.Output(), "traffic-console [--data-dir ROOT | --session DIR]\ntraffic-console web [--listen ADDR] [--data-dir ROOT | --session DIR]\ntraffic-console <status|requests|events|show ID|export ID> --session DIR")
 		fmt.Fprintln(fs.Output(), "默认打开中文会话选择界面，查询命令输出 JSON。")
 		fs.PrintDefaults()
 	}
