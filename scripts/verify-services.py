@@ -15,6 +15,7 @@ import time
 parser = argparse.ArgumentParser()
 parser.add_argument("output", type=Path)
 parser.add_argument("--binary", default="/opt/traffic/bin/traffic-services")
+parser.add_argument("--analysis-binary", default="/opt/traffic/bin/traffic-console")
 parser.add_argument("--service", required=True)
 parser.add_argument("--ecapture", default="/opt/traffic/bin/ecapture-services")
 parser.add_argument("--http-port", type=int, required=True)
@@ -77,11 +78,7 @@ try:
             connection.close()
         time.sleep(0.25)
     time.sleep(2)
-    with sqlite3.connect(args.output / "index.sqlite") as db:
-        live_rows = [json.loads(r[0]) for r in db.execute("SELECT data FROM requests")]
-    for path, method, status, secure, body in expected:
-        matches = [r for r in live_rows if r["url"] == path]
-        assert len(matches) == 1 and matches[0].get("response"), ("live capture", path, matches)
+    assert not (args.output / "index.sqlite").exists(), "collector performed local indexing"
 finally:
     existing.close()
     process.send_signal(signal.SIGINT)
@@ -90,8 +87,10 @@ assert process.returncode == 0
 assert before == hashlib.sha256(args.config.read_bytes()).hexdigest()
 after_ids = sorted(t["id"] for t in json.loads(subprocess.check_output(doctor_command))["targets"])
 assert set(before_ids) <= set(after_ids), (before_ids, after_ids)
-with sqlite3.connect(args.output / "index.sqlite") as db:
-    rows = [json.loads(r[0]) for r in db.execute("SELECT data FROM requests")]
+subprocess.run([args.analysis_binary, "analyze", "--session", str(args.output)], check=True)
+pointer = json.loads((args.output / "analysis-current.json").read_text())
+with sqlite3.connect(args.output / pointer["file"]) as db:
+    rows = [json.loads(r[0]) for r in db.execute("SELECT json_set(CAST(r.data AS TEXT),'$.alerts',json(a.alerts)) FROM requests r JOIN results a ON a.id=r.id")]
 for path, method, status, secure, body in expected:
     matches = [r for r in rows if r["url"] == path]
     assert len(matches) == 1, (path, matches)

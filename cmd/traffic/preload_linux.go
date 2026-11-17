@@ -99,28 +99,21 @@ func preloadUIDAllowed(uid uint32, allowedUIDs []uint32) bool {
 	return false
 }
 
-func capturePreload(ctx context.Context, s *Store, p *HTTPProcessor, path string, allowedUIDs []uint32) error {
+func capturePreload(ctx context.Context, s *Store, p *eventRecorder, path string, allowedUIDs []uint32) error {
 	connection, err := openPreloadSocket(path, allowedUIDs)
 	if err != nil {
 		return err
 	}
 	defer connection.Close()
 	defer os.Remove(path)
-	directory := filepath.Join(s.dir, "tls")
-	if err := os.MkdirAll(directory, 0700); err != nil {
-		return err
+	type rawTarget struct {
+		pid    int
+		target session.Target
 	}
-	evidence, err := os.OpenFile(filepath.Join(directory, "openssl-preload.jsonl"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	raw := newEvidenceWriter(s, evidence, "openssl-preload")
-	defer raw.Close()
-	encoder := json.NewEncoder(raw)
-	assemblers := map[string]*opensslAssembler{}
+	assemblers := map[string]*rawTarget{}
 	defer func() {
-		for _, assembler := range assemblers {
-			if err := assembler.close(""); err != nil {
+		for id, a := range assemblers {
+			if err := p.record("preload/"+id, "openssl-preload", a.target, session.RawEvent{Type: "end"}); err != nil {
 				s.fail(err)
 			}
 		}
@@ -136,9 +129,6 @@ func capturePreload(ctx context.Context, s *Store, p *HTTPProcessor, path string
 		n, oobn, flags, _, err := connection.ReadMsgUnix(buffer, ancillary)
 		if err != nil {
 			if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
-				for _, assembler := range assemblers {
-					assembler.frames.expire(time.Now(), false, p, "")
-				}
 				continue
 			}
 			return err
@@ -187,7 +177,7 @@ func capturePreload(ctx context.Context, s *Store, p *HTTPProcessor, path string
 			for id, old := range assemblers {
 				live, err := processIdentity("/proc", old.pid)
 				if err != nil || live != id {
-					if err := old.close(""); err != nil {
+					if err := p.record("preload/"+id, "openssl-preload", old.target, session.RawEvent{Type: "end"}); err != nil {
 						return err
 					}
 					delete(assemblers, id)
@@ -199,7 +189,7 @@ func capturePreload(ctx context.Context, s *Store, p *HTTPProcessor, path string
 				s.mu.Unlock()
 				continue
 			}
-			assembler = &opensslAssembler{processor: p, frames: &Frames{}, prefix: "preload/" + identity + "/", pid: int(credentials.Pid)}
+			assembler = &rawTarget{pid: int(credentials.Pid), target: session.Target{PID: int(credentials.Pid), ID: identity, Service: "openssl"}}
 			assemblers[identity] = assembler
 			target, err := processTarget("/proc", assembler.pid)
 			if err == nil {
@@ -208,6 +198,7 @@ func capturePreload(ctx context.Context, s *Store, p *HTTPProcessor, path string
 					target.Service = "openssl"
 				}
 				target.State = "active-preload"
+				assembler.target = target
 				s.mu.Lock()
 				var active []session.Target
 				for _, previous := range s.stats.Targets {
@@ -219,11 +210,8 @@ func capturePreload(ctx context.Context, s *Store, p *HTTPProcessor, path string
 				s.mu.Unlock()
 			}
 		}
-		if err := encoder.Encode(event); err != nil {
+		if err := p.openssl("preload/"+identity, "openssl-preload", assembler.target, event.opensslEvent); err != nil {
 			return err
-		}
-		if err := assembler.ingest(event.opensslEvent); err != nil {
-			return fmt.Errorf("preload event: %w", err)
 		}
 		s.mu.Lock()
 		s.stats.TLS = "active-preload"

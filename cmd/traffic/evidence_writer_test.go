@@ -110,3 +110,36 @@ func TestEvidenceWriterFailureAndBoundedStop(t *testing.T) {
 		t.Fatal(s.stats)
 	}
 }
+
+type finalizeFailingSink struct {
+	bytes.Buffer
+	syncFailure bool
+}
+
+func (s *finalizeFailingSink) Sync() error {
+	if s.syncFailure {
+		return errors.New("injected sync failure")
+	}
+	return nil
+}
+func (s *finalizeFailingSink) Close() error {
+	if !s.syncFailure {
+		return errors.New("injected close failure")
+	}
+	return nil
+}
+func TestEvidenceFinalizationFailuresStopCapture(t *testing.T) {
+	for _, syncFailure := range []bool{true, false} {
+		s := &Store{dir: t.TempDir()}
+		writer := newEvidenceWriter(s, &finalizeFailingSink{syncFailure: syncFailure}, "finalize")
+		if _, err := writer.Write([]byte("raw evidence")); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err == nil {
+			t.Fatal("finalization failure hidden")
+		}
+		if s.fatal == nil || !s.stats.RawEvidenceDrainUnconfirmed {
+			t.Fatal("failure marked successful", s.stats)
+		}
+	}
+}

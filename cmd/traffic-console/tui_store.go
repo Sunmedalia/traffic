@@ -146,10 +146,19 @@ func readTUIStatus(dir string) (Stats, string) {
 
 // Query summaries in SQLite so bodies are only transferred for an opened detail.
 func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly bool, page int, detailID string, anchor *tuiRow) (tuiSnapshot, error) {
+	fresh, openErr := openStore(s.dir)
+	if openErr != nil {
+		return tuiSnapshot{}, openErr
+	}
+	defer fresh.db.Close()
+	s = fresh
 	result := tuiSnapshot{Page: page}
 	result.Stats, result.StatusWarning = readTUIStatus(s.dir)
 	if s.analysis != nil {
 		result.Stats.Alerts = s.analysis.Alerts
+		if s.analysis.Reconstructed {
+			result.Stats.Transactions = s.analysis.Transactions
+		}
 	}
 	if s.analysisNote != "" {
 		if result.StatusWarning != "" {
@@ -257,6 +266,12 @@ const tuiSourceLimit = 200
 // loadTUISummary aggregates the alerts of matching requests in one scan. Rule and
 // severity conditions also restrict which alerts of a request are counted.
 func loadTUISummary(ctx context.Context, s *Store, filter tuiFilter) (*tuiSummary, error) {
+	fresh, openErr := openStore(s.dir)
+	if openErr != nil {
+		return nil, openErr
+	}
+	defer fresh.db.Close()
+	s = fresh
 	where, args := filter.where(true)
 	// One json_extract with several paths parses each record once.
 	rows, err := s.db.QueryContext(ctx, `SELECT id, time, client, json_extract(CAST(data AS TEXT),'$.alerts','$.method','$.host','$.url')

@@ -160,15 +160,12 @@ def main():
     existing_preserved = expected[0]["client_endpoint"] == endpoint
     if not existing_preserved:
         failures.append({"preexisting_https_connection_changed": expected[0]["client_endpoint"]})
-    with sqlite3.connect(session / "index.sqlite") as db:
-        rows = [json.loads(data) for (data,) in db.execute("SELECT data FROM requests")]
-    if any(row.get("alerts") for row in rows):
-        raise AssertionError("collector performed detection")
+    if (session / "index.sqlite").exists():
+        raise AssertionError("collector unexpectedly wrote an index")
     subprocess.run([str(args.analysis_binary), "analyze", "--session", str(session)], check=True)
-    with sqlite3.connect(session / "analysis.sqlite") as analysis:
-        matches = {row[0]: json.loads(row[1]) for row in analysis.execute("SELECT id, alerts FROM results")}
-    for row in rows:
-        row["alerts"] = matches[row["id"]]
+    pointer = json.loads((session / "analysis-current.json").read_text())
+    with sqlite3.connect(session / pointer["file"]) as analysis:
+        rows = [json.loads(row[0]) for row in analysis.execute("SELECT json_set(CAST(r.data AS TEXT),'$.alerts',json(a.alerts)) FROM requests r JOIN results a ON a.id=r.id")]
     for sample in expected:
         if sample["secure"] and not args.iis_probe:
             continue
@@ -179,11 +176,11 @@ def main():
         row = matches[0]
         request_data = base64.b64decode(sample["request_body"])
         response_data = base64.b64decode(sample["response_body"])
-        oversized = len(request_data) > 256 << 10 or len(response_data) > 64 << 10
+        oversized = len(request_data) > 1 << 20 or len(response_data) > 1 << 20
         checks = {"status": row["status"] == sample["status"], "service": row.get("service") == "iis",
                   "complete": not row["incomplete"], "truncation": row["truncated"] == oversized,
-                  "response_body": response_body(row) == response_data[:64 << 10],
-                  "request_body": request_data[:256 << 10] in base64.b64decode(row["request"]),
+                  "response_body": response_body(row) == response_data[:1 << 20],
+                  "request_body": request_data[:1 << 20] in base64.b64decode(row["request"]),
                   "backend": row.get("backend") == ("iis-httpapi" if sample["secure"] else "pcap")}
         if not all(checks.values()):
             failures.append({"url": sample["url"], "secure": sample["secure"], "checks": checks})
@@ -192,12 +189,7 @@ def main():
         failures.append({"configuration_or_worker_changed": {"before": before, "after": after}})
     if process.returncode or any(status[k] for k in ("queue_dropped", "dropped", "tls_dropped")):
         failures.append({"collector_exit": process.returncode, "status": status})
-    helper_summaries = []
-    for path in (session / "tls").glob("iis-*.jsonl"):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            item = json.loads(line)
-            if item.get("type") == "host_summary":
-                helper_summaries.append(item)
+    helper_summaries = list(status.get("probe_exits", {}).values())
     if args.iis_probe and (not helper_summaries or not all(item.get("hooks_removed") for item in helper_summaries)):
         failures.append({"helper_unload": "no confirmation that hooks were removed"})
     rules = sorted({alert["rule"] for row in rows for alert in row.get("alerts", [])})

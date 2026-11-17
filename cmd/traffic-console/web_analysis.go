@@ -58,6 +58,8 @@ func (w *webServer) handleAnalyze(rw http.ResponseWriter, r *http.Request) {
 	if s == nil {
 		return
 	}
+	dir := s.dir
+	s.db.Close()
 	w.jobMu.Lock()
 	defer w.jobMu.Unlock()
 	if w.ctx.Err() != nil {
@@ -80,17 +82,7 @@ func (w *webServer) handleAnalyze(rw http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer w.jobs.Done()
 		defer cancel()
-		report, err := analyzeSessionRules(ctx, s.dir, "", rs, time.Minute, 20)
-		// Existing requests finish with their reader; later requests reopen the
-		// index and attach the newly published analysis without stale counters.
-		w.apiMu.Lock()
-		w.mu.Lock()
-		if previous := w.stores[s.dir]; previous != nil {
-			previous.db.Close()
-			delete(w.stores, s.dir)
-		}
-		w.mu.Unlock()
-		w.apiMu.Unlock()
+		report, err := analyzeSessionRules(ctx, dir, "", rs, time.Minute, 20)
 		w.jobMu.Lock()
 		defer w.jobMu.Unlock()
 		job.Finished = time.Now().UTC()
@@ -115,8 +107,6 @@ func (w *webServer) handleAnalysisStatus(rw http.ResponseWriter, r *http.Request
 }
 
 func (w *webServer) handleAnalysisCancel(rw http.ResponseWriter, r *http.Request) {
-	w.jobMu.Lock()
-	defer w.jobMu.Unlock()
 	var input struct {
 		ID string `json:"id"`
 	}
@@ -124,6 +114,8 @@ func (w *webServer) handleAnalysisCancel(rw http.ResponseWriter, r *http.Request
 		webError(rw, 400, err)
 		return
 	}
+	w.jobMu.Lock()
+	defer w.jobMu.Unlock()
 	if w.job == nil || w.job.ID != input.ID || w.job.State != "running" {
 		webError(rw, 409, errors.New("该任务已结束或已被替换"))
 		return

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Sunmedalia/traffic/internal/index"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -15,35 +16,65 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sunmedalia/traffic/internal/replay"
 	"github.com/Sunmedalia/traffic/internal/session"
+	"sort"
 )
 
-const analysisEngineVersion = 1
+const analysisEngineVersion = 2
 
 type analysisReport struct {
-	EngineVersion int           `json:"engine_version"`
-	Completed     time.Time     `json:"completed"`
-	Transactions  uint64        `json:"transactions"`
-	Alerts        uint64        `json:"alerts"`
-	RulesSHA256   string        `json:"rules_sha256"`
-	Rules         []Rule        `json:"rules"`
-	ScanWindow    time.Duration `json:"scan_window_ns"`
-	ScanPaths     int           `json:"scan_paths"`
-	Source        string        `json:"source_signature"`
-	Delivery      *Stats        `json:"delivery,omitempty"`
+	Reconstructed  bool          `json:"reconstructed"`
+	RequestLimit   int           `json:"request_limit"`
+	ResponseLimit  int           `json:"response_limit"`
+	Reconstruction *Stats        `json:"reconstruction,omitempty"`
+	EngineVersion  int           `json:"engine_version"`
+	Completed      time.Time     `json:"completed"`
+	Transactions   uint64        `json:"transactions"`
+	Alerts         uint64        `json:"alerts"`
+	RulesSHA256    string        `json:"rules_sha256"`
+	Rules          []Rule        `json:"rules"`
+	ScanWindow     time.Duration `json:"scan_window_ns"`
+	ScanPaths      int           `json:"scan_paths"`
+	Source         string        `json:"source_signature"`
+	Delivery       *Stats        `json:"delivery,omitempty"`
 }
 
 // A cheap freshness check keeps opening large sessions independent of body size.
 // Copying or changing the source index can invalidate results; analyze rebuilds them.
 func sourceSignature(dir string) (string, error) {
 	var parts []string
-	for _, name := range []string{"index.sqlite", "index.sqlite-wal"} {
+	names := []string{"index.sqlite", "index.sqlite-wal"}
+	if rawSession(dir) {
+		names = []string{"manifest.json"}
+		files, err := session.PacketFiles(dir)
+		if err != nil {
+			return "", err
+		}
+		for _, file := range files {
+			name, err := filepath.Rel(dir, file)
+			if err != nil {
+				return "", err
+			}
+			names = append(names, name)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "tls", "stream.jsonl")); err == nil {
+			names = append(names, filepath.Join("tls", "stream.jsonl"))
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		sort.Strings(names)
+	}
+	for _, name := range names {
 		info, err := os.Stat(filepath.Join(dir, name))
 		if os.IsNotExist(err) && strings.HasSuffix(name, "-wal") {
 			continue
 		}
 		if err != nil {
 			return "", err
+		}
+		if strings.HasSuffix(name, "-wal") && info.Size() == 0 {
+			continue
 		}
 		parts = append(parts, fmt.Sprintf("%s:%d:%d", name, info.Size(), info.ModTime().UnixNano()))
 	}
@@ -60,6 +91,9 @@ func analysisURL(path, mode string) string {
 	q := u.Query()
 	q.Set("mode", mode)
 	q.Set("_busy_timeout", "5000")
+	if mode == "ro" {
+		q.Set("immutable", "1")
+	}
 	u.RawQuery = q.Encode()
 	return u.String()
 }
@@ -67,9 +101,20 @@ func analysisURL(path, mode string) string {
 func openAnalysisDB(dir string, write bool) (*sql.DB, error) {
 	mode := "ro"
 	if write {
+		if err := validateAnalysisDestination(dir); err != nil {
+			return nil, err
+		}
 		mode = "rwc"
 	}
-	db, err := sql.Open("sqlite3", analysisURL(filepath.Join(dir, "analysis.sqlite"), mode))
+	path := filepath.Join(dir, "analysis.sqlite")
+	if !write {
+		var err error
+		path, err = analysisDatabasePath(dir)
+		if err != nil {
+			return nil, err
+		}
+	}
+	db, err := sql.Open("sqlite3", analysisURL(path, mode))
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +145,13 @@ func analyzeSession(ctx context.Context, dir, webhookURL string) (analysisReport
 }
 
 func analyzeSessionRules(ctx context.Context, dir, webhookURL string, rs []Rule, window time.Duration, paths int) (analysisReport, error) {
-	report := analysisReport{EngineVersion: analysisEngineVersion, Rules: rs, ScanWindow: window, ScanPaths: paths}
+	return analyzeConfigured(ctx, dir, webhookURL, rs, window, paths, replay.Options{RequestLimit: requestLimit, ResponseLimit: responseLimit})
+}
+func analyzeConfigured(ctx context.Context, dir, webhookURL string, rs []Rule, window time.Duration, paths int, limits replay.Options) (analysisReport, error) {
+	report := analysisReport{EngineVersion: analysisEngineVersion, Rules: rs, ScanWindow: window, ScanPaths: paths, Reconstructed: rawSession(dir), RequestLimit: limits.RequestLimit, ResponseLimit: limits.ResponseLimit}
+	if err := validateAnalysisDestination(dir); err != nil {
+		return report, err
+	}
 	lock, err := os.Open(filepath.Join(dir, "capture.lock"))
 	if err == nil {
 		defer lock.Close()
@@ -117,20 +168,35 @@ func analyzeSessionRules(ctx context.Context, dir, webhookURL string, rs []Rule,
 			return report, errors.New("stop capture before local analysis")
 		}
 	}
-	source, err := session.OpenDB(dir, false)
-	if err != nil {
-		return report, err
+	var source *sql.DB
+	if !report.Reconstructed {
+		source, err = index.OpenDB(dir, false)
+		if err != nil {
+			return report, err
+		}
+		defer source.Close()
 	}
-	defer source.Close()
 	report.Source, err = sourceSignature(dir)
 	if err != nil {
 		return report, err
 	}
-	db, err := openAnalysisDB(dir, true)
+	work, err := os.MkdirTemp("", "traffic-analysis-*")
+	if err != nil {
+		return report, err
+	}
+	defer os.RemoveAll(work)
+	db, err := openAnalysisDB(work, true)
 	if err != nil {
 		return report, err
 	}
 	defer db.Close()
+	if report.Reconstructed {
+		stats, err := replay.Build(ctx, dir, db, limits)
+		if err != nil {
+			return report, err
+		}
+		report.Reconstruction = &stats
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return report, err
@@ -145,7 +211,12 @@ func analyzeSessionRules(ctx context.Context, dir, webhookURL string, rs []Rule,
 	}
 	defer stmt.Close()
 	scanner := &scanTracker{clients: map[string]*scanState{}}
-	rows, err := source.QueryContext(ctx, "SELECT data FROM requests ORDER BY time,id")
+	var rows *sql.Rows
+	if report.Reconstructed {
+		rows, err = tx.QueryContext(ctx, "SELECT data FROM requests ORDER BY time,id")
+	} else {
+		rows, err = source.QueryContext(ctx, "SELECT data FROM requests ORDER BY time,id")
+	}
 	if err != nil {
 		return report, err
 	}
@@ -159,7 +230,7 @@ func analyzeSessionRules(ctx context.Context, dir, webhookURL string, rs []Rule,
 		if err = json.Unmarshal(raw, &record); err != nil {
 			return report, err
 		}
-		record.Alerts = detectWithRules(record, rs)
+		record.Alerts = detectWithLimits(record, rs, limits.RequestLimit, limits.ResponseLimit)
 		if alert := scanWithState(record, scanner, window, paths); alert != nil {
 			record.Alerts = append(record.Alerts, *alert)
 		}
@@ -193,11 +264,13 @@ func analyzeSessionRules(ctx context.Context, dir, webhookURL string, rs []Rule,
 		return report, errors.New("capture index changed during analysis; retry after capture stops")
 	}
 	ruleData, _ := json.Marshal(struct {
-		Version int
-		Rules   []Rule
-		Window  time.Duration
-		Paths   int
-	}{analysisEngineVersion, rs, window, paths})
+		Version       int
+		Rules         []Rule
+		Window        time.Duration
+		Paths         int
+		RequestLimit  int
+		ResponseLimit int
+	}{analysisEngineVersion, rs, window, paths, limits.RequestLimit, limits.ResponseLimit})
 	hash := sha256.Sum256(ruleData)
 	report.RulesSHA256 = hex.EncodeToString(hash[:])
 	report.Completed = time.Now().UTC()
@@ -209,6 +282,15 @@ func analyzeSessionRules(ctx context.Context, dir, webhookURL string, rs []Rule,
 		return report, err
 	}
 	if err = tx.Commit(); err != nil {
+		return report, err
+	}
+	if err = db.Close(); err != nil {
+		return report, err
+	}
+	if err = ctx.Err(); err != nil {
+		return report, err
+	}
+	if err = publishAnalysis(ctx, dir, work); err != nil {
 		return report, err
 	}
 	// Explicitly requested delivery happens only after successful publication.
@@ -250,6 +332,9 @@ func analyzeSessionRules(ctx context.Context, dir, webhookURL string, rs []Rule,
 }
 
 func readAnalysisReport(dir string) (*analysisReport, error) {
+	if err := validateAnalysisDestination(dir); err != nil {
+		return nil, err
+	}
 	db, err := openAnalysisDB(dir, false)
 	if err != nil {
 		return nil, err

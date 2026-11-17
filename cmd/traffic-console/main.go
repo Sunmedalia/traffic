@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Sunmedalia/traffic/internal/replay"
 	"github.com/Sunmedalia/traffic/internal/session"
 )
 
@@ -85,6 +86,8 @@ func run(args []string) error {
 	scanDuration := fs.Duration("scan-window", time.Minute, "scan correlation window for analyze")
 	scanPaths := fs.Int("scan-paths", 20, "distinct paths for scan detection in analyze")
 	webhookURL := fs.String("alert-webhook", "", "send local analysis alerts to HTTP(S) endpoint")
+	requestBytes := fs.Int("request-limit", 1<<20, "maximum locally reconstructed request body bytes (up to 16 MiB)")
+	responseBytes := fs.Int("response-limit", 1<<20, "maximum locally reconstructed response body bytes (up to 16 MiB)")
 	dir := fs.String("session", "", "existing session directory")
 	dataDir := fs.String("data-dir", "", "session browser search directory")
 	rulesDir := fs.String("rules-dir", defaultRulesDir(), "managed YAML rule directory for web")
@@ -113,7 +116,7 @@ func run(args []string) error {
 		var invalid string
 		fs.Visit(func(f *flag.Flag) {
 			switch f.Name {
-			case "rules", "scan-window", "scan-paths", "alert-webhook":
+			case "rules", "scan-window", "scan-paths", "alert-webhook", "request-limit", "response-limit":
 				invalid = f.Name
 			}
 		})
@@ -124,7 +127,7 @@ func run(args []string) error {
 		var invalid string
 		fs.Visit(func(f *flag.Flag) {
 			switch f.Name {
-			case "session", "rules", "scan-window", "scan-paths", "alert-webhook", "json":
+			case "session", "rules", "scan-window", "scan-paths", "alert-webhook", "json", "request-limit", "response-limit":
 			default:
 				invalid = f.Name
 			}
@@ -173,6 +176,9 @@ func run(args []string) error {
 		return errors.New("--session required")
 	}
 	if cmd == "analyze" {
+		if *requestBytes < 1 || *responseBytes < 1 || *requestBytes > 16<<20 || *responseBytes > 16<<20 {
+			return errors.New("local body limits must be between 1 byte and 16 MiB")
+		}
 		if *scanDuration <= 0 || *scanPaths < 1 {
 			return errors.New("invalid scan detection limits")
 		}
@@ -185,7 +191,7 @@ func run(args []string) error {
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		report, err := analyzeSession(ctx, *dir, *webhookURL)
+		report, err := analyzeConfigured(ctx, *dir, *webhookURL, rules, *scanDuration, *scanPaths, replay.Options{RequestLimit: *requestBytes, ResponseLimit: *responseBytes})
 		if err != nil {
 			return err
 		}

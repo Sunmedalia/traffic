@@ -95,7 +95,7 @@ func TestImportCreatesOrganizedSession(t *testing.T) {
 	if err := run([]string{"import", input, "--data-dir", dataDir, "--name", "case-001"}); err != nil {
 		t.Fatal(err)
 	}
-	indexes, err := filepath.Glob(filepath.Join(dataDir, "*", "*", "*", "index.sqlite"))
+	indexes, err := filepath.Glob(filepath.Join(dataDir, "*", "*", "*", "manifest.json"))
 	if err != nil || len(indexes) != 1 {
 		t.Fatalf("indexes %v %v", indexes, err)
 	}
@@ -113,7 +113,7 @@ func TestImportCreatesOrganizedSession(t *testing.T) {
 	if err = json.Unmarshal(raw, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	if manifest["name"] != "case-001" || manifest["mode"] != "import" || manifest["layout_version"] != float64(2) {
+	if manifest["name"] != "case-001" || manifest["mode"] != "import" || manifest["layout_version"] != float64(3) || manifest["capture_mode"] != "raw" {
 		t.Fatalf("manifest %+v", manifest)
 	}
 	var status Stats
@@ -129,8 +129,8 @@ func TestImportCreatesOrganizedSession(t *testing.T) {
 	if err = run([]string{"import", input, "--output", exact}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = os.Stat(filepath.Join(exact, "index.sqlite")); err != nil {
-		t.Fatal(err)
+	if _, err = os.Stat(filepath.Join(exact, "index.sqlite")); !os.IsNotExist(err) {
+		t.Fatal("raw import created index")
 	}
 	failed := filepath.Join(root, "failed")
 	writeImportFixture(t, input, true)

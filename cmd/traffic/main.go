@@ -98,10 +98,7 @@ func run(args []string) (runErr error) {
 	fs.DurationVar(&drainTimeout, "drain-timeout", 5*time.Second, "maximum probe data drain time")
 	noTLS := fs.Bool("no-tls", false, "disable TLS probes")
 	duration := fs.Duration("duration", 0, "optional capture duration")
-	fs.IntVar(&requestLimit, "request-limit", requestLimit, "maximum saved request body bytes")
-	fs.IntVar(&responseLimit, "response-limit", responseLimit, "maximum saved response body bytes")
 	fs.IntVar(&diskLimitMiB, "disk-limit-mib", diskLimitMiB, "session disk budget MiB")
-	fs.DurationVar(&retention, "retention", retention, "transaction retention")
 	fs.Bool("no-detect", true, "deprecated compatibility flag; collection never runs detection")
 	jsonUsage := "JSON output (default)"
 	if cmd == "doctor" {
@@ -214,7 +211,7 @@ func run(args []string) (runErr error) {
 	if *requireTLS && (*noTLS || cmd != "capture") {
 		return errors.New("--require-tls requires capture with TLS enabled")
 	}
-	if requestLimit < 1 || requestLimit > 1<<20 || responseLimit < 1 || responseLimit > 1<<20 || diskLimitMiB < 64 || retention <= 0 {
+	if diskLimitMiB < 64 {
 		return errors.New("invalid resource or result limits")
 	}
 	if cmd == "doctor" {
@@ -316,7 +313,6 @@ func run(args []string) (runErr error) {
 		if e != nil {
 			return e
 		}
-		defer s.db.Close()
 		s.probeCheck = func(target session.Target) captureCheck {
 			java := *javaAttach && (*javaPID == 0 || *javaPID == target.PID)
 			result := captureChecks(target.Service, target.PID, target.Library, *ecapture, java, *javaAgent, "", *javaPID)
@@ -350,7 +346,8 @@ func run(args []string) (runErr error) {
 		fmt.Fprintf(os.Stderr, "会话目录 %s\n", s.dir)
 		s.report()
 		s.stats.Targets = discoverTargets("/proc", *service, *pid, *lib)
-		p := newHTTP(s)
+		p := newRecorder(s)
+		defer p.close()
 		if cmd == "capture" {
 			cleanup, e := limitResources()
 			if e != nil {
@@ -370,7 +367,10 @@ func run(args []string) (runErr error) {
 		}
 		manifest := map[string]any{
 			"schema_version":                   1,
-			"layout_version":                   2,
+			"layout_version":                   3,
+			"capture_mode":                     "raw",
+			"capture_ports":                    portNumbers(capturePorts),
+			"local_addresses":                  captureAddresses(),
 			"hostname":                         host,
 			"os":                               runtime.GOOS,
 			"arch":                             runtime.GOARCH,
@@ -396,8 +396,6 @@ func run(args []string) (runErr error) {
 			"collector_cpu_percent":            collectorCPUPercent,
 			"probe_drain_timeout_ms":           drainTimeout.Milliseconds(),
 			"in_process_probe_budget_included": false,
-			"request_limit":                    requestLimit,
-			"response_limit":                   responseLimit,
 		}
 		if cmd == "import" {
 			manifest["input_pcap"] = id
@@ -419,10 +417,20 @@ func run(args []string) (runErr error) {
 		s.report()
 		if cmd == "import" {
 			e = capturePackets(ctx, s, p, "offline", filter, id)
-			p.wg.Wait()
-			p.finish()
+			s.mu.Lock()
+			fatal := s.fatal
+			s.mu.Unlock()
+			if e == nil {
+				e = fatal
+			}
 			if e != nil {
 				return e
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := checkDisk(s); err != nil {
+				return err
 			}
 			s.mu.Lock()
 			s.stats.State = "complete"
@@ -430,13 +438,6 @@ func run(args []string) (runErr error) {
 			s.report()
 			return nil
 		}
-		stopIndex := s.startIndexWriter(ctx)
-		defer func() {
-			if err := stopIndex(); err != nil {
-				s.fail(err)
-				s.report()
-			}
-		}()
 		var wg sync.WaitGroup
 		for _, name := range names {
 			wg.Add(1)
@@ -498,9 +499,7 @@ func run(args []string) (runErr error) {
 		s.report()
 		cancel()
 		wg.Wait()
-		p.wg.Wait()
-		p.finish()
-		if err := stopIndex(); err != nil {
+		if err := p.close(); err != nil {
 			s.fail(err)
 		}
 		s.mu.Lock()
@@ -534,16 +533,23 @@ func run(args []string) (runErr error) {
 	return fmt.Errorf("unknown command %s", cmd)
 }
 func maintain(s *Store) error {
-	if e := s.pruneIndex(time.Now().UTC().Add(-retention)); e != nil {
-		return e
-	}
+	return checkDisk(s)
+}
+
+func checkDisk(s *Store) error {
 	var total int64
-	filepath.Walk(s.dir, func(_ string, i os.FileInfo, e error) error {
-		if e == nil && !i.IsDir() {
+	err := filepath.Walk(s.dir, func(_ string, i os.FileInfo, e error) error {
+		if e != nil {
+			return e
+		}
+		if !i.IsDir() {
 			total += i.Size()
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
 	if total > int64(diskLimitMiB)<<20 {
 		return errors.New("session exceeds disk budget; capture stopped")
 	}

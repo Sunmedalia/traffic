@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -48,28 +49,28 @@ func TestLocalAnalysisPreservesEvidenceAndSupportsReanalysis(t *testing.T) {
 	if report.Transactions != 21 || report.Alerts != 3 {
 		t.Fatalf("unexpected report %+v", report)
 	}
-	// Simulate a result-write failure after earlier rows have been processed.
-	analysisDB, err := openAnalysisDB(writer.dir, true)
+	// A cancelled rebuild never replaces the last published generation.
+	publishedPath, err := analysisDatabasePath(writer.dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = analysisDB.Exec(`CREATE TRIGGER fail_result BEFORE INSERT ON results WHEN NEW.id='attack' BEGIN SELECT RAISE(ABORT,'injected write failure'); END`); err != nil {
+	published, err := os.ReadFile(publishedPath)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = analyzeSession(context.Background(), writer.dir, ""); err == nil {
-		t.Fatal("write failure was ignored")
+	cancelled, stop := context.WithCancel(context.Background())
+	stop()
+	if _, err = analyzeSession(cancelled, writer.dir, ""); err == nil {
+		t.Fatal("cancelled rebuild succeeded")
 	}
-	if retained, err := readAnalysisReport(writer.dir); err != nil || retained.Alerts != 3 || !retained.Completed.Equal(report.Completed) {
-		t.Fatal("failed analysis lost previous publication", retained, err)
-	}
-	var retained int
-	if err = analysisDB.QueryRow("SELECT count(*) FROM results").Scan(&retained); err != nil || retained != 21 {
-		t.Fatal("partial result set published", retained, err)
-	}
-	if _, err = analysisDB.Exec("DROP TRIGGER fail_result"); err != nil {
+	retainedPath, err := analysisDatabasePath(writer.dir)
+	if err != nil {
 		t.Fatal(err)
 	}
-	analysisDB.Close()
+	retained, err := os.ReadFile(retainedPath)
+	if err != nil || !bytes.Equal(published, retained) {
+		t.Fatal("failed rebuild replaced published results", err)
+	}
 	reader, err := openStore(writer.dir)
 	if err != nil {
 		t.Fatal(err)

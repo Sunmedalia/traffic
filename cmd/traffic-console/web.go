@@ -39,8 +39,6 @@ type webServer struct {
 
 	mu          sync.Mutex
 	sessions    map[string]sessionEntry
-	stores      map[string]*Store
-	apiMu       sync.RWMutex
 	ruleLibrary *ruleLibrary
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -80,7 +78,7 @@ var errWebSessionNotFound = errors.New("会话不存在，请重新扫描")
 
 func newWebServer(roots []string, token string, refresh time.Duration) *webServer {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &webServer{token: token, roots: roots, refresh: refresh, sessions: map[string]sessionEntry{}, stores: map[string]*Store{}, ctx: ctx, cancel: cancel}
+	return &webServer{token: token, roots: roots, refresh: refresh, sessions: map[string]sessionEntry{}, ctx: ctx, cancel: cancel}
 }
 
 func webSessionID(dir string) string {
@@ -91,14 +89,8 @@ func webSessionID(dir string) string {
 func (w *webServer) close() {
 	w.cancel()
 	w.jobs.Wait()
-	w.apiMu.Lock()
-	defer w.apiMu.Unlock()
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	for dir, s := range w.stores {
-		s.db.Close()
-		delete(w.stores, dir)
-	}
 	if w.ruleLibrary != nil {
 		w.ruleLibrary.root.Close()
 	}
@@ -133,16 +125,10 @@ func (w *webServer) store(ctx context.Context, id string) (*Store, error) {
 			return nil, errWebSessionNotFound
 		}
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if s := w.stores[entry.Dir]; s != nil {
-		return s, nil
-	}
 	s, err := openStore(entry.Dir)
 	if err != nil {
 		return nil, fmt.Errorf("无法打开会话: %w", err)
 	}
-	w.stores[entry.Dir] = s
 	return s, nil
 }
 
@@ -197,8 +183,6 @@ func (w *webServer) handler() http.Handler {
 				webError(rw, http.StatusUnauthorized, errors.New("访问令牌无效"))
 				return
 			}
-			w.apiMu.RLock()
-			defer w.apiMu.RUnlock()
 		}
 		mux.ServeHTTP(rw, r)
 	})
@@ -274,6 +258,7 @@ func (w *webServer) handleRequests(rw http.ResponseWriter, r *http.Request) {
 	if s == nil {
 		return
 	}
+	defer s.db.Close()
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	snapshot, err := loadTUISnapshot(ctx, s, filter, get("alerts") == "1", page, "", anchor)
@@ -302,6 +287,7 @@ func (w *webServer) transaction(rw http.ResponseWriter, r *http.Request) (*Store
 	var b []byte
 	err := s.db.QueryRowContext(ctx, "SELECT data FROM requests WHERE id=?", r.PathValue("rid")).Scan(&b)
 	if err == sql.ErrNoRows {
+		s.db.Close()
 		webError(rw, http.StatusNotFound, errors.New("该记录不存在或已被保留期清理"))
 		return nil, t, nil, false
 	}
@@ -309,6 +295,7 @@ func (w *webServer) transaction(rw http.ResponseWriter, r *http.Request) (*Store
 		err = json.Unmarshal(b, &t)
 	}
 	if err != nil {
+		s.db.Close()
 		webError(rw, http.StatusInternalServerError, fmt.Errorf("读取请求详情: %w", err))
 		return nil, t, nil, false
 	}
@@ -316,10 +303,11 @@ func (w *webServer) transaction(rw http.ResponseWriter, r *http.Request) (*Store
 }
 
 func (w *webServer) handleDetail(rw http.ResponseWriter, r *http.Request) {
-	_, t, _, ok := w.transaction(rw, r)
+	s, t, _, ok := w.transaction(rw, r)
 	if !ok {
 		return
 	}
+	defer s.db.Close()
 	decoded, view := session.DecodedBody(t.Request, 1<<20)
 	responseDecoded, responseView := session.DecodedBody(t.Response, 1<<20)
 	result := map[string]any{
@@ -338,6 +326,7 @@ func (w *webServer) handleExport(rw http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	defer s.db.Close()
 	dir, err := os.MkdirTemp("", "traffic-export-*")
 	if err != nil {
 		webError(rw, http.StatusInternalServerError, err)
@@ -422,7 +411,7 @@ func runWeb(dir, root, rulesDir, listen string, allowRemote bool, refresh time.D
 		listener.Close()
 		return fmt.Errorf("规则目录: %w", err)
 	}
-	server := &http.Server{Handler: w.handler(), ReadHeaderTimeout: 10 * time.Second}
+	server := &http.Server{Handler: w.handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	address := listener.Addr().String()

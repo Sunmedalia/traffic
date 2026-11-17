@@ -21,7 +21,7 @@ import (
 	"github.com/Sunmedalia/traffic/internal/session"
 )
 
-func captureWindowsProbe(ctx context.Context, s *Store, p *HTTPProcessor, target session.Target, attached func()) (result error) {
+func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target session.Target, attached func()) (result error) {
 	backend, helper, protocol := "iis", iisProbe, "traffic-iis-v1"
 	if target.Service != "iis" {
 		backend, helper, protocol = "openssl", opensslProbe, "traffic-openssl-v1"
@@ -32,12 +32,6 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *HTTPProcessor, target
 		}
 	}
 	tag := strings.ReplaceAll(target.ID, ":", "-")
-	raw, err := os.OpenFile(filepath.Join(s.dir, "tls", backend+"-"+tag+".jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	evidence := newEvidenceWriter(s, raw, backend)
-	defer evidence.Close()
 	log, err := os.OpenFile(filepath.Join(s.dir, "logs", backend+"-"+tag+".log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
@@ -50,7 +44,7 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *HTTPProcessor, target
 	sort.Strings(ports)
 	args := []string{helper, "--plaintext", "--control-stdin", "--duration", "0",
 		"--pid", strconv.Itoa(target.PID), "--out", "-", "--runtime-dir", iisRuntime,
-		"--ports", strings.Join(ports, ","), "--request-limit", strconv.Itoa(requestLimit), "--response-limit", strconv.Itoa(responseLimit)}
+		"--ports", strings.Join(ports, ","), "--request-limit", "0", "--response-limit", "0"}
 	if backend == "openssl" {
 		if opensslProfile != "" {
 			args = append(args, "--profile", opensslProfile)
@@ -105,18 +99,9 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *HTTPProcessor, target
 		case <-finished:
 		}
 	}()
-	assembler := &iisAssembler{store: s, target: target}
-	frames := &Frames{}
-	stopExpiry := frames.startExpiry(ctx, p)
-	defer stopExpiry()
-	openssl := &opensslAssembler{processor: p, frames: frames, prefix: fmt.Sprintf("windows-openssl-%d/%s/", serial.Add(1), target.ID), pid: target.PID}
+	source := fmt.Sprintf("windows-%s-%d/%s", backend, serial.Add(1), target.ID)
 	defer func() {
-		if err := openssl.close(""); result == nil && err != nil {
-			result = err
-		}
-	}()
-	defer func() {
-		if err := assembler.finish(); result == nil && err != nil {
+		if err := p.record(source, backend, target, session.RawEvent{Type: "end"}); result == nil && err != nil {
 			result = err
 		}
 	}()
@@ -126,9 +111,6 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *HTTPProcessor, target
 	scanner.Buffer(make([]byte, 4096), 2<<20)
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		if _, err := evidence.Write(append(append([]byte(nil), line...), '\n')); err != nil {
-			return err
-		}
 		var message struct {
 			Type              string          `json:"type"`
 			Message           string          `json:"message"`
@@ -165,18 +147,11 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *HTTPProcessor, target
 		if event.Sequence > 0 {
 			if lastSequence > 0 && event.Sequence != lastSequence+1 {
 				s.gap(backend, target.ID, "transport_sequence_gap", "events", 1)
-				if backend == "openssl" {
-					if err := openssl.close(""); err != nil {
-						return err
-					}
-					openssl.generation++
-					openssl.uncertain = true
-				} else {
-					if err := assembler.ingest(iisEvent{Type: "loss", Count: 0}); err != nil {
-						return err
-					}
+				if err := p.record(source, backend, target, session.RawEvent{Type: "loss", Reason: "transport_sequence_gap"}); err != nil {
+					return err
 				}
 			}
+
 			lastSequence = event.Sequence
 		}
 		if event.Type == "error" {
@@ -204,12 +179,12 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *HTTPProcessor, target
 			if err := json.Unmarshal(message.Payload, &apiEvent); err != nil {
 				return err
 			}
-			if err := assembler.ingest(apiEvent); err != nil {
+			if err := p.record(source, backend, target, session.RawEvent{Type: "iis", Time: apiEvent.Time, IIS: &apiEvent}); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := openssl.ingest(event); err != nil {
+		if err := p.openssl(source, backend, target, event); err != nil {
 			return err
 		}
 
@@ -228,7 +203,7 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *HTTPProcessor, target
 	return fmt.Errorf("Windows TLS helper stopped unexpectedly; see %s", log.Name())
 }
 
-func captureWindowsServices(ctx context.Context, s *Store, p *HTTPProcessor, service string, pid int, library string) {
+func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, service string, pid int, library string) {
 	type worker struct {
 		cancel context.CancelFunc
 		state  string

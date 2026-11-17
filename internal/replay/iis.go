@@ -1,4 +1,4 @@
-package main
+package replay
 
 import (
 	"bytes"
@@ -13,24 +13,7 @@ import (
 	"github.com/Sunmedalia/traffic/internal/session"
 )
 
-type iisEvent struct {
-	HTTPVersion string      `json:"http_version,omitempty"`
-	Protocol    string      `json:"protocol"`
-	Type        string      `json:"type"`
-	ID          string      `json:"id"`
-	Connection  string      `json:"connection"`
-	Time        time.Time   `json:"time"`
-	Method      string      `json:"method"`
-	URL         string      `json:"url"`
-	Headers     [][2]string `json:"headers"`
-	Client      string      `json:"client"`
-	Local       string      `json:"local"`
-	Status      int         `json:"status"`
-	Data        []byte      `json:"data_b64"`
-	Count       uint64      `json:"count"`
-	Length      int64       `json:"length"`
-	Reason      string      `json:"reason"`
-}
+type iisEvent = session.IISEvent
 
 type iisRequest struct {
 	transaction     Transaction

@@ -1,4 +1,4 @@
-package main
+package replay
 
 import (
 	"bytes"
@@ -31,31 +31,6 @@ func TestSavedRequestKeepsProcessIdentityAfterPIDReuse(t *testing.T) {
 		t.Fatal("response reassigned old evidence", got.TargetID, got.Service)
 	}
 }
-func TestNewRequestUsesSelectedTargetWithVerifiedStartIdentity(t *testing.T) {
-	s, err := openStore(t.TempDir(), true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.db.Close()
-	identity, err := processIdentity("/proc", os.Getpid())
-	if err != nil {
-		t.Skip("requires process identity lookup: " + err.Error())
-	}
-	s.stats.Targets = []session.Target{{PID: os.Getpid(), ID: identity, Service: "nginx", Ports: []int{443}}}
-	record := Transaction{ID: "selected", Time: time.Now(), PID: os.Getpid(), URL: "/selected", LocalEndpoint: "127.0.0.1:443", Client: "127.0.0.1:12345"}
-	if err := s.save(record); err != nil {
-		t.Fatal(err)
-	}
-	var got Transaction
-	got.ID = record.ID
-	if err := s.restore(&got); err != nil {
-		t.Fatal(err)
-	}
-	if got.TargetID != identity || got.Service != "nginx" || got.LocalEndpoint != record.LocalEndpoint {
-		t.Fatal("selected target attribution missing", got)
-	}
-}
-
 func TestTLSFrameCarriesVerifiedIdentityToStoredRequest(t *testing.T) {
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {

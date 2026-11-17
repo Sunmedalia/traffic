@@ -1,4 +1,4 @@
-package main
+package replay
 
 import (
 	"bufio"
@@ -74,7 +74,7 @@ func (p *HTTPProcessor) closeHTTP2Locked(key, reason string) {
 func (p *HTTPProcessor) saveHTTP2(c *h2Connection, id uint32, s *h2Stream, incomplete bool, reason string) {
 	t := s.record
 	if t.ID == "" {
-		t = Transaction{ID: fmt.Sprintf("h2-%x", serial.Add(1)), Time: c.meta.first, Source: c.source, Client: c.meta.client, LocalEndpoint: c.meta.local, PID: c.meta.pid, TargetID: c.meta.targetID, Connection: c.meta.connection, Protocol: "HTTP/2.0", StreamID: id}
+		t = Transaction{ID: fmt.Sprintf("h2-%x", serial.Add(1)), Time: c.meta.first, Source: c.source, Client: c.meta.client, LocalEndpoint: c.meta.local, PID: c.meta.pid, TargetID: c.meta.targetID, Backend: c.meta.backend, Service: c.meta.service, Connection: c.meta.connection, Protocol: "HTTP/2.0", StreamID: id}
 		if t.Time.IsZero() {
 			t.Time = time.Now().UTC()
 		}
@@ -134,7 +134,13 @@ func (p *HTTPProcessor) ingestHTTP2(key string, request bool, data []byte, meta 
 	if p.h2 == nil {
 		p.h2 = map[string]*h2Connection{}
 	}
-	now := time.Now().UTC()
+	now := meta.updated
+	if now.IsZero() {
+		now = meta.first
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	if now.Sub(p.h2lastSweep) >= 5*time.Second {
 		for old, c := range p.h2 {
 			if now.Sub(c.updated) > time.Minute {
@@ -442,6 +448,12 @@ func (p *HTTPProcessor) releaseHTTP2Stream(c *h2Connection, id uint32) {
 }
 func (p *HTTPProcessor) processHTTP2Reader(br *bufio.Reader, key, client, source string, pid int, request bool, r io.Reader) {
 	meta := frameContext{connection: key, client: client, pid: pid, first: time.Now().UTC()}
+	if origin, ok := r.(interface {
+		CaptureBackend() string
+		CaptureService() string
+	}); ok {
+		meta.backend, meta.service = origin.CaptureBackend(), origin.CaptureService()
+	}
 	if identity, ok := r.(interface{ TargetIdentity() string }); ok {
 		meta.targetID = identity.TargetIdentity()
 	}

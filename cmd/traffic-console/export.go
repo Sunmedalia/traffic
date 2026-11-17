@@ -26,6 +26,22 @@ import (
 var errCaptureRunning = errors.New("stop capture before exporting evidence")
 
 func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
+	if analysisExists(s.dir) {
+		fresh, err := openStore(s.dir)
+		if err != nil {
+			return err
+		}
+		defer fresh.db.Close()
+		s = fresh
+		if err = s.db.QueryRow("SELECT data FROM requests WHERE id=?", t.ID).Scan(&b); err != nil {
+			return err
+		}
+		t = Transaction{}
+		if err = json.Unmarshal(b, &t); err != nil {
+			return err
+		}
+	}
+
 	f, e := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if e != nil {
 		return e
@@ -82,7 +98,11 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 		if err = s.db.QueryRow("SELECT data FROM main.requests WHERE id=?", t.ID).Scan(&original); err != nil {
 			return err
 		}
-		if err = add("captured-event.json", original); err != nil {
+		name := "captured-event.json"
+		if s.analysis.Reconstructed {
+			name = "reconstructed-event.json"
+		}
+		if err = add(name, original); err != nil {
 			return err
 		}
 	}

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/Sunmedalia/traffic/internal/session"
@@ -55,7 +54,7 @@ func protoFields(b []byte) (map[int][]byte, map[int]uint64, error) {
 	}
 	return s, v, nil
 }
-func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string, pid, uid int, accepts func(int, string) string, snapshot kernelScopeSnapshot, attached func(), failed ...func(error)) error {
+func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string, pid, uid int, accepts func(int, string) string, snapshot kernelScopeSnapshot, attached func(), failed ...func(error)) error {
 	listener, e := net.Listen("tcp", "127.0.0.1:0")
 	if e != nil {
 		return e
@@ -166,23 +165,15 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 		ready = true
 		attached()
 	}
-	events, err := os.OpenFile(filepath.Join(s.dir, "tls", "events.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
-	if err != nil {
-		return err
-	}
-	evidence := newEvidenceWriter(s, events, "ecapture")
-	defer evidence.Close()
-	enc := json.NewEncoder(evidence)
+	source := fmt.Sprintf("ecapture-%d", epoch)
+	defer func() {
+		if err := p.boundary(source, "end", "probe_stopped"); err != nil {
+			s.fail(err)
+		}
+	}()
 	var sequence probeSequence
 	transportUncertain := false
-	identityWarning := false
-	portWarning := false
-	frames := &Frames{}
-	stopExpiry := frames.startExpiry(ctx, p)
-	defer func() {
-		stopExpiry()
-		p.invalidatePrefix(fmt.Sprintf("tls:probe-%d/", epoch), "probe_connection_closed")
-	}()
+	identityWarning, portWarning := false, false
 	for {
 		b, e := transport.next()
 		if e != nil {
@@ -226,8 +217,9 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 			if reset {
 				s.gap("ecapture", lib, "sequence_reset_or_reorder", "transitions", 1)
 			}
-			frames.expire(time.Now(), true, p, "")
-			p.invalidatePrefix(fmt.Sprintf("tls:probe-%d/", epoch), "probe_sequence_gap")
+			if err := p.boundary(source, "loss", "probe_sequence_gap"); err != nil {
+				return err
+			}
 		}
 		if nums[6] != 0 && !capturePorts[int(nums[6])] {
 			continue
@@ -253,10 +245,6 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 			}
 			continue
 		}
-		if err := enc.Encode(map[string]any{"fields": fields, "numbers": nums}); err != nil {
-			s.fail(fmt.Errorf("save TLS evidence: %w", err))
-			return err
-		}
 		payload := fields[11]
 
 		key := string(fields[2])
@@ -281,17 +269,15 @@ func captureTLS(ctx context.Context, s *Store, p *HTTPProcessor, bin, lib string
 		if len(fields[3]) > 0 {
 			client = net.JoinHostPort(string(fields[3]), strconv.Itoa(int(nums[4])))
 		}
+		target := p.target(int(nums[7]), identity)
+		kind := "data"
 		if len(payload) == 0 {
-			if string(fields[14]) == "read" {
-				frames.expire(time.Now(), true, p, key)
-			}
-			continue
+			kind = "close"
 		}
-		p.mu.Lock()
-		queue := p.pending["tls:"+key]
-		head := len(queue) > 0 && queue[0].Method == "HEAD"
-		p.mu.Unlock()
-		frames.ingest(key+string(fields[14]), payload, frameContext{incomplete: transportUncertain, targetID: identity, connection: key, client: client, pid: int(nums[7]), local: net.JoinHostPort(string(fields[5]), strconv.Itoa(int(nums[6])))}, head, p)
+		if err := p.record(source+"/"+identity, "ecapture", target, session.RawEvent{Type: kind, Connection: key, Direction: string(fields[14]), Data: payload, Local: net.JoinHostPort(string(fields[5]), strconv.Itoa(int(nums[6]))), Client: client, Incomplete: transportUncertain}); err != nil {
+			return err
+		}
+
 	}
 }
 

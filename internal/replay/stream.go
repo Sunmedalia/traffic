@@ -1,4 +1,4 @@
-package main
+package replay
 
 import (
 	"io"
@@ -10,12 +10,17 @@ import (
 
 var queuedBytes atomic.Int64
 
+type streamChunk struct {
+	data []byte
+	seen time.Time
+}
+
 type queuedStream struct {
 	server     string
 	connection string
 	abort      *atomic.Bool
 	processor  *HTTPProcessor
-	chunks     chan []byte
+	chunks     chan streamChunk
 	current    []byte
 	failed     atomic.Bool
 	closed     bool
@@ -32,9 +37,6 @@ func (s *queuedStream) Reassembled(rs []tcpassembly.Reassembly) {
 		return
 	}
 	for _, r := range rs {
-		if !r.Seen.IsZero() {
-			s.observed.Store(r.Seen.UnixNano())
-		}
 		if r.Skip != 0 {
 			s.failed.Store(true)
 			s.store.gap("pcap", s.connection, "tcp_sequence_gap", "events", 1)
@@ -56,7 +58,7 @@ func (s *queuedStream) Reassembled(rs []tcpassembly.Reassembly) {
 		}
 		b := append([]byte(nil), r.Bytes...)
 		select {
-		case s.chunks <- b:
+		case s.chunks <- streamChunk{data: b, seen: r.Seen}:
 		default:
 			queuedBytes.Add(-n)
 			s.drop()
@@ -82,9 +84,14 @@ func (s *queuedStream) ReassemblyComplete() {
 func (s *queuedStream) Read(b []byte) (int, error) {
 	for len(s.current) == 0 {
 		var ok bool
-		s.current, ok = <-s.chunks
+		var chunk streamChunk
+		chunk, ok = <-s.chunks
 		if !ok {
 			return 0, io.EOF
+		}
+		s.current = chunk.data
+		if !chunk.seen.IsZero() {
+			s.observed.Store(chunk.seen.UnixNano())
 		}
 	}
 	n := copy(b, s.current)

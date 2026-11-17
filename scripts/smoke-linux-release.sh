@@ -29,6 +29,10 @@ for distro in ubuntu centos7; do
       # Verify the preload loader against the host glibc, including CentOS 7.
       LD_PRELOAD="$APP/libtraffic-openssl.so" /bin/true
       "$APP/traffic" capture --no-tls --ports 18764 --duration 2s --name release-smoke
-      test -n "$(find "$APP/sessions" -name index.sqlite -print -quit)"
+      session=$(dirname "$(find "$APP/sessions" -name manifest.json -print -quit)")
+      test -f "$session/manifest.json"
+      test ! -e "$session/index.sqlite"
+      "$CONSOLE/traffic-console" analyze --session "$session"
+      test -f "$session/analysis-current.json"
     '
 done

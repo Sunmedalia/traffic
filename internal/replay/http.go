@@ -1,4 +1,4 @@
-package main
+package replay
 
 import (
 	"bufio"
@@ -163,6 +163,12 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			}
 			p.mu.Unlock()
 		} else {
+			captured := time.Now().UTC()
+			if timed, ok := r.(interface{ CaptureTime() time.Time }); ok {
+				if stamp := timed.CaptureTime(); !stamp.IsZero() {
+					captured = stamp
+				}
+			}
 			req, e := http.ReadRequest(br)
 			if e != nil {
 				p.s.gap("http1", key, "request_parse_failure", "directions", 1)
@@ -213,13 +219,13 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			if state, ok := r.(interface{ Incomplete() bool }); ok {
 				incomplete = incomplete || state.Incomplete()
 			}
-			captured := time.Now().UTC()
-			if timed, ok := r.(interface{ CaptureTime() time.Time }); ok {
-				if stamp := timed.CaptureTime(); !stamp.IsZero() {
-					captured = stamp
-				}
-			}
 			t := Transaction{ID: fmt.Sprintf("%x-%x", time.Now().UnixNano(), serial.Add(1)), Time: captured, Source: source, Host: req.Host, Client: client, Connection: key, Method: req.Method, URL: req.RequestURI, Request: raw, Incomplete: incomplete || e != nil, Truncated: truncated, PID: pid}
+			if origin, ok := r.(interface {
+				CaptureBackend() string
+				CaptureService() string
+			}); ok {
+				t.Backend, t.Service = origin.CaptureBackend(), origin.CaptureService()
+			}
 			if identity, ok := r.(interface{ TargetIdentity() string }); ok {
 				t.TargetID = identity.TargetIdentity()
 			}

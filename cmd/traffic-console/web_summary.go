@@ -42,6 +42,7 @@ func (w *webServer) handleTimeline(rw http.ResponseWriter, r *http.Request) {
 	if s == nil {
 		return
 	}
+	defer s.db.Close()
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	where, args := filter.where(get("alerts") == "1")
@@ -121,6 +122,7 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 	if s == nil {
 		return
 	}
+	defer s.db.Close()
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	where, args := filter.where(false)

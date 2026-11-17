@@ -63,7 +63,7 @@ sudo ./bin/traffic capture --ports 80,443 --ecapture "$PWD/bin/ecapture"
 | 内核太旧、无 BTF，或选择启动时符号拦截 | `LD_PRELOAD` / `ld.so.preload` | 是 | 启动时加载库；系统级预加载支持白名单 |
 | Tomcat / JVM HTTPS | `--java-attach` | 否 | 动态附加 Java Agent |
 | Windows IIS / nginx / apache | 随包 WinDivert + 自动配置探针 | 否 | IIS 用 Frida，nginx/apache 用 OpenSSL 探针 |
-| 已有 PCAP | `traffic import` | 不涉及 | 离线还原为会话 |
+| 已有 PCAP | `traffic import` | 不涉及 | 保存为原始会话，本地 console 还原 |
 | 在分析机上看别人采的会话 | `traffic-console` | 不涉及 | 支持 Linux / macOS / Windows |
 
 ## 常见场景（复制即用）
@@ -137,7 +137,7 @@ sudo ./bin/traffic capture --service tomcat --pid 1234 \
 # 60 秒普通抓包，不启动 TLS 探针
 sudo ./bin/traffic capture --no-tls --duration 60s --output ./sessions/http-001
 
-# 把已有明文 HTTP PCAP 还原为会话
+# 将已有 PCAP 保存为会话，再在本地还原
 ./bin/traffic import capture.pcap --ports 80,8080 --output ./sessions/offline-001
 ```
 
@@ -194,7 +194,7 @@ IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集]
   --refresh 2s --client 192.0.2.10 --severity high
 ```
 
-无参数启动会递归扫描当前工作目录及程序所在目录对应的 `sessions/`。选择页按主机分组，组内正在采集的会话在前，其余按开始时间从新到旧排列，每行显示状态、开始时间、请求数、告警数和会话名，底部显示选中会话的完整路径。在会话目录内启动也会识别当前会话，兼容旧版平铺目录与新版分层目录。程序通过 `index.sqlite` 及请求表结构识别会话，损坏的索引会标记为不可用。请求数和告警数来自采集状态文件，缺失时显示未知。
+无参数启动会递归扫描当前工作目录及程序所在目录对应的 `sessions/`。选择页按主机分组，组内正在采集的会话在前，其余按开始时间从新到旧排列，每行显示状态、开始时间、请求数、告警数和会话名，底部显示选中会话的完整路径。在会话目录内启动也会识别当前会话，兼容旧版平铺目录与新版分层目录。程序识别 v3 原始会话的 `manifest.json`，兼容旧版 `index.sqlite`。新会话必须先执行本地分析才能查询请求；本地请求和告警计数来自同一份分析结果，尚未分析时显示未知。旧索引损坏时标记不可用。
 
 选择页使用 `↑` / `↓`、`j` / `k` 选择，`Enter` 打开，`/` 按会话名、主机或路径即时查找，`r` 重新扫描，`o` 输入其他采集根目录、会话目录或 `index.sqlite` 文件路径。进入分析页后按 `s` 返回会话选择页，光标停在刚才的会话上。仅含 PCAP 或 HTTP 文本的导出目录需要先导入或找到对应的完整会话。
 
@@ -314,17 +314,15 @@ IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集]
 | `--pid` | 0 | 限定目标进程 |
 | `--ecapture` | `/opt/traffic/bin/ecapture` | eCapture 路径 |
 | `--libssl` | 自动发现 | 指定 TLS 库，排错时很有用 |
-| `--no-tls` | 关 | 只做 HTTP，不启动 TLS 探针 |
+| `--no-tls` | 关 | 只保存网络包，不启动 TLS 探针 |
 | `--openssl-preload-socket` | 空 | 启用预加载后端 |
 | `--openssl-preload-allow-uid` | 空 | 允许非 root 服务账号写入 |
-| `--trusted-proxies` | 空 | 可信代理 IP/CIDR |
+| `--trusted-proxies` | 空 | 保存可信代理 IP/CIDR，供本地还原来源使用 |
 | `--output` | 自动 | 精确会话目录 |
 | `--data-dir` | `./sessions` | 自动命名会话的根目录 |
 | `--name` | `capture` | 会话名 |
 | `--duration` | 0 | 到时自动停止 |
-| `--request-limit` / `--response-limit` | 256 KiB / 64 KiB | 正文保存上限，最大 1 MiB |
 | `--disk-limit-mib` | 2048 | 会话磁盘预算 |
-| `--retention` | 24h | 索引保留期 |
 | `--no-detect` | 兼容参数 | 采集始终不执行检测 |
 | `--require-tls` | 关 | 所选目标未通过 HTTPS 预检时拒绝开始 |
 | `--collector-memory-mib` / `--collector-cpu-percent` | 256 / 50 | 限制采集器及子进程，不含目标内探针 |
@@ -340,19 +338,20 @@ sessions/web-01/2026-11-11/15-04-05-nginx/
 ├── manifest.json     # 主机、名称、过滤条件、布局版本
 ├── status.json       # 心跳、计数、丢弃、错误、资源限制
 ├── gaps.jsonl        # 带原因、后端、连接和单位的已知缺口
-├── index.sqlite      # 请求、响应、告警
+├── analysis-current.json # 本地分析成功后创建的结果指针
+├── analysis-*.sqlite  # 本地还原、索引、告警及规则快照
 ├── capture.lock
-├── packets/          # 循环 PCAP（原始密文）
-├── tls/              # TLS 明文事件 JSONL
+├── packets/          # 顺序分段 PCAP（HTTPS 仍是密文）
+├── tls/stream.jsonl   # 原始探针事件 JSONL（按需创建）
 └── logs/             # 探针诊断
 ```
 
-复制会话要复制整个目录（含 `index.sqlite-wal`/`-shm`）。判断完整性看 `status.json`：
+采集器只保存原始数据，不执行还原、配对和索引。PCAP 每段约 64 MiB，顺序保留，不循环覆盖；达到磁盘预算或剩余空间低于 512 MiB 时停止。磁盘检查存在间隔，可能略超预算。探针仍有单事件及队列上限，零丢弃不证明采全。停止采集后复制整个目录；旧会话还需保留 `index.sqlite-wal`/`-shm`。判断完整性看 `status.json`：
 
 - `gap_counts` / `gaps.jsonl`：按后端、原因和计量单位保存已知缺口；`drain_state` 和 `probe_exits` 分别报告排空及退出确认。
 - `tls`：`attached` / `active-preload` / `partial` / `unavailable` / `disabled`。
 - `tls_dropped`、`queue_dropped`、`dropped`：已观测丢弃，是下限。
-- `tls_wire_records` 与 `tls_requests`：外层记录与已保存明文请求，单位不同，不能相减得到漏采数。
+- 原始采集阶段 `transactions`、`alerts`、`tls_requests` 不表示业务请求数量；还原计数和完整性来自本地分析报告。
 - `tls_coverage=unverified`、`tls_missing_estimate=null`：启动窗口和探针盲区未知，需要外部请求计数核对。
 
 ## 故障排查
@@ -387,13 +386,13 @@ sessions/web-01/2026-11-11/15-04-05-nginx/
 
 ### 命令行分析与规则格式
 
-当前源码已将检测移到本地分析器（尚未发布；v0.1.2 包仍采用旧流程）。`capture` 和 `import` 只保存流量；先停止采集，再执行 `traffic-console analyze --session DIR`。不需要匹配规则时，直接打开控制台浏览流量即可。
+当前源码已将 TCP/HTTP 还原、请求响应配对、索引及检测移到本地分析器（尚未发布；v0.1.2 包仍采用旧流程）。`capture` 和 `import` 只保存原始流量；先停止采集，再执行 `traffic-console analyze --session DIR`。新原始会话在分析前没有可查询的请求表，Web 可在「规则与分析」中启动任务。
 
-每次分析按采集时间顺序读取已保存事务，重新执行内置及本次追加的规则，替换上次结果。`analysis.sqlite` 保存告警、规则内容/指纹、扫描窗口及完成时间；原始索引、正文、PCAP、TLS 事件和状态文件保持只读。分析失败或取消时保留上次完整结果。已有会话中的历史告警可直接读取，重跑后以新结果为准。
+每次分析从原始 PCAP 和 `tls/stream.jsonl` 重建事务，再按采集时间执行内置及本次追加的规则。结果存入不可变的 `analysis-*.sqlite`，包括本地还原正文、索引、告警、规则内容/指纹和完成时间；`analysis-current.json` 原子切换当前结果。原始流量和状态文件保持只读，失败或取消保留上次完整结果。旧版 `index.sqlite` 会话继续使用原索引，支持本地规则重算。
 
-TUI、Web、JSON 查询及导出共用本地结果；重跑分析后重新打开控制台。索引或其 WAL 文件变化（含部分复制方式）会使结果失效，需重新分析。该快速变化检查不代替证据哈希校验。导出另含 `analysis.json` 与 `captured-event.json`，区分本地告警和原始记录。
+TUI、Web、JSON 查询及导出读取同一代分析结果；Web 和 TUI 每次刷新读取最新结果。源文件大小或修改时间变化会使结果失效，需重新分析；这项快速检查不代替证据哈希校验。导出包含 `analysis.json`，原始会话另含 `reconstructed-event.json`，旧会话使用 `captured-event.json` 区分原索引记录。
 
-分析只覆盖已保存的内容：默认最多解压每侧正文 1 MiB；截断、轮换和采集缺口无法通过规则补回。
+`traffic-console analyze --request-limit BYTES --response-limit BYTES` 控制本地正文还原和检测上限，默认每侧 1 MiB，最大 16 MiB；Web 使用默认值。上限造成的本地截断可通过调大后重新分析恢复，采集缺口则无法补回。`--retention` 已从采集器删除，旧版循环 PCAP 曾被覆盖的内容无法恢复。
 
 内置规则覆盖疑似 SQL 注入、命令注入、路径穿越、敏感文件探测、扫描、XSS、SSRF、XXE、SSTI、JNDI、反序列化、Webshell 上传，以及响应中的 passwd / 命令输出特征。原始内容和最多两轮 URL 解码视图参与匹配，gzip 正文有界解压。告警是疑似信号，结论要结合响应和现场证据。
 
@@ -454,7 +453,7 @@ sudo apt-get install -y clang llvm bpftool libelf-dev libssl-dev \
 
 ### 预加载（LD_PRELOAD / ld.so.preload）
 
-库在 `SSL_read`、`SSL_write` 及 `_ex` API 返回后复制实际消费或产生的明文，经有界异步队列发送到 Unix socket；采集器校验内核凭据和 `/proc` 进程启动标识，复用 HTTP 还原和证据存储。该路径可在内核 3.10 上运行。
+库在 `SSL_read`、`SSL_write` 及 `_ex` API 返回后复制实际消费或产生的明文，经有界异步队列发送到 Unix socket；采集器校验内核凭据和 `/proc` 进程启动标识，保存原始明文事件，停采后由 console 还原。该路径可在内核 3.10 上运行。
 
 #### 系统级 `ld.so.preload` 与不同 UID 的服务
 
