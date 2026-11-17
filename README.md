@@ -45,6 +45,9 @@ flowchart LR
 
 ## 采集与本地分析分离（当前源码）
 
+> **版本提示**：本节及下文的 `analyze`、Web 规则/分析页、`--stop-timeout` 等只存在于当前源码，尚未发布。下载的 v0.1.2 发行包仍是旧流程：采集时直接检测并写 `index.sqlite`，无需 `analyze`，直接 `traffic-console --session DIR` 查看；分析参数（`--rules`、`--request-limit` 等）仍在 `traffic capture` 上。按发行包使用时请参考 [v0.1.2 发布说明](docs/releases/v0.1.2.md)。
+
+
 当前源码中的 `traffic capture` / `traffic import` 只保存原始网络包、探针明文事件和元数据，不执行 TCP/HTTP 还原、配对、索引、规则匹配或告警外送。停止采集后，将整个会话目录复制到本地，运行：
 
 ```bash

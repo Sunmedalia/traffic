@@ -41,4 +41,9 @@ var collectorMemoryMiB = 256
 var collectorCPUPercent = 50
 var drainTimeout = 5 * time.Second
 
+// stopTimeout bounds the whole shutdown after cancellation: packet sources,
+// probe helpers and their own drain waits. Exceeding it records an explicit
+// gap and finishes with drain_state=unverified instead of hanging.
+var stopTimeout = 30 * time.Second
+
 var networkNamespacePID int

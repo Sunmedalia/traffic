@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/Sunmedalia/traffic/internal/session"
 	"io"
@@ -20,39 +19,53 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
-func protoFields(b []byte) (map[int][]byte, map[int]uint64, error) {
-	s := map[int][]byte{}
-	v := map[int]uint64{}
+// protoFields holds the protobuf fields the eCapture consumer reads. Fixed
+// arrays replace the two maps previously allocated per message (twice per
+// event), which dominated consumer allocations under load. Field numbers at
+// or above protoFieldLimit are validated and skipped.
+const protoFieldLimit = 32
+
+type protoFields struct {
+	bytes [protoFieldLimit][]byte
+	ints  [protoFieldLimit]uint64
+}
+
+func (m *protoFields) parse(b []byte) error {
+	*m = protoFields{}
 	for len(b) > 0 {
 		n, t, k := protowire.ConsumeTag(b)
 		if k < 0 {
-			return nil, nil, fmt.Errorf("invalid protobuf tag")
+			return fmt.Errorf("invalid protobuf tag")
 		}
 		b = b[k:]
 		switch t {
 		case protowire.BytesType:
 			x, k := protowire.ConsumeBytes(b)
 			if k < 0 {
-				return nil, nil, fmt.Errorf("invalid protobuf bytes")
+				return fmt.Errorf("invalid protobuf bytes")
 			}
-			s[int(n)] = x
+			if n < protoFieldLimit {
+				m.bytes[n] = x
+			}
 			b = b[k:]
 		case protowire.VarintType:
 			x, k := protowire.ConsumeVarint(b)
 			if k < 0 {
-				return nil, nil, fmt.Errorf("invalid protobuf integer")
+				return fmt.Errorf("invalid protobuf integer")
 			}
-			v[int(n)] = x
+			if n < protoFieldLimit {
+				m.ints[n] = x
+			}
 			b = b[k:]
 		default:
 			k := protowire.ConsumeFieldValue(n, t, b)
 			if k < 0 {
-				return nil, nil, fmt.Errorf("invalid protobuf field")
+				return fmt.Errorf("invalid protobuf field")
 			}
 			b = b[k:]
 		}
 	}
-	return s, v, nil
+	return nil
 }
 func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string, pid, uid int, accepts func(int, string) string, snapshot kernelScopeSnapshot, attached func(), failed ...func(error)) error {
 	listener, e := net.Listen("tcp", "127.0.0.1:0")
@@ -174,25 +187,35 @@ func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string
 	var sequence probeSequence
 	transportUncertain := false
 	identityWarning, portWarning := false, false
+	var outerMessage, eventMessage protoFields
+	shedLoss := func(shed uint64) error {
+		if shed == 0 {
+			return nil
+		}
+		transportUncertain = true
+		s.gap("ecapture", lib, "receive_queue_shed", "messages", shed)
+		return p.boundary(source, "loss", "receive_queue_shed")
+	}
+	var pendingShed uint64
 	for {
-		b, e := transport.next()
+		b, shed, e := transport.next()
+		if err := shedLoss(shed); err != nil {
+			return err
+		}
+		pendingShed += shed
 		if e != nil {
 			if ctx.Err() != nil {
 				s.gap("ecapture", lib, "drain_unconfirmed", "shutdowns", 1)
 				s.recordProbeExit("ecapture/"+lib, session.ProbeExit{RuntimeState: "probe process stopped; transport drain not confirmed"})
 				return nil
 			}
-			reason := "transport_interrupted"
-			if errors.Is(e, errProbeTransportBackpressure) {
-				reason = "receive_queue_overflow"
-			}
-			s.gap("ecapture", lib, reason, "transports", 1)
+			s.gap("ecapture", lib, "transport_interrupted", "transports", 1)
 			return e
 		}
-		outer, outerNumbers, e := protoFields(b)
-		if e != nil {
+		if e := outerMessage.parse(b); e != nil {
 			return e
 		}
+		outer, outerNumbers := &outerMessage.bytes, &outerMessage.ints
 		if outerNumbers[1] == 1 && string(outer[4]) == "traffic-control-v1:ready" {
 			markReady()
 			continue
@@ -204,11 +227,17 @@ func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string
 		if outer[2] == nil {
 			continue
 		}
-		fields, nums, e := protoFields(outer[2])
-		if e != nil {
+		if e := eventMessage.parse(outer[2]); e != nil {
 			return e
 		}
+		fields, nums := &eventMessage.bytes, &eventMessage.ints
 		missing, reset := sequence.observe(nums[17])
+		// Messages shed locally were already reported above; only report the
+		// remainder as probe-side sequence loss so one gap is not counted twice.
+		if pendingShed > 0 && !reset {
+			missing -= min(missing, pendingShed)
+		}
+		pendingShed = 0
 		if missing > 0 || reset {
 			transportUncertain = true
 			if missing > 0 {

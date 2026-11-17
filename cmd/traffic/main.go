@@ -97,6 +97,7 @@ func run(args []string) (runErr error) {
 	fs.IntVar(&collectorMemoryMiB, "collector-memory-mib", 256, "collector and helper memory budget MiB; excludes in-process probes")
 	fs.IntVar(&collectorCPUPercent, "collector-cpu-percent", 50, "collector CPU budget as percent of one CPU")
 	fs.DurationVar(&drainTimeout, "drain-timeout", 5*time.Second, "maximum probe data drain time")
+	fs.DurationVar(&stopTimeout, "stop-timeout", 30*time.Second, "total shutdown budget after stop is requested; must be at least --drain-timeout")
 	noTLS := fs.Bool("no-tls", false, "disable TLS probes")
 	duration := fs.Duration("duration", 0, "optional capture duration")
 	fs.IntVar(&diskLimitMiB, "disk-limit-mib", diskLimitMiB, "session disk budget MiB")
@@ -206,7 +207,7 @@ func run(args []string) (runErr error) {
 	if *service == "openssl" && *pid <= 0 {
 		return errors.New("openssl service requires --pid")
 	}
-	if collectorMemoryMiB < 64 || collectorMemoryMiB > 65536 || collectorCPUPercent < 1 || collectorCPUPercent > 100 || drainTimeout <= 0 || drainTimeout > 15*time.Second {
+	if collectorMemoryMiB < 64 || collectorMemoryMiB > 65536 || collectorCPUPercent < 1 || collectorCPUPercent > 100 || drainTimeout <= 0 || drainTimeout > 15*time.Second || stopTimeout < drainTimeout || stopTimeout > 5*time.Minute {
 		return errors.New("invalid collector resource or drain limits")
 	}
 	if *requireTLS && (*noTLS || cmd != "capture") {
@@ -399,6 +400,7 @@ func run(args []string) (runErr error) {
 			"collector_memory_mib":             collectorMemoryMiB,
 			"collector_cpu_percent":            collectorCPUPercent,
 			"probe_drain_timeout_ms":           drainTimeout.Milliseconds(),
+			"stop_timeout_ms":                  stopTimeout.Milliseconds(),
 			"in_process_probe_budget_included": false,
 		}
 		if cmd == "import" {
@@ -502,11 +504,25 @@ func run(args []string) (runErr error) {
 		s.mu.Unlock()
 		s.report()
 		cancel()
-		wg.Wait()
-		if err := p.close(); err != nil {
-			s.fail(err)
+		stopDeadline := time.Now().Add(stopTimeout)
+		budgetExceeded := !waitWithin(wg.Wait, stopTimeout)
+		if budgetExceeded {
+			// Workers still running may later report errors against a closed
+			// recorder; those are consequences of the timeout, not new faults.
+			s.gap("collector", "", "stop_budget_exceeded", "shutdowns", 1)
+			s.problem(fmt.Errorf("shutdown exceeded --stop-timeout %s; remaining probe data not confirmed", stopTimeout))
+		}
+		closeBudget := max(time.Until(stopDeadline), time.Second)
+		if !waitWithin(func() {
+			if err := p.close(); err != nil && !budgetExceeded {
+				s.fail(err)
+			}
+		}, closeBudget) {
+			budgetExceeded = true
+			s.gap("collector", "", "stop_budget_exceeded", "shutdowns", 1)
 		}
 		s.mu.Lock()
+		fatal := s.fatal
 		s.stats.DrainState = "unverified"
 		if *noTLS {
 			s.stats.DrainState = "confirmed"
@@ -525,18 +541,41 @@ func run(args []string) (runErr error) {
 		if s.stats.RawEvidenceWriters > 0 || s.stats.RawEvidencePendingBytes > 0 || s.stats.RawEvidenceDrainUnconfirmed {
 			s.stats.DrainState = "unverified"
 		}
-		if s.fatal != nil {
+		if budgetExceeded {
+			s.stats.StopReason = "stop_budget_exceeded"
+			s.stats.DrainState = "unverified"
+		}
+		if fatal != nil {
 			s.stats.State = "failed"
 			s.stats.StopReason = "fatal_error"
 			s.stats.DrainState = "unverified"
 		}
 		s.mu.Unlock()
 		s.report()
-		emit(s.stats)
-		return s.fatal
+		s.mu.Lock()
+		snapshot := s.stats
+		s.mu.Unlock()
+		emit(snapshot)
+		return fatal
 	}
 	return fmt.Errorf("unknown command %s", cmd)
 }
+
+// waitWithin runs fn and reports whether it returned within budget. On
+// timeout fn keeps running in the background; the process is about to exit.
+func waitWithin(fn func(), budget time.Duration) bool {
+	done := make(chan struct{})
+	go func() { fn(); close(done) }()
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
 func maintain(s *Store) error {
 	return checkDisk(s)
 }

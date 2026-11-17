@@ -61,7 +61,16 @@ func TestWebServesSessionsOverTokenProtectedAPI(t *testing.T) {
 			t.Fatalf("token %q got status %d", bad, status)
 		}
 	}
-	for path, want := range map[string]string{"/": "app.js", "/app.js": "use strict", "/app.css": "--bg"} {
+	index, err := webAssets.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range webScripts {
+		if !strings.Contains(string(index), `<script src="`+name+`"></script>`) {
+			t.Fatalf("index.html does not load %s", name)
+		}
+	}
+	for path, want := range map[string]string{"/": "main.js", "/app.js": "use strict", "/decoder.js": "DECODERS", "/rules.js": "use strict", "/analysis.js": "use strict", "/main.js": "boot();", "/app.css": "--bg"} {
 		status, body, header := webGet(t, server, "", path)
 		if status != http.StatusOK || !strings.Contains(string(body), want) || !strings.Contains(header.Get("Content-Security-Policy"), "script-src 'self'") {
 			t.Fatalf("asset %s status %d", path, status)

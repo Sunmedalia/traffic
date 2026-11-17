@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const { gzipSync, deflateSync } = require('node:zlib');
-const source = fs.readFileSync(path.join(__dirname, '../../cmd/traffic-console/web/app.js'), 'utf8');
+const source = fs.readFileSync(path.join(__dirname, '../../cmd/traffic-console/web/decoder.js'), 'utf8');
 const code = source.slice(source.indexOf("const utf8Out ="), source.indexOf('// Cheap synchronous check'));
 const context = vm.createContext({ TextDecoder, TextEncoder, Blob, DecompressionStream });
 vm.runInContext(code, context);

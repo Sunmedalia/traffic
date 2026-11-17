@@ -3,6 +3,7 @@ package main
 import (
 	"github.com/Sunmedalia/traffic/internal/session"
 	"testing"
+	"time"
 )
 
 func TestProbeFailureImmediatelyInvalidatesAttachedState(t *testing.T) {
@@ -28,7 +29,7 @@ func TestProbeFailureImmediatelyInvalidatesAttachedState(t *testing.T) {
 		t.Fatal("reattach did not recover", s.stats)
 	}
 }
-func TestTransportFailureReportedBeforeQueuedMessagesDrain(t *testing.T) {
+func TestTransportOverflowReportedWithoutTeardown(t *testing.T) {
 	before := probeTransportBytes.Load()
 	reader := newFakeProbeReader()
 	for i := 0; i < 6; i++ {
@@ -36,16 +37,19 @@ func TestTransportFailureReportedBeforeQueuedMessagesDrain(t *testing.T) {
 	}
 	failures := make(chan error, 1)
 	tr := startProbeTransport(reader, func(err error) { failures <- err })
-	awaitProbeDone(t, tr)
-	if len(failures) != 1 || tr.pending.Load() == 0 {
-		t.Fatal("failure was delayed until parsing drained")
+	deadline := time.Now().Add(time.Second)
+	for tr.shedMessages.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(failures) != 0 || tr.pending.Load() == 0 {
+		t.Fatal("overflow must shed, not fail the transport")
 	}
 	s := &Store{}
 	stop := s.observeProbeTransport("probe", 1, tr)
 	stop()
 	stats := s.stats.ProbeTransports["probe"]
-	if stats.Overflows != 1 || !stats.Ended || stats.LastError == "" || stats.PendingBytes != 0 || stats.ReceivedMessages == 0 {
-		t.Fatal("lost terminal transport diagnostics", stats)
+	if stats.Overflows != 1 || stats.ShedMessages == 0 || stats.ShedBytes == 0 || stats.LastError == "" || stats.PendingBytes != 0 || stats.ReceivedMessages == 0 {
+		t.Fatal("lost transport overflow diagnostics", stats)
 	}
 	if probeTransportBytes.Load() != before {
 		t.Fatal("transport leaked memory budget")

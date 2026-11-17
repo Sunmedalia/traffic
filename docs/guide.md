@@ -328,6 +328,7 @@ IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集]
 | `--require-tls` | 关 | 所选目标未通过 HTTPS 预检时拒绝开始 |
 | `--collector-memory-mib` / `--collector-cpu-percent` | 256 / 50 | 限制采集器及子进程，不含目标内探针 |
 | `--drain-timeout` | 5s | 部分后端的数据排空预算，最大 15s |
+| `--stop-timeout` | 30s | 停止后的总等待预算，不小于 `--drain-timeout`；超时记录 `stop_budget_exceeded` 缺口并标记排空未确认 |
 | `--netns-pid` | 0 | Linux 显式选择抓包网络命名空间 |
 
 `traffic capture --help`、`traffic doctor`、`traffic-console rules check FILE` 可随时查看。`doctor` 默认显示中文自检报告，网卡掩码转为 CIDR；自动化读取请使用 `traffic doctor --json`，原始 JSON 字段保持兼容。分析器用 `traffic-console --help` / `--cn-help` 查看总览，`traffic-console web --cn-help`、`analyze --cn-help`、`rules --cn-help` 查看各命令的中文参数和示例；`--help` 为英文帮助。
@@ -349,7 +350,7 @@ sessions/web-01/2026-11-11/15-04-05-nginx/
 
 采集器只保存原始数据，不执行还原、配对和索引。PCAP 每段约 64 MiB，顺序保留，不循环覆盖；达到磁盘预算或剩余空间低于 512 MiB 时停止。磁盘检查存在间隔，可能略超预算。探针仍有单事件及队列上限，零丢弃不证明采全。停止采集后复制整个目录；旧会话还需保留 `index.sqlite-wal`/`-shm`。判断完整性看 `status.json`：
 
-- `gap_counts` / `gaps.jsonl`：按后端、原因和计量单位保存已知缺口；`drain_state` 和 `probe_exits` 分别报告排空及退出确认。
+- `gap_counts` / `gaps.jsonl`：按后端、原因和计量单位保存已知缺口；`drain_state` 和 `probe_exits` 分别报告排空及退出确认。常见原因：`ecapture/receive_queue_shed`（接收队列过载时丢弃的探针消息，传输继续）、`pcap/write_queue_overflow`（磁盘跟不上时丢弃的网络包）、`collector/stop_budget_exceeded`（停止超过 `--stop-timeout`）。
 - `tls`：`attached` / `active-preload` / `partial` / `unavailable` / `disabled`。
 - `tls_dropped`、`queue_dropped`、`dropped`：已观测丢弃，是下限。
 - 原始采集阶段 `transactions`、`alerts`、`tls_requests` 不表示业务请求数量；还原计数和完整性来自本地分析报告。
