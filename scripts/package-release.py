@@ -26,7 +26,9 @@ def module_notices(destination):
             if file.is_file() and file.name.upper().startswith(('LICENSE', 'LICENCE', 'COPYING', 'NOTICE', 'AUTHORS')):
                 target = destination / module['Path'].replace('/', '_') / file.name
                 target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(file, target)
+                # Module-cache licences may be read-only on Windows. Do not
+                # preserve that attribute in the disposable staging directory.
+                shutil.copyfile(file, target)
 
 
 def main():
