@@ -75,6 +75,7 @@ jobs:
         run: |
           bash scripts/smoke-linux-release.sh "$RELEASE_VERSION" '${{ matrix.arch }}'
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: package-linux-${{ matrix.arch }}
           path: dist/*.tar.gz
@@ -137,6 +138,7 @@ jobs:
           }
           ./scripts/windows/smoke-release.ps1 -App "$root/traffic-$env:RELEASE_VERSION-windows-amd64" -Console "$root/traffic-console-$env:RELEASE_VERSION-windows-amd64"
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: package-windows-amd64
           path: dist/*.zip
