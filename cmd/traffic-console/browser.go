@@ -1,6 +1,7 @@
 package main
 
 import (
+	lipgloss "charm.land/lipgloss/v2"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,7 +15,6 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 	termansi "github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/term"
 )
@@ -86,7 +86,7 @@ func sessionRoots(root string) []string {
 		}
 	}
 	// Also recognize a session when started inside its directory.
-	if info, err := os.Stat("index.sqlite"); err == nil && info.Mode().IsRegular() {
+	if info, err := os.Stat("index.sqlite"); (err == nil && info.Mode().IsRegular()) || rawSession(".") {
 		roots = append(roots, sessionPath("."))
 	}
 	return roots
@@ -107,10 +107,13 @@ func discoverSessions(ctx context.Context, roots []string) sessionsFound {
 				}
 				return nil
 			}
-			if entry.IsDir() || entry.Name() != "index.sqlite" || !entry.Type().IsRegular() {
+			if entry.IsDir() || (entry.Name() != "index.sqlite" && entry.Name() != "manifest.json") || !entry.Type().IsRegular() {
 				return nil
 			}
 			dir := filepath.Dir(path)
+			if entry.Name() == "manifest.json" && !rawSession(dir) {
+				return nil
+			}
 			if seen[dir] {
 				return nil
 			}
@@ -144,6 +147,12 @@ func discoverSessions(ctx context.Context, roots []string) sessionsFound {
 			if err == nil {
 				if s.analysis != nil {
 					item.Stats.Alerts = s.analysis.Alerts
+					if s.analysis.Reconstructed {
+						item.Stats.Transactions = s.analysis.Transactions
+						item.CountsKnown = true
+					}
+				} else if rawSession(dir) {
+					item.CountsKnown = false
 				}
 				checkCtx, cancel := context.WithTimeout(ctx, time.Second)
 				// Validate the schema, even for an empty or legacy session without a manifest.

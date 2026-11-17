@@ -142,15 +142,12 @@ def main():
         failures.append({"reason": "middleware process identities changed"})
     if hashes != {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in args.config}:
         failures.append({"reason": "middleware configuration changed"})
-    with sqlite3.connect(session / "index.sqlite") as database:
-        rows = [json.loads(row[0]) for row in database.execute("SELECT data FROM requests")]
-    if any(row.get("alerts") for row in rows):
-        raise AssertionError("collector performed detection")
+    if (session / "index.sqlite").exists():
+        raise AssertionError("collector unexpectedly wrote an index")
     subprocess.run([str(args.analysis_binary), "analyze", "--session", str(session)], check=True)
-    with sqlite3.connect(session / "analysis.sqlite") as analysis:
-        matches = {row[0]: json.loads(row[1]) for row in analysis.execute("SELECT id, alerts FROM results")}
-    for row in rows:
-        row["alerts"] = matches[row["id"]]
+    pointer = json.loads((session / "analysis-current.json").read_text())
+    with sqlite3.connect(session / pointer["file"]) as analysis:
+        rows = [json.loads(row[0]) for row in analysis.execute("SELECT json_set(CAST(r.data AS TEXT),'$.alerts',json(a.alerts)) FROM requests r JOIN results a ON a.id=r.id")]
     for sample in expected:
         matches = [row for row in rows if row.get("url") == sample["path"] and row.get("backend") == ("openssl" if sample["secure"] else "pcap")]
         if len(matches) != 1:
@@ -162,16 +159,14 @@ def main():
         body = base64.b64decode(sample["response"])
         checks = {"service": row.get("service") == sample["service"], "status": row.get("status") == sample["status"],
                   "request_body": base64.b64decode(sample["request"]) in request_data,
-                  "response_body": (body[:65536] in response_data if body else True),
-                  "complete": not row.get("incomplete", False) if len(body) <= 65536 else row.get("truncated", False)}
+                  "response_body": (body[:1 << 20] in response_data if body else True),
+                  "complete": not row.get("incomplete", False) if len(body) <= 1 << 20 else row.get("truncated", False)}
         if "/attack/" in sample["path"]:
             checks["detection"] = any(alert.get("rule") == "SQLI-001" for alert in row.get("alerts", []))
         if not all(checks.values()):
             failures.append({"sample": sample["path"], "checks": checks})
-    summaries = []
-    for path in (session / "tls").glob("openssl-*.jsonl"):
-        messages = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-        summaries.extend(message for message in messages if message.get("type") == "host_summary")
+    status = json.loads((session / "status.json").read_text())
+    summaries = list(status.get("probe_exits", {}).values())
     if not summaries or not all(summary.get("hooks_removed") for summary in summaries):
         failures.append({"reason": "missing hook restoration confirmation"})
     report = {"warmup_requests": len(warmup), "passed": not failures, "expected": len(expected), "records": len(rows), "tls_versions": sorted(tls_versions),

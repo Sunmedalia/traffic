@@ -1,13 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"github.com/Sunmedalia/traffic/internal/session"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 )
@@ -36,7 +37,8 @@ func TestPreloadCredentialAndProcessIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.db.Close()
+	recorder := newRecorder(store)
+	defer recorder.close()
 	// Unix socket names are limited to 108 bytes, including the terminating NUL.
 	directory, err := os.MkdirTemp("/tmp", "traffic-preload-")
 	if err != nil {
@@ -47,7 +49,7 @@ func TestPreloadCredentialAndProcessIdentity(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- capturePreload(ctx, store, newHTTP(store), path, nil) }()
+	go func() { done <- capturePreload(ctx, store, recorder, path, nil) }()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		if _, err := os.Stat(path); err == nil {
@@ -87,13 +89,14 @@ func TestPreloadCredentialAndProcessIdentity(t *testing.T) {
 	send(identity, "data", "write", "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nroot:x:0:0:")
 	send(identity, "close", "", "")
 	deadline = time.Now().Add(3 * time.Second)
+	rawPath := filepath.Join(store.dir, "tls", "stream.jsonl")
 	for {
-		var data []byte
-		if err := store.db.QueryRow("SELECT data FROM requests").Scan(&data); err == nil && strings.Contains(string(data), `"status":200`) {
+		data, _ := os.ReadFile(rawPath)
+		if bytes.Contains(data, []byte(`"type":"close"`)) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("no completed request")
+			t.Fatal("no recorded close event")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -101,23 +104,28 @@ func TestPreloadCredentialAndProcessIdentity(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	var count int
-	if err := store.db.QueryRow("SELECT count(*) FROM requests").Scan(&count); err != nil {
+	if err := recorder.close(); err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatalf("untrusted event accepted: %d", count)
-	}
-	var raw []byte
-	if err := store.db.QueryRow("SELECT data FROM requests").Scan(&raw); err != nil {
+	raw, err := os.ReadFile(rawPath)
+	if err != nil {
 		t.Fatal(err)
 	}
-	var record Transaction
-	if err := json.Unmarshal(raw, &record); err != nil {
-		t.Fatal(err)
+	var payloads [][]byte
+	for _, line := range bytes.Split(bytes.TrimSpace(raw), []byte("\n")) {
+		var e session.RawEvent
+		if err := json.Unmarshal(line, &e); err != nil {
+			t.Fatal(err)
+		}
+		if e.Type == "data" {
+			payloads = append(payloads, e.Data)
+		}
 	}
-	if record.URL != "/valid" || record.Backend != "openssl-preload" || record.Status != 200 || len(record.Alerts) != 0 {
-		t.Fatalf("bad capture %+v", record)
+	if len(payloads) != 2 || !bytes.Contains(payloads[0], []byte("/valid")) || bytes.Contains(raw, []byte("forged")) {
+		t.Fatal("untrusted event accepted or raw data changed")
+	}
+	if _, err := os.Stat(filepath.Join(store.dir, "index.sqlite")); !os.IsNotExist(err) {
+		t.Fatal("collector created index")
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("socket leaked")

@@ -159,7 +159,7 @@ func groupFor(t session.Target) probeGroup {
 	return g
 }
 
-func captureServices(ctx context.Context, s *Store, p *HTTPProcessor, bin, library, service string, pid int, javaAttach bool, javaAgent, javaHelper string, javaPID int) {
+func captureServices(ctx context.Context, s *Store, p *eventRecorder, bin, library, service string, pid int, javaAttach bool, javaAgent, javaHelper string, javaPID int) {
 	var mu sync.RWMutex
 	targets := map[int]session.Target{}
 	targetGroups := map[int]probeGroup{}

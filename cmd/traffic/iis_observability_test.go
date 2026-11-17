@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/Sunmedalia/traffic/internal/session"
 	"strings"
 	"testing"
 )
@@ -27,28 +28,27 @@ func TestAttachWindowBecomesVisible(t *testing.T) {
 	}
 }
 
-func TestReceiveMatchClearsSuspect(t *testing.T) {
-	s := &Store{}
-	s.iisAttached = true
-	applyIISProbeSummary(s, map[string]any{"receive_matches": 12, "send_matches": 12, "unmatched_completions": 10})
-	if !s.stats.PlaintextObserved || s.stats.AttachWindowSuspect {
-		t.Fatalf("a receive match is observed plaintext, got %+v", s.stats)
-	}
-	finishIISObservability(s, false)
-	if s.fatal != nil || len(s.stats.Errors) != 0 {
-		t.Fatalf("a receive match must not be labeled an attach window: fatal=%v errors=%v", s.fatal, s.stats.Errors)
-	}
-	// The flag follows saved requests. A hook match that never reached the index still fails.
+func TestReceiveHookDoesNotProveRecordedPlaintext(t *testing.T) {
+	s := &Store{iisAttached: true}
+	applyIISProbeSummary(s, map[string]any{"receive_matches": 12, "send_matches": 12})
 	finishIISObservability(s, true)
-	if s.fatal == nil {
-		t.Fatal("require-plaintext follows tls_requests, not receive_matches alone")
+	if s.fatal == nil || s.stats.PlaintextObserved {
+		t.Fatal("hook matches accepted without recorded plaintext")
 	}
 	s.fatal = nil
 	s.stats.Errors = nil
-	s.stats.TLSRequests = 12
+	s.stats.PlaintextObserved = true
 	finishIISObservability(s, true)
-	if s.fatal != nil || len(s.stats.Errors) != 0 {
-		t.Fatalf("saved plaintext must satisfy require-plaintext: fatal=%v errors=%v", s.fatal, s.stats.Errors)
+	if s.fatal != nil {
+		t.Fatal(s.fatal)
+	}
+}
+
+func TestRequirePlaintextRejectsMissingIISProbe(t *testing.T) {
+	s := &Store{}
+	finishIISObservability(s, true)
+	if s.fatal == nil {
+		t.Fatal("require-plaintext silently passed without IIS")
 	}
 }
 
@@ -70,5 +70,29 @@ func TestProbeGapKeepsRunningTotal(t *testing.T) {
 	s.noteProbeGap("pid", "unmatched_completion", "unknown", 8)
 	if got := s.stats.GapCounts["iis-httpapi/unmatched_completion_unknown/completions"]; got != 8 {
 		t.Fatalf("running totals must not be summed, got %d", got)
+	}
+}
+
+func TestRawIISRequestSatisfiesPlaintextRequirement(t *testing.T) {
+	s := &Store{dir: t.TempDir(), iisAttached: true}
+	recorder := newRecorder(s)
+	if err := recorder.iis("generation", session.Target{ID: "42:start", PID: 42}, iisEvent{Type: "request", ID: "request", Method: "GET", URL: "/"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.close(); err != nil {
+		t.Fatal(err)
+	}
+	finishIISObservability(s, true)
+	if s.fatal != nil || !s.stats.PlaintextObserved || s.stats.Transactions != 0 || s.stats.TLSRequests != 0 {
+		t.Fatal("raw request was decoded or rejected", s.stats, s.fatal)
+	}
+	failed := &Store{dir: t.TempDir(), iisAttached: true}
+	closed := newRecorder(failed)
+	closed.close()
+	if err := closed.iis("generation", session.Target{}, iisEvent{Type: "request"}); err == nil {
+		t.Fatal("closed recorder accepted request")
+	}
+	if failed.stats.PlaintextObserved {
+		t.Fatal("failed raw write marked plaintext observed")
 	}
 }

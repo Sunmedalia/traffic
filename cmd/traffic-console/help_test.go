@@ -25,7 +25,7 @@ func TestConsoleCommandHelpScopesAndExamples(t *testing.T) {
 		if strings.Contains(web.String(), "--scan-paths") || strings.Contains(web.String(), "--alert-webhook") {
 			t.Fatal("web help contains CLI analysis options")
 		}
-		for _, expected := range []string{"--rules ", "--scan-window", "--scan-paths", "--alert-webhook", "analysis.sqlite"} {
+		for _, expected := range []string{"--rules ", "--scan-window", "--scan-paths", "--alert-webhook", "analysis-current.json"} {
 			if !strings.Contains(analyze.String(), expected) {
 				t.Fatalf("analyze help missing %q: %s", expected, analyze.String())
 			}

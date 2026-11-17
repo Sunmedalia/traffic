@@ -1,6 +1,7 @@
 package main
 
 import (
+	lipgloss "charm.land/lipgloss/v2"
 	"context"
 	"os"
 	"path/filepath"
@@ -9,7 +10,6 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 )
 
 func TestDiscoverSessionsByIndex(t *testing.T) {

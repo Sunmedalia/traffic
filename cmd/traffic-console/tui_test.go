@@ -1,10 +1,12 @@
 package main
 
 import (
+	lipgloss "charm.land/lipgloss/v2"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Sunmedalia/traffic/internal/index"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +15,6 @@ import (
 
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 	termansi "github.com/charmbracelet/x/ansi"
 
 	"github.com/Sunmedalia/traffic/internal/session"
@@ -33,7 +34,7 @@ func putTUITransaction(t *testing.T, s *Store, transaction Transaction) {
 func tuiTestStore(t *testing.T) *Store {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := session.OpenDB(dir, true)
+	db, err := index.OpenDB(dir, true)
 	s := &Store{db: db, dir: dir}
 	if err != nil {
 		t.Fatal(err)

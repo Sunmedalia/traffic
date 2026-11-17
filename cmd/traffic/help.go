@@ -42,8 +42,8 @@ func printCollectorHelp(w io.Writer, cmd string, cn bool, fs *flag.FlagSet) {
 
 用法：traffic <命令> [参数]
   doctor    检查接口、权限、随包依赖和 HTTPS 后端；不开始采集
-  capture   采集 HTTP/HTTPS 并保存会话；规则匹配在本地分析阶段执行
-  import    导入已有明文 HTTP PCAP
+  capture   保存原始网络包及探针明文；本地 console 负责还原与分析
+  import    将已有 PCAP 保存为原始会话
 
 示例：
   traffic doctor
@@ -67,8 +67,8 @@ HTTPS 覆盖取决于后端、目标 ABI 和附加窗口，零丢弃不代表采
 
 Usage: traffic <command> [options]
   doctor   Inspect interfaces, privileges, dependencies and TLS backends
-  capture  Capture HTTP/HTTPS and write an evidence session
-  import   Import an existing plaintext HTTP PCAP
+  capture  Save raw network packets and TLS probe events
+  import   Save an existing PCAP as a raw session
 
 Examples:
   traffic doctor
@@ -99,7 +99,7 @@ Use traffic <command> --help for command-specific help.
 		fmt.Fprintln(w, "Usage: "+usage+"\n\nOptions:")
 	}
 	descriptions := map[string]string{
-		"interfaces": "接口列表，逗号分隔；Windows 随包 WinDivert 默认覆盖本机接口和回环", "ports": "业务 TCP 端口，默认 80,443", "service": "目标服务：auto/nginx/apache/tomcat/openssl/iis", "pid": "只检查或采集指定进程", "libssl": "覆盖 OpenSSL 动态库路径或模块名", "ecapture": "eCapture 路径，默认使用随包版本", "netns-pid": "Linux 目标网络命名空间 PID", "java-attach": "显式附加 Java Agent（Tomcat NIO）", "java-pid": "Java 目标 PID", "java-agent": "Java Agent 文件，默认查找随包 JAR", "java-helper": "带 jdk.attach 的 Java 可执行文件", "json": "输出 JSON（doctor 默认显示中文自检报告）", "duration": "采集时长，例如 60s、10m；0 表示直到 Ctrl+C", "output": "精确的会话输出目录，必须为新目录", "data-dir": "会话根目录，默认位于程序旁的 sessions", "name": "会话名称", "no-tls": "仅抓网络包，不附加明文探针", "no-detect": "兼容旧参数；采集始终不执行检测", "trusted-proxies": "可信代理 IP/CIDR，逗号分隔", "require-tls": "HTTPS 预检失败时拒绝开始。通过预检不代表已经采到明文", "require-plaintext": "IIS 探针已附加但一条明文请求都没保存时，以非 0 退出。小样本会落在附加盲区里，先热身再开", "collector-memory-mib": "采集器及子进程内存预算 MiB，默认 256", "collector-cpu-percent": "单核 CPU 百分比预算，默认 50", "drain-timeout": "探针数据排空等待，默认 5s", "request-limit": "请求正文保存字节上限，默认 262144", "response-limit": "响应正文保存字节上限，默认 65536", "disk-limit-mib": "会话磁盘预算 MiB，默认 2048", "retention": "索引保留时间，默认 24h", "openssl-preload-socket": "Linux 预加载明文 socket；必须先在服务启动时加载库", "openssl-preload-allow-uid": "允许预加载事件的非 root UID", "iis-probe": "覆盖随包 IIS 探针脚本", "openssl-probe": "覆盖随包 OpenSSL 探针脚本", "iis-python": "覆盖随包 Python 解释器", "probe-python": "覆盖随包 Python 解释器", "iis-runtime-dir": "覆盖自动创建的 Frida 运行目录", "probe-runtime-dir": "覆盖自动创建的 Frida 运行目录", "openssl-profile": "覆盖静态 OpenSSL 二进制 profile"}
+		"interfaces": "接口列表，逗号分隔；Windows 随包 WinDivert 默认覆盖本机接口和回环", "ports": "业务 TCP 端口，默认 80,443", "service": "目标服务：auto/nginx/apache/tomcat/openssl/iis", "pid": "只检查或采集指定进程", "libssl": "覆盖 OpenSSL 动态库路径或模块名", "ecapture": "eCapture 路径，默认使用随包版本", "netns-pid": "Linux 目标网络命名空间 PID", "java-attach": "显式附加 Java Agent（Tomcat NIO）", "java-pid": "Java 目标 PID", "java-agent": "Java Agent 文件，默认查找随包 JAR", "java-helper": "带 jdk.attach 的 Java 可执行文件", "json": "输出 JSON（doctor 默认显示中文自检报告）", "duration": "采集时长，例如 60s、10m；0 表示直到 Ctrl+C", "output": "精确的会话输出目录，必须为新目录", "data-dir": "会话根目录，默认位于程序旁的 sessions", "name": "会话名称", "no-tls": "仅抓网络包，不附加明文探针", "no-detect": "兼容旧参数；采集始终不执行检测", "trusted-proxies": "可信代理 IP/CIDR，逗号分隔", "require-plaintext": "IIS 未记录请求侧明文时非零退出；仅检查原始事件，不做 HTTP 还原", "require-tls": "HTTPS 预检失败时拒绝开始", "collector-memory-mib": "采集器及子进程内存预算 MiB，默认 256", "collector-cpu-percent": "单核 CPU 百分比预算，默认 50", "drain-timeout": "探针数据排空等待，默认 5s", "disk-limit-mib": "会话磁盘预算 MiB，默认 2048", "openssl-preload-socket": "Linux 预加载明文 socket；必须先在服务启动时加载库", "openssl-preload-allow-uid": "允许预加载事件的非 root UID", "iis-probe": "覆盖随包 IIS 探针脚本", "openssl-probe": "覆盖随包 OpenSSL 探针脚本", "iis-python": "覆盖随包 Python 解释器", "probe-python": "覆盖随包 Python 解释器", "iis-runtime-dir": "覆盖自动创建的 Frida 运行目录", "probe-runtime-dir": "覆盖自动创建的 Frida 运行目录", "openssl-profile": "覆盖静态 OpenSSL 二进制 profile"}
 	if fs != nil {
 		fs.VisitAll(func(f *flag.Flag) {
 			if cmd == "doctor" && !doctorHelpFlags[f.Name] {
@@ -132,9 +132,9 @@ Use traffic <command> --help for command-specific help.
 	}
 	if cmd == "capture" || cmd == "import" {
 		if cn {
-			fmt.Fprintln(w, "\n采集和导入只保存流量，不执行规则匹配。停采后在本地运行：\n  traffic-console analyze --session SESSION [--rules FILE]\n  traffic-console web --session SESSION --rules-dir ./rules\n规则校验：traffic-console rules check FILE。")
+			fmt.Fprintln(w, "\n采集和导入只保存原始流量，不做 TCP/HTTP 还原、配对、索引或规则匹配。\nPCAP 分段顺序保留，达到磁盘预算停止；正文分析上限在 console 中设置。\n停采后在本地运行：\n  traffic-console analyze --session SESSION [--rules FILE]\n  traffic-console web --session SESSION --rules-dir ./rules\n规则校验：traffic-console rules check FILE。")
 		} else {
-			fmt.Fprintln(w, "\nCapture and import save traffic without rule matching. After capture stops, run locally:\n  traffic-console analyze --session SESSION [--rules FILE]\n  traffic-console web --session SESSION --rules-dir ./rules\nValidate rules: traffic-console rules check FILE.")
+			fmt.Fprintln(w, "\nCapture and import save raw traffic without TCP/HTTP reconstruction, pairing, indexing or matching.\nPCAP segments are retained until the disk budget stops capture. Set body limits in console. After capture stops, run locally:\n  traffic-console analyze --session SESSION [--rules FILE]\n  traffic-console web --session SESSION --rules-dir ./rules\nValidate rules: traffic-console rules check FILE.")
 		}
 	}
 	if cn && cmd == "capture" {

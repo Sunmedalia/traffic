@@ -2,33 +2,47 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"github.com/Sunmedalia/traffic/internal/session"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
-func TestCapturePreservesSuspiciousTrafficWithoutDetection(t *testing.T) {
+func TestCollectorPreservesRawBytesWithoutIndex(t *testing.T) {
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.db.Close()
-	p := newHTTP(s)
-	request := []byte("GET /?q=union%20select%201 HTTP/1.1\r\nHost: test\r\n\r\n")
-	response := []byte("HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nroot:x:0:0:")
-	p.process(bytes.NewReader(request), "capture-only", "192.0.2.1:1234", "test", 0, false)
-	p.process(bytes.NewReader(response), "capture-only", "192.0.2.1:1234", "test", 0, false)
-	var id string
-	if err = s.db.QueryRow("SELECT id FROM requests").Scan(&id); err != nil {
+	r := newRecorder(s)
+	defer r.close()
+	target := session.Target{PID: 17, ID: "17:original", Service: "nginx", Ports: []int{443}}
+	data := bytes.Repeat([]byte("unparsed \x00 bytes union select 1"), 20000)
+	if err = r.record("test-generation", "openssl", target, session.RawEvent{Type: "data", Connection: "c", Direction: "read", Data: data, Local: "127.0.0.1:443", Client: "192.0.2.1:1234"}); err != nil {
 		t.Fatal(err)
 	}
-	record := Transaction{ID: id}
-	if err = s.restore(&record); err != nil {
+	if err = r.close(); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(record.Request, request) || !bytes.Equal(record.Response, response) || len(record.Alerts) != 0 || s.stats.Alerts != 0 {
-		t.Fatalf("capture changed evidence or ran detection: %+v", record)
+	raw, err := os.ReadFile(filepath.Join(s.dir, "tls", "stream.jsonl"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, args := range [][]string{{"rules", "check", "test.yaml"}, {"capture", "--rules", "test.yaml"}, {"capture", "--alert-webhook", "https://example.invalid"}} {
-		if err = run(args); err == nil {
+	lines := bytes.Split(bytes.TrimSpace(raw), []byte("\n"))
+	if len(lines) != 2 {
+		t.Fatal("unexpected records", len(lines))
+	}
+	var metadata, event session.RawEvent
+	json.Unmarshal(lines[0], &metadata)
+	json.Unmarshal(lines[1], &event)
+	if metadata.Target == nil || metadata.Target.ID != target.ID || !bytes.Equal(event.Data, data) {
+		t.Fatal("raw payload or target identity changed")
+	}
+	if _, err = os.Stat(filepath.Join(s.dir, "index.sqlite")); !os.IsNotExist(err) {
+		t.Fatal("collector created an index")
+	}
+	for _, args := range [][]string{{"rules", "check", "x.yaml"}, {"capture", "--rules", "x.yaml"}, {"capture", "--request-limit", "100"}, {"capture", "--alert-webhook", "https://example.invalid"}} {
+		if run(args) == nil {
 			t.Fatalf("collector accepted analysis option %v", args)
 		}
 	}

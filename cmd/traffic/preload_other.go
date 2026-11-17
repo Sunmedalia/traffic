@@ -7,6 +7,6 @@ import (
 	"fmt"
 )
 
-func capturePreload(_ context.Context, _ *Store, _ *HTTPProcessor, _ string, _ []uint32) error {
+func capturePreload(_ context.Context, _ *Store, _ *eventRecorder, _ string, _ []uint32) error {
 	return fmt.Errorf("OpenSSL preload capture requires Linux")
 }

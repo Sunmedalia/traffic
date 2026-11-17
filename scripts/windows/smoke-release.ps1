@@ -35,13 +35,17 @@ try {
     $capture.WaitForExit(30000) | Out-Null
     if (!$capture.HasExited) { throw 'Capture did not stop after duration' }
     if ($capture.ExitCode -ne 0) { throw (Get-Content "$App/capture.err" -Raw) }
-    $index = Get-ChildItem "$App/sessions" -Filter index.sqlite -Recurse | Select-Object -First 1
+    $index = Get-ChildItem "$App/sessions" -Filter manifest.json -Recurse | Select-Object -First 1
     $session = if ($index) { $index.Directory } else { $null }
     if (!$session) { throw 'No session saved' }
     & "$Console/traffic-console.exe" status --session $session.FullName
     Check-Exit
-    # Verify actual parsed requests in SQLite, not just driver startup.
-    & "$App/deps/python/python.exe" -c "import pathlib,sqlite3,sys; p=next(pathlib.Path(sys.argv[1]).rglob('*.sqlite')); db=sqlite3.connect(p); assert db.execute('select count(*) from requests').fetchone()[0] >= 4" $session.FullName
+    if (Test-Path "$($session.FullName)/index.sqlite") { throw 'Collector wrote a request index' }
+    & "$Console/traffic-console.exe" analyze --session $session.FullName
+    Check-Exit
+    # Verify that the local console reconstructed the actual recorded HTTP traffic.
+    $requests = & "$Console/traffic-console.exe" requests --session $session.FullName --limit 100 | ConvertFrom-Json
+    if (@($requests).Count -lt 4) { throw 'Console did not reconstruct the requests' }
     Check-Exit
 } finally {
     if ($capture -and !$capture.HasExited) { Stop-Process -Id $capture.Id -Force }

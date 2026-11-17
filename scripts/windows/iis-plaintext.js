@@ -160,7 +160,7 @@ const fileSize = new NativeFunction(kernel.getExportByName('GetFileSizeEx'), 'bo
 function body(id, direction, pointer, length) {
     const state = requests.get(id);
     if (state === undefined || length === 0) return;
-    const limit = direction === 'request' ? requestLimit : (state.responseLimit || responseLimit);
+    const limit = (direction === 'request' ? requestLimit : (state.responseLimit || responseLimit)) || Number.POSITIVE_INFINITY;
     const used = state[direction];
     const count = Math.min(length, Math.max(0, limit - used));
     state[direction] += length;
@@ -193,7 +193,7 @@ function chunks(id, direction, count, pointer) {
                 continue;
             }
             const state = requests.get(id);
-            const limit = direction === 'request' ? requestLimit : (state.responseLimit || responseLimit);
+            const limit = (direction === 'request' ? requestLimit : (state.responseLimit || responseLimit)) || Number.POSITIVE_INFINITY;
             const wanted = Math.min(length, Math.max(0, limit - state[direction]));
             if (wanted === 0) {
                 state[direction] += length;
@@ -416,7 +416,7 @@ for (const name of ['HttpReceiveHttpRequest', 'HttpReceiveRequestEntityBody', 'H
                         if (status < 200) { operation.kind = 'interim'; return; }
                         const fields = headers(response.add(24), responseHeaders);
                         if (fields.some(field => field[0].toLowerCase() === 'transfer-encoding' && field[1].toLowerCase().includes('chunked'))) {
-                            requests.get(operation.id).responseLimit = responseLimit * 8 + 32768;
+                            requests.get(operation.id).responseLimit = responseLimit ? responseLimit * 8 + 32768 : 0;
                         }
                         dispatch({type: 'response', id: operation.id, status, headers: fields});
                         chunks(operation.id, 'response', response.add(536).readU16(), response.add(544).readPointer());
@@ -448,10 +448,11 @@ rpc.exports = {
         // One record at stop. The completion has no operation kind, so the
         // reason stays unmatched_completion. The collector decides the attach
         // window from receive_matches versus send_matches.
+        // Drain queued sequence numbers before emitting the final direct record.
+        flush();
         if (unmatchedReported.unknown > 0) {
             send({type: 'probe-gap', reason: 'unmatched_completion', kind: 'unknown', count: unmatchedReported.unknown, time: new Date().toISOString(), sequence: ++transportSequence, final: true});
         }
-        flush();
         const plaintextObserved = diagnostics.receive_matches > 0;
         return {type: 'summary', last_sequence: transportSequence, completed, pending: pending.size, diagnostics,
             plaintext_observed: plaintextObserved,
