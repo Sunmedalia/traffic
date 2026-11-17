@@ -243,6 +243,8 @@ func (w *webServer) handler() http.Handler {
 	mux.HandleFunc("GET /api/sessions/{sid}/requests/{rid}/export", w.handleExport)
 	mux.HandleFunc("GET /api/rules", w.handleRuleList)
 	mux.HandleFunc("POST /api/rules/validate", w.handleRuleValidate)
+	mux.HandleFunc("POST /api/rules/test", w.handleRuleTest)
+	mux.HandleFunc("GET /api/sessions/{sid}/rule-hits", w.handleRuleHits)
 	mux.HandleFunc("GET /api/rules/{name}", w.handleRuleFile)
 	mux.HandleFunc("PUT /api/rules/{name}", w.handleRuleFile)
 	mux.HandleFunc("DELETE /api/rules/{name}", w.handleRuleFile)

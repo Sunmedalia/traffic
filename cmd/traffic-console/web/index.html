@@ -169,6 +169,7 @@
               <span class="spacer"></span>
               <button type="button" class="ghost icon" id="detail-prev" title="上一条（k）" aria-label="上一条">↑</button>
               <button type="button" class="ghost icon" id="detail-next" title="下一条（j）" aria-label="下一条">↓</button>
+              <a class="button" id="detail-test" title="在规则页用这条请求测试规则">测试规则</a>
               <button type="button" id="detail-curl" title="复制为 cURL 命令">复制 cURL</button>
               <button type="button" id="detail-export" title="下载请求、响应与关联网络包">导出证据</button>
               <button type="button" class="ghost icon" id="detail-close" title="关闭（Esc）" aria-label="关闭详情">✕</button>
@@ -222,21 +223,55 @@
           <div class="editor-foot"><span id="rules-cursor"></span><span class="spacer"></span><span class="muted"><kbd>Ctrl</kbd> <kbd>S</kbd> 保存 · <kbd>Tab</kbd> 缩进两格</span></div>
         </div>
         <aside class="rules-preview">
-          <header class="card-head"><h2>解析结果</h2><span class="muted" id="rules-preview-meta"></span></header>
-          <div class="table-wrap"><table class="data rules-table"><thead><tr><th>ID</th><th>级别</th><th>字段</th><th class="wide">正则</th></tr></thead><tbody id="rules-table"></tbody></table></div>
-          <div class="blank" id="rules-table-empty" hidden></div>
-          <details class="rules-ref">
-            <summary>字段与写法</summary>
-            <dl>
-              <dt><code>url</code></dt><dd>请求行中的 URL（含查询参数）</dd>
-              <dt><code>request</code> / <code>response</code></dt><dd>整个请求或响应（起始行、头部与正文）</dd>
-              <dt><code>request.headers</code></dt><dd>全部请求头；响应同理</dd>
-              <dt><code>request.header.User-Agent</code></dt><dd>指定名称的单个头部</dd>
-              <dt><code>request.body</code> / <code>response.body</code></dt><dd>正文；压缩或编码过的正文也会匹配解码后的内容</dd>
-              <dt><code>severity</code></dt><dd><code>low</code>、<code>medium</code> 或 <code>high</code></dd>
-              <dt><code>pattern</code></dt><dd>Go RE2 正则，用 <code>(?i)</code> 忽略大小写；不支持回溯引用</dd>
-            </dl>
-          </details>
+          <div class="preview-bar">
+            <nav class="tabs small" role="tablist" aria-label="规则面板">
+              <button type="button" role="tab" data-ptab="rules">规则<span class="badge" id="rules-count"></span></button>
+              <button type="button" role="tab" data-ptab="test">测试<span class="badge" id="test-count"></span></button>
+            </nav>
+            <span class="spacer"></span>
+            <label class="inline" title="命中统计和会话请求测试使用这个会话">参照会话<select id="rules-session" aria-label="参照会话"></select></label>
+          </div>
+          <div id="ptab-rules" class="ptab">
+            <div class="hits-meta" id="hits-meta"></div>
+            <div class="table-wrap"><table class="data rules-table"><thead><tr><th>ID</th><th>级别</th><th>字段</th><th class="wide">正则</th><th class="num">命中</th><th>最近</th></tr></thead><tbody id="rules-table"></tbody></table></div>
+            <div class="blank" id="rules-table-empty" hidden></div>
+            <details class="rules-ref">
+              <summary>字段与写法</summary>
+              <dl>
+                <dt><code>url</code></dt><dd>请求行中的 URL（含查询参数）</dd>
+                <dt><code>request</code> / <code>response</code></dt><dd>整个请求或响应（起始行、头部与正文）</dd>
+                <dt><code>request.headers</code></dt><dd>全部请求头；响应同理</dd>
+                <dt><code>request.header.User-Agent</code></dt><dd>指定名称的单个头部</dd>
+                <dt><code>request.body</code> / <code>response.body</code></dt><dd>正文；压缩或编码过的正文也会匹配解码后的内容</dd>
+                <dt><code>severity</code></dt><dd><code>low</code>、<code>medium</code> 或 <code>high</code></dd>
+                <dt><code>pattern</code></dt><dd>Go RE2 正则，用 <code>(?i)</code> 忽略大小写；不支持回溯引用</dd>
+              </dl>
+            </details>
+          </div>
+          <div id="ptab-test" class="ptab" hidden>
+            <div class="test-source">
+              <div class="seg" role="group" aria-label="测试样本来源">
+                <button type="button" data-src="session">会话请求</button>
+                <button type="button" data-src="manual">手动输入</button>
+              </div>
+              <span class="muted">用编辑器中的内容（无需保存）加内置规则测试，只读，不改动会话</span>
+            </div>
+            <div id="test-session-src" class="test-src">
+              <div class="test-search">
+                <input type="search" id="test-search" placeholder="按 Host 或 URL 查找请求" spellcheck="false" aria-label="查找测试请求">
+                <label class="check"><input type="checkbox" id="test-alerts">仅告警</label>
+              </div>
+              <div class="test-picks" id="test-picks"></div>
+            </div>
+            <div id="test-manual-src" class="test-src" hidden>
+              <label for="test-request">请求报文</label>
+              <textarea id="test-request" spellcheck="false" wrap="off" aria-label="测试请求报文"></textarea>
+              <label for="test-response">响应报文 <span class="muted">· 可选</span></label>
+              <textarea id="test-response" class="short" spellcheck="false" wrap="off" aria-label="测试响应报文"></textarea>
+              <div class="rules-toolbar"><button type="button" class="primary" id="test-run">运行测试</button><span class="muted">修改规则后会自动重新测试</span></div>
+            </div>
+            <div class="test-result" id="test-result" aria-live="polite"></div>
+          </div>
         </aside>
       </div>
     </section>
