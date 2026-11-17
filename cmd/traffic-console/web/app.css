@@ -111,7 +111,7 @@ button.icon { min-width: 30px; padding: 4px 6px; }
 .live { display: inline-flex; align-items: center; gap: 7px; padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px; font-size: 12px; color: var(--muted); white-space: nowrap; }
 .dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--faint); }
 .dot.running { background: var(--ok); box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 60%, transparent); animation: ping 1.8s ease-out infinite; }
-.dot.failed, .dot.stale, .dot.broken { background: var(--high); }
+.dot.failed, .dot.stale, .dot.broken, .dot.interrupted { background: var(--high); }
 .dot.complete, .dot.stopped { background: var(--faint); }
 .live.paused .dot { animation: none; background: var(--medium); box-shadow: none; }
 @keyframes ping { 70%, 100% { box-shadow: 0 0 0 7px transparent; } }

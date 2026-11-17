@@ -259,3 +259,56 @@ func TestWebReconstructsRawSessionBeforeServingRequests(t *testing.T) {
 		t.Fatal(code, string(data))
 	}
 }
+
+func TestRawDiscoveryAndSummaryCachesFollowAnalysisGeneration(t *testing.T) {
+	now := time.Now().UTC()
+	target := &session.Target{PID: 42, ID: "42:start", Service: "nginx", Ports: []int{443}}
+	dir := rawTestSession(t, []session.RawEvent{
+		{Version: 1, Time: now, Source: "a", Type: "source", Backend: "ecapture", Target: target},
+		{Version: 1, Time: now, Source: "a", Type: "data", Connection: "c", Direction: "read", Local: "127.0.0.1:443", Client: "192.0.2.1:1234", Data: []byte("GET /local-marker HTTP/1.1\r\nHost: test\r\n\r\n")},
+		{Version: 1, Time: now, Source: "a", Type: "data", Connection: "c", Direction: "write", Local: "127.0.0.1:443", Client: "192.0.2.1:1234", Data: []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")},
+	})
+	cache := newDiscoveryCache()
+	initial := discoverSessions(context.Background(), []string{dir}, cache)
+	if len(initial.Entries) != 1 || initial.Entries[0].CountsKnown {
+		t.Fatal(initial)
+	}
+	builtins, _ := rulesFromYAML(nil)
+	if _, err := analyzeSessionRules(context.Background(), dir, "", builtins, time.Minute, 20); err != nil {
+		t.Fatal(err)
+	}
+	web := newWebServer([]string{dir}, "raw-cache-test", time.Second)
+	defer web.close()
+	server := httptest.NewServer(web.handler())
+	defer server.Close()
+	summary := func(want int) {
+		t.Helper()
+		code, data := ruleRequest(t, server, web.token, "GET", "/api/sessions/"+webSessionID(dir)+"/summary", nil)
+		var counts struct {
+			Total   int `json:"total"`
+			Alerted int `json:"alerted"`
+		}
+		if err := json.Unmarshal(data, &counts); err != nil || code != 200 || counts.Total != 1 || counts.Alerted != want {
+			t.Fatal(code, string(data), err)
+		}
+	}
+	summary(0)
+	first := discoverSessions(context.Background(), []string{dir}, cache)
+	if len(first.Entries) != 1 || !first.Entries[0].CountsKnown || first.Entries[0].Stats.Transactions != 1 || first.Entries[0].Stats.Alerts != 0 {
+		t.Fatal(first)
+	}
+	rules, _ := validateRuleContent(testManagedRules)
+	if _, err := analyzeSessionRules(context.Background(), dir, "", rules, time.Minute, 20); err != nil {
+		t.Fatal(err)
+	}
+	summary(1)
+	second := discoverSessions(context.Background(), []string{dir}, cache)
+	if len(second.Entries) != 1 || second.Entries[0].Stats.Alerts != 1 || second.Entries[0].Stats.Transactions != 1 {
+		t.Fatal(second)
+	}
+	// Reusing the cache without changes must retain reconstructed counts as well.
+	third := discoverSessions(context.Background(), []string{dir}, cache)
+	if len(third.Entries) != 1 || !third.Entries[0].CountsKnown || third.Entries[0].Stats.Alerts != 1 || third.Entries[0].Stats.Transactions != 1 {
+		t.Fatal(third)
+	}
+}

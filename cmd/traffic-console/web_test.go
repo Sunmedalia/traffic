@@ -3,6 +3,8 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -64,6 +66,50 @@ func TestWebServesSessionsOverTokenProtectedAPI(t *testing.T) {
 		if status != http.StatusOK || !strings.Contains(string(body), want) || !strings.Contains(header.Get("Content-Security-Policy"), "script-src 'self'") {
 			t.Fatalf("asset %s status %d", path, status)
 		}
+		if path != "/" && header.Get("Cache-Control") != "no-cache" {
+			t.Fatalf("asset %s cache control %q", path, header.Get("Cache-Control"))
+		}
+	}
+	status, _, header := webGet(t, server, "", "/app.js")
+	etag := header.Get("ETag")
+	if status != http.StatusOK || etag == "" {
+		t.Fatalf("asset etag %d %q", status, etag)
+	}
+	conditional, err := http.NewRequest(http.MethodGet, server.URL+"/app.js", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conditional.Header.Set("If-None-Match", etag)
+	response, err := server.Client().Do(conditional)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNotModified {
+		t.Fatalf("conditional asset status %d", response.StatusCode)
+	}
+	compressed, err := http.NewRequest(http.MethodGet, server.URL+"/app.js", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressed.Header.Set("Accept-Encoding", "gzip")
+	response, err = server.Client().Do(compressed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Header.Get("Content-Encoding") != "gzip" {
+		response.Body.Close()
+		t.Fatalf("asset was not compressed: %q", response.Header.Get("Content-Encoding"))
+	}
+	gz, err := gzip.NewReader(response.Body)
+	if err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
+	decoded, err := io.ReadAll(gz)
+	response.Body.Close()
+	if err != nil || !bytes.Contains(decoded, []byte("use strict")) {
+		t.Fatalf("compressed asset %v", err)
 	}
 	if status, _, _ := webGet(t, server, "", "/index.sqlite"); status != http.StatusNotFound {
 		t.Fatalf("unexpected file status %d", status)
@@ -72,9 +118,36 @@ func TestWebServesSessionsOverTokenProtectedAPI(t *testing.T) {
 	var sessions struct {
 		Sessions []webSession `json:"sessions"`
 	}
-	status, body, _ := webGet(t, server, token, "/api/sessions")
+	status, body, apiHeader := webGet(t, server, token, "/api/sessions")
+	if apiHeader.Get("Cache-Control") != "no-store" {
+		t.Fatalf("api cache control %q", apiHeader.Get("Cache-Control"))
+	}
 	if err := json.Unmarshal(body, &sessions); err != nil || status != http.StatusOK || len(sessions.Sessions) != 1 {
 		t.Fatalf("sessions %d %s", status, body)
+	}
+	apiCompressed, err := http.NewRequest(http.MethodGet, server.URL+"/api/sessions", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiCompressed.Header.Set("Authorization", "Bearer "+token)
+	apiCompressed.Header.Set("Accept-Encoding", "gzip")
+	apiResponse, err := server.Client().Do(apiCompressed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if apiResponse.Header.Get("Content-Encoding") != "gzip" {
+		apiResponse.Body.Close()
+		t.Fatalf("api was not compressed: %q", apiResponse.Header.Get("Content-Encoding"))
+	}
+	apiGzip, err := gzip.NewReader(apiResponse.Body)
+	if err != nil {
+		apiResponse.Body.Close()
+		t.Fatal(err)
+	}
+	apiBody, err := io.ReadAll(apiGzip)
+	apiResponse.Body.Close()
+	if err != nil || !bytes.Contains(apiBody, []byte(`"sessions"`)) {
+		t.Fatalf("compressed api %v", err)
 	}
 	found := sessions.Sessions[0]
 	if found.State != "stopped" || found.Transactions != 2 || found.Alerts != 1 || found.Problem != "" {
@@ -83,9 +156,11 @@ func TestWebServesSessionsOverTokenProtectedAPI(t *testing.T) {
 	base := "/api/sessions/" + found.ID + "/requests"
 
 	var list struct {
-		Rows  []webRow `json:"rows"`
-		Count int      `json:"count"`
-		Stats Stats    `json:"stats"`
+		Rows     []webRow `json:"rows"`
+		Count    int      `json:"count"`
+		Page     int      `json:"page"`
+		PageSize int      `json:"page_size"`
+		Stats    Stats    `json:"stats"`
 	}
 	cases := map[string]int{"": 2, "?alerts=1": 1, "?severity=high&rule=RULE-A": 1, "?severity=low": 1, "?severity=medium&rule=RULE-B": 0, "?keyword=plain": 1, "?client=192.0.2.2": 1,
 		"?since=" + url.QueryEscape(now.Add(-time.Second).Format(time.RFC3339Nano)): 1}
@@ -104,7 +179,12 @@ func TestWebServesSessionsOverTokenProtectedAPI(t *testing.T) {
 			t.Fatalf("web filter %q: status %d body %s", query, status, body)
 		}
 	}
-	for _, query := range []string{"?severity=critical", "?since=yesterday", "?until=tomorrow", "?status=9xx", "?status=ok", "?status=42"} {
+	status, body, _ = webGet(t, server, token, base+"?limit=1")
+	list.Rows = nil
+	if err := json.Unmarshal(body, &list); err != nil || status != http.StatusOK || list.Count != 2 || len(list.Rows) != 1 || list.PageSize != 1 || list.Page != 0 {
+		t.Fatalf("limit page: status %d body %s", status, body)
+	}
+	for _, query := range []string{"?severity=critical", "?since=yesterday", "?until=tomorrow", "?status=9xx", "?status=ok", "?status=42", "?limit=0", "?limit=501"} {
 		if status, _, _ = webGet(t, server, token, base+query); status != http.StatusBadRequest {
 			t.Fatalf("query %q got status %d", query, status)
 		}
@@ -178,8 +258,21 @@ func TestWebServesSessionsOverTokenProtectedAPI(t *testing.T) {
 	if status, _, _ = webGet(t, server, token, base+"/missing"); status != http.StatusNotFound {
 		t.Fatalf("missing detail status %d", status)
 	}
+	var meta struct {
+		Status     int  `json:"status"`
+		Incomplete bool `json:"incomplete"`
+		Truncated  bool `json:"truncated"`
+		AlertCount int  `json:"alert_count"`
+	}
+	status, body, _ = webGet(t, server, token, base+"/"+url.PathEscape("a/1")+"/meta")
+	if err := json.Unmarshal(body, &meta); err != nil || status != http.StatusOK || meta.Status != 200 || meta.AlertCount != 1 {
+		t.Fatalf("meta: status %d body %s", status, body)
+	}
+	if status, _, _ = webGet(t, server, token, base+"/missing/meta"); status != http.StatusNotFound {
+		t.Fatalf("missing meta status %d", status)
+	}
 
-	status, body, header := webGet(t, server, token, base+"/"+url.PathEscape("a/1")+"/export")
+	status, body, header = webGet(t, server, token, base+"/"+url.PathEscape("a/1")+"/export")
 	if status != http.StatusOK || header.Get("Content-Disposition") != `attachment; filename="evidence-a1.zip"` {
 		t.Fatalf("export %d %s %q", status, body, header.Get("Content-Disposition"))
 	}
@@ -206,5 +299,35 @@ func TestWebListenRequiresLoopbackByDefault(t *testing.T) {
 	}
 	if err := runWeb("", t.TempDir(), t.TempDir(), "0.0.0.0:0", false, time.Second); err == nil || !strings.Contains(err.Error(), "--allow-remote") {
 		t.Fatalf("remote listen was not refused: %v", err)
+	}
+}
+
+func TestWebSummaryCacheInvalidates(t *testing.T) {
+	writer := tuiTestStore(t)
+	now := time.Now().UTC()
+	putTUITransaction(t, writer, Transaction{ID: "first", Time: now, Client: "192.0.2.1:1", Method: "GET", Host: "demo", URL: "/"})
+	if err := os.WriteFile(filepath.Join(writer.dir, "status.json"), []byte(`{"state":"stopped","transactions":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	web := newWebServer([]string{writer.dir}, "{{SECRET_9kq2wvxz}}", time.Second)
+	defer web.close()
+	server := httptest.NewServer(web.handler())
+	defer server.Close()
+	sessions := discoverSessions(context.Background(), []string{writer.dir})
+	if len(sessions.Entries) != 1 {
+		t.Fatalf("sessions: %+v", sessions)
+	}
+	base := "/api/sessions/" + webSessionID(writer.dir) + "/summary"
+	var summary struct {
+		Total int `json:"total"`
+	}
+	status, body, _ := webGet(t, server, web.token, base)
+	if err := json.Unmarshal(body, &summary); err != nil || status != http.StatusOK || summary.Total != 1 {
+		t.Fatalf("first summary: %d %s", status, body)
+	}
+	putTUITransaction(t, writer, Transaction{ID: "second", Time: now.Add(time.Second), Client: "192.0.2.2:1", Method: "GET", Host: "demo", URL: "/"})
+	status, body, _ = webGet(t, server, web.token, base)
+	if err := json.Unmarshal(body, &summary); err != nil || status != http.StatusOK || summary.Total != 2 {
+		t.Fatalf("summary cache did not invalidate: %d %s", status, body)
 	}
 }

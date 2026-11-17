@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -112,6 +115,20 @@ func webCounts(ctx context.Context, db *sql.DB, query string, args []any, scan f
 	return result, rows.Err()
 }
 
+func summaryRevision(s *Store) string {
+	signature, err := sourceSignature(s.dir)
+	if err != nil {
+		return ""
+	}
+	if s.analysis != nil {
+		signature += fmt.Sprintf("|%s|%s", s.analysis.Completed.Format(time.RFC3339Nano), s.analysis.RulesSHA256)
+	}
+	if info, err := os.Stat(filepath.Join(s.dir, "status.json")); err == nil {
+		signature += fmt.Sprintf("|%d:%d", info.Size(), info.ModTime().UnixNano())
+	}
+	return signature
+}
+
 func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 	filter, _, err := webFilter(r)
 	if err != nil {
@@ -123,6 +140,21 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.db.Close()
+	// Finished sessions cannot change until their index or analysis file does.
+	// Cache those summaries; running captures are re-scanned on every request.
+	status, _ := readTUIStatus(s.dir)
+	finished := status.State != "" && status.State != "running" && status.State != "starting" && status.State != "stale"
+	revision := summaryRevision(s)
+	key := s.dir + "|" + r.URL.RawQuery
+	if finished && revision != "" {
+		w.summaryMu.Lock()
+		entry, ok := w.summaries[key]
+		w.summaryMu.Unlock()
+		if ok && entry.revision == revision {
+			webJSON(rw, http.StatusOK, entry.data)
+			return
+		}
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	where, args := filter.where(false)
@@ -189,6 +221,14 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 	} else if ctx.Err() != nil {
 		webError(rw, http.StatusInternalServerError, err)
 		return
+	}
+	if finished && revision != "" {
+		w.summaryMu.Lock()
+		if len(w.summaries) > 128 {
+			w.summaries = map[string]summaryCacheEntry{}
+		}
+		w.summaries[key] = summaryCacheEntry{revision: revision, data: result}
+		w.summaryMu.Unlock()
 	}
 	webJSON(rw, http.StatusOK, result)
 }

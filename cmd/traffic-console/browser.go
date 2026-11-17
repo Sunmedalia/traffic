@@ -1,7 +1,6 @@
 package main
 
 import (
-	lipgloss "charm.land/lipgloss/v2"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,11 +9,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	termansi "github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/term"
 )
@@ -29,6 +30,87 @@ type sessionsFound struct {
 	Entries []sessionEntry
 	Warning string
 }
+
+// discoveryCache remembers schema validation and analysis results until the
+// index or analysis file changes, so periodic discovery does not reopen every
+// session database.
+type sessionCheck struct {
+	revision        string
+	analysisPresent bool
+	alerts          uint64
+	transactions    uint64
+	reconstructed   bool
+}
+
+type discoveryCache struct {
+	mu      sync.Mutex
+	entries map[string]sessionCheck
+}
+
+func newDiscoveryCache() *discoveryCache {
+	return &discoveryCache{entries: map[string]sessionCheck{}}
+}
+
+func sessionRevision(dir string) (string, error) {
+	source, err := sourceSignature(dir)
+	if err != nil {
+		return "", err
+	}
+	path, err := analysisDatabasePath(dir)
+	if err != nil {
+		return "", err
+	}
+	revision := source + "|" + path
+	for _, name := range []string{path, filepath.Join(dir, "status.json")} {
+		info, err := os.Stat(name)
+		if err == nil {
+			revision += fmt.Sprintf("|%s:%d:%d", name, info.Size(), info.ModTime().UnixNano())
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+	}
+	return revision, nil
+}
+func (c *discoveryCache) get(dir, revision string) (sessionCheck, bool) {
+	if c == nil || revision == "" {
+		return sessionCheck{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	got, ok := c.entries[dir]
+	return got, ok && got.revision == revision
+}
+func (c *discoveryCache) put(dir string, entry sessionCheck) {
+	if c == nil || entry.revision == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[dir] = entry
+}
+
+func (c *discoveryCache) clear() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.entries = map[string]sessionCheck{}
+	c.mu.Unlock()
+}
+
+func (c *discoveryCache) retain(seen map[string]bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	for dir := range c.entries {
+		if !seen[dir] {
+			delete(c.entries, dir)
+		}
+	}
+	c.mu.Unlock()
+}
+
 type sessionChildMsg struct {
 	Generation uint64
 	Message    tea.Msg
@@ -92,63 +174,67 @@ func sessionRoots(root string) []string {
 	return roots
 }
 
-func discoverSessions(ctx context.Context, roots []string) sessionsFound {
+func discoverSessions(ctx context.Context, roots []string, caches ...*discoveryCache) sessionsFound {
+	var cache *discoveryCache
+	if len(caches) > 0 {
+		cache = caches[0]
+	}
 	result := sessionsFound{}
 	seen := map[string]bool{}
 	warnings := []string{}
-	for _, root := range roots {
-		err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if walkErr != nil {
-				if !os.IsNotExist(walkErr) {
-					warnings = append(warnings, walkErr.Error())
+	add := func(dir string, indexInfo fs.FileInfo) {
+		if seen[dir] {
+			return
+		}
+		seen[dir] = true
+		item := sessionEntry{Dir: dir, Name: filepath.Base(dir)}
+		var manifest struct {
+			Name    string    `json:"name"`
+			Host    string    `json:"hostname"`
+			Started time.Time `json:"started"`
+		}
+		if b, err := os.ReadFile(filepath.Join(dir, "manifest.json")); err == nil {
+			if json.Unmarshal(b, &manifest) == nil {
+				if manifest.Name != "" {
+					item.Name = manifest.Name
 				}
-				return nil
+				item.Host, item.Started = manifest.Host, manifest.Started
 			}
-			if entry.IsDir() || (entry.Name() != "index.sqlite" && entry.Name() != "manifest.json") || !entry.Type().IsRegular() {
-				return nil
-			}
-			dir := filepath.Dir(path)
-			if entry.Name() == "manifest.json" && !rawSession(dir) {
-				return nil
-			}
-			if seen[dir] {
-				return nil
-			}
-			seen[dir] = true
-			item := sessionEntry{Dir: dir, Name: filepath.Base(dir)}
-			var manifest struct {
-				Name    string    `json:"name"`
-				Host    string    `json:"hostname"`
-				Started time.Time `json:"started"`
-			}
-			if b, err := os.ReadFile(filepath.Join(dir, "manifest.json")); err == nil {
-				if json.Unmarshal(b, &manifest) == nil {
-					if manifest.Name != "" {
-						item.Name = manifest.Name
-					}
-					item.Host, item.Started = manifest.Host, manifest.Started
+		}
+		var statusWarning string
+		item.Stats, statusWarning = readTUIStatus(dir)
+		item.CountsKnown = statusWarning == "" || item.Stats.State == "stale"
+		if item.Started.IsZero() {
+			item.Started = item.Stats.Started
+		}
+		if item.Started.IsZero() {
+			item.Started = indexInfo.ModTime()
+		}
+		revision, _ := sessionRevision(dir)
+		cached, ok := cache.get(dir, revision)
+		if ok {
+			if cached.analysisPresent {
+				item.Stats.Alerts = cached.alerts
+				if cached.reconstructed {
+					item.Stats.Transactions = cached.transactions
+					item.CountsKnown = true
 				}
+			} else if rawSession(dir) {
+				item.CountsKnown = false
 			}
-			var statusWarning string
-			item.Stats, statusWarning = readTUIStatus(dir)
-			item.CountsKnown = statusWarning == "" || item.Stats.State == "stale"
-			if item.Started.IsZero() {
-				item.Started = item.Stats.Started
-			}
-			if item.Started.IsZero() {
-				if info, err := entry.Info(); err == nil {
-					item.Started = info.ModTime()
-				}
-			}
+		} else {
+			var problem string
+			check := sessionCheck{revision: revision}
 			s, err := openStore(dir)
 			if err == nil {
 				if s.analysis != nil {
-					item.Stats.Alerts = s.analysis.Alerts
-					if s.analysis.Reconstructed {
-						item.Stats.Transactions = s.analysis.Transactions
+					check.analysisPresent = true
+					check.alerts = s.analysis.Alerts
+					check.reconstructed = s.analysis.Reconstructed
+					check.transactions = s.analysis.Transactions
+					item.Stats.Alerts = check.alerts
+					if check.reconstructed {
+						item.Stats.Transactions = check.transactions
 						item.CountsKnown = true
 					}
 				} else if rawSession(dir) {
@@ -165,15 +251,56 @@ func discoverSessions(ctx context.Context, roots []string) sessionsFound {
 				err = queryErr
 			}
 			if err != nil {
-				item.Problem = err.Error()
+				problem = err.Error()
 			}
-			result.Entries = append(result.Entries, item)
+			item.Problem = problem
+			// Only cache successful validation. A transient lock or timeout must
+			// not make a session look broken until its index changes.
+			if problem == "" {
+				cache.put(dir, check)
+			}
+		}
+		result.Entries = append(result.Entries, item)
+	}
+	for _, root := range roots {
+		err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if walkErr != nil {
+				if !os.IsNotExist(walkErr) {
+					warnings = append(warnings, walkErr.Error())
+				}
+				return nil
+			}
+			if entry.IsDir() {
+				indexPath := filepath.Join(path, "index.sqlite")
+				if info, err := os.Stat(indexPath); err == nil && info.Mode().IsRegular() {
+					add(path, info)
+					// A session's packets and exports live below it; they cannot
+					// contain another session index.
+					return fs.SkipDir
+				}
+				if rawSession(path) {
+					if info, err := os.Stat(filepath.Join(path, "manifest.json")); err == nil {
+						add(path, info)
+						return fs.SkipDir
+					}
+				}
+				return nil
+			}
+			if entry.Name() == "index.sqlite" {
+				if info, err := entry.Info(); err == nil && info.Mode().IsRegular() {
+					add(filepath.Dir(path), info)
+				}
+			}
 			return nil
 		})
 		if err != nil {
 			warnings = append(warnings, err.Error())
 		}
 	}
+	cache.retain(seen)
 	sort.Slice(result.Entries, func(i, j int) bool {
 		if result.Entries[i].Started.Equal(result.Entries[j].Started) {
 			return result.Entries[i].Dir < result.Entries[j].Dir
