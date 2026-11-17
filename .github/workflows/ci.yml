@@ -32,8 +32,9 @@ jobs:
           bash scripts/test-openssl-preload.sh
       - name: Check validation scripts
         run: |
-          python3 -m py_compile scripts/*.py scripts/linux/*.py
+          python3 -m py_compile scripts/*.py scripts/linux/*.py scripts/windows/*.py
           python3 -m unittest discover -s scripts -p 'test_*.py'
+          node scripts/windows/test-iis-plaintext.js
           bash -n scripts/*.sh
 
   ecapture-patches:

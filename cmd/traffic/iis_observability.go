@@ -43,7 +43,7 @@ func finishIISObservability(s *Store, requirePlaintext bool) {
 	// that this probe never registered.
 	if s.iisAttached && !s.stats.PlaintextObserved && s.stats.ProbeSendMatches > 0 && s.stats.ProbeUnmatchedCompletions > 0 {
 		s.stats.AttachWindowSuspect = true
-		s.stats.Errors = append(s.stats.Errors, "IIS probe attached but observed no request-side plaintext; responses were hooked and receives were not (attach window). Warm the site with more requests than the pre-posted receive count before judging plaintext support. probe_send_matches counts responses only and does not prove request capture.")
+		s.stats.Errors = append(s.stats.Errors, "IIS probe attached but observed no request-side plaintext; responses were hooked and receives were not (attach window). No completed request buffer was recovered; inspect the probe diagnostics. probe_send_matches counts responses only and does not prove request capture.")
 	}
 	if requirePlaintext && (!s.iisAttached || !s.stats.PlaintextObserved) && s.fatal == nil {
 		s.fatal = errors.New("--require-plaintext: no IIS request-side plaintext was recorded")
@@ -53,12 +53,14 @@ func finishIISObservability(s *Store, requirePlaintext bool) {
 
 func applyIISProbeSummary(s *Store, values map[string]any) {
 	receive := diagCount(values, "receive_matches")
+	recovered := diagCount(values, "recovered_receives")
 	body := diagCount(values, "body_matches")
 	send := diagCount(values, "send_matches")
 	unmatched := diagCount(values, "unmatched_completions")
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.stats.ProbeReceiveMatches += receive
+	s.stats.ProbeRecoveredReceives += recovered
 	s.stats.ProbeBodyMatches += body
 	s.stats.ProbeSendMatches += send
 	s.stats.ProbeUnmatchedCompletions += unmatched

@@ -169,8 +169,7 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 				s.mu.Lock()
 				s.iisAttached = true
 				s.mu.Unlock()
-				fmt.Fprintf(os.Stderr, "IIS 探针已附加。附加前已投递的 HttpReceiveHttpRequest 无法补抓，默认应用池实测约 10 个。请先向本机端口打过这个数的热身请求，采集结束时检查 plaintext_observed。probe_receive_matches 在结束时写入 status.json，它表示接收 hook 命中，plaintext_observed 表示请求侧事件已记录。\n")
-				s.problem(fmt.Errorf("IIS dynamic attach cannot recover receive calls posted before attachment; default application pool pre-posts about 10 receives, so the first requests are missed until workers post new ones"))
+				fmt.Fprintf(os.Stderr, "IIS 探针已附加，已启用完成通知中的请求缓冲区恢复，无需预热。停止后检查 plaintext_observed、probe_receive_matches 和 probe_recovered_receives；附加前已完成的请求及无法识别的完成上下文仍不保证覆盖。\n")
 			}
 			continue
 		}
@@ -271,6 +270,7 @@ func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, ser
 					if child.Err() != nil || err == nil {
 						break
 					}
+					s.problem(fmt.Errorf("%s PID %d probe attempt %d: %w", target.Service, target.PID, attempt+1, err))
 					s.gap("windows-probe", target.ID, "probe_restart", "attempts", 1)
 				}
 				mu.Lock()

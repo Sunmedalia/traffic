@@ -1,7 +1,8 @@
 'use strict';
 
-// HTTP Server API v1 prefixes from the Windows x64 SDK. No private IIS object
-// layouts are read. Buffers are copied only after receive I/O has completed.
+// HTTP Server API v1 prefixes from the Windows x64 SDK. Buffers are copied only
+// after I/O completion. Pre-attach receives are recovered by validating bounded
+// pointer references in the completion context, never by reissuing receive I/O.
 if (Process.arch !== 'x64') throw new Error('IIS plaintext capture requires x64');
 const requestLimit = __REQUEST_LIMIT__;
 const responseLimit = __RESPONSE_LIMIT__;
@@ -9,6 +10,7 @@ const selectedPorts = new Set(__PORTS__);
 const requests = new Map();
 const pending = new Map();
 const ignored = new Set();
+const observedRequests = new Set();
 let deferredBytes = 0;
 let deferredCount = 0;
 const listeners = [];
@@ -22,6 +24,7 @@ let eventBytes = 0;
 let dropped = 0;
 let completed = 0;
 const diagnostics = {completion_entries: 0, matches: 0,
+    recovered_receives: 0, recovery_attempts: 0, recovery_failures: 0,
     receive_matches: 0, body_matches: 0, send_matches: 0, interim_matches: 0,
     unmatched_completions: 0, unmatched_receive: 0, unmatched_body: 0, unmatched_send: 0, unmatched_unknown: 0,
     remove_calls: 0, remove_ex_calls: 0, worker_calls: 0, samples: []};
@@ -222,7 +225,31 @@ function chunks(id, direction, count, pointer) {
     }
 }
 
-function receiveRequest(operation) {
+function describeRequest(request) {
+    // Do not trust a pointer merely because it is readable. These independent
+    // public HTTP_REQUEST fields distinguish it from unrelated completed I/O.
+    const major = request.add(32).readU16(), minor = request.add(34).readU16();
+    if (!((major === 1 && minor <= 1) || (major === 2 && minor === 0))) return null;
+    if (request.readU32() > 15 || request.add(8).readU64().compare(0) === 0 || request.add(16).readU64().compare(0) === 0) return null;
+    const verb = request.add(36).readU32();
+    if (verb > 20) return null;
+    const method = verbs[verb] || text(request.add(48).readPointer(), request.add(40).readU16());
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(method)) return null;
+    const length = request.add(42).readU16();
+    if (length < 1 || length > 32768) return null;
+    const url = text(request.add(56).readPointer(), length);
+    const authority = method === 'CONNECT' && /^[^\s/]+:\d{1,5}$/.test(url);
+    if (!(url.startsWith('/') || url === '*' || /^[a-z]+:\/\//i.test(url) || authority) || /[\r\n\x00]/.test(url)) return null;
+    const local = address(request.add(112).readPointer());
+    const client = address(request.add(104).readPointer());
+    if (!selectedPorts.has(local.port) || client.port < 1 || request.add(840).readPointer().isNull()) return null;
+    if (request.add(816).readU16() > 256) return null;
+    return {id: key(request.add(16).readU64()), connection: key(request.add(8).readU64()),
+        http_version: 'HTTP/' + major + '.' + minor, method, url,
+        headers: headers(request.add(120), requestHeaders), client: client.endpoint, local: local.endpoint};
+}
+
+function receiveRequest(operation, description = null) {
     const request = operation.buffer;
     const id = key(request.add(16).readU64());
     // A response may be observed by another worker before the receive callback.
@@ -234,15 +261,16 @@ function receiveRequest(operation) {
         ignored.add(id);
         return;
     }
+    if (observedRequests.has(id)) return;
     const state = stateFor(id);
     if (state === undefined) { dropped++; return; }
+    if (state.known) return;
+    const details = description || describeRequest(request);
+    if (details === null) { gap(id, 'Invalid completed HTTP request'); return; }
+    if (observedRequests.size >= 8192) observedRequests.delete(observedRequests.values().next().value);
+    observedRequests.add(id);
     state.known = true;
-    const verb = request.add(36).readU32();
-    const method = verbs[verb] || text(request.add(48).readPointer(), request.add(40).readU16());
-    enqueue({type: 'request', http_version: 'HTTP/' + request.add(32).readU16() + '.' + request.add(34).readU16(), id, connection: key(request.add(8).readU64()), method,
-        url: text(request.add(56).readPointer(), request.add(42).readU16()),
-        headers: headers(request.add(120), requestHeaders),
-        client: address(request.add(104).readPointer()).endpoint, local: local.endpoint});
+    enqueue(Object.assign({type: 'request'}, details));
     const observed = state.request;
     state.request = 0;
     chunks(id, 'request', request.add(816).readU16(), request.add(824).readPointer());
@@ -256,6 +284,37 @@ function receiveRequest(operation) {
     state.deferred = [];
     if (state.lost) gap(id, 'Orphan event queue overflow');
     if (state.ended) requests.delete(id);
+}
+
+function recoverReceive(overlapped, status, length, expectedId = null) {
+    if (status !== 0 || overlapped.isNull()) return false;
+    diagnostics.recovery_attempts++;
+    // Bounded read-only discovery, not a process/heap scan or a private layout
+    // offset. The callback owns this context until the completion hook returns.
+    // Validate every candidate before changing request state or reading bodies.
+    for (let offset = 32; offset < 512; offset += Process.pointerSize) {
+        let candidate, description;
+        try {
+            candidate = overlapped.add(offset).readPointer();
+            if (candidate.isNull() || !candidate.and(7).isNull()) continue;
+            description = describeRequest(candidate);
+            if (description === null || (expectedId !== null && description.id !== expectedId)) continue;
+        } catch (_) { continue; /* Unrelated/non-readable completion context. */ }
+        if (observedRequests.has(description.id)) return true;
+        // A zero-byte/non-receive completion may retain a stale request
+        // pointer. Require either receive-sized output or an API operation
+        // observed in this attach generation for exactly this request ID.
+        if (length < 848 && !requests.has(description.id)) continue;
+        try {
+            receiveRequest({buffer: candidate}, description);
+            diagnostics.recovered_receives++;
+        } catch (error) {
+            diagnostics.recovery_failures++;
+            gap(description.id, 'Completed request recovery: ' + String(error));
+        }
+        return true;
+    }
+    return false;
 }
 
 function complete(operation, status, length) {
@@ -293,13 +352,11 @@ function noteUnmatched(kind) {
     // A gap event every few misses would fill the 512-event queue and drop HTTP.
 }
 
-// Completions posted before attach never entered pending. Their buffer is
-// unknowable, so they stay unmatched_unknown. The collector treats
-// "send matched, receive never matched, unmatched > 0" as the attach window.
 function completion(overlapped, status, length) {
     diagnostics.completion_entries++;
     const operation = pending.get(overlapped.toString());
     if (operation === undefined) {
+        if (recoverReceive(overlapped, status, length)) return;
         if (diagnostics.samples.length < 8) diagnostics.samples.push({overlapped: overlapped.toString(), pending: Array.from(pending.keys()).slice(0, 8)});
         noteUnmatched('unknown');
         return;
@@ -321,27 +378,25 @@ function hook(module, name, callbacks) {
     listeners.push(Interceptor.attach(location, callbacks));
 }
 
-// Entry-only hooks leave no JavaScript onLeave invocation parked inside an
-// indefinitely blocked receive/dequeue call. Read the result at its caller's
-// return site, and remove both entry and return-site patches when stopping.
+// Completion waits can block indefinitely. Observe their caller return sites
+// without retaining onLeave invocations inside the dequeue functions. HTTP
+// APIs use their own onLeave callbacks below to keep nested calls isolated.
 function atReturn(threadId, location, callback) {
     if (stopping) return;
     const address = location.toString();
     if (!returnLocations.has(address)) {
         returnLocations.add(address);
         originalCode.set(address, Array.from(new Uint8Array(location.readByteArray(16))));
-        listeners.push(Interceptor.attach(location, {
-            onEnter() {
-                if (stopping) return;
-                const stack = returnFrames.get(this.threadId);
-                if (stack === undefined || stack.length === 0) return;
-                const frame = stack[stack.length - 1];
-                if (frame.address !== address) return;
-                stack.pop();
-                if (stack.length === 0) returnFrames.delete(this.threadId);
-                frame.callback(this.context.rax);
-            }
-        }));
+        listeners.push(Interceptor.attach(location, {onEnter() {
+            if (stopping) return;
+            const stack = returnFrames.get(this.threadId);
+            if (stack === undefined || stack.length === 0) return;
+            const frame = stack[stack.length - 1];
+            if (frame.address !== address) return;
+            stack.pop();
+            if (stack.length === 0) returnFrames.delete(this.threadId);
+            frame.callback(this.context.rax);
+        }}));
     }
     let stack = returnFrames.get(threadId);
     if (stack === undefined) {
@@ -353,15 +408,33 @@ function atReturn(threadId, location, callback) {
 }
 
 const ntdll = Process.getModuleByName('ntdll.dll');
+function completionReturn(name, first, second, third) {
+    return result => {
+        if (result.toInt32() !== 0) return;
+        try {
+            if (first.isNull()) return;
+            if (name === 'NtRemoveIoCompletion') {
+                if (second.isNull()) return;
+                completion(first.readPointer(), second.readU32(), second.add(8).readU64().toNumber());
+            } else {
+                if (second < 1 || second > 4096 || third.isNull()) return;
+                const count = Math.min(third.readU32(), second);
+                for (let index = 0; index < count; index++) {
+                    const entry = first.add(index * 32);
+                    completion(entry.add(8).readPointer(), entry.add(16).readU32(), entry.add(24).readU64().toNumber());
+                }
+            }
+        } catch (_) { noteUnmatched('unknown'); }
+    };
+}
+
 hook(ntdll, 'NtRemoveIoCompletion', {
     onEnter(args) {
         if (stopping) return;
         diagnostics.remove_calls++;
         const apc = args[2];
         const io = args[3];
-        atReturn(this.threadId, this.returnAddress, result => {
-            if (result.toInt32() === 0) completion(apc.readPointer(), io.readU32(), io.add(8).readU64().toNumber());
-        });
+        atReturn(this.threadId, this.returnAddress, completionReturn('NtRemoveIoCompletion', apc, io));
     }
 });
 for (const name of ['NtRemoveIoCompletionEx', 'NtWaitForWorkViaWorkerFactory']) {
@@ -373,14 +446,7 @@ for (const name of ['NtRemoveIoCompletionEx', 'NtWaitForWorkViaWorkerFactory']) 
             const entries = args[1];
             const capacity = args[2].toUInt32();
             const countPointer = args[3];
-            atReturn(this.threadId, this.returnAddress, result => {
-                if (result.toInt32() !== 0 || capacity < 1 || capacity > 4096 || countPointer.isNull()) return;
-                const count = Math.min(countPointer.readU32(), capacity);
-                for (let index = 0; index < count; index++) {
-                    const entry = entries.add(index * 32);
-                    completion(entry.add(8).readPointer(), entry.add(16).readU32(), entry.add(24).readU64().toNumber());
-                }
-            });
+            atReturn(this.threadId, this.returnAddress, completionReturn(name, entries, capacity, countPointer));
         }
     });
 }
@@ -397,16 +463,16 @@ for (const name of ['HttpReceiveHttpRequest', 'HttpReceiveRequestEntityBody', 'H
                 bytes: args[5], flags: args[2].toUInt32(), done: false};
             const overlap = args[receiving || bodyRead ? 6 : 8];
             operation.overlap = overlap.toString();
-            atReturn(this.threadId, this.returnAddress, result => {
-                const status = result.toUInt32();
-                if (status === 997) return;
-                if (pending.get(operation.overlap) === operation) pending.delete(operation.overlap);
-                const length = operation.bytes.isNull() ? 0 : operation.bytes.readU32();
-                complete(operation, status, length);
-            });
+            this.operation = operation;
             if (!overlap.isNull()) {
                 if (pending.size >= 4096) { pending.clear(); dropped++; }
                 pending.set(operation.overlap, operation);
+            }
+            if (!receiving && stateFor(operation.id) !== undefined) {
+                // The response/body API still owns the request context, even
+                // when its original receive or dequeue began before attach.
+                // Match the exact API request ID before recovering that buffer.
+                recoverReceive(overlap, 0, 0, operation.id);
             }
             if (!receiving && stateFor(operation.id) !== undefined && !bodyRead) {
                 try {
@@ -425,11 +491,21 @@ for (const name of ['HttpReceiveHttpRequest', 'HttpReceiveRequestEntityBody', 'H
                     }
                 } catch (error) { gap(operation.id, String(error)); }
             }
+        },
+        onLeave(result) {
+            const operation = this.operation;
+            if (stopping || operation === undefined) return;
+            const status = result.toUInt32();
+            if (status === 997) return;
+            if (pending.get(operation.overlap) === operation) pending.delete(operation.overlap);
+            const length = operation.bytes.isNull() ? 0 : operation.bytes.readU32();
+            complete(operation, status, length);
         }
     });
 }
 const timer = setInterval(flush, 50);
-enqueue({type: 'ready', protocol: 'traffic-iis-v1', pid: Process.id, startup_receive_gap_possible: true});
+enqueue({type: 'ready', protocol: 'traffic-iis-v1', pid: Process.id,
+    startup_receive_recovery: 'validated-completion-context', startup_receive_gap_possible: true});
 rpc.exports = {
     finish() {
         stopping = true;
@@ -453,7 +529,7 @@ rpc.exports = {
         if (unmatchedReported.unknown > 0) {
             send({type: 'probe-gap', reason: 'unmatched_completion', kind: 'unknown', count: unmatchedReported.unknown, time: new Date().toISOString(), sequence: ++transportSequence, final: true});
         }
-        const plaintextObserved = diagnostics.receive_matches > 0;
+        const plaintextObserved = observedRequests.size > 0;
         return {type: 'summary', last_sequence: transportSequence, completed, pending: pending.size, diagnostics,
             plaintext_observed: plaintextObserved,
             attach_window_suspect: !plaintextObserved && diagnostics.unmatched_completions > 0 && diagnostics.send_matches > 0,
