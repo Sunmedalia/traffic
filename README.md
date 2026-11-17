@@ -43,12 +43,12 @@ flowchart LR
 
 > **当前发布边界**：HTTP/2 已有有界解析和自动化回归，完整后端实机矩阵仍待验收。持续高负载仍有接收队列溢出样本，低影响门槛、八小时长压和部分后端排空确认尚未完成。已知缺口见 [优化进度](OPTIMIZATION.md)，实测结果见 [验证记录](VALIDATION.md)，本轮修复见 [边界审核](docs/boundary-review-2026-11-17.md)。
 
-## 采集与本地分析分离（当前源码）
+## 采集与本地分析分离
 
-> **版本提示**：本节及下文的 `analyze`、Web 规则/分析页、`--stop-timeout` 等只存在于当前源码，尚未发布。下载的 v0.1.2 发行包仍是旧流程：采集时直接检测并写 `index.sqlite`，无需 `analyze`，直接 `traffic-console --session DIR` 查看；分析参数（`--rules`、`--request-limit` 等）仍在 `traffic capture` 上。按发行包使用时请参考 [v0.1.2 发布说明](docs/releases/v0.1.2.md)。
+> **版本提示**：v0.1.3 起使用采集与本地分析分离流程。旧版 v0.1.2 采集时直接检测并写 `index.sqlite`，使用旧发行包请参考 [v0.1.2 发布说明](docs/releases/v0.1.2.md)。
 
 
-当前源码中的 `traffic capture` / `traffic import` 只保存原始网络包、探针明文事件和元数据，不执行 TCP/HTTP 还原、配对、索引、规则匹配或告警外送。停止采集后，将整个会话目录复制到本地，运行：
+`traffic capture` / `traffic import` 只保存原始网络包、探针明文事件和元数据，不执行 TCP/HTTP 还原、配对、索引、规则匹配或告警外送。停止采集后，将整个会话目录复制到本地，运行：
 
 ```bash
 ./traffic-console analyze --session ./sessions/first-capture
@@ -65,7 +65,7 @@ flowchart LR
 
 Web 顶部导航的「规则」页（`#/rules`）支持新建、导入、编辑、实时校验、保存、下载和删除 YAML 文件，并预览解析出的规则；「分析」页（`#/analysis`）选择规则和会话执行 / 停止后台分析，并列出最近任务，完成后页面自动更新告警。规则默认存放在程序旁的 `rules/`（源码 `bin/` 构建使用项目根目录），可用 `traffic-console web --rules-dir /path/to/rules` 指定。内置规则只读，自定义文件按需追加，修改文件后需重新分析。[规则目录说明](rules/README.md)
 
-`--request-limit`、`--response-limit`、`--rules`、`--scan-window`、`--scan-paths`、`--alert-webhook` 已移到 `traffic-console analyze`；规则校验改用 `traffic-console rules check FILE`。`--retention` 已删除；`--no-detect` 仅保留为采集器兼容参数。**此变更尚未发布，下面列出的 v0.1.2 发行包仍采用旧检测流程。**
+`--request-limit`、`--response-limit`、`--rules`、`--scan-window`、`--scan-paths`、`--alert-webhook` 已移到 `traffic-console analyze`；规则校验改用 `traffic-console rules check FILE`。`--retention` 已删除；`--no-detect` 仅保留为采集器兼容参数。**升级后请先执行 `traffic-console analyze`，再浏览新采集的会话。**
 
 ## 下载与安装
 
@@ -73,9 +73,9 @@ Web 顶部导航的「规则」页（`#/rules`）支持新建、导入、编辑�
 
 | 平台 | 采集器 | 分析器 |
 | :--- | :--- | :--- |
-| Ubuntu x64 / ARM64 | `traffic-v0.1.2-ubuntu-{amd64,arm64}.tar.gz` | `traffic-console-v0.1.2-ubuntu-{amd64,arm64}.tar.gz` |
-| CentOS 7+ x64 / ARM64 | `traffic-v0.1.2-centos7-{amd64,arm64}.tar.gz` | `traffic-console-v0.1.2-centos7-{amd64,arm64}.tar.gz` |
-| Windows x64 | `traffic-v0.1.2-windows-amd64.zip` | `traffic-console-v0.1.2-windows-amd64.zip` |
+| Ubuntu x64 / ARM64 | `traffic-v0.1.3-ubuntu-{amd64,arm64}.tar.gz` | `traffic-console-v0.1.3-ubuntu-{amd64,arm64}.tar.gz` |
+| CentOS 7+ x64 / ARM64 | `traffic-v0.1.3-centos7-{amd64,arm64}.tar.gz` | `traffic-console-v0.1.3-centos7-{amd64,arm64}.tar.gz` |
+| Windows x64 | `traffic-v0.1.3-windows-amd64.zip` | `traffic-console-v0.1.3-windows-amd64.zip` |
 
 Linux 主程序静态链接 libpcap，无需安装运行库；采集包内置配套 eCapture、Java Agent 和 glibc 2.17 基线的 OpenSSL 预加载库。CentOS 提供可直接运行的包。Ubuntu/CentOS 包使用同一兼容构建基线，并分别在干净的发行版容器中检查。
 
@@ -83,8 +83,8 @@ Windows 采集包内置 WinDivert 签名驱动、Python、Frida 和探针脚本�
 
 ```bash
 # Ubuntu x64；CentOS 改用 centos7-amd64 文件名
- tar -xzf traffic-v0.1.2-ubuntu-amd64.tar.gz
- cd traffic-v0.1.2-ubuntu-amd64
+ tar -xzf traffic-v0.1.3-ubuntu-amd64.tar.gz
+ cd traffic-v0.1.3-ubuntu-amd64
  ./traffic --cn-help
  ./traffic doctor --cn-help
  sudo ./traffic doctor
@@ -100,7 +100,7 @@ Windows 采集包内置 WinDivert 签名驱动、Python、Frida 和探针脚本�
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential libpcap-dev git
-git clone --branch v0.1.2 https://github.com/Sunmedalia/traffic.git
+git clone --branch v0.1.3 https://github.com/Sunmedalia/traffic.git
 cd traffic
 ./scripts/build-linux.sh
 ```
@@ -122,7 +122,7 @@ sudo ./traffic capture --no-tls --ports 80,8080 \
 ### 2 · 打开会话
 
 ```bash
-# 停采后在本地执行规则分析（当前源码）
+# 停采后在本地执行规则分析
 ./traffic-console analyze --session ./sessions/first-capture
 
 # 中文终端界面；无参数时进入会话选择页
@@ -221,7 +221,7 @@ sessions/<host>/<date>/<session>/
 | [使用手册](docs/guide.md) | 后端、规则、Windows、参数、停止与回滚、故障排查 |
 | [验证记录](VALIDATION.md) | 实机环境、构建哈希、成功与失败样本 |
 | [优化进度](OPTIMIZATION.md) | 已实现机制、性能门槛与待完成项目 |
-| [v0.1.2 发布说明](docs/releases/v0.1.2.md) | 下载包、升级变化和已知限制 |
+| [v0.1.3 发布说明](docs/releases/v0.1.3.md) | 下载包、升级变化和已知限制 |
 | [第三方组件](THIRD_PARTY_NOTICES.md) | 依赖、探针与许可证说明 |
 
 ```bash
