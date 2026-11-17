@@ -352,7 +352,12 @@ func run(args []string) (runErr error) {
 		s.report()
 		s.stats.Targets = discoverTargets("/proc", *service, *pid, *lib)
 		p := newRecorder(s)
-		defer p.close()
+		recorderFinalized := false
+		defer func() {
+			if !recorderFinalized {
+				_ = p.close()
+			}
+		}()
 		if cmd == "capture" {
 			cleanup, e := limitResources()
 			if e != nil {
@@ -504,61 +509,92 @@ func run(args []string) (runErr error) {
 		s.mu.Unlock()
 		s.report()
 		cancel()
-		stopDeadline := time.Now().Add(stopTimeout)
-		budgetExceeded := !waitWithin(wg.Wait, stopTimeout)
-		if budgetExceeded {
-			// Workers still running may later report errors against a closed
-			// recorder; those are consequences of the timeout, not new faults.
-			s.gap("collector", "", "stop_budget_exceeded", "shutdowns", 1)
-			s.problem(fmt.Errorf("shutdown exceeded --stop-timeout %s; remaining probe data not confirmed", stopTimeout))
-		}
-		closeBudget := max(time.Until(stopDeadline), time.Second)
-		if !waitWithin(func() {
-			if err := p.close(); err != nil && !budgetExceeded {
-				s.fail(err)
-			}
-		}, closeBudget) {
-			budgetExceeded = true
-			s.gap("collector", "", "stop_budget_exceeded", "shutdowns", 1)
-		}
-		s.mu.Lock()
-		fatal := s.fatal
-		s.stats.DrainState = "unverified"
-		if *noTLS {
-			s.stats.DrainState = "confirmed"
-		} else if len(s.stats.ProbeExits) > 0 {
-			confirmed := true
-			for _, exit := range s.stats.ProbeExits {
-				confirmed = confirmed && exit.DataDrained
-			}
-			if confirmed {
-				s.stats.DrainState = "confirmed"
-			}
-		}
-		finishIISObservability(s, *requirePlaintext)
-		s.stats.StopReason = "signal_or_duration"
-		s.stats.State = "stopped"
-		if s.stats.RawEvidenceWriters > 0 || s.stats.RawEvidencePendingBytes > 0 || s.stats.RawEvidenceDrainUnconfirmed {
-			s.stats.DrainState = "unverified"
+		recorderFinalized = true // No unbounded second close in the deferred cleanup.
+		budgetExceeded, closeErr := shutdownWithin(wg.Wait, p.close, stopTimeout)
+		if closeErr != nil {
+			s.fail(closeErr)
 		}
 		if budgetExceeded {
-			s.stats.StopReason = "stop_budget_exceeded"
-			s.stats.DrainState = "unverified"
+			s.gap("collector", "", "stop_budget_exceeded", "shutdowns", 1)
+			s.fail(fmt.Errorf("shutdown exceeded --stop-timeout %s; remaining probe data not confirmed", stopTimeout))
 		}
-		if fatal != nil {
-			s.stats.State = "failed"
-			s.stats.StopReason = "fatal_error"
-			s.stats.DrainState = "unverified"
-		}
-		s.mu.Unlock()
+		fatal := finishCaptureState(s, *noTLS, *requirePlaintext, budgetExceeded)
 		s.report()
-		s.mu.Lock()
-		snapshot := s.stats
-		s.mu.Unlock()
-		emit(snapshot)
+		emit(snapshotStats(s))
 		return fatal
 	}
 	return fmt.Errorf("unknown command %s", cmd)
+}
+
+// finishCaptureState reads the final error only after plaintext checks, which
+// may themselves fail the capture. Callers use the same outcome for JSON and
+// the process exit status.
+func finishCaptureState(s *Store, noTLS, requirePlaintext, budgetExceeded bool) error {
+	s.mu.Lock()
+	s.stats.DrainState = "unverified"
+	if noTLS {
+		s.stats.DrainState = "confirmed"
+	} else if len(s.stats.ProbeExits) > 0 {
+		confirmed := true
+		for _, exit := range s.stats.ProbeExits {
+			confirmed = confirmed && exit.DataDrained
+		}
+		if confirmed {
+			s.stats.DrainState = "confirmed"
+		}
+	}
+	finishIISObservability(s, requirePlaintext)
+	s.stats.StopReason = "signal_or_duration"
+	s.stats.State = "stopped"
+	if s.stats.RawEvidenceWriters > 0 || s.stats.RawEvidencePendingBytes > 0 || s.stats.RawEvidenceDrainUnconfirmed {
+		s.stats.DrainState = "unverified"
+	}
+	if budgetExceeded {
+		s.stats.StopReason = "stop_budget_exceeded"
+		s.stats.DrainState = "unverified"
+	}
+	fatal := s.fatal
+	if fatal != nil {
+		s.stats.State = "failed"
+		if !budgetExceeded {
+			s.stats.StopReason = "fatal_error"
+		}
+		s.stats.DrainState = "unverified"
+	}
+	s.mu.Unlock()
+	return fatal
+}
+
+// shutdownWithin shares one deadline between workers and recorder. A blocked
+// close is never invoked a second time on return, and background goroutines do
+// not read mutable timeout flags or modify the caller's error result.
+func shutdownWithin(wait func(), closeRecorder func() error, budget time.Duration) (bool, error) {
+	deadline := time.Now().Add(budget)
+	workersStopped := waitWithin(wait, budget)
+	closed := make(chan error, 1)
+	go func() { closed <- closeRecorder() }()
+	if !workersStopped {
+		return true, nil
+	}
+	timer := time.NewTimer(max(0, time.Until(deadline)))
+	defer timer.Stop()
+	select {
+	case err := <-closed:
+		return false, err
+	case <-timer.C:
+		return true, nil
+	}
+}
+
+// Workers may still finish after a shutdown timeout. Never emit references to
+// their live maps and slices after releasing the store lock.
+func snapshotStats(s *Store) Stats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, _ := json.Marshal(s.stats)
+	var snapshot Stats
+	_ = json.Unmarshal(b, &snapshot)
+	return snapshot
 }
 
 // waitWithin runs fn and reports whether it returned within budget. On

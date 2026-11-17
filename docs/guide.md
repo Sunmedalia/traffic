@@ -328,7 +328,7 @@ IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集]
 | `--require-tls` | 关 | 所选目标未通过 HTTPS 预检时拒绝开始 |
 | `--collector-memory-mib` / `--collector-cpu-percent` | 256 / 50 | 限制采集器及子进程，不含目标内探针 |
 | `--drain-timeout` | 5s | 部分后端的数据排空预算，最大 15s |
-| `--stop-timeout` | 30s | 停止后的总等待预算，不小于 `--drain-timeout`；超时记录 `stop_budget_exceeded` 缺口并标记排空未确认 |
+| `--stop-timeout` | 30s | 停止后的总等待预算，不小于 `--drain-timeout`；超时记录 `stop_budget_exceeded` 缺口、标记失败及排空未确认，以非零状态退出 |
 | `--netns-pid` | 0 | Linux 显式选择抓包网络命名空间 |
 
 `traffic capture --help`、`traffic doctor`、`traffic-console rules check FILE` 可随时查看。`doctor` 默认显示中文自检报告，网卡掩码转为 CIDR；自动化读取请使用 `traffic doctor --json`，原始 JSON 字段保持兼容。分析器用 `traffic-console --help` / `--cn-help` 查看总览，`traffic-console web --cn-help`、`analyze --cn-help`、`rules --cn-help` 查看各命令的中文参数和示例；`--help` 为英文帮助。

@@ -88,7 +88,7 @@ python3 scripts/impact.py \
 - **eCapture 接收溢出不再拆除传输**。原实现在连接字节、全局字节或条数预算任一耗尽时关闭 WebSocket，随后整段附加窗口内的事件全部丢失，并再次经历附加空窗。现在接收端进入丢弃模式，直到本连接与全局待处理量回落至预算一半、队列空出一半后恢复；恢复后的第一条消息携带丢弃条数，消费端记录 `ecapture/receive_queue_shed/messages` 缺口、写入 `loss` 边界并将后续事件标记为不完整。序号缺口扣除本地已丢弃部分，避免同一批丢失重复计数。`probe_transports` 新增 `shed_messages`、`shed_bytes`，`last_error` 保留最近一次溢出原因。
 - **eCapture 消费端 protobuf 解析零分配**。每条事件原先解析两次、各分配两个 map；现改为固定字段数组复用，字段号 32 以上校验后跳过。
 - **PCAP 写盘移出抓包循环**。实时采集改由每接口一个后台写入器负责编码、缓冲写、每秒 flush 及 64 MiB 轮换时的 fsync；队列上限 8192 包或 16 MiB。写入器跟不上时丢包并按秒汇总记录 `pcap/write_queue_overflow/packets`，不再阻塞 `ReadPacketData` 导致内核环形缓冲无归属丢包。写入失败仍使采集失败退出。离线导入保持同步写入，不丢包；导入的磁盘检查由每 1 MiB 改为每 16 MiB 或每秒，避免大文件导入时反复遍历会话目录。
-- **统一停止预算**。新增 `--stop-timeout`（默认 30s，不小于 `--drain-timeout`，最大 5 分钟），覆盖取消后的抓包源、探针辅助进程及原始证据写入器排空。超时记录 `collector/stop_budget_exceeded/shutdowns`，`stop_reason=stop_budget_exceeded`，`drain_state=unverified`，并写入 manifest 的 `stop_timeout_ms`；采集器随后正常写出状态退出，不再无限等待。
+- **统一停止预算**。新增 `--stop-timeout`（默认 30s，不小于 `--drain-timeout`，最大 5 分钟），覆盖取消后的抓包源、探针辅助进程及原始证据写入器排空。超时记录 `collector/stop_budget_exceeded/shutdowns`，`stop_reason=stop_budget_exceeded`，`drain_state=unverified`，并写入 manifest 的 `stop_timeout_ms`；采集器随后写出失败状态并以非零状态退出，线程和记录器共用一个等待截止时刻，超时后不再执行第二次记录器关闭。状态及缺口文件的操作系统写盘不属于可取消等待，磁盘本身永久阻塞仍不具备硬实时退出保证。
 
 ## 尚未完成的计划项
 
