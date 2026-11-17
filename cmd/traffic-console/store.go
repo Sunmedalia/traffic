@@ -55,6 +55,10 @@ FROM main.requests r LEFT JOIN analysis.results a ON a.id=r.id`)
 		db.Close()
 		return nil, err
 	} else {
+		// Without the analysis temp view, independent read connections are safe.
+		// Analysis stores keep one connection because the view is connection-local.
+		s.db.SetMaxOpenConns(4)
+		s.db.SetMaxIdleConns(4)
 		var manifest struct {
 			DetectionMode string `json:"detection_mode"`
 		}

@@ -23,6 +23,13 @@ func TestDiscoverSessionsByIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	putTUITransaction(t, legacy, Transaction{ID: "legacy", Time: now})
+	nested := filepath.Join(legacy.dir, "packets", "nested")
+	if err := os.MkdirAll(nested, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "index.sqlite"), []byte("not a session"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	broken := t.TempDir()
 	if err := os.WriteFile(filepath.Join(broken, "index.sqlite"), []byte("broken database"), 0600); err != nil {
 		t.Fatal(err)
@@ -133,5 +140,27 @@ func TestBrowserGroupsAndSearches(t *testing.T) {
 	m.Update(tuiKey("esc"))
 	if m.searching || len(m.order) != 4 {
 		t.Fatal("esc did not clear search")
+	}
+}
+
+func TestDiscoverSessionsInvalidatesCache(t *testing.T) {
+	store := tuiTestStore(t)
+	if err := os.WriteFile(filepath.Join(store.dir, "status.json"), []byte(`{"state":"stopped","transactions":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cache := newDiscoveryCache()
+	first := discoverSessions(context.Background(), []string{store.dir}, cache)
+	if len(first.Entries) != 1 || first.Entries[0].Problem != "" {
+		t.Fatalf("first discovery: %+v", first)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.dir, "index.sqlite"), []byte("broken database"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	second := discoverSessions(context.Background(), []string{store.dir}, cache)
+	if len(second.Entries) != 1 || second.Entries[0].Problem == "" {
+		t.Fatalf("cache did not invalidate: %+v", second)
 	}
 }

@@ -144,8 +144,42 @@ func readTUIStatus(dir string) (Stats, string) {
 	return status, ""
 }
 
-// Query summaries in SQLite so bodies are only transferred for an opened detail.
-func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly bool, page int, detailID string, anchor *tuiRow) (tuiSnapshot, error) {
+// decodeTUIRowFields parses the single JSON array produced by the list query.
+func decodeTUIRowFields(raw []byte, row *tuiRow) error {
+	var fields []json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+	if len(fields) != 6 {
+		return fmt.Errorf("请求索引字段数量异常: %d", len(fields))
+	}
+	if err := json.Unmarshal(fields[0], &row.Method); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(fields[1], &row.Host); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(fields[2], &row.URL); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(fields[3], &row.Status); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(fields[4], &row.Incomplete); err != nil {
+		return err
+	}
+	return json.Unmarshal(fields[5], &row.Truncated)
+}
+
+// loadTUISnapshot queries summaries in SQLite so bodies are only transferred for an opened detail.
+func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly bool, page int, detailID string, anchor *tuiRow, limits ...int) (tuiSnapshot, error) {
+	pageSize := 100
+	if len(limits) > 0 && limits[0] > 0 {
+		pageSize = min(limits[0], 500)
+	}
 	result := tuiSnapshot{Page: page}
 	result.Stats, result.StatusWarning = readTUIStatus(s.dir)
 	if s.analysis != nil {
@@ -166,20 +200,15 @@ func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly
 	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM requests WHERE "+where, args...).Scan(&result.Count); err != nil {
 		return result, err
 	}
-	maxPage := (max(result.Count, 1) - 1) / 100
+	maxPage := (max(result.Count, 1) - 1) / pageSize
 	result.Page = max(0, min(page, maxPage))
 	query := `SELECT id,time,client,
- COALESCE(json_extract(CAST(data AS TEXT),'$.method'),''),
- COALESCE(json_extract(CAST(data AS TEXT),'$.host'),''),
- COALESCE(json_extract(CAST(data AS TEXT),'$.url'),''),
- COALESCE(json_extract(CAST(data AS TEXT),'$.status'),0),
- COALESCE(json_extract(CAST(data AS TEXT),'$.incomplete'),0),
- COALESCE(json_extract(CAST(data AS TEXT),'$.truncated'),0),
+ COALESCE(json_extract(CAST(data AS TEXT),'$.method','$.host','$.url','$.status','$.incomplete','$.truncated'),'[]'),
  CASE COALESCE((SELECT max(` + sqlSeverityRank + `) FROM json_each(CAST(requests.data AS TEXT),'$.alerts') a),0)
  WHEN 3 THEN 'high' WHEN 2 THEN 'medium' WHEN 1 THEN 'low' ELSE '' END,
  COALESCE((SELECT json_extract(a.value,'$.rule') FROM json_each(CAST(requests.data AS TEXT),'$.alerts') a ORDER BY ` + sqlSeverityRank + ` DESC LIMIT 1),'')
- FROM requests WHERE ` + where + ` ORDER BY time DESC,id DESC LIMIT 100 OFFSET ?`
-	offset := result.Page * 100
+ FROM requests WHERE ` + where + ` ORDER BY time DESC,id DESC LIMIT ? OFFSET ?`
+	offset := result.Page * pageSize
 	if anchor != nil && result.Page == page {
 		newerArgs := append(append([]any{}, args...), anchor.Time, anchor.Time, anchor.ID)
 		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM requests WHERE "+where+" AND (time>? OR (time=? AND id>?))", newerArgs...).Scan(&result.Newer); err != nil {
@@ -189,14 +218,19 @@ func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly
 		args = append(args, anchor.Time, anchor.Time, anchor.ID)
 		offset = 0
 	}
-	pageArgs := append(append([]any{}, args...), offset)
+	pageArgs := append(append([]any{}, args...), pageSize, offset)
 	rows, err := tx.QueryContext(ctx, query, pageArgs...)
 	if err != nil {
 		return result, err
 	}
 	for rows.Next() {
 		var row tuiRow
-		if err = rows.Scan(&row.ID, &row.Time, &row.Client, &row.Method, &row.Host, &row.URL, &row.Status, &row.Incomplete, &row.Truncated, &row.Severity, &row.Rule); err != nil {
+		var fields []byte
+		if err = rows.Scan(&row.ID, &row.Time, &row.Client, &fields, &row.Severity, &row.Rule); err != nil {
+			rows.Close()
+			return result, err
+		}
+		if err = decodeTUIRowFields(fields, &row); err != nil {
 			rows.Close()
 			return result, err
 		}
@@ -212,7 +246,7 @@ func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly
 		if err := tx.Rollback(); err != nil {
 			return result, err
 		}
-		return loadTUISnapshot(ctx, s, filter, alertsOnly, result.Page, detailID, nil)
+		return loadTUISnapshot(ctx, s, filter, alertsOnly, result.Page, detailID, nil, limits...)
 	}
 	if detailID != "" {
 		var b []byte

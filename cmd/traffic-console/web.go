@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -30,6 +31,80 @@ import (
 //go:embed web/index.html web/app.css web/app.js
 var webAssets embed.FS
 
+// webAssetTags lets browsers revalidate the embedded assets instead of
+// downloading them on every page load.
+var webAssetTags = func() map[string]string {
+	tags := map[string]string{}
+	for _, name := range []string{"index.html", "app.css", "app.js"} {
+		data, err := webAssets.ReadFile("web/" + name)
+		if err != nil {
+			continue
+		}
+		sum := sha256.Sum256(data)
+		tags[name] = `"` + hex.EncodeToString(sum[:8]) + `"`
+	}
+	return tags
+}()
+
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	gz          *gzip.Writer
+	wroteHeader bool
+}
+
+func (w *gzipResponseWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	if status == http.StatusNoContent || status == http.StatusNotModified || status == http.StatusResetContent {
+		w.ResponseWriter.WriteHeader(status)
+		return
+	}
+	w.Header().Set("Content-Encoding", "gzip")
+	w.Header().Del("Content-Length")
+	w.ResponseWriter.WriteHeader(status)
+	w.gz = gzip.NewWriter(w.ResponseWriter)
+}
+
+func (w *gzipResponseWriter) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.gz == nil {
+		return w.ResponseWriter.Write(p)
+	}
+	return w.gz.Write(p)
+}
+
+func (w *gzipResponseWriter) Close() error {
+	if w.gz != nil {
+		return w.gz.Close()
+	}
+	return nil
+}
+
+func acceptsGzip(header string) bool {
+	for _, part := range strings.Split(header, ",") {
+		fields := strings.Split(strings.TrimSpace(part), ";")
+		if !strings.EqualFold(strings.TrimSpace(fields[0]), "gzip") {
+			continue
+		}
+		allowed := true
+		for _, param := range fields[1:] {
+			value := strings.TrimSpace(param)
+			if strings.HasPrefix(value, "q=") {
+				quality, err := strconv.ParseFloat(strings.TrimPrefix(value, "q="), 64)
+				if err == nil && quality <= 0 {
+					allowed = false
+				}
+			}
+		}
+		return allowed
+	}
+	return false
+}
+
 // webServer keeps capture evidence read-only; managed rules and local analysis
 // are explicit token-protected writes.
 type webServer struct {
@@ -40,6 +115,7 @@ type webServer struct {
 	mu          sync.Mutex
 	sessions    map[string]sessionEntry
 	stores      map[string]*Store
+	discovery   *discoveryCache
 	apiMu       sync.RWMutex
 	ruleLibrary *ruleLibrary
 	ctx         context.Context
@@ -48,6 +124,14 @@ type webServer struct {
 	job         *webAnalysisJob
 	jobCancel   context.CancelFunc
 	jobs        sync.WaitGroup
+
+	summaryMu sync.Mutex
+	summaries map[string]summaryCacheEntry
+}
+
+type summaryCacheEntry struct {
+	revision string
+	data     map[string]any
 }
 
 type webSession struct {
@@ -80,7 +164,7 @@ var errWebSessionNotFound = errors.New("会话不存在，请重新扫描")
 
 func newWebServer(roots []string, token string, refresh time.Duration) *webServer {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &webServer{token: token, roots: roots, refresh: refresh, sessions: map[string]sessionEntry{}, stores: map[string]*Store{}, ctx: ctx, cancel: cancel}
+	return &webServer{token: token, roots: roots, refresh: refresh, sessions: map[string]sessionEntry{}, stores: map[string]*Store{}, discovery: newDiscoveryCache(), summaries: map[string]summaryCacheEntry{}, ctx: ctx, cancel: cancel}
 }
 
 func webSessionID(dir string) string {
@@ -104,8 +188,11 @@ func (w *webServer) close() {
 	}
 }
 
-func (w *webServer) discover(ctx context.Context) sessionsFound {
-	found := discoverSessions(ctx, w.roots)
+func (w *webServer) discover(ctx context.Context, force bool) sessionsFound {
+	if force {
+		w.discovery.clear()
+	}
+	found := discoverSessions(ctx, w.roots, w.discovery)
 	if ctx.Err() != nil {
 		return found
 	}
@@ -125,7 +212,7 @@ func (w *webServer) store(ctx context.Context, id string) (*Store, error) {
 	entry, ok := w.sessions[id]
 	w.mu.Unlock()
 	if !ok {
-		w.discover(ctx)
+		w.discover(ctx, true)
 		w.mu.Lock()
 		entry, ok = w.sessions[id]
 		w.mu.Unlock()
@@ -160,6 +247,7 @@ func (w *webServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/sessions", w.handleSessions)
 	mux.HandleFunc("GET /api/sessions/{sid}/requests", w.handleRequests)
+	mux.HandleFunc("GET /api/sessions/{sid}/requests/{rid}/meta", w.handleRequestMeta)
 	mux.HandleFunc("GET /api/sessions/{sid}/timeline", w.handleTimeline)
 	mux.HandleFunc("GET /api/sessions/{sid}/summary", w.handleSummary)
 	mux.HandleFunc("GET /api/sessions/{sid}/requests/{rid}", w.handleDetail)
@@ -174,23 +262,39 @@ func (w *webServer) handler() http.Handler {
 	mux.HandleFunc("DELETE /api/analysis", w.handleAnalysisCancel)
 	static, _ := fs.Sub(webAssets, "web")
 	files := http.FileServerFS(static)
+	serveAsset := func(name string) http.HandlerFunc {
+		return func(rw http.ResponseWriter, r *http.Request) {
+			if tag := webAssetTags[name]; tag != "" {
+				rw.Header().Set("ETag", tag)
+				rw.Header().Set("Cache-Control", "no-cache")
+				if r.Header.Get("If-None-Match") == tag {
+					rw.WriteHeader(http.StatusNotModified)
+					return
+				}
+			}
+			files.ServeHTTP(rw, r)
+		}
+	}
+	appCSS, appJS, index := serveAsset("app.css"), serveAsset("app.js"), serveAsset("index.html")
 	mux.HandleFunc("GET /{file}", func(rw http.ResponseWriter, r *http.Request) {
 		switch r.PathValue("file") {
-		case "app.css", "app.js":
-			files.ServeHTTP(rw, r)
+		case "app.css":
+			appCSS.ServeHTTP(rw, r)
+		case "app.js":
+			appJS.ServeHTTP(rw, r)
 		default:
 			http.NotFound(rw, r)
 		}
 	})
-	mux.HandleFunc("GET /{$}", func(rw http.ResponseWriter, r *http.Request) { files.ServeHTTP(rw, r) })
+	mux.HandleFunc("GET /{$}", index.ServeHTTP)
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		header := rw.Header()
 		// Captured traffic is attacker-controlled, so the page may only load its own embedded assets.
 		header.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 		header.Set("X-Content-Type-Options", "nosniff")
 		header.Set("Referrer-Policy", "no-referrer")
-		header.Set("Cache-Control", "no-store")
 		if strings.HasPrefix(r.URL.Path, "/api/") {
+			header.Set("Cache-Control", "no-store")
 			got := sha256.Sum256([]byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")))
 			want := sha256.Sum256([]byte(w.token))
 			if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
@@ -199,13 +303,22 @@ func (w *webServer) handler() http.Handler {
 			}
 			w.apiMu.RLock()
 			defer w.apiMu.RUnlock()
+		} else {
+			header.Set("Cache-Control", "no-cache")
+		}
+		if acceptsGzip(r.Header.Get("Accept-Encoding")) && r.Header.Get("Range") == "" && !strings.HasSuffix(r.URL.Path, "/export") {
+			header.Set("Vary", "Accept-Encoding")
+			writer := &gzipResponseWriter{ResponseWriter: rw}
+			defer writer.Close()
+			mux.ServeHTTP(writer, r)
+			return
 		}
 		mux.ServeHTTP(rw, r)
 	})
 }
 
 func (w *webServer) handleSessions(rw http.ResponseWriter, r *http.Request) {
-	found := w.discover(r.Context())
+	found := w.discover(r.Context(), r.URL.Query().Get("rescan") == "1")
 	list := make([]webSession, 0, len(found.Entries))
 	for _, entry := range found.Entries {
 		list = append(list, webSession{
@@ -266,6 +379,14 @@ func (w *webServer) handleRequests(rw http.ResponseWriter, r *http.Request) {
 	}
 	page, _ := strconv.Atoi(get("page"))
 	page = max(0, page)
+	limit := 100
+	if raw := get("limit"); raw != "" {
+		limit, err = strconv.Atoi(raw)
+		if err != nil || limit < 1 || limit > 500 {
+			webError(rw, http.StatusBadRequest, errors.New("limit 必须是 1 到 500 之间的整数"))
+			return
+		}
+	}
 	var anchor *tuiRow
 	if page > 0 && get("anchor_id") != "" {
 		anchor = &tuiRow{ID: get("anchor_id"), Time: get("anchor_time")}
@@ -276,7 +397,7 @@ func (w *webServer) handleRequests(rw http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	snapshot, err := loadTUISnapshot(ctx, s, filter, get("alerts") == "1", page, "", anchor)
+	snapshot, err := loadTUISnapshot(ctx, s, filter, get("alerts") == "1", page, "", anchor, limit)
 	if err != nil {
 		webError(rw, http.StatusInternalServerError, err)
 		return
@@ -286,7 +407,7 @@ func (w *webServer) handleRequests(rw http.ResponseWriter, r *http.Request) {
 		rows = append(rows, webRow{ID: row.ID, Time: row.Time, Client: row.Client, Method: row.Method, Host: row.Host, URL: row.URL, Status: row.Status, Severity: row.Severity, Incomplete: row.Incomplete, Truncated: row.Truncated})
 	}
 	webJSON(rw, http.StatusOK, map[string]any{
-		"rows": rows, "count": snapshot.Count, "page": snapshot.Page, "page_size": 100,
+		"rows": rows, "count": snapshot.Count, "page": snapshot.Page, "page_size": limit,
 		"stats": snapshot.Stats, "status_warning": snapshot.StatusWarning, "dir": s.dir, "coverage_warning": session.CoverageWarning,
 	})
 }
@@ -313,6 +434,33 @@ func (w *webServer) transaction(rw http.ResponseWriter, r *http.Request) (*Store
 		return nil, t, nil, false
 	}
 	return s, t, b, true
+}
+
+// handleRequestMeta returns only the fields that change when a response arrives.
+// Pending detail views poll this instead of downloading request and response bodies.
+func (w *webServer) handleRequestMeta(rw http.ResponseWriter, r *http.Request) {
+	s := w.sessionStore(rw, r)
+	if s == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	var status, alertCount int
+	var incomplete, truncated bool
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(json_extract(CAST(data AS TEXT),'$.status'),0),
+ COALESCE(json_extract(CAST(data AS TEXT),'$.incomplete'),0),
+ COALESCE(json_extract(CAST(data AS TEXT),'$.truncated'),0),
+ COALESCE(json_array_length(json_extract(CAST(data AS TEXT),'$.alerts')),0)
+ FROM requests WHERE id=?`, r.PathValue("rid")).Scan(&status, &incomplete, &truncated, &alertCount)
+	if err == sql.ErrNoRows {
+		webError(rw, http.StatusNotFound, errors.New("该记录不存在或已被保留期清理"))
+		return
+	}
+	if err != nil {
+		webError(rw, http.StatusInternalServerError, fmt.Errorf("读取请求状态: %w", err))
+		return
+	}
+	webJSON(rw, http.StatusOK, map[string]any{"status": status, "incomplete": incomplete, "truncated": truncated, "alert_count": alertCount})
 }
 
 func (w *webServer) handleDetail(rw http.ResponseWriter, r *http.Request) {

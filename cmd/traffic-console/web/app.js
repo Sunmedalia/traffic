@@ -24,7 +24,7 @@ function set(node, ...kids) {
 }
 const svg = (tag, props, ...kids) => build(document.createElementNS('http://www.w3.org/2000/svg', tag), props, kids);
 
-const STATES = { running: '采集中', stopped: '已停止', complete: '已完成', failed: '采集失败', stale: '心跳过期' };
+const STATES = { running: '采集中', stopped: '已停止', complete: '已完成', failed: '采集失败', stale: '心跳过期', interrupted: '采集未正常结束' };
 const SEVERITIES = { high: '高', medium: '中', low: '低' };
 const STATUS_LABELS = { pending: '待响应', other: '其他' };
 const FILTER_KEYS = ['keyword', 'severity', 'status', 'method', 'client', 'rule', 'service', 'since', 'until'];
@@ -58,6 +58,7 @@ const state = {
   known: null,
   count: 0,
   baseCount: 0,
+  pageSize: 100,
   stats: null,
   dir: '',
   coverage: '',
@@ -65,6 +66,7 @@ const state = {
   recent: [],
   timelines: {},
   auxAt: 0,
+  summaryAt: 0,
   warning: '',
   error: '',
   offline: false,
@@ -101,13 +103,15 @@ function parts(d) {
     : [d.getFullYear(), d.getMonth() + 1, d.getDate(), d.getHours(), d.getMinutes(), d.getSeconds(), d.getMilliseconds()];
 }
 
-// style: 'full' date and time, 'ms' adds milliseconds, 'row' is month-day and time with milliseconds, 'clock' is time only.
+// style: 'full' date and time, 'ms' adds milliseconds, 'row' is month-day and time with milliseconds,
+// 'dayclock' is month-day and time, 'clock' is time only.
 function formatTime(value, style = 'full') {
   const d = parseTime(value);
   if (!d) return '未知';
   const [y, mo, day, hh, mi, ss, ms] = parts(d);
   const clock = `${pad(hh)}:${pad(mi)}:${pad(ss)}`;
   if (style === 'clock') return clock;
+  if (style === 'dayclock') return `${pad(mo)}-${pad(day)} ${pad(hh)}:${pad(mi)}`;
   if (style === 'row') return `${pad(mo)}-${pad(day)} ${clock}.${pad(ms, 3)}`;
   return `${y}-${pad(mo)}-${pad(day)} ${clock}` + (style === 'ms' ? `.${pad(ms, 3)}` : '');
 }
@@ -307,23 +311,26 @@ function route() {
   if (!state.token) return showGate();
   const next = parseHash();
   if (!next) {
-    Object.assign(state, { sid: null, selected: null, detail: null, listKey: '', warning: '', error: '' });
+    Object.assign(state, { sid: null, selected: null, detail: null, listKey: '', warning: '', error: '', summaryAt: 0 });
     state.seq++;
+    closeDetail();
     show('sessions');
     renderChrome();
     renderBanner();
     loadSessions();
+    schedule();
     return;
   }
   if (next.sid !== state.sid) {
-    Object.assign(state, { sid: next.sid, stats: null, summary: null, recent: [], timelines: {}, dir: '', warning: '', error: '', auxAt: 0 });
+    Object.assign(state, { sid: next.sid, stats: null, summary: null, recent: [], timelines: {}, dir: '', warning: '', error: '', auxAt: 0, summaryAt: 0 });
+    closeDetail();
     renderBanner();
   }
   const listKey = `${next.sid}|${next.tab}|${JSON.stringify(next.filter)}`;
   const changed = listKey !== state.listKey;
   Object.assign(state, { tab: next.tab, filter: next.filter, listKey });
   if (changed) {
-    Object.assign(state, { page: 0, rows: [], rowsKey: '', known: null, count: 0, baseCount: 0, auxAt: 0 });
+    Object.assign(state, { page: 0, rows: [], rowsKey: '', known: null, count: 0, baseCount: 0, auxAt: 0, summaryAt: 0 });
     state.seq++;
     state.busy = false;
   }
@@ -337,11 +344,12 @@ function route() {
     refresh();
   }
   if (next.tab === 'overview' || !next.id) {
-    if (state.selected) hideDetail();
+    if (state.selected || !$('detail').hidden) hideDetail();
   } else if (next.id !== state.selected) {
     showDetail(next.id);
   }
   if (!currentSession()) loadSessions().then(renderChrome);
+  schedule();
 }
 
 // ---- chrome ----
@@ -386,10 +394,10 @@ function applyTheme() {
 
 // ---- sessions ----
 
-async function loadSessions() {
+async function loadSessions(force) {
   $('rescan').disabled = true;
   try {
-    const data = await api('sessions');
+    const data = await api('sessions', force ? { rescan: 1 } : null);
     state.sessions = data.sessions || [];
     state.roots = data.roots || [];
     state.refreshMs = Math.max(500, data.refresh_ms || 1000);
@@ -428,8 +436,8 @@ function renderSessions() {
         h('div', { class: 'name' }, s.name),
         h('div', { class: 'sub' }, [usable ? stateLabel(s.state) : '索引不可用', s.host, `${formatTime(s.started, 'clock')} 开始`, relativeTime(s.started)].filter(Boolean).join(' · '))),
       h('span', { class: 'path where', title: s.dir }, '‎' + s.dir),
-      h('span', { class: 'figure' }, h('b', {}, s.counts_known ? number(s.transactions) : '—'), h('span', {}, '请求')),
-      h('span', { class: 'figure' + (s.counts_known && s.alerts ? ' hot' : '') }, h('b', {}, s.counts_known ? number(s.alerts) : '—'), h('span', {}, '告警'))));
+      h('span', { class: 'figure' }, h('b', { title: s.counts_known ? null : '计数未确认' }, s.counts_known ? number(s.transactions) : s.transactions ? '≈ ' + number(s.transactions) : '—'), h('span', {}, '请求')),
+      h('span', { class: 'figure' + (s.counts_known && s.alerts ? ' hot' : '') }, h('b', { title: s.counts_known ? null : '计数未确认' }, s.counts_known ? number(s.alerts) : s.alerts ? '≈ ' + number(s.alerts) : '—'), h('span', {}, '告警'))));
   }
   set($('session-list'), ...nodes);
   const empty = $('sessions-empty');
@@ -451,7 +459,7 @@ function apiFilter(filter) {
 async function loadRows(anchored) {
   const seq = ++state.seq;
   const overview = state.tab === 'overview';
-  const params = overview ? { alerts: 1, page: 0 } : { ...apiFilter(state.filter), page: state.page, alerts: state.tab === 'alerts' ? 1 : '' };
+  const params = overview ? { alerts: 1, page: 0, limit: 8 } : { ...apiFilter(state.filter), page: state.page, alerts: state.tab === 'alerts' ? 1 : '' };
   if (!overview && anchored && state.page > 0 && state.rows.length) {
     params.anchor_id = state.rows[0].id;
     params.anchor_time = state.rows[0].time;
@@ -467,6 +475,7 @@ async function loadRows(anchored) {
       state.rows = data.rows || [];
       state.count = data.count;
       state.page = data.page;
+      state.pageSize = data.page_size || 100;
       if (state.page === 0) state.baseCount = data.count;
       renderRows();
     }
@@ -485,15 +494,19 @@ async function loadAux() {
   const sid = state.sid;
   const key = state.listKey;
   const overview = state.tab === 'overview';
+  const summaryDue = overview && Date.now() - state.summaryAt >= Math.max(15000, state.refreshMs * 10);
   state.auxAt = Date.now();
   const params = overview ? {} : { ...apiFilter(state.filter), alerts: state.tab === 'alerts' ? 1 : '' };
   const jobs = [api(`sessions/${sid}/timeline`, params)];
-  if (overview) jobs.push(api(`sessions/${sid}/summary`));
+  if (summaryDue) jobs.push(api(`sessions/${sid}/summary`));
   try {
     const [timeline, summary] = await Promise.all(jobs);
     if (sid !== state.sid || key !== state.listKey) return;
     state.timelines[overview ? 'overview' : 'list'] = timeline;
-    if (summary) state.summary = summary;
+    if (summary) {
+      state.summary = summary;
+      state.summaryAt = Date.now();
+    }
     renderTimelines();
     if (overview) renderOverview();
   } catch (error) {
@@ -538,13 +551,14 @@ function renderHealth() {
   const s = state.stats || {};
   const issues = [];
   if (s.state === 'failed') issues.push('采集以失败状态结束，数据可能不完整。');
+  if (s.state === 'interrupted') issues.push('采集未正常结束，尾部数据与探针清理状态未知。');
   if (s.dropped > 0) issues.push(`网卡丢包 ${number(s.dropped)} 个，部分请求可能无法还原。`);
   if (s.queue_dropped > 0) issues.push(`用户态队列丢弃 ${number(s.queue_dropped)} 个。`);
   if (s.probe_failures > 0) issues.push(`探针传输失败 ${number(s.probe_failures)} 次，恢复后仍保留。`);
   if (s.tls_dropped > 0) issues.push(`TLS 已知丢弃 ${number(s.tls_dropped)} 个，这是已观测到的下限。`);
   if (s.alert_delivery_failed > 0 || s.alert_delivery_dropped > 0) issues.push(`告警 Webhook 失败 ${number(s.alert_delivery_failed)} 次，队列丢弃 ${number(s.alert_delivery_dropped)} 次。`);
   if ((s.errors || []).length) issues.push(`采集过程记录了 ${s.errors.length} 条错误，详见“采集状态”。`);
-  const bad = s.state === 'failed' || s.state === 'stale';
+  const bad = s.state === 'failed' || s.state === 'stale' || s.state === 'interrupted';
   set($('health'), issues.length ? h('div', { class: 'health' + (bad ? ' bad' : '') },
     h('div', {}, h('b', {}, '这个会话的数据有缺口'), h('ul', {}, issues.map((text) => h('li', {}, text))))) : '');
 }
@@ -661,7 +675,11 @@ function drawTimeline(host, data, height) {
   const chart = svg('svg', { viewBox: `0 0 ${width} ${height}`, height, preserveAspectRatio: 'none', role: 'img', 'aria-label': '请求与告警随时间的分布' },
     bars, svg('line', { class: 'base', x1: 0, x2: width, y1: height - 0.5, y2: height - 0.5 }), hover, brush);
   const tip = h('div', { class: 'tip', hidden: true });
-  const labels = [0, 0.5, 1].map((at) => formatTime(new Date(start + Math.round((count - 1) * at) * step + (at === 1 ? step : 0)), data.granularity >= 86400 ? 'full' : 'clock'));
+  const firstDay = parts(new Date(start)).slice(0, 3).join('-');
+  const lastDay = parts(new Date(start + (count - 1) * step)).slice(0, 3).join('-');
+  const crossesDay = firstDay !== lastDay;
+  const axisStyle = data.granularity >= 86400 ? 'full' : crossesDay ? 'dayclock' : 'clock';
+  const labels = [0, 0.5, 1].map((at) => formatTime(new Date(start + Math.round((count - 1) * at) * step + (at === 1 ? step : 0)), axisStyle));
   if (data.granularity >= 86400) labels.forEach((text, i) => { labels[i] = text.slice(0, 10); });
   set(host, chart, tip, h('div', { class: 'axis' }, labels.map((text) => h('span', {}, text))));
 
@@ -690,7 +708,8 @@ function drawTimeline(host, data, height) {
         alerts += bucket.alerts;
       }
     }
-    const span = formatTime(new Date(start + from * step), 'clock') + ' – ' + formatTime(new Date(start + (to + 1) * step), 'clock');
+    const tipStyle = data.granularity >= 86400 || crossesDay ? 'dayclock' : 'clock';
+    const span = formatTime(new Date(start + from * step), tipStyle) + ' – ' + formatTime(new Date(start + (to + 1) * step), tipStyle);
     set(tip, span, ' · ', h('b', {}, number(requests)), ' 请求', alerts ? [' · ', h('b', { class: 'hot' }, number(alerts)), ' 含告警'] : null);
     tip.hidden = false;
     tip.style.left = `${Math.max(90, Math.min(width - 90, ((from + to + 1) / 2) * slot))}px`;
@@ -799,7 +818,7 @@ function renderRows(loading) {
     else if (state.tab === 'alerts') set(empty, h('b', {}, '没有告警'), '这个会话里还没有请求命中检测规则。');
     else set(empty, h('b', {}, '还没有请求'), '采集到的 HTTP 请求会显示在这里。');
   }
-  const pages = Math.max(1, Math.ceil(state.count / 100));
+  const pages = Math.max(1, Math.ceil(state.count / (state.pageSize || 100)));
   $('pager-info').textContent = state.count ? `${number(state.count)} 条 · 第 ${state.page + 1} / ${pages} 页` : '';
   $('page-first').disabled = $('page-prev').disabled = state.page === 0;
   $('page-next').disabled = state.page + 1 >= pages;
@@ -831,12 +850,16 @@ function moveSelection(delta, absolute) {
 
 // ---- detail ----
 
-function hideDetail() {
+function closeDetail() {
   state.selected = null;
   state.detail = null;
   $('detail').hidden = $('splitter').hidden = true;
   $('split').classList.remove('open');
   $('tab-list').classList.remove('reading');
+}
+
+function hideDetail() {
+  closeDetail();
   renderRows();
 }
 
@@ -855,14 +878,27 @@ async function showDetail(id, quiet) {
   try {
     const data = await api(`sessions/${sid}/requests/${encodeURIComponent(id)}`);
     if (state.selected !== id || state.sid !== sid) return;
-    const before = JSON.stringify(state.detail);
     state.detail = data;
-    if (JSON.stringify(data) !== before) renderDetail();
+    renderDetail();
   } catch (error) {
     if (state.selected !== id || quiet) return;
     state.detailError = error.status === 404 ? '这条记录已被保留期清理，无法再查看。' : error.message;
     renderDetail();
   }
+}
+
+// Pending requests only need a few fields; avoid downloading the full bodies on every tick.
+async function showDetailMeta(id) {
+  const sid = state.sid;
+  try {
+    const data = await api(`sessions/${sid}/requests/${encodeURIComponent(id)}/meta`);
+    if (state.selected !== id || state.sid !== sid) return;
+    const t = state.detail && state.detail.transaction;
+    if (!t) return;
+    if (t.status !== data.status || Boolean(t.incomplete) !== data.incomplete || Boolean(t.truncated) !== data.truncated || (t.alerts || []).length !== data.alert_count) {
+      await showDetail(id, true);
+    }
+  } catch (_) { /* the next full refresh reports the error */ }
 }
 
 function splitHttp(text) {
@@ -1073,17 +1109,27 @@ async function tick() {
     return;
   }
   if (state.paused || state.busy) return;
+  if (state.stats && state.stats.state !== 'running' && state.stats.state !== 'stale') return;
   await refresh(true);
   const t = state.detail && state.detail.transaction;
   // A response can arrive after the request was first shown.
-  if (t && (!t.status || t.incomplete)) showDetail(t.id, true);
+  if (t && (!t.status || t.incomplete)) showDetailMeta(t.id);
 }
 
+let refreshTimer = 0;
+
 function schedule() {
-  // Finished sessions rarely change, and the session list is a directory walk.
-  const live = state.sid && state.stats && state.stats.state === 'running';
-  const delay = state.offline ? 3000 : live ? state.refreshMs : state.sid ? Math.max(5000, state.refreshMs) : 10000;
-  setTimeout(async () => {
+  clearTimeout(refreshTimer);
+  refreshTimer = 0;
+  if (!state.token) return;
+  let delay;
+  if (state.offline) delay = 3000;
+  else if (!state.sid) delay = 10000;
+  else if (!state.stats) delay = Math.max(500, state.refreshMs);
+  else if (state.stats.state === 'running') delay = state.refreshMs;
+  else if (state.stats.state === 'stale') delay = Math.max(5000, state.refreshMs);
+  else return; // Stopped and finished sessions only refresh on demand.
+  refreshTimer = setTimeout(async () => {
     await tick();
     schedule();
   }, delay);
@@ -1104,7 +1150,7 @@ function bind() {
     renderBanner();
     route();
   });
-  $('rescan').addEventListener('click', loadSessions);
+  $('rescan').addEventListener('click', () => loadSessions(true));
   $('sessions-search').addEventListener('input', renderSessions);
   $('pause').addEventListener('click', togglePause);
   $('tz').addEventListener('click', () => {
@@ -1222,7 +1268,7 @@ function bind() {
 function togglePause() {
   state.paused = !state.paused;
   renderChrome();
-  if (!state.paused) refresh(true);
+  if (!state.paused) refresh(true).then(schedule);
 }
 
 function onKey(event) {
@@ -1251,7 +1297,8 @@ function onKey(event) {
   else if (event.key === ' ' && event.target.tagName !== 'BUTTON') togglePause();
   else if (event.key === 'r') {
     state.auxAt = 0;
-    refresh(true);
+    state.summaryAt = 0;
+    refresh(true).then(schedule);
   } else if (!list) return;
   else if (event.key === 'j' || event.key === 'ArrowDown') moveSelection(1);
   else if (event.key === 'k' || event.key === 'ArrowUp') moveSelection(-1);
@@ -1408,13 +1455,15 @@ async function pollAnalysisJob() {
       await loadSessions();
       if (state.sid === data.job.session_id) {
         state.auxAt = 0;
+        state.summaryAt = 0;
         state.known = null;
         await refresh(false);
+        schedule();
         if (state.selected) await showDetail(state.selected, true);
       }
     }
   } catch (error) { if ($('rules-dialog').open) $('analysis-status').textContent = '获取分析状态失败：' + error.message; }
-  if (state.token && ((ruleUI.job && ruleUI.job.state === 'running') || $('rules-dialog').open)) ruleUI.poll = setTimeout(pollAnalysisJob, 1000);
+  if (state.token && ruleUI.job && ruleUI.job.state === 'running') ruleUI.poll = setTimeout(pollAnalysisJob, 1000);
 }
 async function startRuleAnalysis() {
   $('analysis-start').disabled = true;

@@ -4,7 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -111,6 +115,18 @@ func webCounts(ctx context.Context, db *sql.DB, query string, args []any, scan f
 	return result, rows.Err()
 }
 
+func summaryRevision(dir string) string {
+	parts := make([]string, 0, 4)
+	for _, name := range []string{"index.sqlite", "index.sqlite-wal", "analysis.sqlite", "analysis.sqlite-wal"} {
+		if info, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			parts = append(parts, fmt.Sprintf("%s:%d:%d", name, info.ModTime().UnixNano(), info.Size()))
+		} else {
+			parts = append(parts, name+":-")
+		}
+	}
+	return strings.Join(parts, "|")
+}
+
 func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 	filter, _, err := webFilter(r)
 	if err != nil {
@@ -120,6 +136,21 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 	s := w.sessionStore(rw, r)
 	if s == nil {
 		return
+	}
+	// Finished sessions cannot change until their index or analysis file does.
+	// Cache those summaries; running captures are re-scanned on every request.
+	status, _ := readTUIStatus(s.dir)
+	finished := status.State != "" && status.State != "running" && status.State != "stale"
+	revision := summaryRevision(s.dir)
+	key := s.dir + "|" + r.URL.RawQuery
+	if finished {
+		w.summaryMu.Lock()
+		entry, ok := w.summaries[key]
+		w.summaryMu.Unlock()
+		if ok && entry.revision == revision {
+			webJSON(rw, http.StatusOK, entry.data)
+			return
+		}
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -187,6 +218,14 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 	} else if ctx.Err() != nil {
 		webError(rw, http.StatusInternalServerError, err)
 		return
+	}
+	if finished {
+		w.summaryMu.Lock()
+		if len(w.summaries) > 128 {
+			w.summaries = map[string]summaryCacheEntry{}
+		}
+		w.summaries[key] = summaryCacheEntry{revision: revision, data: result}
+		w.summaryMu.Unlock()
 	}
 	webJSON(rw, http.StatusOK, result)
 }
