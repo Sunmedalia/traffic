@@ -2,12 +2,13 @@ package main
 
 import (
 	"encoding/json"
-	"github.com/Sunmedalia/traffic/internal/session"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Sunmedalia/traffic/internal/session"
 )
 
 type Stats = session.Stats
@@ -36,8 +37,14 @@ type Store struct {
 }
 
 func (s *Store) notePacketPoll(t time.Time) {
-	if !t.IsZero() {
-		s.lastPacketPollNano.Store(t.UTC().UnixNano())
+	if t.IsZero() {
+		return
+	}
+	ns := t.UnixNano()
+	for current := s.lastPacketPollNano.Load(); ns > current; current = s.lastPacketPollNano.Load() {
+		if s.lastPacketPollNano.CompareAndSwap(current, ns) {
+			return
+		}
 	}
 }
 

@@ -127,7 +127,7 @@ type winDivertPacketHandle struct {
 	batches                 chan []winDivertBatchPacket
 	current                 []winDivertBatchPacket
 	errCh                   chan error
-	stopCh                  chan struct{}
+	abortCh                 chan struct{}
 	pumpDone                chan struct{}
 	closing                 atomic.Bool
 	lastPollNano            atomic.Int64
@@ -215,6 +215,7 @@ func openLivePacket(ctx context.Context, iface string) (packetHandle, error) {
 	if err != nil {
 		shutdown.Call(uintptr(handle), 1)
 		closeProc.Call(uintptr(handle))
+		dll.Release()
 		return nil, fmt.Errorf("创建 WinDivert 事件句柄失败: %w", err)
 	}
 	anchorUTC, anchorTicks, qpcFreq := sampleQPCAnchor()
@@ -232,7 +233,7 @@ func openLivePacket(ctx context.Context, iface string) (packetHandle, error) {
 		qpcFreq:     qpcFreq,
 		batches:     make(chan []winDivertBatchPacket, winDivertBatchChannelCap),
 		errCh:       make(chan error, 1),
-		stopCh:      make(chan struct{}),
+		abortCh:     make(chan struct{}),
 		pumpDone:    make(chan struct{}),
 	}
 	result.lastPollNano.Store(anchorUTC.UnixNano())
@@ -266,22 +267,22 @@ func (h *winDivertPacketHandle) recordErr(err error) {
 func (h *winDivertPacketHandle) requestStop() {
 	h.stopOnce.Do(func() {
 		h.closing.Store(true)
-		close(h.stopCh)
 		// WINDIVERT_SHUTDOWN_RECV=1 stops queueing new packets and wakes empty receives with ERROR_NO_DATA.
-		h.shutdown.Call(uintptr(h.handle), 1)
+		if ok, _, err := h.shutdown.Call(uintptr(h.handle), 1); ok == 0 {
+			h.recordErr(fmt.Errorf("stop WinDivert receive: %w", err))
+		}
 	})
 }
 
 func (h *winDivertPacketHandle) pump() {
 	runtime.LockOSThread()
-	abandonedIRP := false
+	defer runtime.UnlockOSThread()
 	defer func() {
+		// Serialize shutdown with handle release, including when the pump fails.
+		h.requestStop()
+		_ = windows.CloseHandle(h.event)
+		h.close.Call(uintptr(h.handle))
 		close(h.batches)
-		if !abandonedIRP {
-			_ = windows.CloseHandle(h.event)
-			h.close.Call(uintptr(h.handle))
-			runtime.UnlockOSThread()
-		}
 		close(h.pumpDone)
 	}()
 
@@ -307,9 +308,10 @@ func (h *winDivertPacketHandle) pump() {
 		var recvErr error
 		if ok != 0 {
 			if h.recvLen == 0 {
-				_ = windows.GetOverlappedResult(h.handle, &h.overlapped, &h.recvLen, false)
+				recvErr = windows.GetOverlappedResult(h.handle, &h.overlapped, &h.recvLen, false)
 			}
 		} else if errors.Is(callErr, windows.ERROR_IO_PENDING) {
+			var shutdownDeadline time.Time
 			for {
 				ev, waitErr := windows.WaitForSingleObject(h.event, 100)
 				h.lastPollNano.Store(time.Now().UTC().UnixNano())
@@ -318,35 +320,32 @@ func (h *winDivertPacketHandle) pump() {
 					break
 				}
 				if ev == uint32(windows.WAIT_TIMEOUT) {
-					if h.closing.Load() {
-						_ = windows.CancelIoEx(h.handle, &h.overlapped)
-						ev2, _ := windows.WaitForSingleObject(h.event, 2000)
-						if ev2 != windows.WAIT_OBJECT_0 {
-							abandonedIRP = true
-							return
-						}
-						recvErr = windows.GetOverlappedResult(h.handle, &h.overlapped, &h.recvLen, false)
-						break
+					if !h.closing.Load() {
+						continue
 					}
-					continue
+					if shutdownDeadline.IsZero() {
+						shutdownDeadline = time.Now().Add(500 * time.Millisecond)
+					}
+					if time.Now().Before(shutdownDeadline) {
+						continue
+					}
 				}
+				if waitErr == nil {
+					waitErr = errors.New("WinDivert receive did not complete after shutdown")
+				}
+				h.recordErr(waitErr)
 				_ = windows.CancelIoEx(h.handle, &h.overlapped)
-				ev2, _ := windows.WaitForSingleObject(h.event, 2000)
-				if ev2 != windows.WAIT_OBJECT_0 {
-					abandonedIRP = true
-					h.recordErr(waitErr)
-					return
-				}
-				_ = windows.GetOverlappedResult(h.handle, &h.overlapped, &h.recvLen, false)
-				recvErr = waitErr
-				break
+				// Keep the handle, event and Go buffers live until the driver is
+				// done with them. Close bounds how long its caller waits.
+				_ = windows.GetOverlappedResult(h.handle, &h.overlapped, &h.recvLen, true)
+				return
 			}
 		} else {
 			recvErr = callErr
 		}
 
 		if recvErr != nil {
-			if h.closing.Load() && (errors.Is(recvErr, windows.ERROR_NO_DATA) || errors.Is(recvErr, windows.ERROR_OPERATION_ABORTED) || errors.Is(recvErr, windows.ERROR_INVALID_HANDLE)) {
+			if h.closing.Load() && errors.Is(recvErr, windows.ERROR_NO_DATA) {
 				return
 			}
 			if errors.Is(recvErr, windows.ERROR_INSUFFICIENT_BUFFER) {
@@ -355,7 +354,7 @@ func (h *winDivertPacketHandle) pump() {
 				}}
 				select {
 				case h.batches <- marker:
-				case <-h.stopCh:
+				case <-h.abortCh:
 					return
 				}
 				continue
@@ -368,7 +367,7 @@ func (h *winDivertPacketHandle) pump() {
 		if len(pkts) > 0 {
 			select {
 			case h.batches <- pkts:
-			case <-h.stopCh:
+			case <-h.abortCh:
 				return
 			}
 		}
@@ -416,7 +415,12 @@ func (h *winDivertPacketHandle) ReadPacketData() ([]byte, gopacket.CaptureInfo, 
 		h.current = batch[1:]
 		return pkt.data, pkt.ci, nil
 	case <-timer.C:
-		return nil, gopacket.CaptureInfo{}, pcap.NextErrorTimeoutExpired
+		select {
+		case err := <-h.errCh:
+			return nil, gopacket.CaptureInfo{}, err
+		default:
+			return nil, gopacket.CaptureInfo{}, pcap.NextErrorTimeoutExpired
+		}
 	}
 }
 
@@ -428,6 +432,8 @@ func (h *winDivertPacketHandle) LastPollTime() time.Time {
 	return time.Unix(0, ns).UTC()
 }
 
+func (h *winDivertPacketHandle) drainsOnCancel() {}
+
 func (h *winDivertPacketHandle) LinkType() layers.LinkType { return layers.LinkTypeRaw }
 func (h *winDivertPacketHandle) SnapLen() int              { return h.snaplen }
 func (h *winDivertPacketHandle) SetBPFFilter(string) error { return nil }
@@ -436,6 +442,7 @@ func (h *winDivertPacketHandle) Stats() (*pcap.Stats, error) {
 }
 func (h *winDivertPacketHandle) Close() {
 	h.closeOnce.Do(func() {
+		close(h.abortCh)
 		h.requestStop()
 		timer := time.NewTimer(2500 * time.Millisecond)
 		defer timer.Stop()

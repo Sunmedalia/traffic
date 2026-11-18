@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -258,11 +259,19 @@ func capturePackets(ctx context.Context, s *Store, p *eventRecorder, iface, filt
 		s.notePacketPoll(time.Now().UTC())
 	}
 	var importedBytes int64
+	_, drainsOnCancel := h.(interface{ drainsOnCancel() })
+	var drainDeadline time.Time
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
+		if ctx.Err() != nil {
+			if !drainsOnCancel {
+				return nil
+			}
+			if drainDeadline.IsZero() {
+				drainDeadline = time.Now().Add(2500 * time.Millisecond)
+			}
+			if time.Now().After(drainDeadline) {
+				return errors.New("WinDivert packet drain timed out")
+			}
 		}
 		data, ci, e := h.ReadPacketData()
 		if input == "" {
@@ -279,10 +288,7 @@ func capturePackets(ctx context.Context, s *Store, p *eventRecorder, iface, filt
 			continue
 		}
 		if e != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			if input != "" && e.Error() == "EOF" {
+			if (input != "" || drainsOnCancel && ctx.Err() != nil) && errors.Is(e, io.EOF) {
 				return nil
 			}
 			return e
