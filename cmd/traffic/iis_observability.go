@@ -2,7 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"encoding/xml"
 	"errors"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/Sunmedalia/traffic/internal/session"
 )
 
 func diagCount(values map[string]any, name string) uint64 {
@@ -67,4 +73,82 @@ func applyIISProbeSummary(s *Store, values map[string]any) {
 	if s.iisAttached && !s.stats.PlaintextObserved && receive == 0 && send > 0 && unmatched > 0 {
 		s.stats.AttachWindowSuspect = true
 	}
+}
+
+func parseIISBindingPorts(data []byte, protocols ...string) []int {
+	if len(data) == 0 {
+		return nil
+	}
+	allowed := map[string]bool{}
+	for _, proto := range protocols {
+		allowed[strings.ToLower(proto)] = true
+	}
+	var config struct {
+		Bindings []struct {
+			Protocol string `xml:"protocol,attr"`
+			Info     string `xml:"bindingInformation,attr"`
+		} `xml:"system.applicationHost>sites>site>bindings>binding"`
+	}
+	if xml.Unmarshal(data, &config) != nil {
+		return nil
+	}
+	set := map[int]bool{}
+	for _, binding := range config.Bindings {
+		if !allowed[strings.ToLower(binding.Protocol)] {
+			continue
+		}
+		parts := strings.Split(binding.Info, ":")
+		if len(parts) < 3 {
+			continue
+		}
+		port, err := strconv.Atoi(parts[len(parts)-2])
+		if err == nil && port > 0 && port <= 65535 {
+			set[port] = true
+		}
+	}
+	var ports []int
+	for port := range set {
+		ports = append(ports, port)
+	}
+	sort.Ints(ports)
+	return ports
+}
+
+// iisPortsMatchHTTPS returns false only when IIS bindings are known and none of
+// the selected capture ports correspond to an HTTPS binding.
+func iisPortsMatchHTTPS(allPorts, httpsPorts []int, selected map[int]bool) bool {
+	if len(allPorts) == 0 {
+		return true
+	}
+	if len(httpsPorts) == 0 {
+		return false
+	}
+	if len(selected) == 0 {
+		return true
+	}
+	for _, port := range httpsPorts {
+		if selected[port] {
+			return true
+		}
+	}
+	return false
+}
+
+func recordWindowsProbeExit(s *Store, targetID string, dataDrained, hooksRemoved, scriptUnloaded, transportDetached bool) {
+	runtimeState := "clean_detach"
+	if !hooksRemoved {
+		runtimeState = "hooks_not_restored"
+		s.gap("windows-probe", targetID, "hooks_not_restored", "shutdowns", 1)
+	} else if !scriptUnloaded || !transportDetached {
+		runtimeState = "hooks_removed_runtime_lingering"
+		s.gap("windows-probe", targetID, "runtime_unload_incomplete", "shutdowns", 1)
+	}
+	s.recordProbeExit(targetID, session.ProbeExit{
+		HookBased:         true,
+		DataDrained:       dataDrained,
+		HooksRemoved:      hooksRemoved,
+		ScriptUnloaded:    scriptUnloaded,
+		TransportDetached: transportDetached,
+		RuntimeState:      runtimeState,
+	})
 }

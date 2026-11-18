@@ -234,11 +234,18 @@ func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly
 	s = fresh
 	result := tuiSnapshot{Page: page}
 	result.Stats, result.StatusWarning = readTUIStatus(s.dir)
+	var reconstructed *Stats
 	if s.analysis != nil {
 		result.Stats.Alerts = s.analysis.Alerts
 		if s.analysis.Reconstructed {
 			result.Stats.Transactions = s.analysis.Transactions
 		}
+		reconstructed = s.analysis.Reconstruction
+	}
+	if statusInfo, statErr := os.Stat(filepath.Join(s.dir, "status.json")); statErr == nil {
+		result.Stats.IntegrityWarnings = session.ComputeIntegrityWarnings(result.Stats, reconstructed, statusInfo.ModTime().UTC())
+	} else if len(result.Stats.IntegrityWarnings) > 0 {
+		result.Stats.IntegrityWarnings = session.ComputeIntegrityWarnings(result.Stats, reconstructed, time.Time{})
 	}
 	if s.analysisNote != "" {
 		if result.StatusWarning != "" {

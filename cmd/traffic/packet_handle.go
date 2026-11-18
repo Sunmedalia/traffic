@@ -9,6 +9,7 @@ import (
 	"github.com/google/gopacket/pcapgo"
 	"io"
 	"os"
+	"time"
 )
 
 type packetHandle interface {
@@ -18,6 +19,10 @@ type packetHandle interface {
 	SetBPFFilter(string) error
 	Stats() (*pcap.Stats, error)
 	Close()
+}
+
+type pollTimestamper interface {
+	LastPollTime() time.Time
 }
 type offlinePacketHandle struct {
 	file *os.File

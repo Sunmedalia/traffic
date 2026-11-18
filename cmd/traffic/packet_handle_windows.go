@@ -4,22 +4,44 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unsafe"
+
 	"github.com/Sunmedalia/traffic/internal/session"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"golang.org/x/sys/windows"
-	"net"
-	"path/filepath"
-	"sort"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
-	"unsafe"
+)
+
+const (
+	winDivertPacketBufferBytes = 512 << 10
+	winDivertBatchChannelCap   = 256
+	winDivertParamQueueLength  = 0
+	winDivertParamQueueTime    = 1
+	winDivertParamQueueSize    = 2
+	winDivertQueueLengthValue  = 16384
+	winDivertQueueTimeMsValue  = 8000
+	winDivertQueueSizeBytes    = 32 << 20
+)
+
+var (
+	kernel32DLL       = windows.NewLazySystemDLL("kernel32.dll")
+	procQueryPerfFreq = kernel32DLL.NewProc("QueryPerformanceFrequency")
+	procQueryPerfCnt  = kernel32DLL.NewProc("QueryPerformanceCounter")
 )
 
 func winDivertPath() string { return session.BundleFile("deps/windivert/WinDivert.dll", "") }
+
 func listCaptureDevices() ([]pcap.Interface, error) {
 	if winDivertPath() == "" {
 		devices, err := pcap.FindAllDevs()
@@ -46,6 +68,7 @@ func listCaptureDevices() ([]pcap.Interface, error) {
 	}
 	return result, nil
 }
+
 func bundledPacketInterfaces(input string) ([]string, bool, error) {
 	if winDivertPath() == "" {
 		return nil, false, nil
@@ -77,12 +100,39 @@ func bundledPacketInterfaces(input string) ([]string, bool, error) {
 	return result, true, nil
 }
 
+func sampleQPCAnchor() (anchorUTC time.Time, anchorTicks int64, freq int64) {
+	anchorUTC = time.Now().UTC()
+	var f, c int64
+	okF, _, _ := procQueryPerfFreq.Call(uintptr(unsafe.Pointer(&f)))
+	okC, _, _ := procQueryPerfCnt.Call(uintptr(unsafe.Pointer(&c)))
+	if okF != 0 && okC != 0 && f > 0 && c > 0 {
+		return anchorUTC, c, f
+	}
+	return anchorUTC, 0, 0
+}
+
 type winDivertPacketHandle struct {
-	handle                windows.Handle
-	recv, shutdown, close *windows.Proc
-	once                  sync.Once
-	done                  chan struct{}
-	buffer                []byte
+	handle                  windows.Handle
+	event                   windows.Handle
+	recvEx, shutdown, close *windows.Proc
+	overlapped              windows.Overlapped
+	buf                     []byte
+	addrBuf                 []byte
+	recvLen                 uint32
+	addrLen                 uint32
+	snaplen                 int
+	anchorUTC               time.Time
+	anchorTicks             int64
+	qpcFreq                 int64
+	batches                 chan []winDivertBatchPacket
+	current                 []winDivertBatchPacket
+	errCh                   chan error
+	stopCh                  chan struct{}
+	pumpDone                chan struct{}
+	closing                 atomic.Bool
+	lastPollNano            atomic.Int64
+	stopOnce                sync.Once
+	closeOnce               sync.Once
 }
 
 func openLivePacket(ctx context.Context, iface string) (packetHandle, error) {
@@ -107,11 +157,12 @@ func openLivePacket(ctx context.Context, iface string) (packetHandle, error) {
 		dll.Release()
 		return nil, err
 	}
-	recv, err := dll.FindProc("WinDivertRecv")
+	recvEx, err := dll.FindProc("WinDivertRecvEx")
 	if err != nil {
 		dll.Release()
 		return nil, err
 	}
+	setParam, _ := dll.FindProc("WinDivertSetParam")
 	shutdown, err := dll.FindProc("WinDivertShutdown")
 	if err != nil {
 		dll.Release()
@@ -154,38 +205,243 @@ func openLivePacket(ctx context.Context, iface string) (packetHandle, error) {
 		dll.Release()
 		return nil, fmt.Errorf("启动随包 WinDivert 驱动失败: %w（检查管理员权限及系统驱动策略）", callErr)
 	}
-	result := &winDivertPacketHandle{handle: windows.Handle(value), recv: recv, shutdown: shutdown, close: closeProc, done: make(chan struct{}), buffer: make([]byte, captureSnapshotLength())}
+	handle := windows.Handle(value)
+	if setParam != nil {
+		_, _, _ = setParam.Call(uintptr(handle), winDivertParamQueueLength, winDivertQueueLengthValue)
+		_, _, _ = setParam.Call(uintptr(handle), winDivertParamQueueTime, winDivertQueueTimeMsValue)
+		_, _, _ = setParam.Call(uintptr(handle), winDivertParamQueueSize, winDivertQueueSizeBytes)
+	}
+	event, err := windows.CreateEvent(nil, 1, 0, nil)
+	if err != nil {
+		shutdown.Call(uintptr(handle), 1)
+		closeProc.Call(uintptr(handle))
+		return nil, fmt.Errorf("创建 WinDivert 事件句柄失败: %w", err)
+	}
+	anchorUTC, anchorTicks, qpcFreq := sampleQPCAnchor()
+	result := &winDivertPacketHandle{
+		handle:      handle,
+		event:       event,
+		recvEx:      recvEx,
+		shutdown:    shutdown,
+		close:       closeProc,
+		buf:         make([]byte, winDivertPacketBufferBytes),
+		addrBuf:     make([]byte, winDivertBatchMax*winDivertAddrSize),
+		snaplen:     int(captureSnapshotLength()),
+		anchorUTC:   anchorUTC,
+		anchorTicks: anchorTicks,
+		qpcFreq:     qpcFreq,
+		batches:     make(chan []winDivertBatchPacket, winDivertBatchChannelCap),
+		errCh:       make(chan error, 1),
+		stopCh:      make(chan struct{}),
+		pumpDone:    make(chan struct{}),
+	}
+	result.lastPollNano.Store(anchorUTC.UnixNano())
+	go result.pump()
 	go func() {
 		select {
 		case <-ctx.Done():
-			shutdown.Call(uintptr(result.handle), 1)
-		case <-result.done:
+			result.requestStop()
+		case <-result.pumpDone:
 		}
 	}()
 	// Keep this DLL loaded for process lifetime: cancellation may still be
-	// unwinding a synchronous receive when Close releases the driver handle.
+	// unwinding an overlapped receive if the kernel driver takes time to complete.
 	return result, nil
 }
-func (h *winDivertPacketHandle) ReadPacketData() ([]byte, gopacket.CaptureInfo, error) {
-	var received uint32
-	var address [80]byte
-	ok, _, err := h.recv.Call(uintptr(h.handle), uintptr(unsafe.Pointer(&h.buffer[0])), uintptr(len(h.buffer)), uintptr(unsafe.Pointer(&received)), uintptr(unsafe.Pointer(&address[0])))
-	if ok == 0 {
-		return nil, gopacket.CaptureInfo{}, err
-	}
-	if received > uint32(len(h.buffer)) {
-		return nil, gopacket.CaptureInfo{}, errors.New("invalid WinDivert packet length")
-	}
-	// Ownership must survive the next receive and asynchronous TCP assembly.
-	data := append([]byte(nil), h.buffer[:received]...)
-	return data, gopacket.CaptureInfo{Timestamp: time.Now().UTC(), CaptureLength: len(data), Length: len(data)}, nil
+
+func (h *winDivertPacketHandle) toUTC(ticks int64) time.Time {
+	return qpcTicksToUTC(ticks, h.anchorTicks, h.qpcFreq, h.anchorUTC)
 }
+
+func (h *winDivertPacketHandle) recordErr(err error) {
+	if err == nil {
+		return
+	}
+	select {
+	case h.errCh <- err:
+	default:
+	}
+}
+
+func (h *winDivertPacketHandle) requestStop() {
+	h.stopOnce.Do(func() {
+		h.closing.Store(true)
+		close(h.stopCh)
+		// WINDIVERT_SHUTDOWN_RECV=1 stops queueing new packets and wakes empty receives with ERROR_NO_DATA.
+		h.shutdown.Call(uintptr(h.handle), 1)
+	})
+}
+
+func (h *winDivertPacketHandle) pump() {
+	runtime.LockOSThread()
+	abandonedIRP := false
+	defer func() {
+		close(h.batches)
+		if !abandonedIRP {
+			_ = windows.CloseHandle(h.event)
+			h.close.Call(uintptr(h.handle))
+			runtime.UnlockOSThread()
+		}
+		close(h.pumpDone)
+	}()
+
+	for {
+		h.lastPollNano.Store(time.Now().UTC().UnixNano())
+		_ = windows.ResetEvent(h.event)
+		h.overlapped = windows.Overlapped{HEvent: h.event}
+		h.recvLen = 0
+		h.addrLen = uint32(len(h.addrBuf))
+
+		ok, _, callErr := h.recvEx.Call(
+			uintptr(h.handle),
+			uintptr(unsafe.Pointer(&h.buf[0])),
+			uintptr(len(h.buf)),
+			uintptr(unsafe.Pointer(&h.recvLen)),
+			0,
+			uintptr(unsafe.Pointer(&h.addrBuf[0])),
+			uintptr(unsafe.Pointer(&h.addrLen)),
+			uintptr(unsafe.Pointer(&h.overlapped)),
+		)
+		h.lastPollNano.Store(time.Now().UTC().UnixNano())
+
+		var recvErr error
+		if ok != 0 {
+			if h.recvLen == 0 {
+				_ = windows.GetOverlappedResult(h.handle, &h.overlapped, &h.recvLen, false)
+			}
+		} else if errors.Is(callErr, windows.ERROR_IO_PENDING) {
+			for {
+				ev, waitErr := windows.WaitForSingleObject(h.event, 100)
+				h.lastPollNano.Store(time.Now().UTC().UnixNano())
+				if ev == windows.WAIT_OBJECT_0 {
+					recvErr = windows.GetOverlappedResult(h.handle, &h.overlapped, &h.recvLen, false)
+					break
+				}
+				if ev == uint32(windows.WAIT_TIMEOUT) {
+					if h.closing.Load() {
+						_ = windows.CancelIoEx(h.handle, &h.overlapped)
+						ev2, _ := windows.WaitForSingleObject(h.event, 2000)
+						if ev2 != windows.WAIT_OBJECT_0 {
+							abandonedIRP = true
+							return
+						}
+						recvErr = windows.GetOverlappedResult(h.handle, &h.overlapped, &h.recvLen, false)
+						break
+					}
+					continue
+				}
+				_ = windows.CancelIoEx(h.handle, &h.overlapped)
+				ev2, _ := windows.WaitForSingleObject(h.event, 2000)
+				if ev2 != windows.WAIT_OBJECT_0 {
+					abandonedIRP = true
+					h.recordErr(waitErr)
+					return
+				}
+				_ = windows.GetOverlappedResult(h.handle, &h.overlapped, &h.recvLen, false)
+				recvErr = waitErr
+				break
+			}
+		} else {
+			recvErr = callErr
+		}
+
+		if recvErr != nil {
+			if h.closing.Load() && (errors.Is(recvErr, windows.ERROR_NO_DATA) || errors.Is(recvErr, windows.ERROR_OPERATION_ABORTED) || errors.Is(recvErr, windows.ERROR_INVALID_HANDLE)) {
+				return
+			}
+			if errors.Is(recvErr, windows.ERROR_INSUFFICIENT_BUFFER) {
+				marker := []winDivertBatchPacket{{
+					ci: gopacket.CaptureInfo{Timestamp: time.Now().UTC(), CaptureLength: 0, Length: len(h.buf) + 1},
+				}}
+				select {
+				case h.batches <- marker:
+				case <-h.stopCh:
+					return
+				}
+				continue
+			}
+			h.recordErr(recvErr)
+			return
+		}
+
+		pkts, splitErr := splitWinDivertBatch(h.buf, h.recvLen, h.addrBuf, h.addrLen, h.snaplen, h.toUTC)
+		if len(pkts) > 0 {
+			select {
+			case h.batches <- pkts:
+			case <-h.stopCh:
+				return
+			}
+		}
+		if splitErr != nil {
+			h.recordErr(splitErr)
+			return
+		}
+	}
+}
+
+func (h *winDivertPacketHandle) ReadPacketData() ([]byte, gopacket.CaptureInfo, error) {
+	if len(h.current) > 0 {
+		pkt := h.current[0]
+		h.current = h.current[1:]
+		return pkt.data, pkt.ci, nil
+	}
+	select {
+	case batch, ok := <-h.batches:
+		if ok && len(batch) > 0 {
+			pkt := batch[0]
+			h.current = batch[1:]
+			return pkt.data, pkt.ci, nil
+		}
+	default:
+	}
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case batch, ok := <-h.batches:
+		if !ok {
+			select {
+			case err := <-h.errCh:
+				return nil, gopacket.CaptureInfo{}, err
+			default:
+				if h.closing.Load() {
+					return nil, gopacket.CaptureInfo{}, io.EOF
+				}
+				return nil, gopacket.CaptureInfo{}, errors.New("WinDivert packet stream ended unexpectedly")
+			}
+		}
+		if len(batch) == 0 {
+			return nil, gopacket.CaptureInfo{}, pcap.NextErrorTimeoutExpired
+		}
+		pkt := batch[0]
+		h.current = batch[1:]
+		return pkt.data, pkt.ci, nil
+	case <-timer.C:
+		return nil, gopacket.CaptureInfo{}, pcap.NextErrorTimeoutExpired
+	}
+}
+
+func (h *winDivertPacketHandle) LastPollTime() time.Time {
+	ns := h.lastPollNano.Load()
+	if ns <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns).UTC()
+}
+
 func (h *winDivertPacketHandle) LinkType() layers.LinkType { return layers.LinkTypeRaw }
-func (h *winDivertPacketHandle) SnapLen() int              { return int(captureSnapshotLength()) }
+func (h *winDivertPacketHandle) SnapLen() int              { return h.snaplen }
 func (h *winDivertPacketHandle) SetBPFFilter(string) error { return nil }
 func (h *winDivertPacketHandle) Stats() (*pcap.Stats, error) {
 	return nil, fmt.Errorf("WinDivert does not expose per-handle queue-drop counters")
 }
 func (h *winDivertPacketHandle) Close() {
-	h.once.Do(func() { close(h.done); h.shutdown.Call(uintptr(h.handle), 1); h.close.Call(uintptr(h.handle)) })
+	h.closeOnce.Do(func() {
+		h.requestStop()
+		timer := time.NewTimer(2500 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-h.pumpDone:
+		case <-timer.C:
+		}
+	})
 }

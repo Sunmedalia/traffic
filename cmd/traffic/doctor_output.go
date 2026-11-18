@@ -142,6 +142,8 @@ func writeDoctorReport(w io.Writer, report map[string]any, ports string) error {
 			status := "不可用"
 			if check.Status == "candidate" {
 				status = "待附加验证"
+			} else if check.Status == "http-only" {
+				status = "仅 HTTP（无需探针）"
 			} else if check.Status != "unavailable" {
 				status = doctorSafe(check.Status)
 			}
@@ -193,12 +195,13 @@ func doctorBackend(value string) string {
 
 func doctorReason(value string) string {
 	translated := map[string]string{
-		"probe is not explicitly enabled":             "未配置该目标的明文探针",
-		"probe helper files are not readable":         "探针脚本缺失或不可读",
-		"Python executable is unavailable":            "Python 解释器不可用",
-		"probe runtime directory is unavailable":      "探针临时运行目录不可用",
-		"cannot import Frida using configured Python": "配置的 Python 无法导入 Frida",
-		"Frida version differs from validated 17.5.1": "Frida 版本与已验证的 17.5.1 不一致",
+		"probe is not explicitly enabled": "未配置该目标的明文探针",
+		"selected --ports contain no IIS HTTPS bindings; HTTP packet capture covers plain HTTP without Frida": "所选 --ports 未包含 IIS HTTPS 绑定端口；纯 HTTP 由网卡抓包直接还原，无需附加 Frida 探针",
+		"probe helper files are not readable":                                                              "探针脚本缺失或不可读",
+		"Python executable is unavailable":                                                                 "Python 解释器不可用",
+		"probe runtime directory is unavailable":                                                           "探针临时运行目录不可用",
+		"cannot import Frida using configured Python":                                                      "配置的 Python 无法导入 Frida",
+		"Frida version differs from validated 17.5.1":                                                      "Frida 版本与已验证的 17.5.1 不一致",
 		"Frida dependency checked; attach permissions, target ABI and runtime access require verification": "Frida 依赖检查通过；附加权限、目标 ABI 和临时目录访问仍需验证",
 		"Java attachment requires explicit opt-in":                                                         "Java 目标需要显式使用 --java-attach",
 		"Java agent archive is not readable":                                                               "Java Agent JAR 缺失或不可读",

@@ -214,12 +214,26 @@ func replayEvents(ctx context.Context, dir string, s *Store, p *HTTPProcessor) e
 			if event.IIS == nil || source.iis == nil {
 				return errors.New("invalid IIS raw event")
 			}
+			if !event.Time.IsZero() && (event.IIS.Type == "request" || event.IIS.Type == "response") {
+				s.mu.Lock()
+				if event.Time.UTC().After(s.stats.LastTLSEventAt) {
+					s.stats.LastTLSEventAt = event.Time.UTC()
+				}
+				s.mu.Unlock()
+			}
 			if err = source.iis.ingest(*event.IIS); err != nil {
 				return err
 			}
 		case "data":
 			if event.Direction != "read" && event.Direction != "write" {
 				return errors.New("invalid raw event direction")
+			}
+			if !event.Time.IsZero() {
+				s.mu.Lock()
+				if event.Time.UTC().After(s.stats.LastTLSEventAt) {
+					s.stats.LastTLSEventAt = event.Time.UTC()
+				}
+				s.mu.Unlock()
 			}
 			source.frames.expire(event.Time, false, p, "")
 			source.frames.ingest(key+event.Direction, event.Data, frameContext{first: event.Time, updated: event.Time, connection: key, client: event.Client, local: event.Local, backend: replayBackend(source.backend), service: source.target.Service, pid: source.target.PID, targetID: source.target.ID, incomplete: event.Incomplete || source.uncertain}, false, p)

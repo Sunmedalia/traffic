@@ -114,8 +114,8 @@ func TestPacketWriterPersistsInOrderOffCaptureLoop(t *testing.T) {
 	w := newPacketWriter(s, "lo", ring)
 	for i := 0; i < 100; i++ {
 		data := []byte{byte(i), 1, 2, 3}
-		if err := w.write(gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: len(data), Length: len(data)}, data); err != nil {
-			t.Fatal(err)
+		if accepted, err := w.write(gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: len(data), Length: len(data)}, data); err != nil || !accepted {
+			t.Fatalf("accepted=%v err=%v", accepted, err)
 		}
 	}
 	if err := w.close(); err != nil {
@@ -156,7 +156,7 @@ func TestPacketWriterShedsWithExplicitGapWhenQueueFull(t *testing.T) {
 	data := make([]byte, 64)
 	info := gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: len(data), Length: len(data)}
 	for i := 0; i < 5; i++ {
-		if err := w.write(info, data); err != nil {
+		if _, err := w.write(info, data); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -164,8 +164,8 @@ func TestPacketWriterShedsWithExplicitGapWhenQueueFull(t *testing.T) {
 		t.Fatal("queue overflow was not counted", w.dropped.Load())
 	}
 	w.pending.Store(packetWriteQueueBytes)
-	if err := w.write(info, data); err != nil || w.dropped.Load() != 4 {
-		t.Fatal("byte budget was not enforced", w.dropped.Load())
+	if accepted, err := w.write(info, data); err != nil || accepted || w.dropped.Load() != 4 {
+		t.Fatal("byte budget was not enforced", accepted, w.dropped.Load())
 	}
 	w.pending.Store(int64(2 * len(data)))
 	go w.run()
@@ -182,7 +182,7 @@ func TestPacketWriterReportsWriteFailure(t *testing.T) {
 	ring := &packetRing{dir: filepath.Join(t.TempDir(), "missing"), iface: "eth0", link: layers.LinkTypeEthernet, snaplen: uint32(captureSnapshotLength())}
 	w := newPacketWriter(s, "eth0", ring)
 	data := []byte("x")
-	_ = w.write(gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: 1, Length: 1}, data)
+	_, _ = w.write(gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: 1, Length: 1}, data)
 	deadline := time.Now().Add(time.Second)
 	for w.failure() == nil && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -190,7 +190,7 @@ func TestPacketWriterReportsWriteFailure(t *testing.T) {
 	if w.failure() == nil {
 		t.Fatal("write failure not surfaced to the capture loop")
 	}
-	if err := w.write(gopacket.CaptureInfo{}, data); err == nil {
+	if _, err := w.write(gopacket.CaptureInfo{}, data); err == nil {
 		t.Fatal("write accepted after failure")
 	}
 	if err := w.close(); err == nil {
