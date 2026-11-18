@@ -1,0 +1,951 @@
+diff --git a/cli/cmd/root.go b/cli/cmd/root.go
+index 7bab780..db68880 100644
+--- a/cli/cmd/root.go
++++ b/cli/cmd/root.go
+@@ -317,6 +317,26 @@ func (g *probeGeneration) close() error {
+ 	return errors.Join(shutdownErrors...)
+ }
+ 
++func (g *probeGeneration) lostSamples() uint64 {
++	if g == nil || g.probe == nil {
++		return 0
++	}
++	if p, ok := g.probe.(interface{ LostSamples() uint64 }); ok {
++		return p.LostSamples()
++	}
++	return 0
++}
++
++func (g *probeGeneration) drainedCleanly() bool {
++	if g == nil || g.probe == nil {
++		return true
++	}
++	if p, ok := g.probe.(interface{ DrainedCleanly() bool }); ok {
++		return p.DrainedCleanly()
++	}
++	return true
++}
++
+ func prepareReloadConfig(
+ 	current domain.Configuration,
+ 	update *http.ConfigUpdate,
+@@ -462,6 +482,17 @@ func runProbe(probeType factory.ProbeType, probeConfig domain.Configuration) (ru
+ 				logger.Warn().Msg("reload stopper channel closed.")
+ 			}
+ 			runErr = active.close()
++			if runErr == nil && active.drainedCleanly() && eqServer != nil {
++				drainCtx, cancelDrain := context.WithTimeout(ctx, 15*time.Second)
++				msg := fmt.Sprintf("traffic-control-v1:drained:seq=%d,dropped=%d,perf_lost=%d",
++					eqServer.LastSequence(), eqServer.DroppedMessages(), active.lostSamples())
++				if err := eqServer.PublishLog(drainCtx, domain.OperationalLogRecord{Message: msg}); err != nil {
++					logger.Warn().Err(err).Msg("failed to publish drain control record")
++				} else if err := eqServer.Drain(drainCtx); err != nil {
++					logger.Warn().Err(err).Msg("ecaptureq client drain incomplete before timeout")
++				}
++				cancelDrain()
++			}
+ 			logger.Info().Msg("bye bye.")
+ 			return runErr
+ 		case update, ok := <-reloadConfig:
+diff --git a/docs/agent/output-pipeline.md b/docs/agent/output-pipeline.md
+index 3a25fcc..0f46956 100644
+--- a/docs/agent/output-pipeline.md
++++ b/docs/agent/output-pipeline.md
+@@ -146,7 +146,9 @@ their raw payloads; normal text destinations retain existing formatting.
+ The eCaptureQ client queue holds at most 16384 messages or 8 MiB, with a
+ 32 MiB aggregate client queue budget per server. Consumption releases byte
+ reservations; queue exhaustion closes that client and releases its unsent tail.
+-Normal stop still does not provide a final-event acknowledgement to clients.
++On normal stop, probes detach kernel hooks, drain queued perf/reorder records,
++publish `traffic-control-v1:drained:seq=...,dropped=...,perf_lost=...`, and
++flush connected eCaptureQ client queues before closing sockets.
+ 
+ ## Bundled OpenSSL payload ownership
+ 
+diff --git a/internal/probe/base/base_probe.go b/internal/probe/base/base_probe.go
+index 76daae4..9ddc6eb 100644
+--- a/internal/probe/base/base_probe.go
++++ b/internal/probe/base/base_probe.go
+@@ -42,6 +42,8 @@ import (
+ const (
+ 	TcFuncNameIngress = "ingress_cls_func"
+ 	TcFuncNameEgress  = "egress_cls_func"
++	perfDrainBudget        = 5 * time.Second
++	idleReaderPollInterval = 50 * time.Millisecond
+ )
+ 
+ // BaseProbe provides common functionality for all probes.
+@@ -54,9 +56,12 @@ type BaseProbe struct {
+ 	dispatcher   domain.EventDispatcher
+ 	selector     *bytecode.Selector
+ 	newSelector  func(requestedMode, assetMode uint8) *bytecode.Selector
+-	isRunning    atomic.Bool
+-	readers      []io.Closer
+-	readerLoopsW sync.WaitGroup // perf/ringbuf read goroutines; see GoReaderLoop
++	isRunning       atomic.Bool
++	draining        atomic.Bool
++	drainIncomplete atomic.Bool
++	lostSamples     atomic.Uint64
++	readers         []io.Closer
++	readerLoopsW    sync.WaitGroup // perf/ringbuf read goroutines; see GoReaderLoop
+ }
+ 
+ // NewBaseProbe creates a new BaseProbe instance.
+@@ -221,30 +226,78 @@ func (p *BaseProbe) SelectBytecode(baseName string) (string, error) {
+ 	return p.selector.Select(baseName)
+ }
+ 
+-// Close releases all resources.
+-func (p *BaseProbe) Close() error {
+-	p.isRunning.Store(false)
+-	var closeErrors []error
++type deadlineReader interface {
++	SetDeadline(time.Time)
++}
+ 
+-	// Close all readers in reverse order
+-	for i := len(p.readers) - 1; i >= 0; i-- {
+-		if err := p.readers[i].Close(); err != nil {
++// cilium/ebpf perf and ringbuf readers hold their internal mutex inside ReadInto
++// while waiting on epoll, so SetDeadline must only be called by the reader loop
++// goroutine itself between Read calls. Close() remains safe to call concurrently
++// if the drain budget expires.
++func drainDeadlineReaders(readers []io.Closer, wait func(), budget time.Duration) (bool, []error) {
++	var closeErrors []error
++	hasDeadline := false
++	for i := len(readers) - 1; i >= 0; i-- {
++		if readers[i] == nil {
++			continue
++		}
++		if _, ok := readers[i].(deadlineReader); ok {
++			hasDeadline = true
++			continue
++		}
++		if err := readers[i].Close(); err != nil {
+ 			closeErrors = append(closeErrors, err)
+-			if p.logger != nil {
+-				p.logger.Warn().
+-					Err(err).
+-					Int("reader_index", i).
+-					Msg("Failed to close reader")
+-			}
++		}
++		readers[i] = nil
++	}
++	drained := true
++	if hasDeadline {
++		done := make(chan struct{})
++		go func() {
++			wait()
++			close(done)
++		}()
++		timer := time.NewTimer(budget)
++		select {
++		case <-done:
++			timer.Stop()
++		case <-timer.C:
++			drained = false
+ 		}
+ 	}
++	for i := len(readers) - 1; i >= 0; i-- {
++		if readers[i] == nil {
++			continue
++		}
++		if err := readers[i].Close(); err != nil {
++			closeErrors = append(closeErrors, err)
++		}
++	}
++	wait()
++	return drained, closeErrors
++}
+ 
++// Close drains buffered reader records, flushes reorder windows, and releases resources.
++func (p *BaseProbe) Close() error {
++	p.isRunning.Store(false)
++	p.draining.Store(true)
++	drained, closeErrors := drainDeadlineReaders(p.readers, p.readerLoopsW.Wait, perfDrainBudget)
++	if !drained {
++		p.drainIncomplete.Store(true)
++		if p.logger != nil {
++			p.logger.Warn().Msg("Perf/ringbuf reader drain exceeded budget; closing readers")
++		}
++	}
++	for i, err := range closeErrors {
++		if p.logger != nil {
++			p.logger.Warn().
++				Err(err).
++				Int("error_index", i).
++				Msg("Failed to close reader")
++		}
++	}
+ 	p.readers = nil
+ 
+-	// Reader Close() unblocks rd.Read(); read loops may still run deferred work
+-	// (e.g. userland perf reorder flush) that calls Dispatch. Wait before closing dispatcher.
+-	p.readerLoopsW.Wait()
+-
+ 	if p.dispatcher != nil {
+ 		err := p.dispatcher.Close()
+ 		if err != nil {
+@@ -260,6 +313,16 @@ func (p *BaseProbe) Close() error {
+ 	return stderrors.Join(closeErrors...)
+ }
+ 
++// LostSamples returns the total number of kernel perf samples reported lost.
++func (p *BaseProbe) LostSamples() uint64 {
++	return p.lostSamples.Load()
++}
++
++// DrainedCleanly reports whether reader drain completed without hitting the drain timeout.
++func (p *BaseProbe) DrainedCleanly() bool {
++	return !p.drainIncomplete.Load()
++}
++
+ // Name returns the probe's identifier.
+ func (p *BaseProbe) Name() string {
+ 	return p.name
+@@ -385,18 +448,35 @@ func (p *BaseProbe) TrackReader(c io.Closer) {
+ 	p.readers = append(p.readers, c)
+ }
+ 
++func (p *BaseProbe) shouldDrainReader() bool {
++	return p.draining.Load() || (p.ctx != nil && p.ctx.Err() != nil)
++}
++
+ // perfEventLoop reads events from a perf buffer.
+ func (p *BaseProbe) perfEventLoop(rd *perf.Reader, em *ebpf.Map, decoder domain.EventDecoder) {
++	var drainStop time.Time
+ 	for {
+-		select {
+-		case <-p.ctx.Done():
+-			p.logger.Debug().Msg("Perf event reader stopping")
+-			return
+-		default:
++		if p.shouldDrainReader() {
++			if drainStop.IsZero() {
++				drainStop = time.Now().Add(perfDrainBudget)
++			}
++			if !time.Now().Before(drainStop) {
++				p.drainIncomplete.Store(true)
++				return
++			}
++			rd.SetDeadline(time.Unix(0, 1))
++		} else {
++			rd.SetDeadline(time.Now().Add(idleReaderPollInterval))
+ 		}
+ 
+ 		record, err := rd.Read()
+ 		if err != nil {
++			if stderrors.Is(err, os.ErrDeadlineExceeded) {
++				if p.shouldDrainReader() {
++					return
++				}
++				continue
++			}
+ 			if stderrors.Is(err, perf.ErrClosed) {
+ 				return
+ 			}
+@@ -405,6 +485,7 @@ func (p *BaseProbe) perfEventLoop(rd *perf.Reader, em *ebpf.Map, decoder domain.
+ 		}
+ 
+ 		if record.LostSamples != 0 {
++			p.lostSamples.Add(record.LostSamples)
+ 			p.logger.Warn().
+ 				Uint64("lost_samples", record.LostSamples).
+ 				Msg("Perf buffer full, samples lost")
+@@ -465,20 +546,36 @@ func (p *BaseProbe) perfEventLoopOrdered(rd *perf.Reader, em *ebpf.Map, decoder
+ 	}
+ 	defer flush()
+ 
++	var drainStop time.Time
++	lastReadAt := time.Now()
++	pollWait := idleReaderPollInterval
++	if lagWait := time.Duration(lagNs); lagWait > 0 && lagWait < pollWait {
++		pollWait = lagWait
++	}
+ 	for {
+-		select {
+-		case <-p.ctx.Done():
+-			p.logger.Debug().Msg("Perf event reader stopping")
+-			return
+-		default:
++		if p.shouldDrainReader() {
++			if drainStop.IsZero() {
++				drainStop = time.Now().Add(perfDrainBudget)
++			}
++			if !time.Now().Before(drainStop) {
++				p.drainIncomplete.Store(true)
++				return
++			}
++			rd.SetDeadline(time.Unix(0, 1))
++		} else {
++			// Poll frequently enough to observe probe shutdown without cross-goroutine
++			// SetDeadline contention, while flushing idle batches once lagNs elapses.
++			rd.SetDeadline(time.Now().Add(pollWait))
+ 		}
+-
+-		// Flush the final batch while the service is idle, including a lone event.
+-		rd.SetDeadline(time.Now().Add(time.Duration(lagNs)))
+ 		record, err := rd.Read()
+ 		if err != nil {
+ 			if stderrors.Is(err, os.ErrDeadlineExceeded) {
+-				flush()
++				if p.shouldDrainReader() {
++					return
++				}
++				if lagNs == 0 || time.Since(lastReadAt) >= time.Duration(lagNs) {
++					flush()
++				}
+ 				continue
+ 			}
+ 			if stderrors.Is(err, perf.ErrClosed) {
+@@ -487,8 +584,10 @@ func (p *BaseProbe) perfEventLoopOrdered(rd *perf.Reader, em *ebpf.Map, decoder
+ 			p.logger.Warn().Err(err).Msg("Error reading from perf buffer")
+ 			continue
+ 		}
++		lastReadAt = time.Now()
+ 
+ 		if record.LostSamples != 0 {
++			p.lostSamples.Add(record.LostSamples)
+ 			p.logger.Warn().
+ 				Uint64("lost_samples", record.LostSamples).
+ 				Msg("Perf buffer full, samples lost")
+@@ -553,16 +652,29 @@ func (p *BaseProbe) StartRingbufReader(em *ebpf.Map, decoder domain.EventDecoder
+ 
+ // ringbufEventLoop reads events from a ringbuf.
+ func (p *BaseProbe) ringbufEventLoop(rd *ringbuf.Reader, em *ebpf.Map, decoder domain.EventDecoder) {
++	var drainStop time.Time
+ 	for {
+-		select {
+-		case <-p.ctx.Done():
+-			p.logger.Debug().Msg("Ringbuf reader stopping")
+-			return
+-		default:
++		if p.shouldDrainReader() {
++			if drainStop.IsZero() {
++				drainStop = time.Now().Add(perfDrainBudget)
++			}
++			if !time.Now().Before(drainStop) {
++				p.drainIncomplete.Store(true)
++				return
++			}
++			rd.SetDeadline(time.Unix(0, 1))
++		} else {
++			rd.SetDeadline(time.Now().Add(idleReaderPollInterval))
+ 		}
+ 
+ 		record, err := rd.Read()
+ 		if err != nil {
++			if stderrors.Is(err, os.ErrDeadlineExceeded) {
++				if p.shouldDrainReader() {
++					return
++				}
++				continue
++			}
+ 			if stderrors.Is(err, ringbuf.ErrClosed) {
+ 				return
+ 			}
+diff --git a/internal/probe/base/traffic_drain_test.go b/internal/probe/base/traffic_drain_test.go
+new file mode 100644
+index 0000000..5689775
+--- /dev/null
++++ b/internal/probe/base/traffic_drain_test.go
+@@ -0,0 +1,136 @@
++package base
++
++import (
++	"io"
++	"os"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// fakeDeadlineReader mirrors cilium/ebpf perf.Reader and ringbuf.Reader locking:
++// Read holds mu while waiting for either deadline expiry or Close(), and
++// SetDeadline also acquires mu (so calling SetDeadline from another goroutine
++// while Read is blocked would deadlock).
++type fakeDeadlineReader struct {
++	mu                sync.Mutex
++	deadline          time.Time
++	items             int
++	closedCh          chan struct{}
++	closeOnce         sync.Once
++	closedBeforeDrain atomic.Bool
++	drained           atomic.Bool
++}
++
++func newFakeDeadlineReader(items int) *fakeDeadlineReader {
++	return &fakeDeadlineReader{
++		items:    items,
++		closedCh: make(chan struct{}),
++	}
++}
++
++func (r *fakeDeadlineReader) SetDeadline(t time.Time) {
++	r.mu.Lock()
++	r.deadline = t
++	r.mu.Unlock()
++}
++
++func (r *fakeDeadlineReader) Read() (bool, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if r.items > 0 {
++		r.items--
++		return true, nil
++	}
++	if r.deadline.IsZero() {
++		<-r.closedCh
++		return false, io.EOF
++	}
++	wait := time.Until(r.deadline)
++	if wait <= 0 {
++		return false, os.ErrDeadlineExceeded
++	}
++	timer := time.NewTimer(wait)
++	defer timer.Stop()
++	select {
++	case <-r.closedCh:
++		return false, io.EOF
++	case <-timer.C:
++		return false, os.ErrDeadlineExceeded
++	}
++}
++
++func (r *fakeDeadlineReader) Close() error {
++	r.closeOnce.Do(func() {
++		if !r.drained.Load() {
++			r.closedBeforeDrain.Store(true)
++		}
++		close(r.closedCh)
++	})
++	return nil
++}
++
++func TestDrainDeadlineReadersWaitsForBufferedItemsWithoutCrossGoroutineSetDeadline(t *testing.T) {
++	reader := newFakeDeadlineReader(5)
++	var draining atomic.Bool
++	var wg sync.WaitGroup
++	wg.Add(1)
++	var dispatched atomic.Int32
++	enteredIdleWait := make(chan struct{}, 1)
++	go func() {
++		defer wg.Done()
++		for {
++			if draining.Load() {
++				reader.SetDeadline(time.Unix(0, 1))
++			} else {
++				reader.SetDeadline(time.Now().Add(25 * time.Millisecond))
++			}
++			if reader.items == 0 && !draining.Load() {
++				select {
++				case enteredIdleWait <- struct{}{}:
++				default:
++				}
++			}
++			ok, err := reader.Read()
++			if err != nil {
++				if err == os.ErrDeadlineExceeded {
++					if draining.Load() {
++						reader.drained.Store(true)
++						return
++					}
++					continue
++				}
++				return
++			}
++			if ok {
++				dispatched.Add(1)
++			}
++		}
++	}()
++
++	<-enteredIdleWait
++	draining.Store(true)
++	drained, errs := drainDeadlineReaders([]io.Closer{reader}, wg.Wait, time.Second)
++	if !drained || len(errs) != 0 {
++		t.Fatalf("drained=%v errs=%v", drained, errs)
++	}
++	if dispatched.Load() != 5 || reader.closedBeforeDrain.Load() {
++		t.Fatalf("dispatched=%d closedBeforeDrain=%v", dispatched.Load(), reader.closedBeforeDrain.Load())
++	}
++}
++
++func TestDrainDeadlineReadersForcesCloseAfterBudget(t *testing.T) {
++	reader := newFakeDeadlineReader(0)
++	var wg sync.WaitGroup
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		_, _ = reader.Read()
++	}()
++
++	drained, errs := drainDeadlineReaders([]io.Closer{reader}, wg.Wait, 25*time.Millisecond)
++	if drained || len(errs) != 0 {
++		t.Fatalf("expected timeout (drained=false), got drained=%v errs=%v", drained, errs)
++	}
++}
+diff --git a/internal/probe/openssl/openssl_probe.go b/internal/probe/openssl/openssl_probe.go
+index 4c9df08..a90da09 100644
+--- a/internal/probe/openssl/openssl_probe.go
++++ b/internal/probe/openssl/openssl_probe.go
+@@ -208,12 +208,30 @@ func (p *Probe) retrieveEventMaps() error {
+ 	return nil
+ }
+ 
+-// Stop gracefully stops the probe.
++// Stop gracefully stops the probe and detaches eBPF hooks so no new kernel
++// events enter perf buffers while readers drain accepted records.
+ func (p *Probe) Stop(ctx context.Context) error {
+-	// Stop event readers are handled by BaseProbe
++	p.stopBPFManager()
+ 	return p.BaseProbe.Stop(ctx)
+ }
+ 
++func (p *Probe) stopBPFManager() {
++	if p.bpfManager == nil {
++		return
++	}
++	if p.config != nil && p.config.TrafficScopeFile != "" {
++		if m, ok, err := p.bpfManager.GetMap("tr_scope_ctl"); err == nil && ok && m != nil {
++			_ = m.Put(uint32(0), uint32(2))
++		}
++	}
++	p.Logger().Debug().Msg("Stopping eBPF manager")
++	if err := p.bpfManager.Stop(manager.CleanAll); err != nil {
++		p.Logger().Warn().Err(err).Msg("Failed to stop eBPF manager")
++	}
++	p.bpfManager = nil
++	p.Logger().Debug().Msg("eBPF manager stopped")
++}
++
+ // Events returns the eBPF maps for event collection.
+ func (p *Probe) Events() []*ebpf.Map {
+ 	if p.eventMaps == nil {
+@@ -226,19 +244,13 @@ func (p *Probe) Events() []*ebpf.Map {
+ func (p *Probe) Close() error {
+ 	p.Logger().Debug().Msg("Closing OpenSSL probe")
+ 
+-	// Stop eBPF manager
+-	if p.bpfManager != nil {
+-		p.Logger().Debug().Msg("Stopping eBPF manager")
+-		if err := p.bpfManager.Stop(manager.CleanAll); err != nil {
+-			p.Logger().Warn().Err(err).Msg("Failed to stop eBPF manager")
+-		}
+-		p.Logger().Debug().Msg("eBPF manager stopped")
+-	}
++	p.stopBPFManager()
+ 	for _, closer := range p.closer {
+ 		if err := closer.Close(); err != nil {
+ 			p.Logger().Warn().Err(err).Msg("Failed to close resource")
+ 		}
+ 	}
++	p.closer = nil
+ 	p.Logger().Debug().Msg("Calling BaseProbe.Close()")
+ 	err := p.BaseProbe.Close()
+ 	p.Logger().Debug().Msg("OpenSSL probe closed")
+diff --git a/pkg/ecaptureq/client.go b/pkg/ecaptureq/client.go
+index bace2c0..d34c7db 100644
+--- a/pkg/ecaptureq/client.go
++++ b/pkg/ecaptureq/client.go
+@@ -102,11 +102,22 @@ func (c *Client) sendHeartbeat() error {
+ func (c *Client) stop() {
+ 	c.stopOnce.Do(func() {
+ 		c.hub.unregisterClient(c)
+-		_ = c.conn.Close()
++		if c.conn != nil {
++			_ = c.conn.SetDeadline(time.Now().Add(100 * time.Millisecond))
++			_ = c.conn.Close()
++		}
+ 		close(c.done)
+ 	})
+ }
+ 
++func (c *Client) abortConn() {
++	if c.conn == nil {
++		return
++	}
++	_ = c.conn.SetDeadline(time.Unix(0, 1))
++	_ = c.conn.Close()
++}
++
+ func (c *Client) logf(format string, args ...any) {
+ 	if c.logger == nil {
+ 		return
+@@ -120,14 +131,16 @@ func (c *Client) release(message []byte) {
+ 	c.hub.queuedBytes.Add(-n)
+ }
+ 
++func (c *Client) releaseClosedQueue() {
++	for message := range c.send {
++		c.release(message)
++	}
++}
++
+ // Called only by the hub after removing the client. A concurrent writer may
+ // consume messages too; each channel receive releases exactly one reservation.
+ func (c *Client) closeQueue() {
+ 	close(c.send)
+-	for message := range c.send {
+-		c.release(message)
+-	}
+-	if c.conn != nil {
+-		_ = c.conn.Close()
+-	}
++	c.releaseClosedQueue()
++	c.abortConn()
+ }
+diff --git a/pkg/ecaptureq/drain_test.go b/pkg/ecaptureq/drain_test.go
+new file mode 100644
+index 0000000..53ad10e
+--- /dev/null
++++ b/pkg/ecaptureq/drain_test.go
+@@ -0,0 +1,163 @@
++package ecaptureq
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"testing"
++	"time"
++
++	"golang.org/x/net/websocket"
++
++	"github.com/gojue/ecapture/v2/internal/domain"
++	pb "github.com/gojue/ecapture/v2/protobuf/gen/v1"
++)
++
++func TestServerDrainFlushesQueuedEventsAndFinalControlOverWebSocket(t *testing.T) {
++	server := NewServer("127.0.0.1:0", io.Discard)
++	t.Cleanup(func() { _ = server.Close() })
++	errCh, err := server.StartAsync()
++	if err != nil {
++		t.Fatal(err)
++	}
++	server.httpMu.Lock()
++	addr := server.listener.Addr().String()
++	server.httpMu.Unlock()
++
++	ws, err := websocket.Dial("ws://"+addr+"/", "", "http://"+addr)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ws.Close()
++
++	// Receive the initial heartbeat so we know registration completed.
++	var first []byte
++	if err := websocket.Message.Receive(ws, &first); err != nil {
++		t.Fatal(err)
++	}
++	if decodeEntry(t, first).GetLogType() != pb.LogType_LOG_TYPE_HEARTBEAT {
++		t.Fatalf("expected initial heartbeat, got %v", decodeEntry(t, first).GetLogType())
++	}
++
++	const total = 64
++	for seq := uint64(1); seq <= total; seq++ {
++		if err := server.PublishEvent(context.Background(), domain.CapturedEventEnvelope{
++			Format:   domain.CaptureFormatText,
++			Payload:  []byte(fmt.Sprintf("payload-%d", seq)),
++			Sequence: seq,
++		}); err != nil {
++			t.Fatalf("publish %d: %v", seq, err)
++		}
++	}
++	if got := server.LastSequence(); got != total {
++		t.Fatalf("LastSequence() = %d, want %d", got, total)
++	}
++	finalControl := fmt.Sprintf("traffic-control-v1:drained:seq=%d,dropped=%d,perf_lost=0", server.LastSequence(), server.DroppedMessages())
++	if err := server.PublishLog(context.Background(), domain.OperationalLogRecord{Message: finalControl}); err != nil {
++		t.Fatal(err)
++	}
++
++	drainDone := make(chan error, 1)
++	go func() {
++		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++		defer cancel()
++		drainDone <- server.Drain(ctx)
++	}()
++
++	var seenSeq uint64
++	sawDrained := false
++	for {
++		var raw []byte
++		err := websocket.Message.Receive(ws, &raw)
++		if errors.Is(err, io.EOF) {
++			break
++		}
++		if err != nil {
++			t.Fatalf("receive during drain: %v", err)
++		}
++		entry := decodeEntry(t, raw)
++		switch entry.GetLogType() {
++		case pb.LogType_LOG_TYPE_EVENT:
++			if sawDrained {
++				t.Fatal("received event after drained control record")
++			}
++			seenSeq++
++			if entry.GetEventPayload().GetSequence() != seenSeq {
++				t.Fatalf("sequence = %d, want %d", entry.GetEventPayload().GetSequence(), seenSeq)
++			}
++		case pb.LogType_LOG_TYPE_PROCESS_LOG:
++			if entry.GetRunLog() == finalControl {
++				sawDrained = true
++			}
++		}
++	}
++
++	if err := <-drainDone; err != nil {
++		t.Fatalf("Drain() error = %v", err)
++	}
++	if seenSeq != total || !sawDrained {
++		t.Fatalf("seenSeq=%d (want %d) sawDrained=%v", seenSeq, total, sawDrained)
++	}
++	if server.hub.queuedBytes.Load() != 0 {
++		t.Fatalf("queuedBytes = %d, want 0", server.hub.queuedBytes.Load())
++	}
++	if err := server.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if err := <-errCh; err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestServerDrainTimeoutReleasesReservationsOnClose(t *testing.T) {
++	server := NewServer("127.0.0.1:0", io.Discard)
++	errCh, err := server.StartAsync()
++	if err != nil {
++		t.Fatal(err)
++	}
++	server.httpMu.Lock()
++	addr := server.listener.Addr().String()
++	server.httpMu.Unlock()
++
++	ws, err := websocket.Dial("ws://"+addr+"/", "", "http://"+addr)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ws.Close()
++
++	var first []byte
++	if err := websocket.Message.Receive(ws, &first); err != nil {
++		t.Fatal(err)
++	}
++
++	// Fill enough large payloads without reading from ws so writePump blocks in socket write.
++	chunk := make([]byte, 256<<10)
++	for seq := uint64(1); seq <= 24; seq++ {
++		if err := server.PublishEvent(context.Background(), domain.CapturedEventEnvelope{
++			Format:   domain.CaptureFormatText,
++			Payload:  chunk,
++			Sequence: seq,
++		}); err != nil {
++			t.Fatalf("publish %d: %v", seq, err)
++		}
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
++	defer cancel()
++	err = server.Drain(ctx)
++	if !errors.Is(err, context.DeadlineExceeded) {
++		// On machines with very large socket buffers Drain may finish immediately;
++		// either nil or DeadlineExceeded is valid, and Close must always release all bytes.
++		if err != nil {
++			t.Fatalf("unexpected Drain() error: %v", err)
++		}
++	}
++	if err := server.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if server.hub.queuedBytes.Load() != 0 {
++		t.Fatalf("leaked queuedBytes after Close: %d", server.hub.queuedBytes.Load())
++	}
++	<-errCh
++}
+diff --git a/pkg/ecaptureq/hub.go b/pkg/ecaptureq/hub.go
+index f536860..aa068a2 100644
+--- a/pkg/ecaptureq/hub.go
++++ b/pkg/ecaptureq/hub.go
+@@ -42,7 +42,9 @@ type Hub struct {
+ 	broadcast   chan publishRequest
+ 	register    chan registerRequest
+ 	unregister  chan *Client
++	drainCh     chan chan []<-chan struct{}
+ 	clients     map[*Client]struct{}
++	draining    map[*Client]struct{}
+ 	history     [][]byte
+ 	done        chan struct{}
+ 	closeOnce   sync.Once
+@@ -56,7 +58,9 @@ func newHub(ctx context.Context) *Hub {
+ 		broadcast:  make(chan publishRequest, 256),
+ 		register:   make(chan registerRequest, 32),
+ 		unregister: make(chan *Client, 32),
++		drainCh:    make(chan chan []<-chan struct{}, 1),
+ 		clients:    make(map[*Client]struct{}),
++		draining:   make(map[*Client]struct{}),
+ 		history:    make([][]byte, 0, LogBuffLen),
+ 		done:       make(chan struct{}),
+ 	}
+@@ -73,7 +77,25 @@ func (h *Hub) run() {
+ 				delete(h.clients, client)
+ 				client.closeQueue()
+ 			}
++			for client := range h.draining {
++				delete(h.draining, client)
++				client.releaseClosedQueue()
++				client.abortConn()
++			}
+ 			return
++		case reply := <-h.drainCh:
++			waitList := make([]<-chan struct{}, 0, len(h.clients))
++			for client := range h.clients {
++				delete(h.clients, client)
++				if client.conn == nil {
++					client.closeQueue()
++					continue
++				}
++				h.draining[client] = struct{}{}
++				close(client.send)
++				waitList = append(waitList, client.done)
++			}
++			reply <- waitList
+ 		case request := <-h.register:
+ 			var err error
+ 			for _, message := range h.history {
+@@ -95,6 +117,9 @@ func (h *Hub) run() {
+ 			if _, ok := h.clients[client]; ok {
+ 				delete(h.clients, client)
+ 				client.closeQueue()
++			} else if _, ok := h.draining[client]; ok {
++				delete(h.draining, client)
++				client.releaseClosedQueue()
+ 			}
+ 		case request := <-h.broadcast:
+ 			if request.processLog {
+@@ -183,6 +208,25 @@ func (h *Hub) unregisterClient(client *Client) {
+ 	}
+ }
+ 
++func (h *Hub) drain(ctx context.Context) ([]<-chan struct{}, error) {
++	reply := make(chan []<-chan struct{}, 1)
++	select {
++	case h.drainCh <- reply:
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	case <-h.ctx.Done():
++		return nil, context.Canceled
++	}
++	select {
++	case waitList := <-reply:
++		return waitList, nil
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	case <-h.ctx.Done():
++		return nil, context.Canceled
++	}
++}
++
+ func (h *Hub) wait() { <-h.done }
+ 
+ func (h *Hub) droppedCount() uint64 { return h.dropped.Load() }
+diff --git a/pkg/ecaptureq/server.go b/pkg/ecaptureq/server.go
+index b43fe93..8961f98 100644
+--- a/pkg/ecaptureq/server.go
++++ b/pkg/ecaptureq/server.go
+@@ -22,6 +22,7 @@ import (
+ 	"net"
+ 	"net/http"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/gojue/ecapture/v2/internal/domain"
+@@ -34,19 +35,20 @@ import (
+ const LogBuffLen = 128
+ 
+ type Server struct {
+-	addr      string
+-	logger    io.Writer
+-	ctx       context.Context
+-	cancel    context.CancelFunc
+-	hub       *Hub
+-	httpMu    sync.Mutex
+-	http      *http.Server
+-	listener  net.Listener
+-	clientsMu sync.Mutex
+-	closing   bool
+-	closeOnce sync.Once
+-	closeErr  error
+-	wg        sync.WaitGroup
++	addr         string
++	logger       io.Writer
++	ctx          context.Context
++	cancel       context.CancelFunc
++	hub          *Hub
++	httpMu       sync.Mutex
++	http         *http.Server
++	listener     net.Listener
++	clientsMu    sync.Mutex
++	closing      bool
++	closeOnce    sync.Once
++	closeErr     error
++	wg           sync.WaitGroup
++	lastSequence atomic.Uint64
+ }
+ 
+ func NewServer(addr string, logWriter io.Writer) *Server {
+@@ -136,6 +138,7 @@ func (s *Server) handleWebSocket(conn *websocket.Conn) {
+ 	select {
+ 	case <-client.done:
+ 	case <-s.ctx.Done():
++		client.abortConn()
+ 		client.stop()
+ 		<-client.done
+ 	}
+@@ -180,6 +183,10 @@ func (s *Server) PublishEvent(ctx context.Context, event domain.CapturedEventEnv
+ 	if err != nil {
+ 		return fmt.Errorf("marshal captured event: %w", err)
+ 	}
++	if event.Sequence > 0 {
++		for cur := s.lastSequence.Load(); event.Sequence > cur && !s.lastSequence.CompareAndSwap(cur, event.Sequence); cur = s.lastSequence.Load() {
++		}
++	}
+ 	return s.hub.publishOwned(ctx, data, false)
+ }
+ 
+@@ -207,6 +214,31 @@ func (s *Server) Name() string { return "ecaptureq" }
+ 
+ func (s *Server) DroppedMessages() uint64 { return s.hub.droppedCount() }
+ 
++func (s *Server) LastSequence() uint64 { return s.lastSequence.Load() }
++
++// Drain stops accepting new clients, closes active client send queues after
++// already-enqueued messages, and waits until connected clients finish flushing
++// their queues or ctx expires.
++func (s *Server) Drain(ctx context.Context) error {
++	s.clientsMu.Lock()
++	s.closing = true
++	s.clientsMu.Unlock()
++	waitList, err := s.hub.drain(ctx)
++	if err != nil {
++		return err
++	}
++	for _, done := range waitList {
++		select {
++		case <-done:
++		case <-ctx.Done():
++			return ctx.Err()
++		case <-s.ctx.Done():
++			return context.Canceled
++		}
++	}
++	return nil
++}
++
+ func (s *Server) Close() error {
+ 	s.closeOnce.Do(func() {
+ 		s.clientsMu.Lock()

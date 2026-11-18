@@ -161,6 +161,38 @@ int main(void) {
     assert(recv(fd, data, sizeof(data), 0) < 0 &&
            (errno == EAGAIN || errno == EWOULDBLOCK));
 
+    /* Collector read-shutdown stops new datagrams while preserving queued ones,
+     * and resets the sender socket on EPIPE so a later collector can rebind. */
+    assert(send_event("pre", 3));
+    struct timeval poll_timeout = {0, 10000};
+    assert(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &poll_timeout, sizeof(poll_timeout)) == 0);
+    uint64_t wait_queued = monotonic_milliseconds() + 1000;
+    while (queue_length() > 0 && monotonic_milliseconds() < wait_queued)
+        usleep(1000);
+    assert(shutdown(fd, SHUT_RD) == 0);
+    assert(unlink(destination) == 0);
+    expect_message(fd, "pre");
+    assert(recv(fd, data, sizeof(data), 0) == 0);
+    close(fd);
+
+    uint64_t prior_transport_lost = __atomic_load_n(&transport_lost, __ATOMIC_ACQUIRE);
+    assert(send_event("epipe", 5));
+    deadline = monotonic_milliseconds() + 2000;
+    while (__atomic_load_n(&transport_lost, __ATOMIC_ACQUIRE) == prior_transport_lost &&
+           monotonic_milliseconds() < deadline)
+        usleep(1000);
+    assert(__atomic_load_n(&transport_lost, __ATOMIC_ACQUIRE) > prior_transport_lost);
+
+    fd = receiver(destination);
+    assert(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &longer_timeout, sizeof(longer_timeout)) == 0);
+    usleep(1050000); /* wait past the 1s transport retry cooldown */
+    assert(send_event("rec", 3));
+    loss_length = recv(fd, data, sizeof(data) - 1, 0);
+    assert(loss_length > 0);
+    data[loss_length] = 0;
+    assert(strstr(data, "\"type\":\"loss\""));
+    expect_message(fd, "rec");
+
     pthread_mutex_lock(&connection_mutex[0]);
     atomic_store(&stop_deadline, monotonic_milliseconds() + 500);
     __atomic_store_n(&stopping, 1, __ATOMIC_RELEASE);
