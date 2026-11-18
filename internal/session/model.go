@@ -65,6 +65,7 @@ type Alert struct {
 	Decoding int    `json:"decoding"`
 }
 type ProbeExit struct {
+	HookBased         bool   `json:"hook_based,omitempty"`
 	DataDrained       bool   `json:"data_drained"`
 	HooksRemoved      bool   `json:"hooks_removed"`
 	ScriptUnloaded    bool   `json:"script_unloaded"`
@@ -126,6 +127,12 @@ type Stats struct {
 	TLSDropped                  uint64                         `json:"tls_dropped"`
 	QueueDropped                uint64                         `json:"queue_dropped"`
 	Started                     time.Time                      `json:"started"`
+	Stopped                     time.Time                      `json:"stopped,omitempty"`
+	FirstPacketAt               time.Time                      `json:"first_packet_at,omitempty"`
+	LastPacketAt                time.Time                      `json:"last_packet_at,omitempty"`
+	LastPacketPollAt            time.Time                      `json:"last_packet_poll_at,omitempty"`
+	LastTLSEventAt              time.Time                      `json:"last_tls_event_at,omitempty"`
+	IntegrityWarnings           []string                       `json:"integrity_warnings,omitempty"`
 	State                       string                         `json:"state"`
 	Packets                     uint64                         `json:"packets"`
 	Transactions                uint64                         `json:"transactions"`

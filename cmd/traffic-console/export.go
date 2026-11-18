@@ -82,6 +82,13 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 		packetScope = "packet selection unavailable because the transaction lacks both transport endpoints"
 	}
 	note := map[string]any{"schema_version": 1, "source": t.Source, "protocol": t.Protocol, "stream_id": t.StreamID, "integrity_reasons": t.IntegrityReasons, "incomplete": t.Incomplete, "truncated": t.Truncated, "capture_coverage": session.CoverageWarning, "packet_scope": packetScope, "tls_plaintext_source": "process hook; network PCAP remains encrypted"}
+	var reconstructed *Stats
+	if s.analysis != nil {
+		reconstructed = s.analysis.Reconstruction
+	}
+	if warnings := sessionIntegrityWarnings(s.dir, reconstructed); len(warnings) > 0 {
+		note["session_integrity_warnings"] = warnings
+	}
 	var truncatedFiles []string
 	lock, e := os.Open(filepath.Join(s.dir, "capture.lock"))
 	if e != nil {

@@ -598,6 +598,7 @@ function renderHealth() {
   if (s.probe_failures > 0) issues.push(`探针传输失败 ${number(s.probe_failures)} 次，恢复后仍保留。`);
   if (s.tls_dropped > 0) issues.push(`TLS 已知丢弃 ${number(s.tls_dropped)} 个，这是已观测到的下限。`);
   if (s.alert_delivery_failed > 0 || s.alert_delivery_dropped > 0) issues.push(`告警 Webhook 失败 ${number(s.alert_delivery_failed)} 次，队列丢弃 ${number(s.alert_delivery_dropped)} 次。`);
+  for (const warning of s.integrity_warnings || []) issues.push(warning);
   const gaps = gapEntries(s);
   if (gaps.length) issues.push(`记录了 ${gaps.length} 类已知缺口，详见“采集状态”。`);
   const errors = captureErrors(s);
@@ -654,9 +655,13 @@ function renderOverview() {
 
   const session = currentSession();
   const started = parseTime(s.started);
+  const stopped = parseTime(s.stopped);
+  const lastPacket = parseTime(s.last_packet_at);
   const facts = [
     ['状态', stateLabel(s.state)],
     ['开始时间', started ? `${formatTime(started)}（${relativeTime(started)}）` : '未知'],
+    ['停止时间', stopped ? `${formatTime(stopped)}` + (s.stop_reason ? ` · ${s.stop_reason}` : '') : (s.stop_reason || '—')],
+    ['最后收包', lastPacket ? formatTime(lastPacket, 'ms') : '—'],
     ['会话目录', state.dir || (session && session.dir) || '—', true],
     ['TLS 探针', s.tls || '—', true],
     ['TLS 明文请求', number(s.tls_requests)],

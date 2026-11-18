@@ -64,8 +64,13 @@ func (r *eventRecorder) record(source, backend string, target session.Target, ev
 		event.Time = now
 	}
 	err := r.encoder.Encode(event)
-	if err == nil && event.Type == "end" {
-		delete(r.sources, source)
+	if err == nil {
+		if r.store != nil && (event.Type == "data" || (event.Type == "iis" && event.IIS != nil && (event.IIS.Type == "request" || event.IIS.Type == "response"))) {
+			r.store.noteTLSEvent(event.Time)
+		}
+		if event.Type == "end" {
+			delete(r.sources, source)
+		}
 	}
 	return err
 }

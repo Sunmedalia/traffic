@@ -94,7 +94,7 @@ type packetWriter struct {
 }
 
 type packetSink interface {
-	write(gopacket.CaptureInfo, []byte) error
+	write(gopacket.CaptureInfo, []byte) (bool, error)
 	failure() error
 	close() error
 }
@@ -107,7 +107,7 @@ type syncPacketSink struct {
 	rings map[int]*packetRing
 }
 
-func (w *syncPacketSink) write(ci gopacket.CaptureInfo, data []byte) error {
+func (w *syncPacketSink) write(ci gopacket.CaptureInfo, data []byte) (bool, error) {
 	ring := w.rings[ci.InterfaceIndex]
 	if ring == nil {
 		name := "offline"
@@ -117,7 +117,8 @@ func (w *syncPacketSink) write(ci gopacket.CaptureInfo, data []byte) error {
 		ring = &packetRing{dir: w.dir, iface: name, link: w.input.Link, snaplen: w.input.Snap}
 		w.rings[ci.InterfaceIndex] = ring
 	}
-	return ring.write(ci, data)
+	err := ring.write(ci, data)
+	return err == nil, err
 }
 func (w *syncPacketSink) failure() error { return nil }
 func (w *syncPacketSink) close() error {
@@ -140,24 +141,25 @@ func (w *packetWriter) failure() error {
 	return w.err
 }
 
-func (w *packetWriter) write(ci gopacket.CaptureInfo, data []byte) error {
+func (w *packetWriter) write(ci gopacket.CaptureInfo, data []byte) (bool, error) {
 	if err := w.failure(); err != nil {
-		return err
+		return false, err
 	}
 	n := int64(len(data))
 	item := packetWriteItem{ci: ci, data: data}
 	if w.pending.Load()+n > packetWriteQueueBytes {
 		w.dropped.Add(1)
-		return nil
+		return false, nil
 	}
 	w.pending.Add(n)
 	select {
 	case w.queue <- item:
+		return true, nil
 	default:
 		w.pending.Add(-n)
 		w.dropped.Add(1)
+		return false, nil
 	}
-	return nil
 }
 
 // reportDrops publishes shed packets as one aggregated gap per interval so an
@@ -276,15 +278,32 @@ func capturePackets(ctx context.Context, s *Store, p *eventRecorder, iface, filt
 		if err := checkDisk(s); err != nil {
 			return err
 		}
+	} else {
+		s.notePacketPoll(time.Now().UTC())
 	}
 	var importedBytes int64
+	_, drainsOnCancel := h.(interface{ drainsOnCancel() })
+	var drainDeadline time.Time
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
+		if ctx.Err() != nil {
+			if !drainsOnCancel {
+				return nil
+			}
+			if drainDeadline.IsZero() {
+				drainDeadline = time.Now().Add(2500 * time.Millisecond)
+			}
+			if time.Now().After(drainDeadline) {
+				return errors.New("WinDivert packet drain timed out")
+			}
 		}
 		data, ci, e := h.ReadPacketData()
+		if input == "" {
+			if pt, ok := h.(pollTimestamper); ok {
+				s.notePacketPoll(pt.LastPollTime())
+			} else {
+				s.notePacketPoll(time.Now().UTC())
+			}
+		}
 		if e == pcap.NextErrorTimeoutExpired {
 			if err := writer.failure(); err != nil {
 				return err
@@ -292,34 +311,34 @@ func capturePackets(ctx context.Context, s *Store, p *eventRecorder, iface, filt
 			continue
 		}
 		if e != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			if input != "" && e == io.EOF {
+			if (input != "" || drainsOnCancel && ctx.Err() != nil) && errors.Is(e, io.EOF) {
 				return nil
 			}
 			return e
 		}
-		{
-			if e = writer.write(ci, data); e != nil {
-				return e
-			}
-			if input != "" {
-				// checkDisk walks the session directory; checking every 1 MiB
-				// made large imports quadratic in the number of segments.
-				importedBytes += int64(len(data)) + 16
-				if importedBytes >= 16<<20 || time.Since(last) > time.Second {
-					if e = checkDisk(s); e != nil {
-						return e
-					}
-					importedBytes = 0
-					last = time.Now()
+		if len(data) == 0 && ci.CaptureLength == 0 && ci.Length > 0 {
+			s.gap("pcap", iface, "driver_buffer_overflow", "packets", 1)
+			continue
+		}
+		accepted, writeErr := writer.write(ci, data)
+		if writeErr != nil {
+			return writeErr
+		}
+		if input != "" {
+			// checkDisk walks the session directory; checking every 1 MiB
+			// made large imports quadratic in the number of segments.
+			importedBytes += int64(len(data)) + 16
+			if importedBytes >= 16<<20 || time.Since(last) > time.Second {
+				if e = checkDisk(s); e != nil {
+					return e
 				}
+				importedBytes = 0
+				last = time.Now()
 			}
 		}
-		s.mu.Lock()
-		s.stats.Packets++
-		s.mu.Unlock()
+		if accepted {
+			s.notePacketCaptured(ci.Timestamp)
+		}
 		if ci.CaptureLength < ci.Length {
 			s.gap("pcap", iface, "snapshot_truncated", "packets", 1)
 		}

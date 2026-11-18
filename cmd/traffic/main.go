@@ -368,12 +368,22 @@ func run(args []string) (runErr error) {
 				defer cleanup()
 			}
 		}
-		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		sigCtx, stopSig := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stopSig()
+		ctx, cancel := context.WithCancel(sigCtx)
 		defer cancel()
+		var durationCtx context.Context
 		if *duration > 0 {
 			var stop context.CancelFunc
-			ctx, stop = context.WithTimeout(ctx, *duration)
+			durationCtx, stop = context.WithTimeout(context.Background(), *duration)
 			defer stop()
+			go func() {
+				select {
+				case <-durationCtx.Done():
+					cancel()
+				case <-ctx.Done():
+				}
+			}()
 		}
 		manifest := map[string]any{
 			"schema_version":                   1,
@@ -504,7 +514,15 @@ func run(args []string) (runErr error) {
 				}
 			}
 		}
+		stopRequestedAt := time.Now().UTC()
+		stopReason := "signal_or_duration"
+		if durationCtx != nil && errors.Is(durationCtx.Err(), context.DeadlineExceeded) {
+			stopReason = "duration"
+		} else if sigCtx.Err() != nil {
+			stopReason = "signal"
+		}
 		s.mu.Lock()
+		s.stats.Stopped = stopRequestedAt
 		s.stats.DrainState = "draining"
 		s.mu.Unlock()
 		s.report()
@@ -518,7 +536,7 @@ func run(args []string) (runErr error) {
 			s.gap("collector", "", "stop_budget_exceeded", "shutdowns", 1)
 			s.fail(fmt.Errorf("shutdown exceeded --stop-timeout %s; remaining probe data not confirmed", stopTimeout))
 		}
-		fatal := finishCaptureState(s, *noTLS, *requirePlaintext, budgetExceeded)
+		fatal := finishCaptureStateReason(s, *noTLS, *requirePlaintext, budgetExceeded, stopReason)
 		s.report()
 		emit(snapshotStats(s))
 		return fatal
@@ -530,21 +548,32 @@ func run(args []string) (runErr error) {
 // may themselves fail the capture. Callers use the same outcome for JSON and
 // the process exit status.
 func finishCaptureState(s *Store, noTLS, requirePlaintext, budgetExceeded bool) error {
+	return finishCaptureStateReason(s, noTLS, requirePlaintext, budgetExceeded, "signal_or_duration")
+}
+
+func finishCaptureStateReason(s *Store, noTLS, requirePlaintext, budgetExceeded bool, stopReason string) error {
 	s.mu.Lock()
+	s.syncAtomicStatsLocked()
+	if s.stats.Stopped.IsZero() {
+		s.stats.Stopped = time.Now().UTC()
+	}
 	s.stats.DrainState = "unverified"
-	if noTLS {
+	if noTLS || (s.stats.TLS == "http-only" && len(s.stats.ProbeExits) == 0) {
 		s.stats.DrainState = "confirmed"
 	} else if len(s.stats.ProbeExits) > 0 {
 		confirmed := true
 		for _, exit := range s.stats.ProbeExits {
-			confirmed = confirmed && exit.DataDrained
+			confirmed = confirmed && exit.DataDrained && (!exit.HookBased || exit.HooksRemoved)
 		}
 		if confirmed {
 			s.stats.DrainState = "confirmed"
 		}
 	}
 	finishIISObservability(s, requirePlaintext)
-	s.stats.StopReason = "signal_or_duration"
+	if stopReason == "" {
+		stopReason = "signal_or_duration"
+	}
+	s.stats.StopReason = stopReason
 	s.stats.State = "stopped"
 	if s.stats.RawEvidenceWriters > 0 || s.stats.RawEvidencePendingBytes > 0 || s.stats.RawEvidenceDrainUnconfirmed {
 		s.stats.DrainState = "unverified"
@@ -561,6 +590,7 @@ func finishCaptureState(s *Store, noTLS, requirePlaintext, budgetExceeded bool) 
 		}
 		s.stats.DrainState = "unverified"
 	}
+	s.stats.IntegrityWarnings = session.ComputeIntegrityWarnings(s.stats, nil, s.stats.Stopped)
 	s.mu.Unlock()
 	return fatal
 }
@@ -591,6 +621,7 @@ func shutdownWithin(wait func(), closeRecorder func() error, budget time.Duratio
 func snapshotStats(s *Store) Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.syncAtomicStatsLocked()
 	b, _ := json.Marshal(s.stats)
 	var snapshot Stats
 	_ = json.Unmarshal(b, &snapshot)
@@ -624,6 +655,9 @@ func checkDisk(s *Store) error {
 			return nil
 		}
 		if e != nil {
+			if os.IsNotExist(e) {
+				return nil
+			}
 			return e
 		}
 		if !i.IsDir() {

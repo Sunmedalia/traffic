@@ -16,3 +16,5 @@ func doctorReport(devices []pcap.Interface, service string, pid int, library, pr
 	_, probe := os.Stat(probePath)
 	return map[string]any{"os": runtime.GOOS, "arch": runtime.GOARCH, "root": os.Geteuid() == 0, "btf": btf == nil, "ecapture_installed": probe == nil, "nginx": string(maps), "interfaces": devices, "targets": discoverTargets("/proc", service, pid, library), "tls_verified": false}
 }
+
+func iisHasSelectedHTTPSPort(map[int]bool) bool { return true }

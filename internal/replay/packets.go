@@ -82,6 +82,23 @@ func replayPacketFiles(ctx context.Context, s *Store, p *HTTPProcessor, paths []
 	assembler.MaxBufferedPagesPerConnection = 64
 	defer assembler.FlushAll()
 	var last time.Time
+	var packets uint64
+	var firstPacketAt, lastPacketAt time.Time
+	syncPacketTimestamps := func() {
+		if packets == 0 {
+			return
+		}
+		s.mu.Lock()
+		s.stats.Packets += packets
+		if !firstPacketAt.IsZero() && (s.stats.FirstPacketAt.IsZero() || firstPacketAt.Before(s.stats.FirstPacketAt)) {
+			s.stats.FirstPacketAt = firstPacketAt
+		}
+		if !lastPacketAt.IsZero() && lastPacketAt.After(s.stats.LastPacketAt) {
+			s.stats.LastPacketAt = lastPacketAt
+		}
+		s.mu.Unlock()
+	}
+	defer syncPacketTimestamps()
 	for index, path := range paths {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -118,6 +135,16 @@ func replayPacketFiles(ctx context.Context, s *Store, p *HTTPProcessor, paths []
 			} else if ci.InterfaceIndex != interfaceIndex {
 				file.Close()
 				return fmt.Errorf("%s: import multi-interface PCAPNG before replay", path)
+			}
+			packets++
+			if !ci.Timestamp.IsZero() {
+				ts := ci.Timestamp.UTC()
+				if firstPacketAt.IsZero() || ts.Before(firstPacketAt) {
+					firstPacketAt = ts
+				}
+				if ts.After(lastPacketAt) {
+					lastPacketAt = ts
+				}
 			}
 			packet := packetio.Decode(data, reader.Link)
 			if tcp, ok := packet.Layer(layers.LayerTypeTCP).(*layers.TCP); ok && packet.NetworkLayer() != nil && (len(capturePorts) == 0 || capturePorts[int(tcp.SrcPort)] || capturePorts[int(tcp.DstPort)]) {

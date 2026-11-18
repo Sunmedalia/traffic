@@ -88,6 +88,11 @@ func captureChecks(service string, pid int, library, probe string, java bool, ja
 			if target.Service == "iis" {
 				c.Backend = "iis-httpapi"
 				helper = iisProbe
+				if !iisHasSelectedHTTPSPort(capturePorts) {
+					c.Status = "http-only"
+					c.Reason = "selected --ports contain no IIS HTTPS bindings; HTTP packet capture covers plain HTTP without Frida"
+					break
+				}
 			}
 			_, pythonErr := exec.LookPath(iisPython)
 			if helper == "" {

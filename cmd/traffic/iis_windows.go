@@ -132,7 +132,7 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 			applyIISProbeSummary(s, message.Diagnostics)
 		}
 		if message.Type == "host_summary" {
-			s.recordProbeExit(target.ID, session.ProbeExit{DataDrained: probeDrain && message.QueueDropped == 0, HooksRemoved: message.HooksRemoved, ScriptUnloaded: message.ScriptUnloaded, TransportDetached: message.TransportDetached, RuntimeState: "inspect hooks, script and transport separately"})
+			recordWindowsProbeExit(s, target.ID, probeDrain && message.QueueDropped == 0, message.HooksRemoved, message.ScriptUnloaded, message.TransportDetached)
 		}
 		if message.Type == "attach_error" || message.Type == "error" {
 			return fmt.Errorf("Windows TLS helper: %s %s", message.Message, message.Description)
@@ -217,6 +217,7 @@ func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, ser
 		state  string
 	}
 	workers := make(map[string]*worker)
+	httpOnlyNotified := make(map[string]bool)
 	var mu sync.Mutex
 	var running sync.WaitGroup
 	defer func() {
@@ -242,6 +243,14 @@ func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, ser
 				continue
 			}
 			if (target.Service == "iis" && iisProbe == "") || (target.Service != "iis" && opensslProbe == "") {
+				workers[target.ID] = &worker{cancel: func() {}, state: "http-only"}
+				continue
+			}
+			if target.Service == "iis" && !iisHasSelectedHTTPSPort(capturePorts) {
+				if !httpOnlyNotified[target.ID] {
+					httpOnlyNotified[target.ID] = true
+					fmt.Fprintf(os.Stderr, "IIS 目标 %s (PID %d) 在所选端口上未发现 HTTPS 绑定，跳过 Frida 明文探针附加，直接通过数据包还原纯 HTTP。\n", target.ID, target.PID)
+				}
 				workers[target.ID] = &worker{cancel: func() {}, state: "http-only"}
 				continue
 			}
@@ -285,7 +294,7 @@ func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, ser
 				}
 			}(target)
 		}
-		attached, unavailable := 0, 0
+		attached, unavailable, httpOnly := 0, 0, 0
 		mu.Lock()
 		for index := range targets {
 			targets[index].State = workers[targets[index].ID].state
@@ -295,11 +304,16 @@ func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, ser
 			if targets[index].State == "unavailable" {
 				unavailable++
 			}
+			if targets[index].State == "http-only" {
+				httpOnly++
+			}
 		}
 		mu.Unlock()
 		state := "starting"
 		if len(targets) == 0 {
 			state = "no-targets"
+		} else if attached == 0 && unavailable == 0 && httpOnly == len(targets) {
+			state = "http-only"
 		}
 		if attached > 0 {
 			state = "attached"

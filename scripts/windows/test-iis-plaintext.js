@@ -8,7 +8,7 @@ const source = fs.readFileSync(require('node:path').join(__dirname, 'iis-plainte
     .replace('__REQUEST_LIMIT__', '0').replace('__RESPONSE_LIMIT__', '0').replace('__PORTS__', '[8443]');
 
 function fixture(options = {}) {
-    const memory = Buffer.alloc(1 << 20);
+    const memory = Buffer.alloc(options.memoryBytes || (1 << 20));
     let allocated = 0x10000, exported = 0x1000;
     const exports = new Map();
     const callbacks = new Map();
@@ -41,16 +41,27 @@ function fixture(options = {}) {
     function u64(p, n, value) { memory.writeBigUInt64LE(BigInt(value instanceof Pointer ? value.value : value), p.value + n); }
     function string(value) { const bytes = Buffer.from(value); const p = allocate(bytes.length); bytes.copy(memory, p.value); return p; }
     function sockaddr(port) { const p = allocate(32); u16(p, 0, 2); memory.writeUInt16BE(port, p.value + 2); memory.set([127, 0, 0, 1], p.value + 4); return p; }
+    const sentMessages = [];
+    const nativeImpls = options.nativeImpls || {};
+    let currentExport = '';
     const context = vm.createContext({
-        Process: {arch: 'x64', pointerSize: 8, findRangeByAddress: () => ({protection: 'r-x'}), enumerateThreads: () => [], getModuleByName: () => ({
-            getExportByName: exportedPointer, findExportByName: exportedPointer
+        Process: {id: 4242, arch: 'x64', pointerSize: 8, findRangeByAddress: () => ({protection: 'r-x'}), enumerateThreads: () => [], getModuleByName: () => ({
+            getExportByName: name => { currentExport = name; return exportedPointer(name); },
+            findExportByName: name => { currentExport = name; return exportedPointer(name); }
         })},
-        NativeFunction: function () { return () => new Pointer(0); },
+        Memory: {alloc: allocate},
+        NativeFunction: function () {
+            const name = currentExport;
+            if (nativeImpls[name]) return nativeImpls[name]({Pointer, allocate, u64, memory});
+            return () => new Pointer(0);
+        },
         Interceptor: {attach: (pointer, handler) => { callbacks.set(pointer.toString(), handler); return {detach() {}}; }, flush() {}},
-        ptr: value => new Pointer(value), send() {}, rpc: {}, setInterval() {}, clearInterval() {}
+        ptr: value => new Pointer(value),
+        send(event, data = null) { sentMessages.push({event, data}); },
+        rpc: {}, setInterval() {}, clearInterval() {}
     });
     vm.runInContext(source, context);
-    const request = allocate(864), overlap = allocate(512), data = string('hello');
+    const request = allocate(864), overlap = allocate(1024), data = string('hello');
     u64(request, 8, 0xff00112233445566n); u64(request, 16, 0xfe00112233445577n);
     u16(request, 32, 1); u16(request, 34, 1); u32(request, 36, 6);
     const url = options.url || '/startup?index=1'; u16(request, 42, Buffer.byteLength(url)); u64(request, 56, string(url));
@@ -63,7 +74,7 @@ function fixture(options = {}) {
     context.request = request; context.overlap = overlap;
     function evaluate(code) { return vm.runInContext(code, context); }
     function value(code) { return JSON.parse(evaluate('JSON.stringify(' + code + ')')); }
-    return {evaluate, value, memory, u16, u32, u64, request, overlap, data, allocate, exportedPointer, context, callbacks};
+    return {evaluate, value, memory, u16, u32, u64, string, sockaddr, request, overlap, data, allocate, exportedPointer, context, callbacks, sentMessages, Pointer};
 }
 
 for (const offset of [32, 184, 504]) {
@@ -159,5 +170,157 @@ for (const options of [{plaintext: true}, {port: 443}, {url: '/bad\r\nurl'}]) {
     assert.equal(f.value("events.filter(x=>x.event.type==='request').length"),1);
     assert.equal(f.value("events.filter(x=>x.event.type==='response-end').length"),1);
     assert.equal(f.value('requests.size'),0);
+}
+
+// Regression (P2): Out-of-LIFO concurrent IOCP completions across interleaved invocations
+// must both succeed without wedging per-thread return stacks, including offsets > 512.
+{
+    const f = fixture({offset: 896});
+    const req2 = f.allocate(864), ov2 = f.allocate(1024);
+    f.u64(req2, 8, 0xff00112233445588n); f.u64(req2, 16, 0xfe00112233445599n);
+    f.u16(req2, 32, 1); f.u16(req2, 34, 1); f.u32(req2, 36, 4); // GET
+    const u2 = '/concurrent?n=2'; f.u16(req2, 42, Buffer.byteLength(u2)); f.u64(req2, 56, f.string(u2));
+    f.u64(req2, 104, f.sockaddr(23456)); f.u64(req2, 112, f.sockaddr(8443));
+    f.u64(req2, 840, f.allocate(16)); f.u16(req2, 816, 0);
+    // Sprinkle non-canonical / low integer values before the real pointer at offset 960.
+    f.u64(ov2, 64, 0x1000n);
+    f.u64(ov2, 72, 0xffff800000000000n);
+    f.u64(ov2, 960, req2);
+
+    const entries1 = f.allocate(32), count1 = f.allocate(4);
+    f.u64(entries1, 8, f.overlap); f.u32(entries1, 16, 0); f.u64(entries1, 24, 900n); f.u32(count1, 0, 1);
+    const entries2 = f.allocate(32), count2 = f.allocate(4);
+    f.u64(entries2, 8, ov2); f.u32(entries2, 16, 0); f.u64(entries2, 24, 900n); f.u32(count2, 0, 1);
+
+    const iocpHook = f.callbacks.get(f.exportedPointer('NtRemoveIoCompletionEx').toString());
+    const callA = {}, callB = {};
+    const zero = new f.Pointer(0);
+    iocpHook.onEnter.call(callA, [zero, entries1, {toUInt32: () => 4}, count1]);
+    iocpHook.onEnter.call(callB, [zero, entries2, {toUInt32: () => 4}, count2]);
+    // Leave out of LIFO order: callA finishes before callB!
+    iocpHook.onLeave.call(callA, {toInt32: () => 0});
+    iocpHook.onLeave.call(callB, {toInt32: () => 0});
+    assert.equal(f.value("events.filter(x => x.event.type === 'request').length"), 2);
+    assert.equal(f.value('diagnostics.recovered_receives'), 2);
+}
+
+// Regression (P3): Plain HTTP request (pSslInfo == NULL) marked ignored must not inflate
+// send_matches or trigger false attach_window_suspect when HttpSendHttpResponse runs.
+{
+    const f = fixture({plaintext: true});
+    const recvHook = f.callbacks.get(f.exportedPointer('HttpReceiveHttpRequest').toString());
+    const sendHook = f.callbacks.get(f.exportedPointer('HttpSendHttpResponse').toString());
+    const zero = new f.Pointer(0), bytes = f.allocate(4); f.u32(bytes, 0, 900);
+    const recvCall = {};
+    recvHook.onEnter.call(recvCall, [zero, {toString: () => '0x0'}, {toUInt32: () => 0}, f.request, {toUInt32: () => 900}, bytes, f.overlap]);
+    recvHook.onLeave.call(recvCall, {toUInt32: () => 0});
+
+    const response = f.allocate(552), sent = f.allocate(4), sendOv = f.allocate(64);
+    f.u16(response, 8, 200); f.u32(sent, 0, 0);
+    const sendCall = {};
+    sendHook.onEnter.call(sendCall, [zero, {toString: () => '0xfe00112233445577'}, {toUInt32: () => 0}, response, {toUInt32: () => 0}, sent, zero, zero, sendOv]);
+    f.evaluate(`completion(ptr(${sendOv.value}), 0, 0)`);
+    const summary = f.evaluate('rpc.exports.finish()');
+    assert.equal(summary.diagnostics.send_matches, 0);
+    assert.equal(summary.attach_window_suspect, false);
+}
+
+// Regression (P6): Deferred response whose request was never matched/recovered must emit
+// explicit loss and unrecovered_receive probe-gap at finish(), never silently vanish.
+{
+    const f = fixture();
+    f.evaluate("stateFor('0xdeadbeef'); dispatch({type: 'response', id: '0xdeadbeef', status: 200});");
+    const summary = f.evaluate('rpc.exports.finish()');
+    assert.equal(summary.diagnostics.unmatched_receive, 1);
+    assert.equal(f.sentMessages.some(m => m.event.type === 'loss' && m.event.count >= 1), true);
+    assert.equal(f.sentMessages.some(m => m.event.type === 'probe-gap' && m.event.reason === 'unrecovered_receive' && m.event.count === 1), true);
+}
+
+// Regression: File-backed bodies retain their declared length and report omissions,
+// and pending map evicts single oldest entry instead of clearing all 4096 entries.
+{
+    let mapped = false;
+    const f = fixture({
+        nativeImpls: {
+            GetFileSizeEx: ({u64}) => (_handle, sizeBuf) => { u64(sizeBuf, 0, 100n * 1024n * 1024n); return 1; },
+            CreateFileMappingW: ({Pointer}) => () => new Pointer(0x50000),
+            MapViewOfFile: () => () => { mapped = true; throw new Error("unexpected file mapping"); },
+            UnmapViewOfFile: () => () => 1,
+            CloseHandle: () => () => 1
+        }
+    });
+    f.evaluate('receiveRequest({buffer: request})');
+    f.evaluate("requests.set('0xfe00112233445577', {request: 0, response: 0, known: true, deferred: [], created: Date.now(), ended: false, lost: false})");
+    const fileChunk = f.allocate(32);
+    f.u32(fileChunk, 0, 1); // HttpDataChunkFromFileHandle
+    f.u64(fileChunk, 8, 0n);
+    f.u64(fileChunk, 16, 0xffffffffffffffffn);
+    f.u64(fileChunk, 24, 0x1234n);
+    f.evaluate(`chunks('0xfe00112233445577', 'response', 1, ptr(${fileChunk.value}))`);
+    assert.equal(mapped, false);
+    assert.equal(f.value("events.find(x => x.event.type === 'response-body').event.length"), 100 * 1024 * 1024);
+    assert.equal(f.value("events.some(x => x.event.type === 'gap' && x.event.reason.includes('File-backed body'))"), true);
+    assert.equal(f.value("events.some(x => x.event.type === 'truncated')"), true);
+
+    f.evaluate('for (let i = 0; i < 4096; i++) pending.set("ov-" + i, {id: "0x1", kind: "send"});');
+    const recvHook = f.callbacks.get(f.exportedPointer('HttpReceiveHttpRequest').toString());
+    const zero = new f.Pointer(0);
+    recvHook.onEnter.call({}, [zero, {toString: () => '0x0'}, {toUInt32: () => 0}, f.request, {toUInt32: () => 900}, zero, f.overlap]);
+    assert.equal(f.value('pending.size'), 4096);
+    assert.equal(f.value('pending.has("ov-0")'), false);
+    assert.equal(f.value('pending.has("ov-1")'), true);
+}
+
+// Regression: openssl-plaintext.js preserves payloads > 64 KiB when limits are 0,
+// caches (ssl, fd) endpoints across reads/writes, and copies SSL_write only on success.
+{
+    const opensslSource = fs.readFileSync(require('node:path').join(__dirname, 'openssl-plaintext.js'), 'utf8')
+        .replace('__PORTS__', '[443]').replace('__PROFILES__', '[]').replace('__LIBRARY__', '""')
+        .replace('__REQUEST_LIMIT__', '0').replace('__RESPONSE_LIMIT__', '0');
+    const sslHooks = new Map();
+    const sslMem = Buffer.alloc(256 * 1024, 0x41);
+    let localAddrCalls = 0, readByteCalls = 0;
+    class SSLPtr {
+        constructor(v) { this.v = v; }
+        toString() { return '0x' + this.v.toString(16); }
+        toUInt32() { return this.v >>> 0; }
+        toInt32() { return this.v | 0; }
+        isNull() { return this.v === 0; }
+        readByteArray(n) { readByteCalls++; return Uint8Array.from(sslMem.subarray(0, n)).buffer; }
+    }
+    let observerAdded = null;
+    const sslCtx = vm.createContext({
+        Process: {
+            arch: 'x64', pointerSize: 8, mainModule: {name: 'nginx.exe'},
+            getModuleByName: () => ({getExportByName: () => new SSLPtr(0x9000)}),
+            attachModuleObserver: obs => { observerAdded = obs.onAdded; return {detach() {}}; }
+        },
+        NativeFunction: function () { return () => 42; },
+        Socket: {
+            localAddress: () => { localAddrCalls++; return {ip: '127.0.0.1', port: 443}; },
+            peerAddress: () => ({ip: '192.0.2.9', port: 51000})
+        },
+        Interceptor: {attach: (addr, cb) => { sslHooks.set(addr.toString(), cb); return {detach() {}}; }, flush() {}},
+        ptr: v => new SSLPtr(Number(v)),
+        send() {}, rpc: {}, setInterval() { return 1; }, clearInterval() {}, setTimeout() { return 1; }, clearTimeout() {}
+    });
+    vm.runInContext(opensslSource, sslCtx);
+    const exportsMap = {SSL_read: 0x1001, SSL_write: 0x1002, SSL_get_fd: 0x1003};
+    observerAdded({name: 'libssl-3-x64.dll', path: 'C:\\libssl-3-x64.dll', findExportByName: n => exportsMap[n] ? new SSLPtr(exportsMap[n]) : null});
+    readByteCalls = 0; // ignore initial 16-byte prologue snapshots
+    const writeHook = sslHooks.get('0x1002');
+    const c1 = {};
+    writeHook.onEnter.call(c1, [new SSLPtr(0xabc0), new SSLPtr(0x2000), new SSLPtr(100000)]);
+    writeHook.onLeave.call(c1, new SSLPtr(-1)); // WANT_WRITE: must not copy buffer
+    assert.equal(readByteCalls, 0);
+
+    const c2 = {};
+    writeHook.onEnter.call(c2, [new SSLPtr(0xabc0), new SSLPtr(0x2000), new SSLPtr(100000)]);
+    writeHook.onLeave.call(c2, new SSLPtr(100000));
+    assert.equal(localAddrCalls, 1); // endpoint cached after first lookup!
+    const events = vm.runInContext('events', sslCtx);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].data.byteLength, 100000); // > 65536 not truncated!
+    assert.equal(events[0].event.incomplete, false);
 }
 console.log('IIS completion recovery regression tests passed');

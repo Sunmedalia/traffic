@@ -42,6 +42,12 @@ func TestIISBindingPorts(t *testing.T) {
 	if ports := iisPorts(); !reflect.DeepEqual(ports, []int{8080, 8443}) {
 		t.Fatalf("IIS binding ports %v", ports)
 	}
+	if https := iisHTTPSPorts(); !reflect.DeepEqual(https, []int{8443}) {
+		t.Fatalf("IIS HTTPS binding ports %v", https)
+	}
+	if iisHasSelectedHTTPSPort(map[int]bool{8080: true}) || !iisHasSelectedHTTPSPort(map[int]bool{8443: true}) {
+		t.Fatal("IIS HTTPS scope selection mismatch")
+	}
 }
 
 func TestWindowsMiddlewareDiscovery(t *testing.T) {

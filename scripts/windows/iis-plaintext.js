@@ -6,6 +6,7 @@
 if (Process.arch !== 'x64') throw new Error('IIS plaintext capture requires x64');
 const requestLimit = __REQUEST_LIMIT__;
 const responseLimit = __RESPONSE_LIMIT__;
+const defaultBodyCap = 16 * 1024 * 1024;
 const selectedPorts = new Set(__PORTS__);
 const requests = new Map();
 const pending = new Map();
@@ -58,7 +59,14 @@ let transportSequence = 0;
 function flush() {
     recoveryBudget = 32;
     for (const [id, state] of requests) {
-        if (!state.known && Date.now() - state.created > 5000) discard(id);
+        if (!state.known && Date.now() - state.created > 5000) {
+            if (state.deferred.length > 0 && !ignored.has(id)) {
+                dropped++;
+                diagnostics.unmatched_receive++;
+                unmatchedReported.receive++;
+            }
+            discard(id);
+        }
     }
     const batch = events;
     events = [];
@@ -156,7 +164,8 @@ function address(pointer) {
 function body(id, direction, pointer, length, budget = maxBodyCopyPerCall) {
     const state = requests.get(id);
     if (state === undefined || length === 0) return 0;
-    const limit = (direction === 'request' ? requestLimit : (state.responseLimit || responseLimit)) || Number.POSITIVE_INFINITY;
+    const configured = direction === 'request' ? requestLimit : (state.responseLimit || responseLimit);
+    const limit = configured > 0 ? configured : defaultBodyCap;
     const used = state[direction];
     const clipped = direction + 'Clipped';
     const room = state.known ? captureQueueBytes - eventBytes : captureQueueBytes - deferredBytes;
@@ -214,25 +223,35 @@ function chunks(id, direction, count, pointer) {
     }
 }
 
+function isCanonicalUserPtr(pointer) {
+    if (pointer.isNull() || !pointer.and(7).isNull()) return false;
+    const addr = BigInt(pointer.toString());
+    return addr >= 0x10000n && addr <= 0x7fffffffffffn;
+}
+
 function describeRequest(request) {
-    // Do not trust a pointer merely because it is readable. These independent
-    // public HTTP_REQUEST fields distinguish it from unrelated completed I/O.
+    // Do not trust a pointer merely because it is readable. Check scalar
+    // public HTTP_REQUEST fields and canonical user-space pointer ranges first
+    // so random completion values do not trigger hardware access violations.
     const major = request.add(32).readU16(), minor = request.add(34).readU16();
     if (!((major === 1 && minor <= 1) || (major === 2 && minor === 0))) return null;
     if (request.readU32() > 15 || request.add(8).readU64().compare(0) === 0 || request.add(16).readU64().compare(0) === 0) return null;
     const verb = request.add(36).readU32();
     if (verb > 20) return null;
-    const method = verbs[verb] || text(request.add(48).readPointer(), request.add(40).readU16());
-    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(method)) return null;
     const length = request.add(42).readU16();
     if (length < 1 || length > 32768) return null;
+    if (request.add(816).readU16() > 256 || request.add(840).readPointer().isNull()) return null;
+    const localPtr = request.add(112).readPointer();
+    const clientPtr = request.add(104).readPointer();
+    if (!isCanonicalUserPtr(localPtr) || !isCanonicalUserPtr(clientPtr)) return null;
+    const local = address(localPtr);
+    const client = address(clientPtr);
+    if (!selectedPorts.has(local.port) || client.port < 1) return null;
+    const method = verbs[verb] || text(request.add(48).readPointer(), request.add(40).readU16());
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(method)) return null;
     const url = text(request.add(56).readPointer(), length);
     const authority = method === 'CONNECT' && /^[^\s/]+:\d{1,5}$/.test(url);
     if (!(url.startsWith('/') || url === '*' || /^[a-z]+:\/\//i.test(url) || authority) || /[\r\n\x00]/.test(url)) return null;
-    const local = address(request.add(112).readPointer());
-    const client = address(request.add(104).readPointer());
-    if (!selectedPorts.has(local.port) || client.port < 1 || request.add(840).readPointer().isNull()) return null;
-    if (request.add(816).readU16() > 256) return null;
     return {id: key(request.add(16).readU64()), connection: key(request.add(8).readU64()),
         http_version: 'HTTP/' + major + '.' + minor, method, url,
         headers: headers(request.add(120), requestHeaders), client: client.endpoint, local: local.endpoint};
@@ -246,7 +265,10 @@ function receiveRequest(operation, description = null) {
     const local = address(request.add(112).readPointer());
     if (request.add(840).readPointer().isNull() || !selectedPorts.has(local.port)) {
         discard(id);
-        if (ignored.size >= 2048) ignored.clear();
+        for (const [ov, op] of pending) {
+            if (op.id === id) pending.delete(ov);
+        }
+        if (ignored.size >= 4096) ignored.delete(ignored.values().next().value);
         ignored.add(id);
         return;
     }
@@ -280,18 +302,18 @@ function recoverReceive(overlapped, status, length, expectedId = null) {
     // Most IOCP completions belong to unrelated APIs. Spend a bounded amount
     // of time on speculative recovery and prioritize exact request IDs.
     if (expectedId === null) {
-        if (length < 848 || recoveryBudget <= 0) return false;
+        if ((length < 848 && deferredCount === 0) || recoveryBudget <= 0) return false;
         recoveryBudget--;
     }
     diagnostics.recovery_attempts++;
     // Bounded read-only discovery, not a process/heap scan or a private layout
     // offset. The callback owns this context until the completion hook returns.
     // Validate every candidate before changing request state or reading bodies.
-    for (let offset = 32; offset < 512; offset += Process.pointerSize) {
+    for (let offset = 32; offset < 1024; offset += Process.pointerSize) {
         let candidate, description;
         try {
             candidate = overlapped.add(offset).readPointer();
-            if (candidate.isNull() || !candidate.and(7).isNull()) continue;
+            if (!isCanonicalUserPtr(candidate)) continue;
             description = describeRequest(candidate);
             if (description === null || (expectedId !== null && description.id !== expectedId)) continue;
         } catch (_) { continue; /* Unrelated/non-readable completion context. */ }
@@ -356,12 +378,13 @@ function completion(overlapped, status, length) {
         noteUnmatched('unknown');
         return;
     }
+    pending.delete(overlapped.toString());
+    if (operation.id && ignored.has(operation.id)) return;
     diagnostics.matches++;
     if (operation.kind === 'receive') diagnostics.receive_matches++;
     else if (operation.kind === 'body') diagnostics.body_matches++;
     else if (operation.kind === 'send') diagnostics.send_matches++;
     else if (operation.kind === 'interim') diagnostics.interim_matches++;
-    pending.delete(overlapped.toString());
     complete(operation, status, length);
 }
 
@@ -394,6 +417,8 @@ function completionReturn(name, first, second, third) {
     };
 }
 
+// Attach only to exported function prologues with per-invocation context (`this`)
+// rather than dynamically patching mid-function caller return addresses during live traffic.
 hook(ntdll, 'NtRemoveIoCompletion', {
     onEnter(args) {
         if (stopping) return;
@@ -428,8 +453,10 @@ for (const name of ['HttpReceiveHttpRequest', 'HttpReceiveRequestEntityBody', 'H
             if (stopping) return;
             const receiving = name === 'HttpReceiveHttpRequest';
             const bodyRead = name === 'HttpReceiveRequestEntityBody';
+            const id = args[1].toString();
+            if (!receiving && ignored.has(id)) return;
             const operation = {kind: receiving ? 'receive' : bodyRead ? 'body' : 'send',
-                id: args[1].toString(), buffer: args[3], capacity: args[4].toUInt32(),
+                id, buffer: args[3], capacity: args[4].toUInt32(),
                 bytes: args[5], flags: args[2].toUInt32(), done: false};
             const overlap = args[receiving || bodyRead ? 6 : 8];
             operation.overlap = overlap.toString();
@@ -455,7 +482,7 @@ for (const name of ['HttpReceiveHttpRequest', 'HttpReceiveRequestEntityBody', 'H
                         if (status < 200) { operation.kind = 'interim'; return; }
                         const fields = headers(response.add(24), responseHeaders);
                         if (fields.some(field => field[0].toLowerCase() === 'transfer-encoding' && field[1].toLowerCase().includes('chunked'))) {
-                            requests.get(operation.id).responseLimit = responseLimit ? responseLimit * 8 + 32768 : 0;
+                            requests.get(operation.id).responseLimit = responseLimit ? responseLimit * 8 + 32768 : defaultBodyCap;
                         }
                         dispatch({type: 'response', id: operation.id, status, headers: fields});
                         chunks(operation.id, 'response', response.add(536).readU16(), response.add(544).readPointer());
@@ -471,6 +498,7 @@ for (const name of ['HttpReceiveHttpRequest', 'HttpReceiveRequestEntityBody', 'H
             const status = result.toUInt32();
             if (status === 997) return;
             if (pending.get(operation.overlap) === operation) pending.delete(operation.overlap);
+            if (operation.id && ignored.has(operation.id)) return;
             const length = operation.bytes.isNull() ? 0 : operation.bytes.readU32();
             complete(operation, status, length);
         }
@@ -491,13 +519,20 @@ rpc.exports = {
         }
         clearInterval(timer);
         for (const [id, state] of requests) {
-            if (state.known) gap(id, 'Capture stopped before response completed');
+            if (state.known) {
+                gap(id, 'Capture stopped before response completed');
+            } else if (state.deferred.length > 0 && !ignored.has(id)) {
+                dropped++;
+                diagnostics.unmatched_receive++;
+                unmatchedReported.receive++;
+                discard(id);
+            }
         }
-        // One record at stop. The completion has no operation kind, so the
-        // reason stays unmatched_completion. The collector decides the attach
-        // window from receive_matches versus send_matches.
-        // Drain queued sequence numbers before emitting the final direct record.
+        // Drain queued sequence numbers before emitting final direct gap records.
         flush();
+        if (unmatchedReported.receive > 0) {
+            send({type: 'probe-gap', reason: 'unrecovered_receive', kind: 'receive', count: unmatchedReported.receive, time: new Date().toISOString(), sequence: ++transportSequence, final: true});
+        }
         if (unmatchedReported.unknown > 0) {
             send({type: 'probe-gap', reason: 'unmatched_completion', kind: 'unknown', count: unmatchedReported.unknown, time: new Date().toISOString(), sequence: ++transportSequence, final: true});
         }
