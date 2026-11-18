@@ -34,6 +34,8 @@ type Store struct {
 	dir                string
 	mu                 sync.Mutex
 	stats              Stats
+
+	rawEvidenceControlPending uint64 // guarded by mu
 }
 
 func (s *Store) notePacketPoll(t time.Time) {

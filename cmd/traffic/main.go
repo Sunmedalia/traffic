@@ -98,6 +98,7 @@ func run(args []string) (runErr error) {
 	fs.IntVar(&collectorCPUPercent, "collector-cpu-percent", 50, "collector CPU budget as percent of one CPU")
 	fs.DurationVar(&drainTimeout, "drain-timeout", 5*time.Second, "maximum probe data drain time")
 	fs.DurationVar(&stopTimeout, "stop-timeout", 30*time.Second, "total shutdown budget after stop is requested; must be at least --drain-timeout")
+	fs.StringVar(&evidenceBackpressure, "evidence-backpressure", string(evidenceBackpressureStrict), "raw evidence queue congestion policy: strict or drop")
 	noTLS := fs.Bool("no-tls", false, "disable TLS probes")
 	duration := fs.Duration("duration", 0, "optional capture duration")
 	fs.IntVar(&diskLimitMiB, "disk-limit-mib", diskLimitMiB, "session disk budget MiB")
@@ -209,6 +210,10 @@ func run(args []string) (runErr error) {
 	}
 	if collectorMemoryMiB < 64 || collectorMemoryMiB > 65536 || collectorCPUPercent < 1 || collectorCPUPercent > 100 || drainTimeout <= 0 || drainTimeout > 15*time.Second || stopTimeout < drainTimeout || stopTimeout > 5*time.Minute {
 		return errors.New("invalid collector resource or drain limits")
+	}
+	backpressurePolicy, backpressureErr := parseEvidenceBackpressurePolicy(evidenceBackpressure)
+	if backpressureErr != nil {
+		return backpressureErr
 	}
 	if *requireTLS && (*noTLS || cmd != "capture") {
 		return errors.New("--require-tls requires capture with TLS enabled")
@@ -351,7 +356,7 @@ func run(args []string) (runErr error) {
 		fmt.Fprintf(os.Stderr, "会话目录 %s\n", s.dir)
 		s.report()
 		s.stats.Targets = discoverTargets("/proc", *service, *pid, *lib)
-		p := newRecorder(s)
+		p := newRecorderWithPolicy(s, backpressurePolicy)
 		recorderFinalized := false
 		defer func() {
 			if !recorderFinalized {
@@ -416,6 +421,7 @@ func run(args []string) (runErr error) {
 			"collector_cpu_percent":            collectorCPUPercent,
 			"probe_drain_timeout_ms":           drainTimeout.Milliseconds(),
 			"stop_timeout_ms":                  stopTimeout.Milliseconds(),
+			"evidence_backpressure":            string(backpressurePolicy),
 			"in_process_probe_budget_included": false,
 		}
 		if cmd == "import" {
