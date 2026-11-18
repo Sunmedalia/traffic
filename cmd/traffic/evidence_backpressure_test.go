@@ -764,3 +764,51 @@ func TestRecorderSustainedCongestionStopDeadlineAndHardWriteFailure(t *testing.T
 		}
 	})
 }
+
+func TestDropWritersShareIndependentGlobalControlAndDataBudgets(t *testing.T) {
+	s := &Store{}
+	cfg := evidenceWriterConfig{
+		policy: evidenceBackpressureDrop, dataBudget: 128, controlBudget: 128,
+		globalDataBudget: 128, globalControlReserve: 64, timeout: time.Second,
+	}
+	gate := make(chan struct{})
+	control := newEvidenceWriterWithConfig(s, &blockingEvidenceSink{gate: gate}, "control", cfg)
+	data := newEvidenceWriterWithConfig(s, &blockingEvidenceSink{gate: gate}, "data", cfg)
+	defer func() {
+		close(gate)
+		_ = control.Close()
+		_ = data.Close()
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.rawEvidenceControlPending != 0 || s.stats.RawEvidencePendingBytes != 0 {
+			t.Fatalf("pending evidence leaked: control=%d total=%d", s.rawEvidenceControlPending, s.stats.RawEvidencePendingBytes)
+		}
+	}()
+	if err := control.writeControl(make([]byte, 64)); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := data.writeData(make([]byte, 128)); !accepted || err != nil {
+		t.Fatalf("another writer's control reservation consumed data budget: accepted=%t err=%v", accepted, err)
+	}
+	if err := data.writeControl([]byte{1}); !errors.Is(err, errEvidenceControlOverflow) {
+		t.Fatalf("expected exhausted global control budget, got %v", err)
+	}
+}
+
+func TestEvidenceSyncFailureReportsFlushedBytesAsUnconfirmed(t *testing.T) {
+	dir := t.TempDir()
+	s := &Store{dir: dir}
+	sink, _ := newControllableFileSink(t, dir)
+	sink.syncErr = syscall.EIO
+	w := newEvidenceWriter(s, sink, "raw-tls")
+	data := []byte("{\"type\":\"data\"}\n")
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); !errors.Is(err, errEvidenceIO) {
+		t.Fatalf("expected classified sync error, got %v", err)
+	}
+	if got := s.stats.GapCounts["raw-tls/evidence_write_unconfirmed/bytes"]; got != uint64(len(data)) {
+		t.Fatalf("unconfirmed bytes = %d, want %d", got, len(data))
+	}
+}

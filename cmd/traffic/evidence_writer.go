@@ -313,6 +313,9 @@ func (w *evidenceWriter) enqueueStrictLocked(data []byte, control bool) (string,
 		return "evidence_global_budget", errEvidenceBackpressure
 	}
 	w.store.stats.RawEvidencePendingBytes += uint64(len(data))
+	if control {
+		w.store.rawEvidenceControlPending += uint64(len(data))
+	}
 	if w.store.stats.RawEvidencePendingBytes > w.store.stats.RawEvidenceHighWaterBytes {
 		w.store.stats.RawEvidenceHighWaterBytes = w.store.stats.RawEvidencePendingBytes
 	}
@@ -357,7 +360,8 @@ func (w *evidenceWriter) writeControl(data []byte) error {
 		return errEvidenceControlOverflow
 	}
 	w.store.mu.Lock()
-	if w.store.stats.RawEvidencePendingBytes+uint64(len(data)) > w.globalDataBudget+w.globalControlReserve {
+	if w.store.rawEvidenceControlPending+uint64(len(data)) > w.globalControlReserve ||
+		w.store.stats.RawEvidencePendingBytes+uint64(len(data)) > w.globalDataBudget+w.globalControlReserve {
 		w.store.mu.Unlock()
 		w.err = errEvidenceControlOverflow
 		w.mu.Unlock()
@@ -366,6 +370,7 @@ func (w *evidenceWriter) writeControl(data []byte) error {
 		return errEvidenceControlOverflow
 	}
 	w.store.stats.RawEvidencePendingBytes += uint64(len(data))
+	w.store.rawEvidenceControlPending += uint64(len(data))
 	if w.store.stats.RawEvidencePendingBytes > w.store.stats.RawEvidenceHighWaterBytes {
 		w.store.stats.RawEvidenceHighWaterBytes = w.store.stats.RawEvidencePendingBytes
 	}
@@ -392,12 +397,14 @@ func (w *evidenceWriter) checkAndReserveDataDropLocked(lossData, eventData []byt
 	}
 	w.store.mu.Lock()
 	globalPending := w.store.stats.RawEvidencePendingBytes
-	globalDataPending := globalPending - min(globalPending, uint64(w.controlPending))
+	globalControlPending := w.store.rawEvidenceControlPending
+	globalDataPending := globalPending - globalControlPending
 	if w.shedding && !w.dataDrainedLocked(globalDataPending) {
 		w.store.mu.Unlock()
 		return false, w.noteShedLocked(len(eventData), false), nil
 	}
-	if w.dataPending+len(eventData) > w.dataBudget || w.dataQueued >= w.dataSlots || globalDataPending+uint64(len(eventData)) > w.globalDataBudget {
+	if w.dataPending+len(eventData) > w.dataBudget || w.dataQueued >= w.dataSlots || globalDataPending+uint64(len(eventData)) > w.globalDataBudget ||
+		globalPending+uint64(len(eventData)) > w.globalDataBudget+w.globalControlReserve {
 		w.store.mu.Unlock()
 		wasShedding := w.shedding
 		w.shedding = true
@@ -405,7 +412,9 @@ func (w *evidenceWriter) checkAndReserveDataDropLocked(lossData, eventData []byt
 		return false, w.noteShedLocked(len(eventData), !wasShedding), nil
 	}
 	if len(lossData) > 0 {
-		if len(lossData) > evidenceMaxRecordBytes || len(lossData) > w.controlBudget || w.controlPending+len(lossData) > w.controlBudget || w.controlQueued >= w.controlSlots || globalPending+uint64(len(lossData)+len(eventData)) > w.globalDataBudget+w.globalControlReserve {
+		if len(lossData) > evidenceMaxRecordBytes || len(lossData) > w.controlBudget || w.controlPending+len(lossData) > w.controlBudget || w.controlQueued >= w.controlSlots ||
+			globalControlPending+uint64(len(lossData)) > w.globalControlReserve ||
+			globalPending+uint64(len(lossData)+len(eventData)) > w.globalDataBudget+w.globalControlReserve {
 			w.store.mu.Unlock()
 			w.err = errEvidenceControlOverflow
 			return false, 0, errEvidenceControlOverflow
@@ -414,6 +423,7 @@ func (w *evidenceWriter) checkAndReserveDataDropLocked(lossData, eventData []byt
 	w.shedding = false
 	w.congested.Store(false)
 	w.store.stats.RawEvidencePendingBytes += uint64(len(lossData) + len(eventData))
+	w.store.rawEvidenceControlPending += uint64(len(lossData))
 	if w.store.stats.RawEvidencePendingBytes > w.store.stats.RawEvidenceHighWaterBytes {
 		w.store.stats.RawEvidenceHighWaterBytes = w.store.stats.RawEvidencePendingBytes
 	}
@@ -517,6 +527,7 @@ func (w *evidenceWriter) release(dataBytes, controlBytes, dataItems, controlItem
 	w.controlQueued -= controlItems
 	released := uint64(dataBytes + controlBytes)
 	w.store.mu.Lock()
+	w.store.rawEvidenceControlPending -= uint64(controlBytes)
 	if released >= w.store.stats.RawEvidencePendingBytes {
 		w.store.stats.RawEvidencePendingBytes = 0
 	} else {
@@ -538,15 +549,23 @@ func (w *evidenceWriter) recordHardFailure(err error) (error, string) {
 
 func (w *evidenceWriter) run() {
 	var runErr error
-	var hardErr error
 	var hardReason string
+	var flushedUnsynced uint64
+	fail := func(err error) {
+		hardErr, reason := w.recordHardFailure(err)
+		hardReason = reason
+		w.store.mu.Lock()
+		w.store.stats.RawEvidenceDrainUnconfirmed = true
+		w.store.mu.Unlock()
+		w.store.fail(hardErr)
+	}
 	defer func() {
 		if runErr != nil {
-			hardErr, hardReason = w.recordHardFailure(runErr)
+			fail(runErr)
 		}
 		if err := w.sink.Close(); runErr == nil && err != nil {
 			runErr = err
-			hardErr, hardReason = w.recordHardFailure(runErr)
+			fail(runErr)
 		}
 		w.mu.Lock()
 		remainingData := w.dataPending
@@ -559,17 +578,13 @@ func (w *evidenceWriter) run() {
 		w.release(remainingData, remainingControl, remainingDataItems, remainingControlItems)
 		w.store.mu.Lock()
 		w.store.stats.RawEvidenceWriters--
-		if runErr != nil {
-			w.store.stats.RawEvidenceDrainUnconfirmed = true
-		}
 		w.store.mu.Unlock()
 		if shedDelta > 0 {
 			w.store.gap(w.backend, "", "evidence_queue_shed", "events", shedDelta)
 		}
 		if runErr != nil {
-			w.store.fail(hardErr)
 			w.store.gap(w.backend, "", hardReason, "errors", 1)
-			w.store.gap(w.backend, "", "evidence_write_unconfirmed", "bytes", uint64(remaining))
+			w.store.gap(w.backend, "", "evidence_write_unconfirmed", "bytes", uint64(remaining)+flushedUnsynced)
 		}
 		close(w.done)
 	}()
@@ -581,6 +596,7 @@ func (w *evidenceWriter) run() {
 			return err
 		}
 		if bufferedData > 0 || bufferedControl > 0 || bufferedDataItems > 0 || bufferedControlItems > 0 {
+			flushedUnsynced += uint64(bufferedData + bufferedControl)
 			w.release(bufferedData, bufferedControl, bufferedDataItems, bufferedControlItems)
 			bufferedData, bufferedControl = 0, 0
 			bufferedDataItems, bufferedControlItems = 0, 0
@@ -596,6 +612,9 @@ func (w *evidenceWriter) run() {
 				runErr = flush()
 				if runErr == nil {
 					runErr = w.sink.Sync()
+					if runErr == nil {
+						flushedUnsynced = 0
+					}
 				}
 				return
 			}
