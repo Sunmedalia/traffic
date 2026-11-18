@@ -581,7 +581,7 @@ func finishCaptureStateReason(s *Store, noTLS, requirePlaintext, budgetExceeded 
 	}
 	s.stats.StopReason = stopReason
 	s.stats.State = "stopped"
-	if s.stats.RawEvidenceWriters > 0 || s.stats.RawEvidencePendingBytes > 0 || s.stats.RawEvidenceDrainUnconfirmed {
+	if s.stats.RawEvidenceWriters > 0 || s.stats.RawEvidencePendingBytes > 0 || s.stats.RawEvidenceDrainUnconfirmed || hasUnconfirmedDrainGap(s.stats.GapCounts) {
 		s.stats.DrainState = "unverified"
 	}
 	if budgetExceeded {
@@ -599,6 +599,18 @@ func finishCaptureStateReason(s *Store, noTLS, requirePlaintext, budgetExceeded 
 	s.stats.IntegrityWarnings = session.ComputeIntegrityWarnings(s.stats, nil, s.stats.Stopped)
 	s.mu.Unlock()
 	return fatal
+}
+
+func hasUnconfirmedDrainGap(gaps map[string]uint64) bool {
+	for key, count := range gaps {
+		if count == 0 {
+			continue
+		}
+		if strings.Contains(key, "/drain_unconfirmed/") || strings.Contains(key, "/drain_sequence_mismatch/") || strings.Contains(key, "/drain_timeout/") {
+			return true
+		}
+	}
+	return false
 }
 
 // shutdownWithin shares one deadline between workers and recorder. A blocked

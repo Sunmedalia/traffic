@@ -292,7 +292,9 @@ static int transmit_event(const char *message, size_t length) {
     result = send(event_socket, message, length, MSG_DONTWAIT | MSG_NOSIGNAL);
     if (result == (ssize_t)length)
         return 1;
-    if (result < 0 && (errno == ECONNREFUSED || errno == ENOENT)) {
+    if (result < 0 && (errno == ECONNREFUSED || errno == ENOENT ||
+                       errno == EPIPE || errno == ENOTCONN ||
+                       errno == EDESTADDRREQ)) {
         close(event_socket);
         event_socket = -1;
     }
