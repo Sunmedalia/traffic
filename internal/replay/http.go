@@ -40,6 +40,7 @@ func newHTTP(s *Store) *HTTPProcessor {
 	return &HTTPProcessor{s: s, requestMethods: map[string][]string{}, requestReady: make(chan struct{}), pending: map[string][]Transaction{}, responses: map[string][]responseData{}, slots: make(chan struct{}, 2000)}
 }
 func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int, incomplete bool) {
+	_, packetReplay := r.(*queuedStream)
 	bufferSize := 32768
 	if frame, ok := r.(interface{ FramingComplete() bool }); ok && frame.FramingComplete() {
 		if sized, ok := r.(interface{ Len() int }); ok && sized.Len() > 0 {
@@ -242,10 +243,14 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				p.mu.Unlock()
 				return
 			}
-			for k, items := range p.pending {
-				if len(items) > 0 && captured.Sub(items[len(items)-1].Time) > time.Minute {
-					p.s.gap("http1", k, "response_timeout", "connections", 1)
-					p.invalidateLocked(k, "response_timeout")
+			// Packets from another connection can be parsed before this
+			// connection's response, regardless of their capture timestamps.
+			if !packetReplay {
+				for k, items := range p.pending {
+					if len(items) > 0 && captured.Sub(items[len(items)-1].Time) > time.Minute {
+						p.s.gap("http1", k, "response_timeout", "connections", 1)
+						p.invalidateLocked(k, "response_timeout")
+					}
 				}
 			}
 			if len(p.pending) >= 2000 {

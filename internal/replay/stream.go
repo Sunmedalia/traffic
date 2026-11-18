@@ -1,14 +1,16 @@
 package replay
 
 import (
+	"context"
 	"io"
 	"sync/atomic"
 	"time"
 
 	"github.com/google/gopacket/tcpassembly"
+	"golang.org/x/sync/semaphore"
 )
 
-var queuedBytes atomic.Int64
+const packetQueueBudget = 32 << 20
 
 type streamChunk struct {
 	data []byte
@@ -16,12 +18,16 @@ type streamChunk struct {
 }
 
 type queuedStream struct {
+	ctx        context.Context
+	budget     *semaphore.Weighted
+	onClose    func()
 	server     string
 	connection string
 	abort      *atomic.Bool
 	processor  *HTTPProcessor
 	chunks     chan streamChunk
 	current    []byte
+	reserved   int64
 	failed     atomic.Bool
 	closed     bool
 	store      *Store
@@ -29,11 +35,11 @@ type queuedStream struct {
 }
 
 func (s *queuedStream) Reassembled(rs []tcpassembly.Reassembly) {
-	if s.closed {
+	if s.closed || s.ctx.Err() != nil {
 		return
 	}
 	if s.abort != nil && s.abort.Load() {
-		s.ReassemblyComplete()
+		s.closeInput()
 		return
 	}
 	for _, r := range rs {
@@ -43,7 +49,7 @@ func (s *queuedStream) Reassembled(rs []tcpassembly.Reassembly) {
 			// Stop this direction at a gap rather than interpreting shifted bytes.
 			if r.Skip > 0 {
 				s.abortConnection()
-				s.ReassemblyComplete()
+				s.closeInput()
 				return
 			}
 		}
@@ -51,31 +57,28 @@ func (s *queuedStream) Reassembled(rs []tcpassembly.Reassembly) {
 			continue
 		}
 		n := int64(len(r.Bytes))
-		if queuedBytes.Add(n) > 32<<20 {
-			queuedBytes.Add(-n)
-			s.drop()
+		// The input is already on disk. Wait for the parser to consume data
+		// instead of losing a TCP direction when the reader gets ahead.
+		if s.budget.Acquire(s.ctx, n) != nil {
 			return
 		}
 		b := append([]byte(nil), r.Bytes...)
 		select {
 		case s.chunks <- streamChunk{data: b, seen: r.Seen}:
-		default:
-			queuedBytes.Add(-n)
-			s.drop()
+		case <-s.ctx.Done():
+			s.budget.Release(n)
 			return
 		}
 	}
 }
-func (s *queuedStream) drop() {
-	s.abortConnection()
-	s.store.gap("pcap", s.connection, "queue_overflow", "events", 1)
-	s.failed.Store(true)
-	s.store.mu.Lock()
-	s.store.stats.QueueDropped++
-	s.store.mu.Unlock()
-	s.ReassemblyComplete()
-}
 func (s *queuedStream) ReassemblyComplete() {
+	s.closeInput()
+	if s.onClose != nil {
+		s.onClose()
+		s.onClose = nil
+	}
+}
+func (s *queuedStream) closeInput() {
 	if !s.closed {
 		s.closed = true
 		close(s.chunks)
@@ -90,13 +93,17 @@ func (s *queuedStream) Read(b []byte) (int, error) {
 			return 0, io.EOF
 		}
 		s.current = chunk.data
+		s.reserved = int64(len(chunk.data))
 		if !chunk.seen.IsZero() {
 			s.observed.Store(chunk.seen.UnixNano())
 		}
 	}
 	n := copy(b, s.current)
 	s.current = s.current[n:]
-	queuedBytes.Add(-int64(n))
+	if len(s.current) == 0 {
+		s.current = nil
+		s.budget.Release(s.reserved)
+	}
 	return n, nil
 }
 func (s *queuedStream) Incomplete() bool { return s.failed.Load() }
