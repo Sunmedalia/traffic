@@ -79,7 +79,10 @@ def run_load(config, record):
                                                       'X-Traffic-Test-ID': marker})
             response = conn.getresponse()
             data = response.read((2 << 20) + 1)
-            good = response.status == 200 and len(data) <= 2 << 20 and json.loads(data)['body'] == body
+            decoded = json.loads(data) if response.status == 200 and len(data) <= 2 << 20 else None
+            good = isinstance(decoded, dict) and decoded.get('body') == body
+            if not good:
+                error = 'invalid_echo_response'
         except (OSError, ValueError, KeyError, http.client.HTTPException) as failure:
             error = type(failure).__name__
             if conn is not None:
@@ -89,7 +92,7 @@ def run_load(config, record):
             local.connection = None
         elapsed = time.monotonic() - entered
         return elapsed, good, {'id': marker, 'phase': phase, 'sent_at_unix': sent_at,
-                               'elapsed_ms': elapsed * 1000, 'success': good, 'error': error}
+                               'elapsed_ms': elapsed * 1000, 'sent': True, 'success': good, 'error': error}
 
     histogram, errors, dropped, pending = LatencyHistogram(), 0, 0, set()
 
@@ -115,7 +118,7 @@ def run_load(config, record):
                 if len(pending) >= concurrency * 2:
                     dropped += 1
                     record({'id': '{}-{}-{}'.format(prefix, phase, index), 'phase': phase,
-                            'sent': False, 'error': 'generator_capacity'})
+                            'sent': False, 'success': False, 'error': 'generator_capacity'})
                     continue
                 pending.add(pool.submit(request, index))
             for future in concurrent.futures.as_completed(pending):
@@ -126,7 +129,8 @@ def run_load(config, record):
             conn.close()
     return {'requests': histogram.count, 'errors': errors, 'generator_dropped': dropped,
             'successful_rps': (histogram.count - errors) / duration,
-            'p95_ms': histogram.quantile(.95), 'p99_ms': histogram.quantile(.99),
+            'p95_ms': histogram.quantile(.95) if histogram.count else None,
+            'p99_ms': histogram.quantile(.99) if histogram.count else None,
             'latency_quantile_error': 'upper bound; <=0.1% plus 1us',
             'load_duration_seconds': duration}
 
