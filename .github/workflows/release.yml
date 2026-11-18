@@ -64,6 +64,10 @@ jobs:
           bash scripts/build-ecapture.sh "$RUNNER_TEMP/ecapture"
           bash scripts/build-portable-linux.sh "$RUNNER_TEMP/ecapture"
           bash scripts/test-openssl-preload.sh
+      - name: Verify native eCapture child lifecycle
+        run: |
+          go build -o "$RUNNER_TEMP/traffic-native" ./cmd/traffic
+          sudo python3 scripts/linux/review-pr9-lifecycle.py "$RUNNER_TEMP/traffic-native" bin/ecapture scripts/linux/verify-kernel-scope.py
       - name: Package collector and console separately for each distro
         run: |
           for distro in ubuntu centos7; do
@@ -137,6 +141,26 @@ jobs:
             Expand-Archive "dist/$component-$env:RELEASE_VERSION-windows-amd64.zip" $root
           }
           ./scripts/windows/smoke-release.ps1 -App "$root/traffic-$env:RELEASE_VERSION-windows-amd64" -Console "$root/traffic-console-$env:RELEASE_VERSION-windows-amd64"
+      - name: Verify concurrent native IIS attach and shutdown
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Install-WindowsFeature Web-Server,Web-Asp-Net45,Web-Scripting-Tools | Out-Host
+          $site = Join-Path $env:RUNNER_TEMP 'traffic-iis'
+          ./scripts/windows/setup-iis.ps1 -Root $site
+          $root = Join-Path $env:RUNNER_TEMP 'traffic portable test'
+          $app = Join-Path $root "traffic-$env:RELEASE_VERSION-windows-amd64"
+          $console = Join-Path $root "traffic-console-$env:RELEASE_VERSION-windows-amd64"
+          $out = Join-Path $env:RUNNER_TEMP 'iis-evidence'
+          & "$app/deps/python/python.exe" scripts/windows/verify-iis-startup.py --rounds 2 --count 40 --concurrency 8 --duration 20 --binary "$app/traffic.exe" --analysis-binary "$console/traffic-console.exe" --iis-probe "$app/deps/probes/probe-iis.py" --iis-python "$app/deps/python/python.exe" --runtime-dir "$site/probe-runtime" --site-root $site --interfaces windivert --output $out
+          $verifyExit = $LASTEXITCODE
+          Get-ChildItem $out -Filter status.json -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            $status = Get-Content $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            $status.probe_exits | ConvertTo-Json -Depth 7 -Compress
+            $exits = @($status.probe_exits.PSObject.Properties.Value)
+            if ($exits.Count -eq 0 -or @($exits | Where-Object { !$_.hooks_removed -or !$_.data_drained }).Count -gt 0) { $verifyExit = 1 }
+          }
+          if ($verifyExit) { throw 'IIS concurrent capture or hook shutdown failed' }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
