@@ -38,6 +38,18 @@ func parsePreloadUIDs(value string) ([]uint32, error) {
 }
 
 var collectorMemoryMiB = 256
+
+// pcapBufferMiB sizes the kernel capture ring of each libpcap interface. The
+// libpcap default of 2 MiB holds only eight 256 KiB TPACKET_V3 blocks at the
+// collector's snapshot length, about 16 ms of gigabit traffic, so short
+// stalls overflowed it into unattributed kernel drops.
+var pcapBufferMiB = 32
+
+const (
+	minPCAPBufferMiB = 2
+	maxPCAPBufferMiB = 1024
+)
+
 var collectorCPUPercent = 50
 var drainTimeout = 5 * time.Second
 

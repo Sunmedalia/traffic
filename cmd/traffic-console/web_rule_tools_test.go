@@ -81,7 +81,7 @@ func TestWebRuleHitsAndRuleTest(t *testing.T) {
 		t.Fatalf("unencoded space in request line accepted %d %s", status, data)
 	}
 	status, data = ruleRequest(t, server, web.token, "POST", "/api/rules/test", map[string]string{"request": "GET /a HTTP/1.1\nbroken header line\n\n"})
-	if status != 200 || !strings.Contains(string(data), "无法按 HTTP 报文解析") {
+	if status != 200 || !strings.Contains(string(data), "已按宽松方式解析") || !strings.Contains(string(data), "malformed_header_line") {
 		t.Fatalf("unparsable request did not warn %d %s", status, data)
 	}
 	for _, input := range []map[string]string{

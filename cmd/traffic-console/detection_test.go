@@ -184,3 +184,18 @@ func TestCompressedResponseDetection(t *testing.T) {
 	}
 	t.Fatal("missing compressed response alert")
 }
+
+// Header-field rules must still see a request that net/http rejects; such
+// requests are kept leniently by local replay.
+func TestHeaderFieldsOfMalformedRequest(t *testing.T) {
+	message := detectionMessage([]byte("GET /%zz HTTP/1.1\r\nHost: test\r\nUser-Agent: sqlmap/1.7\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nab"), false, 1024)
+	if got, _ := message.content("request.header.User-Agent"); got != "sqlmap/1.7" {
+		t.Fatalf("User-Agent field %q", got)
+	}
+	if got, _ := message.content("request.header.Host"); got != "test" {
+		t.Fatalf("Host field %q", got)
+	}
+	if got, _ := message.content("request.body"); got != "ab" {
+		t.Fatalf("body field %q", got)
+	}
+}

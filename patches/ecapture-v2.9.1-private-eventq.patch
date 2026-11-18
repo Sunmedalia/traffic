@@ -1,0 +1,278 @@
+Serve eCaptureQ on a private Unix socket.
+
+A loopback WebSocket lets any local user subscribe to decrypted plaintext and
+leaves a window in which another process can bind the announced port first.
+--ecaptureq unix:///DIR/SOCK binds only inside a directory owned by the
+current user with no group or other access, sets the socket to 0600 and never
+replaces an existing path.
+
+diff --git a/cli/cmd/ecaptureq_address_test.go b/cli/cmd/ecaptureq_address_test.go
+new file mode 100644
+index 0000000..8f179ae
+--- /dev/null
++++ b/cli/cmd/ecaptureq_address_test.go
+@@ -0,0 +1,34 @@
++// Copyright 2026 CFC4N <cfc4n.cs@gmail.com>. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package cmd
++
++import "testing"
++
++func TestECaptureQListenAddressAcceptsPrivateUnixSocket(t *testing.T) {
++	for value, want := range map[string]string{
++		"ws://127.0.0.1:28257/":      "127.0.0.1:28257",
++		"unix:///run/traffic/q.sock": "unix:/run/traffic/q.sock",
++	} {
++		got, err := ecaptureQListenAddress(value)
++		if err != nil || got != want {
++			t.Fatalf("%s => %q, %v; want %q", value, got, err, want)
++		}
++	}
++	for _, value := range []string{"unix://host/q.sock", "unix:relative.sock", "unix:///q.sock?x=1", "tcp://127.0.0.1:1"} {
++		if got, err := ecaptureQListenAddress(value); err == nil {
++			t.Fatalf("%s accepted as %q", value, got)
++		}
++	}
++}
+diff --git a/cli/cmd/root.go b/cli/cmd/root.go
+index db68880..5770907 100644
+--- a/cli/cmd/root.go
++++ b/cli/cmd/root.go
+@@ -22,6 +22,7 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"os/signal"
++	"path/filepath"
+ 	"strings"
+ 	"syscall"
+ 	"time"
+@@ -146,7 +147,7 @@ func init() {
+ 	rootCmd.PersistentFlags().Uint64VarP(&globalConf.Uid, "uid", "u", defaultUid, "if uid is 0 then we target all users")
+ 	rootCmd.PersistentFlags().StringVarP(&globalConf.LoggerAddr, "logaddr", "l", "", "send logs to this server. -l /tmp/ecapture.log or -l ws://127.0.0.1:8090/ecapture or -l tcp://127.0.0.1:8080")
+ 	rootCmd.PersistentFlags().StringVar(&globalConf.EventCollectorAddr, "eventaddr", "", "captured-event destination: stdout, path, file://, tcp://, ws://, or wss:// (text defaults to stdout)")
+-	rootCmd.PersistentFlags().StringVar(&globalConf.EcaptureQ, "ecaptureq", "", "listening server, waiting for clients to connect before sending events and logs; false: send directly to the remote server.")
++	rootCmd.PersistentFlags().StringVar(&globalConf.EcaptureQ, "ecaptureq", "", "listening server (ws://HOST:PORT/ or unix:///private/dir/socket), waiting for clients to connect before sending events and logs")
+ 	rootCmd.PersistentFlags().StringVar(&globalConf.Listen, "listen", configUpdateAddr, "Listens on a port, receives HTTP requests, and is used to update the runtime configuration. default: disabled. e.g. --listen 127.0.0.1:28256")
+ 	rootCmd.PersistentFlags().Uint64VarP(&globalConf.TruncateSize, "tsize", "t", defaultTruncateSize, "the truncate size in text mode, default: 0 (B), no truncate")
+ 	rootCmd.PersistentFlags().Uint16Var(&globalConf.EventRotateSizeMB, "eventroratesize", 0, "the rorate size(MB) of the event collector file, 1M~65535M, only works for eventaddr server is file. --eventaddr=tls.log --eventroratesize=1 --eventroratetime=30")
+@@ -555,8 +556,16 @@ func ecaptureQListenAddress(value string) (string, error) {
+ 	if err != nil {
+ 		return "", fmt.Errorf("invalid ecaptureq address: %w", err)
+ 	}
++	if parsedURL.Scheme == "unix" {
++		// A private Unix socket keeps decrypted plaintext away from other local
++		// users; the server refuses a parent directory others can enter.
++		if parsedURL.Host != "" || !filepath.IsAbs(parsedURL.Path) || parsedURL.RawQuery != "" || parsedURL.Fragment != "" {
++			return "", fmt.Errorf("ecaptureq unix address must be unix:///absolute/path")
++		}
++		return ecaptureq.UnixAddress(filepath.Clean(parsedURL.Path)), nil
++	}
+ 	if parsedURL.Scheme != "ws" {
+-		return "", fmt.Errorf("ecaptureq address must use ws://")
++		return "", fmt.Errorf("ecaptureq address must use ws:// or unix://")
+ 	}
+ 	if parsedURL.Host == "" {
+ 		return "", fmt.Errorf("ecaptureq address requires a host and port")
+diff --git a/pkg/ecaptureq/server.go b/pkg/ecaptureq/server.go
+index ac9d682..0fb7ee7 100644
+--- a/pkg/ecaptureq/server.go
++++ b/pkg/ecaptureq/server.go
+@@ -95,7 +95,13 @@ func (s *Server) prepare() (*http.Server, net.Listener, error) {
+ 	if s.ctx.Err() != nil {
+ 		return nil, nil, fmt.Errorf("ecaptureq server is closed")
+ 	}
+-	listener, err := net.Listen("tcp", s.addr)
++	var listener net.Listener
++	var err error
++	if path, ok := strings.CutPrefix(s.addr, unixAddressPrefix); ok {
++		listener, err = listenPrivateUnix(path)
++	} else {
++		listener, err = net.Listen("tcp", s.addr)
++	}
+ 	if err != nil {
+ 		return nil, nil, fmt.Errorf("listen for ecaptureq on %s: %w", s.addr, err)
+ 	}
+diff --git a/pkg/ecaptureq/unix.go b/pkg/ecaptureq/unix.go
+new file mode 100644
+index 0000000..41d0de2
+--- /dev/null
++++ b/pkg/ecaptureq/unix.go
+@@ -0,0 +1,56 @@
++// Copyright 2026 CFC4N <cfc4n.cs@gmail.com>. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package ecaptureq
++
++import (
++	"fmt"
++	"net"
++	"os"
++	"path/filepath"
++	"syscall"
++)
++
++const unixAddressPrefix = "unix:"
++
++// UnixAddress marks a listen address as a private Unix socket path.
++func UnixAddress(path string) string { return unixAddressPrefix + path }
++
++// listenPrivateUnix serves decrypted events only to the owner of the socket.
++// The parent directory must be a real directory owned by this user with no
++// group or other access, so no other local user can connect to the socket or
++// pre-create a look-alike before it is bound. An existing path is never
++// removed.
++func listenPrivateUnix(path string) (net.Listener, error) {
++	if !filepath.IsAbs(path) {
++		return nil, fmt.Errorf("ecaptureq unix socket path must be absolute")
++	}
++	info, err := os.Lstat(filepath.Dir(path))
++	if err != nil {
++		return nil, fmt.Errorf("ecaptureq unix socket directory: %w", err)
++	}
++	stat, ok := info.Sys().(*syscall.Stat_t)
++	if !info.IsDir() || !ok || int(stat.Uid) != os.Geteuid() || info.Mode().Perm()&0o077 != 0 {
++		return nil, fmt.Errorf("ecaptureq unix socket directory must be a private directory owned by uid %d", os.Geteuid())
++	}
++	listener, err := net.Listen("unix", path)
++	if err != nil {
++		return nil, err
++	}
++	if err = os.Chmod(path, 0o600); err != nil {
++		_ = listener.Close()
++		return nil, fmt.Errorf("ecaptureq unix socket permissions: %w", err)
++	}
++	return listener, nil
++}
+diff --git a/pkg/ecaptureq/unix_test.go b/pkg/ecaptureq/unix_test.go
+new file mode 100644
+index 0000000..a705ac2
+--- /dev/null
++++ b/pkg/ecaptureq/unix_test.go
+@@ -0,0 +1,104 @@
++// Copyright 2026 CFC4N <cfc4n.cs@gmail.com>. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package ecaptureq
++
++import (
++	"io"
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"golang.org/x/net/websocket"
++
++	pb "github.com/gojue/ecapture/v2/protobuf/gen/v1"
++)
++
++func TestPrivateUnixSocketServesOwner(t *testing.T) {
++	dir, err := os.MkdirTemp("", "eq-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(dir)
++	path := filepath.Join(dir, "q.sock")
++	server := NewServer(UnixAddress(path), io.Discard)
++	serveErrors, err := server.StartAsync()
++	if err != nil {
++		t.Fatal(err)
++	}
++	info, err := os.Stat(path)
++	if err != nil || info.Mode().Perm() != 0o600 || info.Mode()&os.ModeSocket == 0 {
++		t.Fatalf("socket mode = %v, %v", info, err)
++	}
++	raw, err := net.Dial("unix", path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	config, err := websocket.NewConfig("ws://ecapture/", "http://ecapture/")
++	if err != nil {
++		t.Fatal(err)
++	}
++	conn, err := websocket.NewClient(config, raw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var data []byte
++	if err = websocket.Message.Receive(conn, &data); err != nil {
++		t.Fatal(err)
++	}
++	if got := decodeEntry(t, data).GetLogType(); got != pb.LogType_LOG_TYPE_HEARTBEAT {
++		t.Fatalf("first message type = %v", got)
++	}
++	_ = conn.Close()
++	if err = server.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if err = <-serveErrors; err != nil {
++		t.Fatal(err)
++	}
++	if _, err = os.Lstat(path); !os.IsNotExist(err) {
++		t.Fatalf("socket left behind: %v", err)
++	}
++}
++
++func TestPrivateUnixSocketRejectsSharedDirectory(t *testing.T) {
++	dir, err := os.MkdirTemp("", "eq-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(dir)
++	if err = os.Chmod(dir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = NewServer(UnixAddress(filepath.Join(dir, "q.sock")), io.Discard).StartAsync(); err == nil {
++		t.Fatal("shared directory accepted")
++	}
++	existing := filepath.Join(dir, "taken")
++	if err = os.Chmod(dir, 0o700); err != nil {
++		t.Fatal(err)
++	}
++	if err = os.WriteFile(existing, nil, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = NewServer(UnixAddress(existing), io.Discard).StartAsync(); err == nil {
++		t.Fatal("existing path replaced")
++	}
++	if _, err = os.Stat(existing); err != nil {
++		t.Fatalf("existing path removed: %v", err)
++	}
++	if _, err = NewServer(UnixAddress("relative.sock"), io.Discard).StartAsync(); err == nil {
++		t.Fatal("relative path accepted")
++	}
++}

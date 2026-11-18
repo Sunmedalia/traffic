@@ -1,13 +1,12 @@
 package replay
 
 import (
-	"bufio"
-	"bytes"
 	"fmt"
 	"net"
-	"net/http"
 	"net/netip"
 	"strings"
+
+	"github.com/Sunmedalia/traffic/internal/session"
 )
 
 var trustedProxies []netip.Prefix
@@ -59,7 +58,7 @@ func resolveClient(t *Transaction) {
 	if err != nil || !trustedProxy(peer) {
 		return
 	}
-	request, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(t.Request)))
+	request, _, err := session.ParseRequest(t.Request)
 	if err != nil {
 		return
 	}

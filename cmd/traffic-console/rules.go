@@ -220,7 +220,7 @@ func detectionMessage(raw []byte, response bool, limit int) detectionHTTP {
 			message.fields, body = parsed.Header, parsed.Body
 		}
 	} else {
-		parsed, err := http.ReadRequest(reader)
+		parsed, _, err := session.ReadRequest(reader)
 		if err == nil {
 			message.fields, body = parsed.Header, parsed.Body
 			if parsed.Host != "" {

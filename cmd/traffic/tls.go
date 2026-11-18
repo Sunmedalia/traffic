@@ -174,13 +174,12 @@ type probeController interface {
 func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string, pid, uid int, probeKey string, accepts func(int, string) string, snapshot kernelScopeSnapshot, attached func(), failed ...func(error)) error {
 	localDrainTimeout := drainTimeout
 	localStopTimeout := stopTimeout
-	listener, e := net.Listen("tcp", "127.0.0.1:0")
+	queue, e := newECaptureQueueEndpoint(s, bin)
 	if e != nil {
 		return e
 	}
-	addr := listener.Addr().String()
-	listener.Close()
-	args := []string{"tls", "--libssl", lib, "--mapsize", "1024", "--perf-reorder", "--perf-reorder-lag-ms", "100", "--eventaddr", os.DevNull, "--ecaptureq", "ws://" + addr + "/"}
+	defer queue.cleanup()
+	args := []string{"tls", "--libssl", lib, "--mapsize", "1024", "--perf-reorder", "--perf-reorder-lag-ms", "100", "--eventaddr", os.DevNull, "--ecaptureq", queue.listen}
 	if pid > 0 {
 		args = append(args, "-p", strconv.Itoa(pid))
 	} else {
@@ -256,9 +255,9 @@ func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string
 	}()
 
 	var ws *websocket.Conn
-	dialHandshake := min(time.Second, localDrainTimeout)
+	dialer := queue.dialer(min(time.Second, localDrainTimeout), cmd.Process.Pid)
 	for i := 0; i < 60; i++ {
-		ws, _, e = (&websocket.Dialer{HandshakeTimeout: dialHandshake}).DialContext(ctx, "ws://"+addr+"/", http.Header{"Origin": []string{"http://" + addr}})
+		ws, _, e = dialer.DialContext(ctx, queue.url, http.Header{"Origin": []string{queue.origin}})
 		if e == nil {
 			break
 		}

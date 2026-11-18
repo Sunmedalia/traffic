@@ -324,6 +324,7 @@ IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集]
 | `--name` | `capture` | 会话名 |
 | `--duration` | 0 | 到时自动停止 |
 | `--disk-limit-mib` | 2048 | 会话磁盘预算 |
+| `--pcap-buffer-mib` | 32 | 每个 libpcap 接口的内核抓包缓冲，范围 2–1024；内核拒绝时回退 libpcap 默认值并记录 `pcap/capture_buffer_fallback` 缺口。WinDivert 不使用 |
 | `--no-detect` | 兼容参数 | 采集始终不执行检测 |
 | `--require-tls` | 关 | 所选目标未通过 HTTPS 预检时拒绝开始 |
 | `--collector-memory-mib` / `--collector-cpu-percent` | 256 / 50 | 限制采集器及子进程，不含目标内探针 |

@@ -119,8 +119,8 @@ func (s *Store) save(t Transaction) error {
 	if t.Truncated && !slices.Contains(t.IntegrityReasons, "body_truncated") {
 		t.IntegrityReasons = append(t.IntegrityReasons, "body_truncated")
 	}
-	if t.Incomplete && len(t.IntegrityReasons) == 0 {
-		t.IntegrityReasons = []string{"stream_incomplete"}
+	if t.Incomplete && !slices.ContainsFunc(t.IntegrityReasons, func(reason string) bool { return !session.IsParseNote(reason) }) {
+		t.IntegrityReasons = append(t.IntegrityReasons, "stream_incomplete")
 	}
 	if t.ID == "" {
 		h := sha256.Sum256([]byte(fmt.Sprintf("%s/%s/%d/%s", t.Connection, t.Source, time.Now().UnixNano(), t.URL)))
