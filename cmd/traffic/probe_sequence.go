@@ -20,3 +20,12 @@ func (s *probeSequence) observe(current uint64) (missing uint64, reset bool) {
 	}
 	return current - previous - 1, false
 }
+
+// sequenceDiscontinuity describes a nonconsecutive pair. A restart or reorder
+// counts as a transition because the number of missing events is unknown.
+func sequenceDiscontinuity(previous, current uint64) (reason, unit string, count uint64) {
+	if current <= previous {
+		return "transport_sequence_reset_or_reorder", "transitions", 1
+	}
+	return "transport_sequence_gap", "events", current - previous - 1
+}

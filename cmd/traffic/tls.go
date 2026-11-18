@@ -95,6 +95,9 @@ func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string
 		defer os.Remove(scope.path)
 		args = append(args, "--traffic-scope-file", scope.path)
 	}
+	if pid == 0 && uid == 0 && scope == nil {
+		return fmt.Errorf("grouped root probe requires a verified kernel PID scope")
+	}
 	log, e := os.OpenFile(filepath.Join(s.dir, "logs", "tls.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if e != nil {
 		return e
@@ -107,6 +110,8 @@ func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string
 	}
 
 	cmd.Stderr = &probeLog{file: log, store: s}
+	releaseParentThread := bindProbeParent(cmd)
+	defer releaseParentThread()
 	if e = cmd.Start(); e != nil {
 		return e
 	}
@@ -180,21 +185,19 @@ func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string
 	}
 	source := fmt.Sprintf("ecapture-%d", epoch)
 	defer func() {
-		if err := p.boundary(source, "end", "probe_stopped"); err != nil {
+		if err := p.boundary(source, session.RawEvent{Type: "end", Reason: "probe_stopped"}); err != nil {
 			s.fail(err)
 		}
 	}()
 	var sequence probeSequence
-	transportUncertain := false
 	identityWarning, portWarning := false, false
 	var outerMessage, eventMessage protoFields
 	shedLoss := func(shed uint64) error {
 		if shed == 0 {
 			return nil
 		}
-		transportUncertain = true
 		s.gap("ecapture", lib, "receive_queue_shed", "messages", shed)
-		return p.boundary(source, "loss", "receive_queue_shed")
+		return p.boundary(source, session.RawEvent{Type: "loss", Reason: "receive_queue_shed", Unit: "messages", Count: shed})
 	}
 	var pendingShed uint64
 	for {
@@ -239,14 +242,17 @@ func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string
 		}
 		pendingShed = 0
 		if missing > 0 || reset {
-			transportUncertain = true
 			if missing > 0 {
 				s.gap("ecapture", lib, "sequence_gap", "published_events", missing)
 			}
 			if reset {
 				s.gap("ecapture", lib, "sequence_reset_or_reorder", "transitions", 1)
 			}
-			if err := p.boundary(source, "loss", "probe_sequence_gap"); err != nil {
+			boundary := session.RawEvent{Type: "loss", Reason: "sequence_gap", Unit: "published_events", Count: missing}
+			if reset {
+				boundary.Reason, boundary.Unit, boundary.Count = "sequence_reset_or_reorder", "transitions", 1
+			}
+			if err := p.boundary(source, boundary); err != nil {
 				return err
 			}
 		}
@@ -303,7 +309,7 @@ func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string
 		if len(payload) == 0 {
 			kind = "close"
 		}
-		if err := p.record(source+"/"+identity, "ecapture", target, session.RawEvent{Type: kind, Connection: key, Direction: string(fields[14]), Data: payload, Local: net.JoinHostPort(string(fields[5]), strconv.Itoa(int(nums[6]))), Client: client, Incomplete: transportUncertain}); err != nil {
+		if err := p.record(source+"/"+identity, "ecapture", target, session.RawEvent{Type: kind, Connection: key, Direction: string(fields[14]), Data: payload, Local: net.JoinHostPort(string(fields[5]), strconv.Itoa(int(nums[6]))), Client: client}); err != nil {
 			return err
 		}
 

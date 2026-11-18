@@ -116,13 +116,19 @@ func (r *eventRecorder) openssl(source, backend string, target session.Target, e
 			return nil
 		}
 	}
+	if event.Type == "data" && event.OriginalLength > len(event.Data) {
+		r.store.gap(backend, target.ID, "single_call_truncated", "bytes", uint64(event.OriginalLength-len(event.Data)))
+		event.Incomplete = true
+	}
+	reason := ""
 	if event.Type == "loss" {
+		reason = "probe_queue_loss"
 		r.store.gap(backend, target.ID, "probe_queue_loss", "events", event.Count)
 		r.store.mu.Lock()
 		r.store.stats.TLSDropped += event.Count
 		r.store.mu.Unlock()
 	}
-	return r.record(source, backend, target, session.RawEvent{Type: event.Type, Connection: event.Connection, Direction: event.Direction, Local: event.Local, Client: event.Client, Data: event.Data, Incomplete: event.Incomplete, Count: event.Count})
+	return r.record(source, backend, target, session.RawEvent{Type: event.Type, Connection: event.Connection, Direction: event.Direction, Local: event.Local, Client: event.Client, Data: event.Data, Incomplete: event.Incomplete, OriginalLength: event.OriginalLength, Count: event.Count, Reason: reason})
 }
 
 func portNumbers(ports map[int]bool) []int {
@@ -150,19 +156,22 @@ func captureAddresses() []string {
 	})
 	return result
 }
-func (r *eventRecorder) boundary(prefix, kind, reason string) error {
+func (r *eventRecorder) boundary(generation string, event session.RawEvent) error {
 	r.mu.Lock()
 	var sources []string
 	for source := range r.sources {
-		if strings.HasPrefix(source, prefix) {
+		if strings.HasPrefix(source, generation+"/") {
 			sources = append(sources, source)
 		}
 	}
 	r.mu.Unlock()
+	sort.Strings(sources)
 	for _, source := range sources {
-		if err := r.record(source, "", session.Target{}, session.RawEvent{Type: kind, Reason: reason}); err != nil {
+		if err := r.record(source, "", session.Target{}, event); err != nil {
 			return err
 		}
+		// A transport-wide count belongs to the whole boundary, not each PID.
+		event.Count = 0
 	}
 	return nil
 }

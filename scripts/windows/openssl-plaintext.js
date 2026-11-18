@@ -21,18 +21,18 @@ let captured = 0;
 
 function enqueue(event, data = null) {
     const size = data === null ? 0 : data.byteLength;
-    if (events.length >= 256 || queuedBytes + size > 8 * 1024 * 1024) { dropped++; return; }
+    if (dropped || events.length >= 256 || queuedBytes + size > 8 * 1024 * 1024) { dropped++; return; }
     event.time = new Date().toISOString();
     events.push({event, data});
     queuedBytes += size;
 }
 let transportSequence = 0;
 function flush() {
-    if (dropped) { send({type: 'loss', count: dropped, sequence: ++transportSequence}); dropped = 0; }
     const batch = events;
     events = [];
     queuedBytes = 0;
     for (const item of batch) { item.event.sequence = ++transportSequence; send(item.event, item.data); }
+    if (dropped) { send({type: 'loss', count: dropped, sequence: ++transportSequence}); dropped = 0; }
 }
 function hook(address, callbacks) {
     if (!originals.has(address.toString())) originals.set(address.toString(), new Uint8Array(address.readByteArray(16)));
@@ -138,9 +138,9 @@ function install(module) {
                     const length = extended ? (Process.pointerSize === 8 ? Number(this.resultSize.readU64()) : this.resultSize.readU32()) : status;
                     if (length <= 0) return;
                     const count = Math.min(length, this.capacity);
-                    if (events.length >= 256 || queuedBytes + count > 8 * 1024 * 1024) { dropped++; return; }
+                    if (dropped || events.length >= 256 || queuedBytes + count > 8 * 1024 * 1024) { dropped++; return; }
                     const data = this.buffer.readByteArray(count);
-                    enqueue({type: 'data', connection: this.state.id, direction, local: this.state.local, client: this.state.remote, incomplete: length > count}, data);
+                    enqueue({type: 'data', connection: this.state.id, direction, local: this.state.local, client: this.state.remote, incomplete: length > count, original_length: length}, data);
                     captured++;
                 } catch (error) { dropped++; }
             }

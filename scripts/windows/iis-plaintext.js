@@ -22,6 +22,9 @@ let events = [];
 let eventBytes = 0;
 let dropped = 0;
 let completed = 0;
+const captureQueueBytes = 8 * 1024 * 1024;
+const maxBodyCopyPerCall = 128 * 1024;
+let recoveryBudget = 32;
 const diagnostics = {completion_entries: 0, matches: 0,
     recovered_receives: 0, recovery_attempts: 0, recovery_failures: 0,
     receive_matches: 0, body_matches: 0, send_matches: 0, interim_matches: 0,
@@ -43,7 +46,7 @@ const responseHeaders = commonHeaders.concat(['Accept-Ranges', 'Age', 'ETag', 'L
 
 function enqueue(event, data = null) {
     const size = data === null ? 0 : data.byteLength;
-    if (events.length >= 512 || eventBytes + size > 8 * 1024 * 1024) {
+    if (events.length >= 512 || eventBytes + size > captureQueueBytes) {
         dropped++;
         return;
     }
@@ -54,6 +57,7 @@ function enqueue(event, data = null) {
 
 let transportSequence = 0;
 function flush() {
+    recoveryBudget = 32;
     for (const [id, state] of requests) {
         if (!state.known && Date.now() - state.created > 5000) {
             if (state.deferred.length > 0 && !ignored.has(id)) {
@@ -99,7 +103,7 @@ function dispatch(event, data = null) {
     if (state === undefined) return;
     if (state.known) { enqueue(event, data); return; }
     const size = data === null ? 0 : data.byteLength;
-    if (deferredCount >= 512 || deferredBytes + size > 8 * 1024 * 1024) {
+    if (deferredCount >= 512 || deferredBytes + size > captureQueueBytes) {
         state.lost = true;
         dropped++;
         return;
@@ -157,75 +161,61 @@ function address(pointer) {
     throw new Error('Unsupported socket address family');
 }
 
-const kernel = Process.getModuleByName('kernel32.dll');
-const createMapping = new NativeFunction(kernel.getExportByName('CreateFileMappingW'), 'pointer',
-    ['pointer', 'pointer', 'uint', 'uint', 'uint', 'pointer']);
-const mapView = new NativeFunction(kernel.getExportByName('MapViewOfFile'), 'pointer',
-    ['pointer', 'uint', 'uint', 'uint', 'ulong']);
-const unmapView = new NativeFunction(kernel.getExportByName('UnmapViewOfFile'), 'bool', ['pointer']);
-const closeHandle = new NativeFunction(kernel.getExportByName('CloseHandle'), 'bool', ['pointer']);
-const fileSize = new NativeFunction(kernel.getExportByName('GetFileSizeEx'), 'bool', ['pointer', 'pointer']);
-
-function body(id, direction, pointer, length) {
+function body(id, direction, pointer, length, budget = maxBodyCopyPerCall) {
     const state = requests.get(id);
-    if (state === undefined || length === 0) return;
+    if (state === undefined || length === 0) return 0;
     const configured = direction === 'request' ? requestLimit : (state.responseLimit || responseLimit);
     const limit = configured > 0 ? configured : defaultBodyCap;
     const used = state[direction];
-    const count = Math.min(length, Math.max(0, limit - used));
+    const clipped = direction + 'Clipped';
+    const room = state.known ? captureQueueBytes - eventBytes : captureQueueBytes - deferredBytes;
+    const slots = state.known ? 512 - events.length : 512 - deferredCount;
+    const count = state[clipped] ? 0 : Math.min(length, Math.max(0, limit - used),
+        Math.max(0, room), Math.max(0, slots) * 65536, budget);
     state[direction] += length;
     if (count === 0) dispatch({type: direction + '-body', id, length});
     for (let offset = 0; offset < count; offset += 65536) {
         dispatch({type: direction + '-body', id, length: offset === 0 ? length : 0},
             pointer.add(offset).readByteArray(Math.min(65536, count - offset)));
     }
-    if (used <= limit && used + length > limit) dispatch({type: 'truncated', id});
+    if (count < length && !state[clipped]) {
+        state[clipped] = true;
+        dispatch({type: 'truncated', id});
+    }
+    return count;
 }
+
+const kernel = Process.getModuleByName('kernel32.dll');
+const fileSize = new NativeFunction(kernel.getExportByName('GetFileSizeEx'), 'bool', ['pointer', 'pointer']);
 
 function chunks(id, direction, count, pointer) {
     if (!requests.has(id)) return;
     if (count > 256) throw new Error('Too many entity chunks');
+    let budget = maxBodyCopyPerCall;
     for (let index = 0; index < count; index++) {
         const chunk = pointer.add(index * 32);
         const type = chunk.readU32();
         if (type === 0) {
-            body(id, direction, chunk.add(8).readPointer(), chunk.add(16).readU32());
+            budget -= body(id, direction, chunk.add(8).readPointer(), chunk.add(16).readU32(), budget);
         } else if (type === 1) {
-            const handle = chunk.add(24).readPointer();
-            const sizeBuffer = Memory.alloc(8);
-            if (!fileSize(handle, sizeBuffer)) { gap(id, 'Cannot query file chunk size'); continue; }
-            const offset = chunk.add(8).readU64().toNumber();
+            // Preserve the declared body length without mapping or faulting in
+            // file pages on the target's HTTP API callback.
+            const rangeOffset = chunk.add(8).readU64();
             const declared = chunk.add(16).readU64();
-            const size = sizeBuffer.readU64().toNumber();
-            const length = declared.toString() === '18446744073709551615' ? size - offset : declared.toNumber();
-            if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || length < 0) {
+            let length = declared.toNumber();
+            if (declared.toString() === '18446744073709551615') {
+                const sizeBuffer = Memory.alloc(8);
+                const handle = chunk.add(24).readPointer();
+                if (!fileSize(handle, sizeBuffer)) { gap(id, 'Cannot query file chunk size'); continue; }
+                length = sizeBuffer.readU64().toNumber() - rangeOffset.toNumber();
+            }
+            if (!Number.isSafeInteger(length) || length < 0) {
                 gap(id, 'Unsupported file chunk range');
                 continue;
             }
-            const state = requests.get(id);
-            const configured = direction === 'request' ? requestLimit : (state.responseLimit || responseLimit);
-            const limit = configured > 0 ? configured : defaultBodyCap;
-            const wanted = Math.min(length, Math.max(0, limit - state[direction]));
-            if (wanted === 0) {
-                state[direction] += length;
-                if (length > 0) {
-                    dispatch({type: direction + '-body', id, length});
-                    dispatch({type: 'truncated', id});
-                }
-                continue;
-            }
-            // A read-only view preserves the server's file position and handle.
-            const mapping = createMapping(handle, ptr(0), 2, 0, 0, ptr(0));
-            if (mapping.isNull()) { gap(id, 'Cannot map file chunk'); continue; }
-            const aligned = Math.floor(offset / 65536) * 65536;
-            const delta = offset - aligned;
-            const view = mapView(mapping, 4, Math.floor(aligned / 4294967296), aligned % 4294967296, wanted + delta);
-            try {
-                if (view.isNull()) gap(id, 'Cannot read file chunk');
-                else body(id, direction, view.add(delta), length);
-            } finally {
-                if (!view.isNull()) unmapView(view);
-                closeHandle(mapping);
+            if (length > 0) {
+                body(id, direction, null, length, 0);
+                gap(id, 'File-backed body omitted by live capture');
             }
         } else {
             gap(id, 'Unsupported cached entity chunk type ' + type);
@@ -309,6 +299,12 @@ function receiveRequest(operation, description = null) {
 
 function recoverReceive(overlapped, status, length, expectedId = null) {
     if (status !== 0 || overlapped.isNull()) return false;
+    // Most IOCP completions belong to unrelated APIs. Spend a bounded amount
+    // of time on speculative recovery and prioritize exact request IDs.
+    if (expectedId === null) {
+        if ((length < 848 && deferredCount === 0) || recoveryBudget <= 0) return false;
+        recoveryBudget--;
+    }
     diagnostics.recovery_attempts++;
     // Bounded read-only discovery, not a process/heap scan or a private layout
     // offset. The callback owns this context until the completion hook returns.
@@ -427,12 +423,10 @@ hook(ntdll, 'NtRemoveIoCompletion', {
     onEnter(args) {
         if (stopping) return;
         diagnostics.remove_calls++;
-        this.apc = args[2];
-        this.io = args[3];
+        this.complete = completionReturn('NtRemoveIoCompletion', args[2], args[3]);
     },
     onLeave(result) {
-        if (stopping || this.apc === undefined) return;
-        completionReturn('NtRemoveIoCompletion', this.apc, this.io)(result);
+        if (!stopping && this.complete !== undefined) this.complete(result);
     }
 });
 for (const name of ['NtRemoveIoCompletionEx', 'NtWaitForWorkViaWorkerFactory']) {
@@ -441,13 +435,13 @@ for (const name of ['NtRemoveIoCompletionEx', 'NtWaitForWorkViaWorkerFactory']) 
             if (stopping) return;
             if (name === 'NtRemoveIoCompletionEx') diagnostics.remove_ex_calls++;
             else diagnostics.worker_calls++;
-            this.entries = args[1];
-            this.capacity = args[2].toUInt32();
-            this.countPointer = args[3];
+            const entries = args[1];
+            const capacity = args[2].toUInt32();
+            const countPointer = args[3];
+            this.complete = completionReturn(name, entries, capacity, countPointer);
         },
         onLeave(result) {
-            if (stopping || this.entries === undefined) return;
-            completionReturn(name, this.entries, this.capacity, this.countPointer)(result);
+            if (!stopping && this.complete !== undefined) this.complete(result);
         }
     });
 }
@@ -468,7 +462,10 @@ for (const name of ['HttpReceiveHttpRequest', 'HttpReceiveRequestEntityBody', 'H
             operation.overlap = overlap.toString();
             this.operation = operation;
             if (!overlap.isNull()) {
-                if (pending.size >= 4096) { pending.delete(pending.keys().next().value); dropped++; }
+                if (!pending.has(operation.overlap) && pending.size >= 4096) {
+                    pending.delete(pending.keys().next().value);
+                    dropped++;
+                }
                 pending.set(operation.overlap, operation);
             }
             if (!receiving && stateFor(operation.id) !== undefined) {

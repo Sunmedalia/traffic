@@ -442,7 +442,7 @@ TUI、Web、JSON 查询及导出读取同一代分析结果；Web 和 TUI 每次
 | 索引保留期 | 24 小时 |
 | 进程资源 | Linux cgroup v1/v2 / Windows Job Object，256 MiB、单核 50% |
 
-证据 ZIP 含请求、响应、关联 PCAP 和 SHA-256 清单；PCAP 按客户端端点及请求前后各 60 秒筛选，可能包含同连接上的其他请求。HTTPS 明文来自进程探针，PCAP 仍是原始密文。明文事件、Cookie 和认证信息可能出现在会话里，分享前先检查。
+证据 ZIP 含请求、响应和 SHA-256 清单。有完整传输端点的请求还包含按双端 TCP 地址、端口及请求前后各 60 秒筛选的 PCAP，可能包含同连接上的其他请求或窗口内重用同一对端点的流量。最后一段 PCAP 或缺口日志存在残缺记录时，ZIP 保留完整记录并在 `evidence.json` 中列出受影响的源文件。HTTPS 明文来自进程探针，PCAP 保留原始报文字节。明文事件、Cookie 和认证信息可能出现在会话里，分享前先检查。
 
 ## Linux HTTPS 依赖与 eCapture
 
@@ -574,7 +574,7 @@ go test -race ./...
 go vet ./...
 ```
 
-CI 在 ARM64 / x86_64 Linux 执行格式检查、竞态测试、静态检查和构建，Windows x64 执行原生测试与构建，Java 17/21 执行 Maven 测试与打包。PCAP/PCAPNG 离线导入使用纯 Go 读取器，Windows 无需 Npcap 即可运行离线集成测试；发布流程另验证随包 WinDivert 的回环 HTTP 实际采集。
+CI 在 ARM64 / x86_64 Linux 执行格式检查、竞态测试、静态检查和构建，Windows x64 执行原生测试与构建，Java 17/21 执行 Maven 测试与打包。PCAP/PCAPNG 离线导入使用纯 Go 读取器，支持 Linux SLL2，并按 PCAPNG 接口分别保存分段。Windows 无需 Npcap 即可运行离线集成测试；发布流程另验证随包 WinDivert 的回环 HTTP 实际采集。
 
 实机脚本需要兼容的测试站接口（`/api/health`、`/api/echo`、`/search`、未知路径 404），串行发送请求，输出目录必须为新目录：
 

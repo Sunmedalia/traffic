@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Sunmedalia/traffic/internal/packetio"
 	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/pcapgo"
 )
@@ -25,7 +25,7 @@ type packetRing struct {
 	writer     *pcapgo.Writer
 	size       int64
 	index      int
-	link       layers.LinkType
+	link       uint32
 	snaplen    uint32
 }
 
@@ -44,8 +44,8 @@ func (r *packetRing) write(ci gopacket.CaptureInfo, b []byte) error {
 		}
 		r.file = f
 		r.buffer = bufio.NewWriterSize(f, 256<<10)
-		r.writer = pcapgo.NewWriter(r.buffer)
-		if e = r.writer.WriteFileHeader(r.snaplen, r.link); e != nil {
+		r.writer = pcapgo.NewWriterNanos(r.buffer)
+		if e = packetio.WriteHeader(r.buffer, r.snaplen, r.link); e != nil {
 			return e
 		}
 		r.size = 24
@@ -99,16 +99,35 @@ type packetSink interface {
 	close() error
 }
 
-// syncPacketSink is used for offline import: input can wait, so every packet
-// is written in order and a write error stops the import immediately.
-type syncPacketSink struct{ ring *packetRing }
+// syncPacketSink keeps each PCAPNG interface separate. Import can wait for
+// disk without discarding input. The reader bounds the number of interfaces.
+type syncPacketSink struct {
+	dir   string
+	input *offlinePacketHandle
+	rings map[int]*packetRing
+}
 
-func (w syncPacketSink) write(ci gopacket.CaptureInfo, data []byte) (bool, error) {
-	err := w.ring.write(ci, data)
+func (w *syncPacketSink) write(ci gopacket.CaptureInfo, data []byte) (bool, error) {
+	ring := w.rings[ci.InterfaceIndex]
+	if ring == nil {
+		name := "offline"
+		if w.input.IsPCAPNG() {
+			name = fmt.Sprintf("offline-%d", ci.InterfaceIndex)
+		}
+		ring = &packetRing{dir: w.dir, iface: name, link: w.input.Link, snaplen: w.input.Snap}
+		w.rings[ci.InterfaceIndex] = ring
+	}
+	err := ring.write(ci, data)
 	return err == nil, err
 }
-func (w syncPacketSink) failure() error { return nil }
-func (w syncPacketSink) close() error   { return w.ring.close() }
+func (w *syncPacketSink) failure() error { return nil }
+func (w *syncPacketSink) close() error {
+	var err error
+	for _, ring := range w.rings {
+		err = errors.Join(err, ring.close())
+	}
+	return err
+}
 
 func newPacketWriter(s *Store, iface string, ring *packetRing) *packetWriter {
 	w := &packetWriter{store: s, iface: iface, ring: ring, queue: make(chan packetWriteItem, packetWriteQueueItems), done: make(chan struct{})}
@@ -210,8 +229,10 @@ func (w *packetWriter) close() error {
 func capturePackets(ctx context.Context, s *Store, p *eventRecorder, iface, filter, input string) error {
 	var h packetHandle
 	var e error
+	var offline *offlinePacketHandle
 	if input != "" {
-		h, e = openOfflinePacket(input)
+		offline, e = openOfflinePacket(input)
+		h = offline
 	} else {
 		h, e = openLivePacket(ctx, iface)
 	}
@@ -240,9 +261,11 @@ func capturePackets(ctx context.Context, s *Store, p *eventRecorder, iface, filt
 		s.packetSourceState(iface, "ready")
 		defer s.packetSourceState(iface, "stopped")
 	}
-	ring := &packetRing{dir: packetDir, iface: iface, link: h.LinkType(), snaplen: uint32(h.SnapLen())}
-	var writer packetSink = syncPacketSink{ring}
-	if input == "" {
+	var writer packetSink
+	if offline != nil {
+		writer = &syncPacketSink{dir: packetDir, input: offline, rings: make(map[int]*packetRing)}
+	} else {
+		ring := &packetRing{dir: packetDir, iface: iface, link: uint32(h.LinkType()), snaplen: uint32(h.SnapLen())}
 		writer = newPacketWriter(s, iface, ring)
 	}
 	defer func() {

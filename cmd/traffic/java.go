@@ -181,9 +181,10 @@ func captureJava(ctx context.Context, s *Store, p *eventRecorder, t session.Targ
 			return err
 		}
 		if event.Dropped > lastDropped {
-			s.gap("java-agent", t.ID, "probe_queue_loss", "events", event.Dropped-lastDropped)
+			missing := event.Dropped - lastDropped
+			s.gap("java-agent", t.ID, "probe_queue_loss", "events", missing)
 			lastDropped = event.Dropped
-			if err := p.record(source, "java-agent", t, session.RawEvent{Type: "loss", Reason: "probe_queue_loss"}); err != nil {
+			if err := p.record(source, "java-agent", t, session.RawEvent{Type: "loss", Reason: "probe_queue_loss", Count: missing}); err != nil {
 				return err
 			}
 		}
@@ -197,8 +198,9 @@ func captureJava(ctx context.Context, s *Store, p *eventRecorder, t session.Targ
 		}
 		if event.Sequence > 0 {
 			if lastSequence > 0 && event.Sequence != lastSequence+1 {
-				s.gap("java-agent", t.ID, "transport_sequence_gap", "events", 1)
-				if err := p.record(source, "java-agent", t, session.RawEvent{Type: "loss", Reason: "transport_sequence_gap"}); err != nil {
+				reason, unit, count := sequenceDiscontinuity(lastSequence, event.Sequence)
+				s.gap("java-agent", t.ID, reason, unit, count)
+				if err := p.record(source, "java-agent", t, session.RawEvent{Type: "loss", Reason: reason, Unit: unit, Count: count}); err != nil {
 					return err
 				}
 			}

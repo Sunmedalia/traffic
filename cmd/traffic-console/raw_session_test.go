@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/Sunmedalia/traffic/internal/replay"
 	"github.com/Sunmedalia/traffic/internal/session"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 func rawTestSession(t *testing.T, events []session.RawEvent) string {
@@ -313,6 +316,92 @@ func TestRawDiscoveryAndSummaryCachesFollowAnalysisGeneration(t *testing.T) {
 	}
 }
 
+func TestRawReplayRecoversNewHTTP2AfterLoss(t *testing.T) {
+	now := time.Now().UTC()
+	target := &session.Target{ID: "nginx", Service: "nginx"}
+	events := []session.RawEvent{{Version: 1, Source: "one", Backend: "ecapture", Type: "source", Target: target, Time: now}}
+	add := func(connection, direction string, data []byte) {
+		events = append(events, session.RawEvent{Version: 1, Source: "one", Type: "data", Direction: direction,
+			Connection: connection, Local: "127.0.0.1:443", Client: "192.0.2.1:50001", Data: data, Time: now,
+			Incomplete: len(events) > 2})
+	}
+	http2Side := func(preface bool, fields ...hpack.HeaderField) []byte {
+		var out, header bytes.Buffer
+		if preface {
+			out.WriteString(http2.ClientPreface)
+		}
+		encoder := hpack.NewEncoder(&header)
+		for _, field := range fields {
+			if err := encoder.WriteField(field); err != nil {
+				t.Fatal(err)
+			}
+		}
+		framer := http2.NewFramer(&out, nil)
+		if err := framer.WriteSettings(); err != nil {
+			t.Fatal(err)
+		}
+		if err := framer.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, EndHeaders: true, EndStream: true, BlockFragment: header.Bytes()}); err != nil {
+			t.Fatal(err)
+		}
+		return out.Bytes()
+	}
+	old := http2Side(true, hpack.HeaderField{Name: ":method", Value: "GET"}, hpack.HeaderField{Name: ":scheme", Value: "https"}, hpack.HeaderField{Name: ":path", Value: "/old"}, hpack.HeaderField{Name: ":authority", Value: "example"})
+	add("old", "read", old)
+	events = append(events, session.RawEvent{Version: 1, Source: "one", Type: "loss", Time: now, Reason: "receive_queue_shed", Unit: "messages", Count: 5})
+	fresh := http2Side(true, hpack.HeaderField{Name: ":method", Value: "GET"}, hpack.HeaderField{Name: ":scheme", Value: "https"}, hpack.HeaderField{Name: ":path", Value: "/fresh"}, hpack.HeaderField{Name: ":authority", Value: "example"})
+	add("fresh", "read", fresh[:3])
+	add("fresh", "read", fresh[3:])
+	response := http2Side(false, hpack.HeaderField{Name: ":status", Value: "200"})
+	add("old", "write", response)
+	add("fresh", "write", response)
+
+	dir := rawTestSession(t, events)
+	stream := filepath.Join(dir, "tls", "stream.jsonl")
+	file, err := os.OpenFile(stream, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = file.WriteString(`{"source":"one","type":`)
+	if closeErr := file.Close(); err != nil || closeErr != nil {
+		t.Fatal(err, closeErr)
+	}
+	before, err := os.ReadFile(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs, _ := rulesFromYAML(nil)
+	report, err := analyzeSessionRules(context.Background(), dir, "", rs, time.Minute, 20)
+	if err != nil || report.Transactions != 2 {
+		t.Fatal(report, err)
+	}
+	if counts := report.Reconstruction.GapCounts; counts["ecapture/receive_queue_shed/messages"] != 5 || counts["tls/truncated_raw_tail/records"] != 1 {
+		t.Fatalf("missing diagnostics: %+v", counts)
+	}
+	store, err := openStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.db.Close()
+	for _, url := range []string{"/old", "/fresh"} {
+		var raw []byte
+		var transaction Transaction
+		if err := store.db.QueryRow("SELECT data FROM requests WHERE json_extract(data, '$.url')=?", url).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(raw, &transaction); err != nil {
+			t.Fatal(err)
+		}
+		fresh := url == "/fresh"
+		if transaction.Incomplete == fresh || (transaction.Status == 200) != fresh {
+			t.Fatalf("unexpected reconstruction state for %s: %+v", url, transaction)
+		}
+	}
+	after, err := os.ReadFile(stream)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("recovery changed the raw evidence: %v", err)
+	}
+}
+
 func TestAnalyzeStatusTUIAndExportSurfaceStalledCaptureWarnings(t *testing.T) {
 	started := time.Date(2026, 11, 18, 2, 48, 59, 0, time.UTC)
 	pktTime := started.Add(190 * time.Millisecond)
@@ -428,7 +517,23 @@ func TestAnalyzeStatusTUIAndExportSurfaceStalledCaptureWarnings(t *testing.T) {
 	if err := exportEvidence(store, txRecord, txRaw, zipPath); err != nil {
 		t.Fatal(err)
 	}
-	if fi, err := os.Stat(zipPath); err != nil || fi.Size() == 0 {
-		t.Fatalf("missing exported zip: %v", err)
+	evidence, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer evidence.Close()
+	manifest, err := evidence.Open("evidence.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manifest.Close()
+	var note struct {
+		Warnings []string `json:"session_integrity_warnings"`
+	}
+	if err := json.NewDecoder(manifest).Decode(&note); err != nil {
+		t.Fatal(err)
+	}
+	if len(note.Warnings) < 3 {
+		t.Fatalf("evidence manifest missing integrity warnings: %v", note.Warnings)
 	}
 }

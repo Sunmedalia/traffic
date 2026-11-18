@@ -236,16 +236,15 @@ for (const options of [{plaintext: true}, {port: 443}, {url: '/bad\r\nurl'}]) {
     assert.equal(f.sentMessages.some(m => m.event.type === 'probe-gap' && m.event.reason === 'unrecovered_receive' && m.event.count === 1), true);
 }
 
-// Regression: File-handle entity chunks cap MapViewOfFile length at 16 MiB when responseLimit == 0,
+// Regression: File-backed bodies retain their declared length and report omissions,
 // and pending map evicts single oldest entry instead of clearing all 4096 entries.
 {
-    let mappedLength = 0;
+    let mapped = false;
     const f = fixture({
-        memoryBytes: 18 << 20,
         nativeImpls: {
             GetFileSizeEx: ({u64}) => (_handle, sizeBuf) => { u64(sizeBuf, 0, 100n * 1024n * 1024n); return 1; },
             CreateFileMappingW: ({Pointer}) => () => new Pointer(0x50000),
-            MapViewOfFile: ({Pointer}) => (_m, _a, _hi, _lo, len) => { mappedLength = len; return new Pointer(0x20000); },
+            MapViewOfFile: () => () => { mapped = true; throw new Error("unexpected file mapping"); },
             UnmapViewOfFile: () => () => 1,
             CloseHandle: () => () => 1
         }
@@ -258,7 +257,9 @@ for (const options of [{plaintext: true}, {port: 443}, {url: '/bad\r\nurl'}]) {
     f.u64(fileChunk, 16, 0xffffffffffffffffn);
     f.u64(fileChunk, 24, 0x1234n);
     f.evaluate(`chunks('0xfe00112233445577', 'response', 1, ptr(${fileChunk.value}))`);
-    assert.equal(mappedLength, 16 * 1024 * 1024);
+    assert.equal(mapped, false);
+    assert.equal(f.value("events.find(x => x.event.type === 'response-body').event.length"), 100 * 1024 * 1024);
+    assert.equal(f.value("events.some(x => x.event.type === 'gap' && x.event.reason.includes('File-backed body'))"), true);
     assert.equal(f.value("events.some(x => x.event.type === 'truncated')"), true);
 
     f.evaluate('for (let i = 0; i < 4096; i++) pending.set("ov-" + i, {id: "0x1", kind: "send"});');

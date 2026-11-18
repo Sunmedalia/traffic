@@ -2,7 +2,6 @@ package main
 
 import (
 	"archive/zip"
-	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,15 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Sunmedalia/traffic/internal/packetio"
 	"github.com/Sunmedalia/traffic/internal/session"
-	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
 )
@@ -72,18 +70,26 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 			return e
 		}
 	}
+	peer := t.PeerClient
+	if peer == "" {
+		peer = t.Client
+	}
+	remote, remoteErr := netip.ParseAddrPort(peer)
+	local, localErr := netip.ParseAddrPort(t.LocalEndpoint)
+	hasEndpoints := remoteErr == nil && localErr == nil && remote.Port() != 0 && local.Port() != 0
+	packetScope := "TCP connection endpoints within 60 seconds of transaction time; may include other transactions or reused connections with the same endpoints"
+	if !hasEndpoints {
+		packetScope = "packet selection unavailable because the transaction lacks both transport endpoints"
+	}
+	note := map[string]any{"schema_version": 1, "source": t.Source, "protocol": t.Protocol, "stream_id": t.StreamID, "integrity_reasons": t.IntegrityReasons, "incomplete": t.Incomplete, "truncated": t.Truncated, "capture_coverage": session.CoverageWarning, "packet_scope": packetScope, "tls_plaintext_source": "process hook; network PCAP remains encrypted"}
 	var reconstructed *Stats
 	if s.analysis != nil {
 		reconstructed = s.analysis.Reconstruction
 	}
-	note := map[string]any{"schema_version": 1, "source": t.Source, "protocol": t.Protocol, "stream_id": t.StreamID, "integrity_reasons": t.IntegrityReasons, "incomplete": t.Incomplete, "truncated": t.Truncated, "capture_coverage": session.CoverageWarning, "packet_scope": "transport peer endpoint and 120-second window; may include other requests on the same connection; original packets may have rotated", "tls_plaintext_source": "process hook; network PCAP remains encrypted"}
 	if warnings := sessionIntegrityWarnings(s.dir, reconstructed); len(warnings) > 0 {
 		note["session_integrity_warnings"] = warnings
 	}
-	info, _ := json.MarshalIndent(note, "", "  ")
-	if e = add("evidence.json", info); e != nil {
-		return e
-	}
+	var truncatedFiles []string
 	lock, e := os.Open(filepath.Join(s.dir, "capture.lock"))
 	if e != nil {
 		return e
@@ -124,90 +130,62 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 	}
 	if file, err := os.Open(filepath.Join(s.dir, "gaps.jsonl")); err == nil {
 		var selected bytes.Buffer
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 4096), 1<<20)
-		for scanner.Scan() {
+		lines := session.NewJSONLines(file, 1<<20)
+		for {
 			var gap session.GapEvent
-			if err := json.Unmarshal(scanner.Bytes(), &gap); err != nil {
+			err := lines.Next(&gap)
+			if err == io.EOF {
+				break
+			}
+			if err == session.ErrTruncatedJSONLine {
+				truncatedFiles = append(truncatedFiles, "gaps.jsonl")
+				break
+			}
+			if err != nil {
 				file.Close()
 				return err
 			}
-			if gap.Connection == "" || strings.Contains(t.Connection, gap.Connection) || (t.TargetID != "" && gap.Connection == t.TargetID) {
-				selected.Write(scanner.Bytes())
+			if gap.Connection == "" || gap.Connection == t.Connection || gap.Connection == strings.TrimPrefix(t.Connection, "tls:") || (t.TargetID != "" && gap.Connection == t.TargetID) {
+				selected.Write(lines.Bytes())
 				selected.WriteByte('\n')
 			}
 		}
-		err = scanner.Err()
 		file.Close()
-		if err != nil {
-			return err
-		}
 		if err := add("capture-gaps.jsonl", selected.Bytes()); err != nil {
 			return err
 		}
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	peer := t.Client
-	if t.PeerClient != "" {
-		peer = t.PeerClient
-	}
-	host, port, e := net.SplitHostPort(peer)
-	if e == nil {
+	if hasEndpoints {
 		files, err := session.PacketFiles(s.dir)
 		if err != nil {
 			return err
 		}
-		for _, name := range files {
-			file, e := os.Open(name)
-			if e != nil {
-				return e
+		first, last := t.Time.Add(-time.Minute), t.Time.Add(time.Minute)
+		packetSource, hasPacketSource := strings.CutPrefix(t.Source, "pcap:")
+		for i, name := range files {
+			if hasPacketSource && filepath.Base(session.PacketSegmentGroup(name)) != packetSource {
+				continue
 			}
-			handle, e := pcapgo.NewReader(file)
-			if e != nil {
-				file.Close()
-				return e
-			}
-			entry, err := filepath.Rel(s.dir, name)
+			entry, digest, truncated, err := exportPacketSegment(z, s.dir, name, remote, local, first, last, lastPacketSegment(files, i))
 			if err != nil {
-				file.Close()
 				return err
 			}
-			entry = filepath.ToSlash(entry)
-			w, e := z.Create(entry)
-			if e != nil {
-				file.Close()
-				return e
+			if truncated {
+				truncatedFiles = append(truncatedFiles, filepath.ToSlash(entry))
 			}
-			hash := sha256.New()
-			writer := pcapgo.NewWriter(io.MultiWriter(w, hash))
-			if err := writer.WriteFileHeader(handle.Snaplen(), handle.LinkType()); err != nil {
-				file.Close()
-				return err
+			if digest != "" {
+				hashes[entry] = digest
 			}
-			for {
-				data, ci, err := handle.ReadPacketData()
-				if err != nil {
-					if err != io.EOF {
-						file.Close()
-						return err
-					}
-					break
-				}
-				if ci.Timestamp.Before(t.Time.Add(-60*time.Second)) || ci.Timestamp.After(t.Time.Add(60*time.Second)) {
-					continue
-				}
-				if !matchesEndpoint(data, handle.LinkType(), host, port) {
-					continue
-				}
-				if err = writer.WritePacket(ci, data); err != nil {
-					file.Close()
-					return err
-				}
-			}
-			file.Close()
-			hashes[entry] = hex.EncodeToString(hash.Sum(nil))
 		}
+	}
+	if len(truncatedFiles) > 0 {
+		note["truncated_source_files"] = truncatedFiles
+	}
+	info, _ := json.MarshalIndent(note, "", "  ")
+	if e = add("evidence.json", info); e != nil {
+		return e
 	}
 	h, _ := json.MarshalIndent(hashes, "", "  ")
 	if e = add("sha256.json", h); e != nil {
@@ -223,19 +201,85 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 	return nil
 }
 
-// Match the previous BPF scope: TCP, either IP endpoint, and either TCP port.
-func matchesEndpoint(data []byte, link layers.LinkType, host, port string) bool {
-	ip := net.ParseIP(host)
-	number, err := strconv.ParseUint(port, 10, 16)
-	if ip == nil || err != nil {
-		return false
+func lastPacketSegment(files []string, index int) bool {
+	return index+1 == len(files) || session.PacketSegmentGroup(files[index]) != session.PacketSegmentGroup(files[index+1])
+}
+
+func exportPacketSegment(z *zip.Writer, dir, path string, remote, local netip.AddrPort, first, last time.Time, allowTornTail bool) (entry, digest string, truncated bool, err error) {
+	entry, err = filepath.Rel(dir, path)
+	if err != nil {
+		return
 	}
-	packet := gopacket.NewPacket(data, link, gopacket.DecodeOptions{Lazy: true, NoCopy: true})
+	entry = filepath.ToSlash(entry)
+	file, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	reader, err := packetio.NewReader(file)
+	if err != nil {
+		return
+	}
+	hash := sha256.New()
+	var writer *pcapgo.Writer
+	interfaceIndex := -1
+	for {
+		data, ci, readErr := reader.ReadPacketData()
+		if readErr == io.EOF {
+			break
+		}
+		if readErr == io.ErrUnexpectedEOF && allowTornTail {
+			truncated = true
+			break
+		}
+		if readErr != nil {
+			return entry, "", false, fmt.Errorf("%s: %w", entry, readErr)
+		}
+		if interfaceIndex == -1 {
+			interfaceIndex = ci.InterfaceIndex
+		} else if ci.InterfaceIndex != interfaceIndex {
+			return entry, "", false, fmt.Errorf("%s: import multi-interface PCAPNG before export", entry)
+		}
+		if ci.Timestamp.Before(first) || ci.Timestamp.After(last) || !matchesConnection(data, reader.Link, remote, local) {
+			continue
+		}
+		if writer == nil {
+			member, err := z.Create(entry)
+			if err != nil {
+				return entry, "", false, err
+			}
+			output := io.MultiWriter(member, hash)
+			if err := packetio.WriteHeader(output, reader.Snap, reader.Link); err != nil {
+				return entry, "", false, err
+			}
+			writer = pcapgo.NewWriterNanos(output)
+		}
+		if err := writer.WritePacket(ci, data); err != nil {
+			return entry, "", false, err
+		}
+	}
+	if writer != nil {
+		digest = hex.EncodeToString(hash.Sum(nil))
+	}
+	return
+}
+
+func matchesConnection(data []byte, link uint32, remote, local netip.AddrPort) bool {
+	packet := packetio.Decode(data, link)
 	network := packet.NetworkLayer()
 	tcp, ok := packet.TransportLayer().(*layers.TCP)
 	if network == nil || !ok {
 		return false
 	}
 	flow := network.NetworkFlow()
-	return (net.IP(flow.Src().Raw()).Equal(ip) || net.IP(flow.Dst().Raw()).Equal(ip)) && (uint64(tcp.SrcPort) == number || uint64(tcp.DstPort) == number)
+	src, srcOK := netip.AddrFromSlice(flow.Src().Raw())
+	dst, dstOK := netip.AddrFromSlice(flow.Dst().Raw())
+	if !srcOK || !dstOK {
+		return false
+	}
+	source := netip.AddrPortFrom(src.Unmap(), uint16(tcp.SrcPort))
+	destination := netip.AddrPortFrom(dst.Unmap(), uint16(tcp.DstPort))
+	remote = netip.AddrPortFrom(remote.Addr().WithZone("").Unmap(), remote.Port())
+	local = netip.AddrPortFrom(local.Addr().WithZone("").Unmap(), local.Port())
+	return (source == remote && destination == local) || (source == local && destination == remote)
 }

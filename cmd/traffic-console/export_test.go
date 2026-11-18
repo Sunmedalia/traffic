@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
@@ -68,25 +69,27 @@ func evidencePacket(t *testing.T, ipv6 bool, port layers.TCPPort) []byte {
 }
 func TestEvidenceEndpointMatching(t *testing.T) {
 	for _, ipv6 := range []bool{false, true} {
-		host := "192.0.2.1"
-		peer := "192.0.2.2"
+		remote := netip.MustParseAddrPort("192.0.2.1:12345")
+		local := netip.MustParseAddrPort("192.0.2.2:80")
 		if ipv6 {
-			host = "2001:db8::1"
-			peer = "2001:db8::2"
+			remote = netip.MustParseAddrPort("[2001:db8::1]:12345")
+			local = netip.MustParseAddrPort("[2001:db8::2]:80")
 		}
 		data := evidencePacket(t, ipv6, 12345)
-		if !matchesEndpoint(data, layers.LinkTypeEthernet, host, "12345") {
-			t.Fatalf("source not matched ipv6=%t", ipv6)
+		link := uint32(layers.LinkTypeEthernet)
+		if !matchesConnection(data, link, remote, local) || !matchesConnection(data, link, local, remote) {
+			t.Fatalf("bidirectional tuple not matched ipv6=%t", ipv6)
 		}
-		if !matchesEndpoint(data, layers.LinkTypeEthernet, peer, "80") {
-			t.Fatalf("destination not matched ipv6=%t", ipv6)
-		}
-		for _, endpoint := range [][2]string{{host, "9999"}, {"192.0.2.99", "12345"}, {host, "invalid"}, {"invalid", "12345"}} {
-			if matchesEndpoint(data, layers.LinkTypeEthernet, endpoint[0], endpoint[1]) {
-				t.Fatalf("unexpected match %v", endpoint)
+		for _, other := range []netip.AddrPort{
+			netip.AddrPortFrom(local.Addr(), 9999),
+			netip.AddrPortFrom(local.Addr(), remote.Port()),
+			netip.AddrPortFrom(remote.Addr(), local.Port()),
+		} {
+			if matchesConnection(data, link, remote, other) {
+				t.Fatalf("unexpected match %v", other)
 			}
 		}
-		if matchesEndpoint(nil, layers.LinkTypeEthernet, host, "12345") {
+		if matchesConnection(nil, link, remote, local) {
 			t.Fatal("malformed packet matched")
 		}
 	}
@@ -131,10 +134,21 @@ func TestExportPacketScopeAndHashes(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if folder == "organized" {
+				// A complete packet header with no payload is a torn record.
+				var record bytes.Buffer
+				data := evidencePacket(t, false, 12345)
+				if err = pcapgo.NewWriter(&record).WritePacket(gopacket.CaptureInfo{Timestamp: now, CaptureLength: len(data), Length: len(data)}, data); err != nil {
+					t.Fatal(err)
+				}
+				if _, err = packets.Write(record.Bytes()[:16]); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if err = packets.Close(); err != nil {
 				t.Fatal(err)
 			}
-			transaction := Transaction{ID: "packet-scope", Time: now, Client: "198.51.100.1:0", PeerClient: "192.0.2.1:12345", ClientSource: "x-forwarded-for"}
+			transaction := Transaction{ID: "packet-scope", Time: now, Client: "198.51.100.1:0", PeerClient: "192.0.2.1:12345", LocalEndpoint: "192.0.2.2:80", ClientSource: "x-forwarded-for"}
 			raw, err := json.Marshal(transaction)
 			if err != nil {
 				t.Fatal(err)
@@ -159,6 +173,9 @@ func TestExportPacketScopeAndHashes(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+			}
+			if folder == "organized" && !bytes.Contains(contents["evidence.json"], []byte(entry)) {
+				t.Fatal("missing truncated packet segment warning")
 			}
 			var hashes map[string]string
 			if err = json.Unmarshal(contents["sha256.json"], &hashes); err != nil {
@@ -216,7 +233,7 @@ func TestExportIncludesScopedIntegrityDiagnostics(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(s.dir, "status.json"), status, 0600); err != nil {
 		t.Fatal(err)
 	}
-	journal := []byte("{\"connection\":\"one\",\"reason\":\"keep\"}\n{\"connection\":\"other\",\"reason\":\"exclude\"}\n")
+	journal := []byte("{\"connection\":\"one\",\"reason\":\"keep\"}\n{\"connection\":\"other\",\"reason\":\"exclude\"}\n{\"reason\":")
 	if err := os.WriteFile(filepath.Join(s.dir, "gaps.jsonl"), journal, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -249,6 +266,9 @@ func TestExportIncludesScopedIntegrityDiagnostics(t *testing.T) {
 	}
 	if !bytes.Equal(contents["capture-status.json"], status) || !bytes.Contains(contents["capture-gaps.jsonl"], []byte("keep")) || bytes.Contains(contents["capture-gaps.jsonl"], []byte("exclude")) {
 		t.Fatal("missing or unscoped diagnostics")
+	}
+	if !bytes.Contains(contents["evidence.json"], []byte("gaps.jsonl")) {
+		t.Fatal("missing torn gap journal warning")
 	}
 	var hashes map[string]string
 	if err := json.Unmarshal(contents["sha256.json"], &hashes); err != nil {

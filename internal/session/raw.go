@@ -6,35 +6,38 @@ import "time"
 // Source identifies one attach generation. A source record supplies its target;
 // later records reference Source rather than repeating process metadata.
 type RawEvent struct {
-	Version    int       `json:"version"`
-	Time       time.Time `json:"time"`
-	Source     string    `json:"source"`
-	Backend    string    `json:"backend,omitempty"`
-	Type       string    `json:"type"`
-	Target     *Target   `json:"target,omitempty"`
-	Connection string    `json:"connection,omitempty"`
-	Direction  string    `json:"direction,omitempty"`
-	Local      string    `json:"local,omitempty"`
-	Client     string    `json:"client,omitempty"`
-	Data       []byte    `json:"data,omitempty"`
-	Incomplete bool      `json:"incomplete,omitempty"`
-	Count      uint64    `json:"count,omitempty"`
-	Reason     string    `json:"reason,omitempty"`
-	IIS        *IISEvent `json:"iis,omitempty"`
+	Version        int       `json:"version"`
+	Time           time.Time `json:"time"`
+	Source         string    `json:"source"`
+	Backend        string    `json:"backend,omitempty"`
+	Type           string    `json:"type"`
+	Target         *Target   `json:"target,omitempty"`
+	Connection     string    `json:"connection,omitempty"`
+	Direction      string    `json:"direction,omitempty"`
+	Local          string    `json:"local,omitempty"`
+	Client         string    `json:"client,omitempty"`
+	Data           []byte    `json:"data,omitempty"`
+	Incomplete     bool      `json:"incomplete,omitempty"`
+	OriginalLength int       `json:"original_length,omitempty"`
+	Count          uint64    `json:"count,omitempty"`
+	Reason         string    `json:"reason,omitempty"`
+	Unit           string    `json:"unit,omitempty"`
+	IIS            *IISEvent `json:"iis,omitempty"`
 }
 
 type OpenSSLEvent struct {
-	Sequence   uint64 `json:"sequence,omitempty"`
-	Type       string `json:"type"`
-	Protocol   string `json:"protocol"`
-	Message    string `json:"message"`
-	Connection string `json:"connection"`
-	Direction  string `json:"direction"`
-	Local      string `json:"local"`
-	Client     string `json:"client"`
-	Data       []byte `json:"data_b64"`
-	Incomplete bool   `json:"incomplete"`
-	Count      uint64 `json:"count"`
+	Sequence       uint64 `json:"sequence,omitempty"`
+	Type           string `json:"type"`
+	Protocol       string `json:"protocol"`
+	Message        string `json:"message"`
+	Connection     string `json:"connection"`
+	Direction      string `json:"direction"`
+	Local          string `json:"local"`
+	Client         string `json:"client"`
+	Data           []byte `json:"data_b64"`
+	OriginalLength int    `json:"original_length,omitempty"`
+	Incomplete     bool   `json:"incomplete"`
+	Count          uint64 `json:"count"`
 }
 
 type IISEvent struct {

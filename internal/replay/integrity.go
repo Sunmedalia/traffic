@@ -77,3 +77,20 @@ func (p *HTTPProcessor) invalidatePrefix(prefix, reason string) {
 		}
 	}
 }
+
+// forPendingConnections enumerates the pairing state that was live when a
+// source reported loss. Its callback must not call back into the processor.
+func (p *HTTPProcessor) forPendingConnections(prefix string, visit func(string)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for key := range p.pending {
+		if strings.HasPrefix(key, prefix) {
+			visit(key)
+		}
+	}
+	for key := range p.responses {
+		if strings.HasPrefix(key, prefix) {
+			visit(key)
+		}
+	}
+}

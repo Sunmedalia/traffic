@@ -1,13 +1,11 @@
 package replay
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"fmt"
+	"github.com/Sunmedalia/traffic/internal/packetio"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcapgo"
 	"github.com/google/gopacket/tcpassembly"
 	"io"
 	"net"
@@ -101,7 +99,7 @@ func replayPacketFiles(ctx context.Context, s *Store, p *HTTPProcessor, paths []
 		s.mu.Unlock()
 	}
 	defer syncPacketTimestamps()
-	for _, path := range paths {
+	for index, path := range paths {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -109,43 +107,34 @@ func replayPacketFiles(ctx context.Context, s *Store, p *HTTPProcessor, paths []
 		if err != nil {
 			return err
 		}
-		reader := bufio.NewReader(file)
-		magic, err := reader.Peek(4)
+		reader, err := packetio.NewReader(file)
 		if err != nil {
 			file.Close()
-			return err
+			return fmt.Errorf("%s: %w", path, err)
 		}
-		var next func() ([]byte, gopacket.CaptureInfo, error)
-		var link layers.LinkType
-		if bytes.Equal(magic, []byte{10, 13, 13, 10}) {
-			r, e := pcapgo.NewNgReader(reader, pcapgo.DefaultNgReaderOptions)
-			if e != nil {
-				file.Close()
-				return e
-			}
-			next = r.ReadPacketData
-			link = r.LinkType()
-		} else {
-			r, e := pcapgo.NewReader(reader)
-			if e != nil {
-				file.Close()
-				return e
-			}
-			next = r.ReadPacketData
-			link = r.LinkType()
-		}
+		interfaceIndex := -1
 		for {
 			if err := ctx.Err(); err != nil {
 				file.Close()
 				return err
 			}
-			data, ci, err := next()
+			data, ci, err := reader.ReadPacketData()
 			if err == io.EOF {
+				break
+			}
+			if err == io.ErrUnexpectedEOF && index == len(paths)-1 {
+				s.gap("pcap", source, "truncated_raw_tail", "records", 1)
 				break
 			}
 			if err != nil {
 				file.Close()
-				return err
+				return fmt.Errorf("%s: %w", path, err)
+			}
+			if interfaceIndex == -1 {
+				interfaceIndex = ci.InterfaceIndex
+			} else if ci.InterfaceIndex != interfaceIndex {
+				file.Close()
+				return fmt.Errorf("%s: import multi-interface PCAPNG before replay", path)
 			}
 			packets++
 			if !ci.Timestamp.IsZero() {
@@ -157,7 +146,7 @@ func replayPacketFiles(ctx context.Context, s *Store, p *HTTPProcessor, paths []
 					lastPacketAt = ts
 				}
 			}
-			packet := gopacket.NewPacket(data, link, gopacket.NoCopy)
+			packet := packetio.Decode(data, reader.Link)
 			if tcp, ok := packet.Layer(layers.LayerTypeTCP).(*layers.TCP); ok && packet.NetworkLayer() != nil && (len(capturePorts) == 0 || capturePorts[int(tcp.SrcPort)] || capturePorts[int(tcp.DstPort)]) {
 				assembler.AssembleWithTimestamp(packet.NetworkLayer().NetworkFlow(), tcp, ci.Timestamp)
 			}
