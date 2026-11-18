@@ -213,6 +213,8 @@ func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string
 	logSink := &probeLog{file: log, store: s}
 	cmd := exec.Command(bin, args...)
 	cmd.Stdout = io.Discard
+	// Bound Wait if an inherited output pipe survives the probe process.
+	cmd.WaitDelay = min(200*time.Millisecond, localStopTimeout)
 	cmd.Stderr = logSink
 	releaseParentThread := bindProbeParent(cmd)
 	defer releaseParentThread()
@@ -581,7 +583,7 @@ type probeLog struct {
 	accountedLost uint64
 }
 
-var ansi = regexp.MustCompile(` \[[0-9;]*m`)
+var ansi = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 var lost = regexp.MustCompile(`lost_samples=([0-9]+)`)
 
 func (l *probeLog) Write(b []byte) (int, error) {
