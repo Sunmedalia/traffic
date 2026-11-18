@@ -171,7 +171,7 @@ type probeController interface {
 	reap(grace time.Duration) (cleanExit bool, waitErr error)
 }
 
-func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string, pid, uid int, accepts func(int, string) string, snapshot kernelScopeSnapshot, attached func(), failed ...func(error)) error {
+func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string, pid, uid int, probeKey string, accepts func(int, string) string, snapshot kernelScopeSnapshot, attached func(), failed ...func(error)) error {
 	localDrainTimeout := drainTimeout
 	localStopTimeout := stopTimeout
 	listener, e := net.Listen("tcp", "127.0.0.1:0")
@@ -195,13 +195,13 @@ func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string
 	if probeCapability(bin, "feature:pid_scope_v1") {
 		scope, e = newKernelScopeFile(filepath.Join(s.dir, "logs"), snapshot, capturePorts)
 		if e != nil {
-			return e
+			return fmt.Errorf("%w: kernel PID scope: %w", errECaptureConfiguration, e)
 		}
 		defer os.Remove(scope.path)
 		args = append(args, "--traffic-scope-file", scope.path)
 	}
 	if pid == 0 && uid == 0 && scope == nil {
-		return fmt.Errorf("grouped root probe requires a verified kernel PID scope")
+		return fmt.Errorf("%w: grouped root probe requires a verified kernel PID scope", errECaptureConfiguration)
 	}
 	log, e := os.OpenFile(filepath.Join(s.dir, "logs", "tls.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if e != nil {
@@ -209,7 +209,6 @@ func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string
 	}
 	defer log.Close()
 
-	probeKey := fmt.Sprintf("ecapture/%s/%d/%d", lib, uid, pid)
 	logSink := &probeLog{file: log, store: s}
 	cmd := exec.Command(bin, args...)
 	cmd.Stdout = io.Discard
@@ -385,11 +384,11 @@ func consumeTLSProbe(
 	var pendingShed uint64
 	for {
 		b, shed, e := transport.next()
-		if err := shedLoss(shed); err != nil {
+		if err := shedLoss(shed.messages); err != nil {
 			return err
 		}
-		pendingShed += shed
-		if drainSummary != nil && shed > 0 {
+		pendingShed += shed.sequenced
+		if drainSummary != nil && shed.messages > 0 {
 			sawEventAfterDrain = true
 		}
 		if e != nil {
@@ -496,8 +495,8 @@ func consumeTLSProbe(
 			sawUnsequencedData = true
 		}
 		missing, reset := sequence.observe(nums[17])
-		// Messages shed locally were already reported above; only report the
-		// remainder as probe-side sequence loss so one gap is not counted twice.
+		// Only shed TLS events with a published sequence can explain a sequence
+		// hole. Heartbeats and operational logs never consume one.
 		if pendingShed > 0 && !reset {
 			missing -= min(missing, pendingShed)
 		}

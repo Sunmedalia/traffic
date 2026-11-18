@@ -112,7 +112,7 @@ func TestCaptureTLSSubprocessEndToEndDrain(t *testing.T) {
 	readyCh := make(chan struct{}, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- captureTLS(ctx, s, recorder, scriptPath, "/lib/libssl.so.3", targetPID, 0,
+		done <- captureTLS(ctx, s, recorder, scriptPath, "/lib/libssl.so.3", targetPID, 0, "ecapture/subprocess",
 			func(pid int, _ string) string {
 				if pid == targetPID {
 					return targetID

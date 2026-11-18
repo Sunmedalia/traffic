@@ -323,6 +323,10 @@ func captureServices(ctx context.Context, s *Store, p *eventRecorder, bin, libra
 				}
 				setState := func(state string) {
 					mu.Lock()
+					defer mu.Unlock()
+					if groupCtx.Err() != nil {
+						return
+					}
 					states[g] = state
 					identities := map[string]bool{}
 					for id, target := range targets {
@@ -331,34 +335,32 @@ func captureServices(ctx context.Context, s *Store, p *eventRecorder, bin, libra
 						}
 					}
 					s.setTLSTargetsState(identities, state)
-					mu.Unlock()
 				}
-				for attempt := 0; attempt < 3; attempt++ {
-					if attempt > 0 {
-						select {
-						case <-groupCtx.Done():
-							return
-						case <-time.After(time.Second << (attempt - 1)):
-						}
-					}
-					setState("starting")
-					err := captureTLS(groupCtx, s, p, bin, g.Library, g.PID, g.UID, accepts, snapshot, func() {
-						if groupCtx.Err() == nil {
-							setState("attached")
-						}
-					}, func(error) { setState("unavailable") })
-					if groupCtx.Err() != nil {
-						return
-					}
-					if err == nil {
-						return
-					}
-					setState("unavailable")
-					s.problem(fmt.Errorf("%s UID %d: %w", g.Library, g.UID, err))
+				key := fmt.Sprintf("ecapture/%s/%d/%d", g.Library, g.UID, g.PID)
+				if g.Service != "" {
+					key += "/" + g.Service
 				}
-				mu.Lock()
-				states[g] = "unavailable"
-				mu.Unlock()
+				attempted := false
+				superviseECapture(groupCtx, func(ready func()) error {
+					s.mu.Lock()
+					fatal := s.fatal
+					s.mu.Unlock()
+					if fatal != nil || groupCtx.Err() != nil {
+						return nil
+					}
+					if attempted {
+						s.gap("ecapture", key, "probe_restart", "attempts", 1)
+					}
+					attempted = true
+					return captureTLS(groupCtx, s, p, bin, g.Library, g.PID, g.UID, key, accepts, snapshot, ready,
+						func(error) { setState("unavailable") })
+				}, setState, func(err error, delay time.Duration) {
+					if delay == 0 {
+						s.problem(fmt.Errorf("%s: retry disabled: %w", key, err))
+					} else {
+						s.problem(fmt.Errorf("%s: retrying in %s: %w", key, delay, err))
+					}
+				}, time.Now, waitECaptureRetry)
 			}(groupCtx, group)
 		}
 		mu.RLock()

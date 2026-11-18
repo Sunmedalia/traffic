@@ -60,7 +60,7 @@ func TestProbeTransportReceivesBurstWhileParserPaused(t *testing.T) {
 	}
 	for i := 0; i < 512; i++ {
 		data, shed, err := tr.next()
-		if err != nil || shed != 0 || len(data) != 2 || int(data[0])*256+int(data[1]) != i {
+		if err != nil || shed.messages != 0 || len(data) != 2 || int(data[0])*256+int(data[1]) != i {
 			t.Fatal("probe messages reordered", i, data, err)
 		}
 	}
@@ -105,13 +105,13 @@ func TestProbeTransportShedsAndRecoversWithinBounds(t *testing.T) {
 		// Drain, then deliver one more message: it must carry the shed count.
 		queued := len(tr.queue)
 		for i := 0; i < queued; i++ {
-			if _, shed, err := tr.next(); err != nil || shed != 0 {
+			if _, shed, err := tr.next(); err != nil || shed.messages != 0 {
 				t.Fatal("unexpected shed before boundary", shed, err)
 			}
 		}
 		r.messages <- []byte("after")
 		data, shed, err := tr.next()
-		if err != nil || string(data) != "after" || shed != tr.shedMessages.Load() {
+		if err != nil || string(data) != "after" || shed.messages != tr.shedMessages.Load() {
 			t.Fatal("shed boundary not delivered with next message", string(data), shed, err)
 		}
 		tr.close()
@@ -138,7 +138,37 @@ func TestProbeTransportGlobalBudget(t *testing.T) {
 	_, shed, err := tr.next()
 	probeTransportBytes.Add(-probeTransportBudget)
 	tr.close()
-	if !errors.Is(err, io.EOF) || shed != 1 || tr.overflows.Load() != 1 || tr.pending.Load() != 0 || probeTransportBytes.Load() != before {
+	if !errors.Is(err, io.EOF) || shed.messages != 1 || tr.overflows.Load() != 1 || tr.pending.Load() != 0 || probeTransportBytes.Load() != before {
 		t.Fatal("global receive budget was not enforced", err, shed)
+	}
+}
+
+func TestProbeTransportPreservesTerminalControlAndCountsOnlySequencedDrops(t *testing.T) {
+	baseData, baseControls := probeTransportBytes.Load(), probeFinalControlBytes.Load()
+	reader := newFakeProbeReader()
+	// Enforce deterministic pressure without relying on disk or scheduler timing.
+	probeTransportBytes.Add(probeTransportBudget)
+	defer probeTransportBytes.Add(-probeTransportBudget)
+	reader.messages <- encodeFakeProcessLog("unsequenced operational log")
+	reader.messages <- encodeFakeTLSEvent(7, 1, "conn", "read", []byte("data"))
+	drain := "traffic-control-v1:drained:seq=9,dropped=2,perf_lost=0"
+	reader.messages <- encodeFakeProcessLog(drain)
+	close(reader.messages)
+	tr := startProbeTransport(reader)
+	defer tr.close()
+	awaitProbeDone(t, tr)
+	data, shed, err := tr.next()
+	var frame protoFields
+	if err != nil || frame.parse(data) != nil || string(frame.bytes[4]) != drain {
+		t.Fatalf("terminal control lost: %v, %q", err, frame.bytes[4])
+	}
+	if shed.messages != 2 || shed.sequenced != 1 {
+		t.Fatalf("wrong loss accounting: %+v", shed)
+	}
+	if _, remainder, err := tr.next(); !errors.Is(err, io.EOF) || remainder != (probeShed{}) {
+		t.Fatalf("unexpected terminal loss: %+v, %v", remainder, err)
+	}
+	if probeTransportBytes.Load() != baseData+probeTransportBudget || probeFinalControlBytes.Load() != baseControls {
+		t.Fatal("receive queue leaked byte reservations")
 	}
 }
