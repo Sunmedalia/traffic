@@ -21,4 +21,5 @@ git apply "$project_dir/patches/ecapture-v2.9.1-kernel-scope.patch"
 git apply "$project_dir/patches/ecapture-v2.9.1-owned-payload.patch"
 git apply "$project_dir/patches/ecapture-v2.9.1-reorder-heap.patch"
 git apply "$project_dir/patches/ecapture-v2.9.1-drain.patch"
+git apply "$project_dir/patches/ecapture-v2.9.1-overload-recovery.patch"
 go test -race ./internal/probe/base ./internal/probe/base/handlers ./internal/output/writers ./pkg/ecaptureq ./internal/probe/openssl ./cli/cmd

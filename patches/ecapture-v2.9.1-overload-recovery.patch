@@ -1,0 +1,301 @@
+diff --git a/pkg/ecaptureq/client.go b/pkg/ecaptureq/client.go
+index d34c7db..0b8468f 100644
+--- a/pkg/ecaptureq/client.go
++++ b/pkg/ecaptureq/client.go
+@@ -36,6 +36,8 @@ type Client struct {
+ 	done           chan struct{}
+ 	stopOnce       sync.Once
+ 	pendingBytes   atomic.Int64
++	shedding       bool // hub goroutine only
++	finalQueued    bool // hub goroutine only
+ }
+ 
+ func (c *Client) readPump() {
+diff --git a/pkg/ecaptureq/hub.go b/pkg/ecaptureq/hub.go
+index aa068a2..b759a3e 100644
+--- a/pkg/ecaptureq/hub.go
++++ b/pkg/ecaptureq/hub.go
+@@ -24,10 +24,24 @@ import (
+ 
+ var ErrBackpressure = errors.New("ecaptureq backpressure")
+ 
++type publication uint8
++
++const (
++	unsequencedEvent publication = iota
++	sequencedEvent
++	operationalLog
++	requiredControl
++	finalDrainControl
++)
++
++func (p publication) canShed() bool {
++	return p == sequencedEvent
++}
++
+ type publishRequest struct {
+-	message    []byte
+-	processLog bool
+-	result     chan error
++	message []byte
++	kind    publication
++	result  chan error
+ }
+ 
+ type registerRequest struct {
+@@ -122,24 +136,56 @@ func (h *Hub) run() {
+ 				client.releaseClosedQueue()
+ 			}
+ 		case request := <-h.broadcast:
+-			if request.processLog {
++			if request.kind >= operationalLog {
+ 				h.appendHistory(request.message)
+ 			}
+ 			var deliveryErr error
+ 			for client := range h.clients {
+-				if !h.enqueue(client, request.message) {
+-					queued := client.pendingBytes.Load()
++				if h.deliver(client, request) {
++					continue
++				}
++				queued := client.pendingBytes.Load()
++				// Routine logs retain their error reporting without closing an
++				// otherwise healthy capture transport.
++				if request.kind != operationalLog {
+ 					delete(h.clients, client)
+ 					client.closeQueue()
+-					h.dropped.Add(1)
+-					deliveryErr = fmt.Errorf("%w: client queue budget exhausted (pending_bytes=%d)", ErrBackpressure, queued)
+ 				}
++				h.dropped.Add(1)
++				deliveryErr = fmt.Errorf("%w: client queue budget exhausted (pending_bytes=%d)", ErrBackpressure, queued)
+ 			}
+ 			request.result <- deliveryErr
+ 		}
+ 	}
+ }
+ 
++// A sequenced drop needs no publish error: it is visible in the next
++// delivered sequence or, at shutdown, in the final published sequence.
++func (h *Hub) deliver(client *Client, request publishRequest) bool {
++	if request.kind == finalDrainControl {
++		return h.enqueueFinalControl(client, request.message)
++	}
++	if request.kind == sequencedEvent && client.shedding {
++		if client.pendingBytes.Load() > clientQueueBytes/2 ||
++			len(client.send) > (cap(client.send)-1)/2 || h.queuedBytes.Load() > serverQueueBytes/2 {
++			h.dropped.Add(1)
++			return true
++		}
++		client.shedding = false
++	}
++	if h.enqueue(client, request.message) {
++		return true
++	}
++	if !request.kind.canShed() {
++		return false
++	}
++	if request.kind == sequencedEvent {
++		client.shedding = true
++	}
++	h.dropped.Add(1)
++	return true
++}
++
+ func (h *Hub) appendHistory(message []byte) {
+ 	copyMessage := append([]byte(nil), message...)
+ 	if len(h.history) < LogBuffLen {
+@@ -151,17 +197,17 @@ func (h *Hub) appendHistory(message []byte) {
+ }
+ 
+ func (h *Hub) publish(ctx context.Context, message []byte, processLog bool) error {
+-	return h.publishOwned(ctx, append([]byte(nil), message...), processLog)
++	kind := unsequencedEvent
++	if processLog {
++		kind = operationalLog
++	}
++	return h.publishOwned(ctx, append([]byte(nil), message...), kind)
+ }
+ 
+ // publishOwned transfers a fresh marshal buffer to the hub. Callers must never
+ // mutate it afterwards; generic publishers retain the copying publish method.
+-func (h *Hub) publishOwned(ctx context.Context, message []byte, processLog bool) error {
+-	request := publishRequest{
+-		message:    message,
+-		processLog: processLog,
+-		result:     make(chan error, 1),
+-	}
++func (h *Hub) publishOwned(ctx context.Context, message []byte, kind publication) error {
++	request := publishRequest{message: message, kind: kind, result: make(chan error, 1)}
+ 	select {
+ 	case h.broadcast <- request:
+ 	case <-ctx.Done():
+@@ -170,6 +216,9 @@ func (h *Hub) publishOwned(ctx context.Context, message []byte, processLog bool)
+ 		return context.Canceled
+ 	default:
+ 		h.dropped.Add(1)
++		if kind.canShed() {
++			return nil
++		}
+ 		return fmt.Errorf("%w: publisher queue full", ErrBackpressure)
+ 	}
+ 	select {
+@@ -234,10 +283,32 @@ func (h *Hub) droppedCount() uint64 { return h.dropped.Load() }
+ const clientQueueBytes = 8 << 20
+ const serverQueueBytes = 32 << 20
+ const clientQueueMessages = 16 << 10
++const finalControlMaxBytes = 1024
++const finalControlReserveBytes = 64 << 10
++
++// Each client has one extra slot for the final control. The aggregate extra
++// bytes are bounded and the control uses the same FIFO as accepted events.
++func (h *Hub) enqueueFinalControl(client *Client, message []byte) bool {
++	n := int64(len(message))
++	if client.finalQueued || n > finalControlMaxBytes || len(client.send) == cap(client.send) {
++		return false
++	}
++	if h.queuedBytes.Add(n) > serverQueueBytes+finalControlReserveBytes {
++		h.queuedBytes.Add(-n)
++		return false
++	}
++	client.finalQueued = true
++	client.pendingBytes.Add(n)
++	client.send <- message
++	return true
++}
+ 
+ // The hub is the only producer and owns closing client queues. The writer
+ // releases reservations as it consumes messages, independent of network I/O.
+ func (h *Hub) enqueue(client *Client, message []byte) bool {
++	if len(client.send) >= cap(client.send)-1 {
++		return false
++	}
+ 	n := int64(len(message))
+ 	if client.pendingBytes.Add(n) > clientQueueBytes {
+ 		client.pendingBytes.Add(-n)
+diff --git a/pkg/ecaptureq/server.go b/pkg/ecaptureq/server.go
+index 8961f98..ac9d682 100644
+--- a/pkg/ecaptureq/server.go
++++ b/pkg/ecaptureq/server.go
+@@ -21,6 +21,7 @@ import (
+ 	"io"
+ 	"net"
+ 	"net/http"
++	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+@@ -124,7 +125,7 @@ func (s *Server) handleWebSocket(conn *websocket.Conn) {
+ 	client := &Client{
+ 		hub:    s.hub,
+ 		conn:   conn,
+-		send:   make(chan []byte, clientQueueMessages),
++		send:   make(chan []byte, clientQueueMessages+1),
+ 		logger: s.logger,
+ 		done:   make(chan struct{}),
+ 	}
+@@ -153,7 +154,13 @@ func (s *Server) PublishLog(ctx context.Context, record domain.OperationalLogRec
+ 	if err != nil {
+ 		return fmt.Errorf("marshal process log: %w", err)
+ 	}
+-	return s.hub.publishOwned(ctx, data, true)
++	kind := operationalLog
++	if strings.HasPrefix(record.Message, "traffic-control-v1:drained:") {
++		kind = finalDrainControl
++	} else if record.Message == "traffic-control-v1:ready" || record.Message == "traffic-control-v1:scope-error" {
++		kind = requiredControl
++	}
++	return s.hub.publishOwned(ctx, data, kind)
+ }
+ 
+ func (s *Server) PublishEvent(ctx context.Context, event domain.CapturedEventEnvelope) error {
+@@ -187,7 +194,11 @@ func (s *Server) PublishEvent(ctx context.Context, event domain.CapturedEventEnv
+ 		for cur := s.lastSequence.Load(); event.Sequence > cur && !s.lastSequence.CompareAndSwap(cur, event.Sequence); cur = s.lastSequence.Load() {
+ 		}
+ 	}
+-	return s.hub.publishOwned(ctx, data, false)
++	kind := unsequencedEvent
++	if event.Sequence != 0 {
++		kind = sequencedEvent
++	}
++	return s.hub.publishOwned(ctx, data, kind)
+ }
+ 
+ func captureFormat(format domain.CaptureFormat) pb.CaptureFormat {
+diff --git a/pkg/ecaptureq/server_test.go b/pkg/ecaptureq/server_test.go
+index eb165da..670e899 100644
+--- a/pkg/ecaptureq/server_test.go
++++ b/pkg/ecaptureq/server_test.go
+@@ -33,7 +33,7 @@ import (
+ func newQueueClient(server *Server, size int) *Client {
+ 	return &Client{
+ 		hub:  server.hub,
+-		send: make(chan []byte, size),
++		send: make(chan []byte, size+1),
+ 		done: make(chan struct{}),
+ 	}
+ }
+@@ -298,3 +298,63 @@ func TestServerQueueBudgetAcrossClients(t *testing.T) {
+ 		t.Fatal("server byte budget not enforced")
+ 	}
+ }
++
++func TestSequencedClientSheddingKeepsFastClientAndFlushesTail(t *testing.T) {
++	ctx := context.Background()
++	server := NewServer("127.0.0.1:0", io.Discard)
++	defer server.Close()
++	slow, fast := newQueueClient(server, 4), newQueueClient(server, 4)
++	for _, client := range []*Client{slow, fast} {
++		if err := server.hub.registerClient(ctx, client); err != nil {
++			t.Fatal(err)
++		}
++	}
++	publish := func(seq uint64) {
++		t.Helper()
++		if err := server.PublishEvent(ctx, domain.CapturedEventEnvelope{Sequence: seq, Payload: []byte("data")}); err != nil {
++			t.Fatalf("publisher failed on sequenced event %d: %v", seq, err)
++		}
++		if got := decodeEntry(t, receiveQueueMessage(fast)).GetEventPayload().GetSequence(); got != seq {
++			t.Fatalf("fast client: got sequence %d, want %d", got, seq)
++		}
++	}
++	for seq := uint64(1); seq <= 100; seq++ {
++		publish(seq)
++	}
++	for _, want := range []uint64{1, 2} {
++		if got := decodeEntry(t, receiveQueueMessage(slow)).GetEventPayload().GetSequence(); got != want {
++			t.Fatalf("slow accepted prefix: got %d, want %d", got, want)
++		}
++	}
++	publish(101)
++	for _, want := range []uint64{3, 4, 101} {
++		if got := decodeEntry(t, receiveQueueMessage(slow)).GetEventPayload().GetSequence(); got != want {
++			t.Fatalf("slow recovered prefix: got %d, want %d", got, want)
++		}
++	}
++
++	for seq := uint64(102); seq <= 106; seq++ {
++		publish(seq)
++	}
++	control := fmt.Sprintf("traffic-control-v1:drained:seq=%d,dropped=%d,perf_lost=0", server.LastSequence(), server.DroppedMessages())
++	if err := server.PublishLog(ctx, domain.OperationalLogRecord{Message: control}); err != nil {
++		t.Fatal(err)
++	}
++	if got := server.DroppedMessages(); got != 97 {
++		t.Fatalf("dropped=%d, want 97", got)
++	}
++	if got := decodeEntry(t, receiveQueueMessage(fast)).GetRunLog(); got != control {
++		t.Fatalf("fast final control: %q", got)
++	}
++	for want := uint64(102); want <= 105; want++ {
++		if got := decodeEntry(t, receiveQueueMessage(slow)).GetEventPayload().GetSequence(); got != want {
++			t.Fatalf("slow terminal queue: got %d, want %d", got, want)
++		}
++	}
++	if got := decodeEntry(t, receiveQueueMessage(slow)).GetRunLog(); got != control {
++		t.Fatalf("slow final control: %q", got)
++	}
++	if slow.pendingBytes.Load() != 0 || fast.pendingBytes.Load() != 0 || server.hub.queuedBytes.Load() != 0 {
++		t.Fatal("drained queues leaked byte reservations")
++	}
++}
