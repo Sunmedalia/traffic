@@ -221,7 +221,7 @@ sessions/<host>/<date>/<session>/
 | [使用手册](docs/guide.md) | 后端、规则、Windows、参数、停止与回滚、故障排查 |
 | [验证记录](VALIDATION.md) | 实机环境、构建哈希、成功与失败样本 |
 | [优化进度](OPTIMIZATION.md) | 已实现机制、性能门槛与待完成项目 |
-| [v0.1.3 发布说明](docs/releases/v0.1.3.md) | 下载包、升级变化和已知限制 |
+| [v0.1.4 发布说明](docs/releases/v0.1.4.md) | 下载包、升级变化和已知限制 |
 | [第三方组件](THIRD_PARTY_NOTICES.md) | 依赖、探针与许可证说明 |
 
 ```bash

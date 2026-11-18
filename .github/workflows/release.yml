@@ -6,7 +6,7 @@ on:
     inputs:
       version:
         description: 'Version for build verification (no publication)'
-        default: v0.1.3
+        default: v0.1.4
         required: true
 permissions:
   contents: read
