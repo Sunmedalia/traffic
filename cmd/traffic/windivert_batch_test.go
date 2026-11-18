@@ -124,3 +124,51 @@ func TestIISBindingPortScopeAndProbeExitAccounting(t *testing.T) {
 		t.Fatalf("http-only target without probes should confirm drain: %+v", s3.stats)
 	}
 }
+
+func TestWinDivertBatchChecksEveryAddressAndAllPacketBytes(t *testing.T) {
+	packet := make([]byte, 40)
+	packet[0] = 0x45
+	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
+	joined := append(append([]byte(nil), packet...), packet...)
+	meta := make([]byte, 3*winDivertAddrSize)
+	for _, tc := range []struct {
+		name         string
+		raw          []byte
+		addressBytes uint32
+	}{
+		{"uninitialized address length", packet, 0},
+		{"partial address record", packet, winDivertAddrSize + 1},
+		{"address length exceeds buffer", packet, 4 * winDivertAddrSize},
+		{"stale extra address", joined, 3 * winDivertAddrSize},
+		{"trailing bytes with one address", joined, winDivertAddrSize},
+		{"incomplete last packet", joined[:len(joined)-1], 2 * winDivertAddrSize},
+		{"packet missing despite address", nil, winDivertAddrSize},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := splitWinDivertBatch(tc.raw, uint32(len(tc.raw)), meta, tc.addressBytes, 65535, nil)
+			if err == nil || len(got) != 0 {
+				t.Fatalf("exposed invalid batch: got %d packets, err=%v", len(got), err)
+			}
+		})
+	}
+}
+
+func TestWinDivertPacketTimeRejectsImplausibleQPC(t *testing.T) {
+	anchor := time.Date(2026, 11, 18, 9, 44, 51, 0, time.UTC)
+	const frequency int64 = 10_000_000
+	const ticks = frequency * 7200
+	received := anchor.Add(7 * time.Second)
+	if stamp, converted := winDivertPacketTime(ticks+6*frequency, ticks, frequency, anchor, received); !converted || !stamp.Equal(anchor.Add(6*time.Second)) {
+		t.Fatalf("valid QPC stamp rejected: %s, converted=%v", stamp, converted)
+	}
+	for _, invalid := range []int64{0, ticks - 2*frequency, ticks + 600*frequency, 1<<63 - 1} {
+		stamp, converted := winDivertPacketTime(invalid, ticks, frequency, anchor, received)
+		if converted || !stamp.Equal(received) {
+			t.Fatalf("implausible ticks %d accepted: %s", invalid, stamp)
+		}
+	}
+	later := anchor.Add(35 * time.Second)
+	if stamp, converted := winDivertPacketTime(ticks+frequency, ticks, frequency, anchor, later); converted || !stamp.Equal(later) {
+		t.Fatalf("stale QPC stamp accepted: %s", stamp)
+	}
+}

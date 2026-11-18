@@ -28,16 +28,21 @@ $server = $null
 $capture = $null
 try {
     $server = Start-Process -FilePath "$App/deps/python/python.exe" -ArgumentList '-m http.server 18763 --bind 127.0.0.1' -WorkingDirectory $App -PassThru -RedirectStandardOutput "$App/http.out" -RedirectStandardError "$App/http.err"
-    $capture = Start-Process -FilePath "$App/traffic.exe" -ArgumentList 'capture --no-tls --ports 18763 --duration 10s --name portable-smoke' -WorkingDirectory $env:TEMP -PassThru -RedirectStandardOutput "$App/capture.out" -RedirectStandardError "$App/capture.err"
+    $capture = Start-Process -FilePath "$App/traffic.exe" -ArgumentList 'capture --no-tls --ports 18763 --duration 25s --name portable-smoke' -WorkingDirectory $env:TEMP -PassThru -RedirectStandardOutput "$App/capture.out" -RedirectStandardError "$App/capture.err"
     Start-Sleep -Seconds 3
     if ($capture.HasExited) { throw (Get-Content "$App/capture.err" -Raw) }
     1..4 | ForEach-Object { Invoke-WebRequest 'http://127.0.0.1:18763/?portable-smoke=verified' | Out-Null }
-    $capture.WaitForExit(30000) | Out-Null
+    $packetSmoke = Join-Path $PSScriptRoot 'verify-win-packets.py'
+    & "$App/deps/python/python.exe" $packetSmoke send --port 18763
+    Check-Exit
+    $capture.WaitForExit(35000) | Out-Null
     if (!$capture.HasExited) { throw 'Capture did not stop after duration' }
     if ($capture.ExitCode -ne 0) { throw (Get-Content "$App/capture.err" -Raw) }
     $index = Get-ChildItem "$App/sessions" -Filter manifest.json -Recurse | Select-Object -First 1
     $session = if ($index) { $index.Directory } else { $null }
     if (!$session) { throw 'No session saved' }
+    & "$App/deps/python/python.exe" $packetSmoke verify --port 18763 --session $session.FullName
+    Check-Exit
     & "$Console/traffic-console.exe" status --session $session.FullName
     Check-Exit
     if (Test-Path "$($session.FullName)/index.sqlite") { throw 'Collector wrote a request index' }

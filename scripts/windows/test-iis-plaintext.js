@@ -204,6 +204,38 @@ for (const options of [{plaintext: true}, {port: 443}, {url: '/bad\r\nurl'}]) {
     assert.equal(f.value('diagnostics.recovered_receives'), 2);
 }
 
+// Reused completion contexts can retain an earlier, already captured request
+// before the new buffer. Cover 100 sequential requests and batches of five.
+for (const concurrent of [1, 5]) {
+    const f = fixture({offset: 32});
+    f.evaluate('completion(overlap, 0, 900); flush()');
+    const lanes = Array.from({length: concurrent}, () => {
+        const current = f.allocate(864), overlap = f.allocate(1024);
+        f.memory.copy(f.memory, current.value, f.request.value, f.request.value + 864);
+        f.u64(overlap, 32, f.request);
+        f.u64(overlap, 184, current);
+        return {current, overlap};
+    });
+    const entries = f.allocate(concurrent * 32), count = f.allocate(4);
+    f.u32(count, 0, concurrent);
+    for (let base = 1; base <= 100; base += concurrent) {
+        for (const [offset, {current, overlap}] of lanes.entries()) {
+            const index = base + offset;
+            f.u64(current, 16, 0xfe00000000000000n + BigInt(index));
+            const url = '/traffic-test/?n=' + index;
+            f.u16(current, 42, Buffer.byteLength(url));
+            f.u64(current, 56, f.string(url));
+            f.u64(entries, offset * 32 + 8, overlap);
+            f.u64(entries, offset * 32 + 24, 900n);
+        }
+        f.evaluate(`completionReturn('NtRemoveIoCompletionEx', ptr(${entries.value}), ${concurrent}, ptr(${count.value}))(ptr(0)); flush()`);
+    }
+    const urls = f.sentMessages.filter(item => item.event.type === 'request').map(item => item.event.url);
+    assert.equal(urls.length, 101);
+    assert.equal(new Set(urls).size, 101);
+    assert.equal(urls.at(-1), '/traffic-test/?n=100');
+}
+
 // Regression (P3): Plain HTTP request (pSslInfo == NULL) marked ignored must not inflate
 // send_matches or trigger false attach_window_suspect when HttpSendHttpResponse runs.
 {

@@ -306,6 +306,7 @@ function recoverReceive(overlapped, status, length, expectedId = null) {
         recoveryBudget--;
     }
     diagnostics.recovery_attempts++;
+    let sawDuplicate = false;
     // Bounded read-only discovery, not a process/heap scan or a private layout
     // offset. The callback owns this context until the completion hook returns.
     // Validate every candidate before changing request state or reading bodies.
@@ -317,7 +318,12 @@ function recoverReceive(overlapped, status, length, expectedId = null) {
             description = describeRequest(candidate);
             if (description === null || (expectedId !== null && description.id !== expectedId)) continue;
         } catch (_) { continue; /* Unrelated/non-readable completion context. */ }
-        if (observedRequests.has(description.id)) return true;
+        if (observedRequests.has(description.id)) {
+            // Reused completions can contain old and current request buffers.
+            // Continue looking for a new request before treating this as a duplicate.
+            sawDuplicate = true;
+            continue;
+        }
         // A zero-byte/non-receive completion may retain a stale request
         // pointer. Require either receive-sized output or an API operation
         // observed in this attach generation for exactly this request ID.
@@ -331,7 +337,7 @@ function recoverReceive(overlapped, status, length, expectedId = null) {
         }
         return true;
     }
-    return false;
+    return sawDuplicate;
 }
 
 function complete(operation, status, length) {
@@ -468,13 +474,12 @@ for (const name of ['HttpReceiveHttpRequest', 'HttpReceiveRequestEntityBody', 'H
                 }
                 pending.set(operation.overlap, operation);
             }
-            if (!receiving && stateFor(operation.id) !== undefined) {
-                // The response/body API still owns the request context, even
-                // when its original receive or dequeue began before attach.
-                // Match the exact API request ID before recovering that buffer.
+            const state = receiving ? undefined : stateFor(operation.id);
+            if (state !== undefined && !state.known && !observedRequests.has(operation.id)) {
+                // Only unresolved requests need to recover a pre-attach buffer.
                 recoverReceive(overlap, 0, 0, operation.id);
             }
-            if (!receiving && stateFor(operation.id) !== undefined && !bodyRead) {
+            if (state !== undefined && requests.get(operation.id) === state && !bodyRead) {
                 try {
                     if (name === 'HttpSendHttpResponse') {
                         const response = args[3];

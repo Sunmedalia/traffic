@@ -240,6 +240,14 @@ func capturePackets(ctx context.Context, s *Store, p *eventRecorder, iface, filt
 		return e
 	}
 	defer h.Close()
+	reportTimestampFallbacks := func() {
+		if source, ok := h.(interface{ takeTimestampFallbacks() uint64 }); ok {
+			if count := source.takeTimestampFallbacks(); count > 0 {
+				s.gap("pcap", iface, "timestamp_fallback", "packets", count)
+			}
+		}
+	}
+	defer reportTimestampFallbacks()
 	if input == "" {
 		defer func() {
 			if stats, err := h.Stats(); err == nil {
@@ -343,6 +351,7 @@ func capturePackets(ctx context.Context, s *Store, p *eventRecorder, iface, filt
 			s.gap("pcap", iface, "snapshot_truncated", "packets", 1)
 		}
 		if input == "" && time.Since(last) > time.Second {
+			reportTimestampFallbacks()
 			if st, e := h.Stats(); e == nil {
 				s.recordPacketDrops(iface, uint64(st.PacketsDropped+st.PacketsIfDropped))
 			}

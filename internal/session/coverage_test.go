@@ -110,3 +110,25 @@ func TestComputeIntegrityWarningsQuietWhenHealthy(t *testing.T) {
 		t.Fatalf("unexpected warnings on healthy session: %v", warnings)
 	}
 }
+
+func TestComputeIntegrityWarningsFlagsWinDivertOutOfSessionTimestamps(t *testing.T) {
+	start := time.Date(2026, 11, 18, 9, 44, 51, 0, time.UTC)
+	capture := Stats{
+		Started: start, Stopped: start.Add(20 * time.Second), State: "stopped",
+		PacketInterfaces: map[string]string{"windivert": "stopped"},
+		GapCounts:        map[string]uint64{"pcap/timestamp_fallback/packets": 2},
+	}
+	replayed := &Stats{Packets: 118, FirstPacketAt: start.Add(8 * time.Minute), LastPacketAt: start.Add(15 * time.Minute)}
+	warnings := strings.Join(ComputeIntegrityWarnings(capture, replayed, time.Time{}), "\n")
+	for _, expected := range []string{"PCAP 时间戳超出实时采集时段", "已使用接收时刻替代"} {
+		if !strings.Contains(warnings, expected) {
+			t.Fatalf("missing warning %q: %s", expected, warnings)
+		}
+	}
+	capture.PacketInterfaces = nil
+	capture.GapCounts = nil
+	capture.State = "complete"
+	if warnings := ComputeIntegrityWarnings(capture, replayed, time.Time{}); len(warnings) != 0 {
+		t.Fatalf("historical packet import has false live-window warning: %v", warnings)
+	}
+}

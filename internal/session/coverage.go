@@ -43,22 +43,33 @@ func ComputeIntegrityWarnings(capture Stats, reconstructed *Stats, statusModTime
 		}
 	}
 
-	lastPacket := capture.LastPacketAt
-	if lastPacket.IsZero() && reconstructed != nil && !reconstructed.LastPacketAt.IsZero() {
-		lastPacket = reconstructed.LastPacketAt
-	}
+	firstPacket, lastPacket := capture.FirstPacketAt, capture.LastPacketAt
 	packets := capture.Packets
-	if reconstructed != nil && reconstructed.Packets > packets {
-		packets = reconstructed.Packets
+	if reconstructed != nil {
+		if firstPacket.IsZero() || (!reconstructed.FirstPacketAt.IsZero() && reconstructed.FirstPacketAt.Before(firstPacket)) {
+			firstPacket = reconstructed.FirstPacketAt
+		}
+		if reconstructed.LastPacketAt.After(lastPacket) {
+			lastPacket = reconstructed.LastPacketAt
+		}
+		packets = max(packets, reconstructed.Packets)
 	}
 	if packets > 0 && !capture.Started.IsZero() && !endTime.IsZero() && !lastPacket.IsZero() {
 		sessionSpan := endTime.Sub(capture.Started)
 		tailSilence := endTime.Sub(lastPacket)
-		if sessionSpan >= 15*time.Second && tailSilence >= 10*time.Second && tailSilence*2 >= sessionSpan {
+		outside := len(capture.PacketInterfaces) > 0 &&
+			(lastPacket.After(endTime.Add(time.Second)) ||
+				(!firstPacket.IsZero() && firstPacket.Before(capture.Started.Add(-time.Second))))
+		if outside {
+			add("PCAP 时间戳超出实时采集时段，按时间对齐探针或筛选证据包时可能遗漏相关报文")
+		} else if sessionSpan >= 15*time.Second && tailSilence >= 10*time.Second && tailSilence*2 >= sessionSpan {
 			add(fmt.Sprintf("收包时间提前中断：最后数据包早于停止时间 %s（会话总时长 %s），后半程可能漏采", tailSilence.Round(100*time.Millisecond), sessionSpan.Round(100*time.Millisecond)))
 		}
 	}
 
+	if capture.GapCounts["pcap/timestamp_fallback/packets"] > 0 {
+		add("部分 WinDivert 报文的 QPC 时间戳超出可信范围，已使用接收时刻替代")
+	}
 	for key, count := range capture.GapCounts {
 		if count > 0 && strings.Contains(key, "drop_counter_unavailable") {
 			add("当前抓包驱动（如 WinDivert）不公开内核队列丢包计数，dropped=0 不能排除内核层丢包")
