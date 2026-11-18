@@ -2,6 +2,7 @@ package replay
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/gopacket/tcpassembly"
+	"golang.org/x/sync/semaphore"
 )
 
 func TestFrames(t *testing.T) {
@@ -68,20 +70,39 @@ func TestResponsePairing(t *testing.T) {
 		t.Fatal(count)
 	}
 }
-func TestLossyQueue(t *testing.T) {
-	s, e := openStore(t.TempDir(), true)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer s.db.Close()
-	q := &queuedStream{chunks: make(chan streamChunk, 1), store: s}
-	q.Reassembled([]tcpassembly.Reassembly{{Bytes: []byte("a")}, {Bytes: []byte("b")}})
-	if !q.Incomplete() {
-		t.Fatal("missing gap")
-	}
-	io.Copy(io.Discard, q)
-	if queuedBytes.Load() != 0 {
-		t.Fatal("buffer accounting leak")
+func TestOfflineQueueBackpressureAndCancellation(t *testing.T) {
+	for _, cancelReplay := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel=%t", cancelReplay), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			// Each chunk exhausts the shared byte budget. Also constrain the
+			// channel so either wait has to make progress.
+			budget := semaphore.NewWeighted(2)
+			q := &queuedStream{ctx: ctx, budget: budget, chunks: make(chan streamChunk, 1)}
+			q.Reassembled([]tcpassembly.Reassembly{{Bytes: []byte("ab")}})
+			done := make(chan struct{})
+			go func() {
+				q.Reassembled([]tcpassembly.Reassembly{{Bytes: []byte("cd")}})
+				q.ReassemblyComplete()
+				close(done)
+			}()
+			if cancelReplay {
+				cancel()
+				<-done
+			}
+			data, err := io.ReadAll(q)
+			<-done
+			want := "abcd"
+			if cancelReplay {
+				want = "ab"
+			}
+			if err != nil || string(data) != want || q.Incomplete() {
+				t.Fatalf("got %q, incomplete=%t, err=%v, want %q", data, q.Incomplete(), err, want)
+			}
+			if !budget.TryAcquire(2) {
+				t.Fatal("buffer accounting leak")
+			}
+		})
 	}
 }
 

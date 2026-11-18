@@ -36,7 +36,9 @@ jobs:
           python3 -m unittest discover -s scripts -p 'test_*.py'
           node scripts/windows/test-iis-plaintext.js
           node scripts/web/test-decoder.cjs
-          bash -n scripts/*.sh
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
 
   ecapture-patches:
     runs-on: ubuntu-24.04

@@ -90,12 +90,14 @@ func Build(ctx context.Context, dir string, db *sql.DB, options Options) (sessio
 		sort.Strings(groups[key])
 		if err = replayPacketFiles(ctx, s, p, groups[key], "pcap:"+filepath.Base(key)); err != nil {
 			p.wg.Wait()
+			_ = stopIndex()
 			return s.stats, err
 		}
 		p.wg.Wait()
 	}
 	if err = replayEvents(ctx, dir, s, p); err != nil {
 		p.finish()
+		_ = stopIndex()
 		return s.stats, err
 	}
 	p.finish()
