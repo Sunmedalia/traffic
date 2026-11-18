@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -31,21 +29,20 @@ type eCaptureQueueEndpoint struct {
 
 func newECaptureQueueEndpoint(s *Store, bin string) (*eCaptureQueueEndpoint, error) {
 	if privateECaptureQueueSupported && probeCapability(bin, "feature:private_eventq_v1") {
-		dir, err := os.MkdirTemp("", "traffic-eq-")
+		socket, release, err := startPrivateQueueGuard()
 		if err != nil {
 			return nil, fmt.Errorf("%w: private queue directory: %w", errECaptureConfiguration, err)
 		}
-		socket := filepath.Join(dir, "q.sock")
-		if len(socket) >= 104 {
-			_ = os.RemoveAll(dir)
-			return nil, fmt.Errorf("%w: private queue socket path too long: %s", errECaptureConfiguration, socket)
-		}
 		return &eCaptureQueueEndpoint{
-			listen:  "unix://" + socket,
-			url:     "ws://ecapture/",
-			origin:  "http://ecapture",
-			socket:  socket,
-			cleanup: func() { _ = os.RemoveAll(dir) },
+			listen: "unix://" + socket,
+			url:    "ws://ecapture/",
+			origin: "http://ecapture",
+			socket: socket,
+			cleanup: func() {
+				if err := release(); err != nil && s != nil {
+					s.problem(fmt.Errorf("clean up private eCapture queue: %w", err))
+				}
+			},
 		}, nil
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
