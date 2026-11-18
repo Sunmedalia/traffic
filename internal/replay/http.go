@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httputil"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Sunmedalia/traffic/internal/session"
 )
 
 type HTTPProcessor struct {
@@ -57,7 +58,8 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			bufferSize = min(bufferSize, sized.Len())
 		}
 	}
-	br, releaseReader := borrowHTTPReader(r, bufferSize)
+	recorder := &rawRecorder{source: r}
+	br, releaseReader := borrowHTTPReader(recorder, bufferSize)
 	defer releaseReader()
 	for {
 		if state, ok := r.(interface{ Aborted() bool }); ok && state.Aborted() {
@@ -102,6 +104,8 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			} else {
 				request = p.responseRequest(key)
 			}
+			headerLength := bufferedHeaderLength(br)
+			recorder.begin(br, headerLength+responseLimit+rawFramingSlack)
 			resp, e := http.ReadResponse(br, request)
 			if e != nil {
 				p.s.gap("http1", key, "response_parse_failure", "directions", 1)
@@ -130,15 +134,7 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				e = nil
 			}
 			truncated := len(body) > responseLimit
-			if truncated {
-				body = body[:responseLimit]
-			}
-			resp.Body = io.NopCloser(bytes.NewReader(body))
-			raw, dumpErr := httputil.DumpResponse(resp, true)
-			if dumpErr != nil || truncated {
-				headers, _ := httputil.DumpResponse(resp, false)
-				raw = append(headers, body...)
-			}
+			raw := savedMessage(recorder, br, headerLength, responseLimit, len(resp.TransferEncoding) > 0, &truncated)
 			p.mu.Lock()
 			if p.http1PairingLossLocked(key) != "" {
 				p.mu.Unlock()
@@ -193,7 +189,9 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 					captured = stamp
 				}
 			}
-			req, e := http.ReadRequest(br)
+			headerLength := bufferedHeaderLength(br)
+			recorder.begin(br, headerLength+requestLimit+rawFramingSlack)
+			req, parseReasons, e := session.ReadRequest(br)
 			if e != nil {
 				p.s.gap("http1", key, "request_parse_failure", "directions", 1)
 				p.invalidate(key, "request_parse_failure")
@@ -227,19 +225,11 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				e = nil
 			}
 			truncated := len(body) > requestLimit
-			if truncated {
-				body = body[:requestLimit]
-			}
-			req.Body = io.NopCloser(bytes.NewReader(body))
-			raw, dumpErr := httputil.DumpRequest(req, true)
-			if dumpErr != nil || truncated {
-				headers, _ := httputil.DumpRequest(req, false)
-				raw = append(headers, body...)
-			}
+			raw := savedMessage(recorder, br, headerLength, requestLimit, req.ContentLength < 0, &truncated)
 			if state, ok := r.(interface{ Incomplete() bool }); ok {
 				incomplete = incomplete || state.Incomplete()
 			}
-			t := Transaction{ID: fmt.Sprintf("%x-%x", time.Now().UnixNano(), serial.Add(1)), Time: captured, Source: source, Host: req.Host, Client: client, Connection: key, Method: req.Method, URL: req.RequestURI, Request: raw, Incomplete: incomplete || e != nil, Truncated: truncated, PID: pid}
+			t := Transaction{ID: fmt.Sprintf("%x-%x", time.Now().UnixNano(), serial.Add(1)), Time: captured, Source: source, Host: req.Host, Client: client, Connection: key, Method: req.Method, URL: req.RequestURI, Request: raw, Incomplete: incomplete || e != nil, Truncated: truncated, PID: pid, IntegrityReasons: parseReasons}
 			if origin, ok := r.(interface {
 				CaptureBackend() string
 				CaptureService() string
@@ -255,7 +245,7 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			p.mu.Lock()
 			if state, ok := r.(interface{ Aborted() bool }); ok && state.Aborted() {
 				t.Incomplete = true
-				t.IntegrityReasons = []string{"tcp_stream_gap"}
+				t.IntegrityReasons = append(t.IntegrityReasons, "tcp_stream_gap")
 				if err := p.s.save(t); err != nil {
 					p.s.fail(err)
 				}
@@ -318,6 +308,27 @@ func (p *HTTPProcessor) observeTLSRecords(reader io.Reader) {
 		p.s.stats.TLSWireRecords++
 		p.s.mu.Unlock()
 	}
+}
+
+// rawFramingSlack leaves room for chunk-size lines and trailers on top of the
+// header and decoded body limits when keeping a message's original bytes.
+const rawFramingSlack = 64 << 10
+
+func bufferedHeaderLength(br *bufio.Reader) int {
+	buffered, _ := br.Peek(br.Buffered())
+	return max(session.HeaderBlockLength(buffered), 0)
+}
+
+// savedMessage returns the original bytes of the message just parsed. A
+// Content-Length body over the limit is cut at the same decoded-body limit as
+// before; chunked framing keeps up to rawFramingSlack extra encoded bytes.
+func savedMessage(recorder *rawRecorder, br *bufio.Reader, headerLength, limit int, chunked bool, truncated *bool) []byte {
+	raw, cut := recorder.end(br)
+	if *truncated && !chunked && len(raw) > headerLength+limit {
+		raw = raw[:headerLength+limit]
+	}
+	*truncated = *truncated || cut
+	return raw
 }
 
 // Inspect a bounded header without consuming or waiting for bytes beyond its terminator.

@@ -22,7 +22,7 @@ func DecodedBody(raw []byte, limit int) (string, string) {
 		}
 		body, headers = response.Body, response.Header
 	} else {
-		request, err := http.ReadRequest(buffer)
+		request, _, err := ReadRequest(buffer)
 		if err != nil {
 			return "", ""
 		}

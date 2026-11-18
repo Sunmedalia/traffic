@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/Sunmedalia/traffic/internal/session"
 )
 
 // webRuleHit is one rule's footprint in a session's current analysis result.
@@ -112,8 +114,10 @@ func (w *webServer) handleRuleTest(rw http.ResponseWriter, r *http.Request) {
 	}
 	warnings := []string{}
 	if source == "manual" {
-		if _, parseErr := http.ReadRequest(bufio.NewReader(bytes.NewReader(t.Request))); parseErr != nil {
-			warnings = append(warnings, "请求无法按 HTTP 报文解析（URL 中的空格需写成 %20），request.header.* 与 request.body 字段可能无法命中")
+		if _, reasons, parseErr := session.ParseRequest(t.Request); parseErr != nil {
+			warnings = append(warnings, "请求无法按 HTTP 报文解析（头部需以空行结束），request.header.* 与 request.body 字段可能无法命中")
+		} else if len(reasons) > 0 {
+			warnings = append(warnings, "请求不符合严格 HTTP 语法，已按宽松方式解析（"+strings.Join(reasons, ", ")+"），与采集还原的处理一致")
 		}
 		if len(t.Response) > 0 {
 			if _, parseErr := http.ReadResponse(bufio.NewReader(bytes.NewReader(t.Response)), nil); parseErr != nil {

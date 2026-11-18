@@ -240,6 +240,12 @@ func capturePackets(ctx context.Context, s *Store, p *eventRecorder, iface, filt
 		return e
 	}
 	defer h.Close()
+	if source, ok := h.(interface{ bufferFallback() error }); ok {
+		if err := source.bufferFallback(); err != nil {
+			s.gap("pcap", iface, "capture_buffer_fallback", "sources", 1)
+			s.problem(err)
+		}
+	}
 	reportTimestampFallbacks := func() {
 		if source, ok := h.(interface{ takeTimestampFallbacks() uint64 }); ok {
 			if count := source.takeTimestampFallbacks(); count > 0 {

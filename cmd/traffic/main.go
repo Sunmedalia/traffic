@@ -102,6 +102,7 @@ func run(args []string) (runErr error) {
 	noTLS := fs.Bool("no-tls", false, "disable TLS probes")
 	duration := fs.Duration("duration", 0, "optional capture duration")
 	fs.IntVar(&diskLimitMiB, "disk-limit-mib", diskLimitMiB, "session disk budget MiB")
+	fs.IntVar(&pcapBufferMiB, "pcap-buffer-mib", pcapBufferMiB, "kernel capture buffer MiB per libpcap interface")
 	fs.Bool("no-detect", true, "deprecated compatibility flag; collection never runs detection")
 	jsonUsage := "JSON output (default)"
 	if cmd == "doctor" {
@@ -220,6 +221,9 @@ func run(args []string) (runErr error) {
 	}
 	if *requirePlaintext && (*noTLS || cmd != "capture" || (*service != "iis" && *service != "auto")) {
 		return errors.New("--require-plaintext requires capture with IIS TLS enabled")
+	}
+	if pcapBufferMiB < minPCAPBufferMiB || pcapBufferMiB > maxPCAPBufferMiB {
+		return fmt.Errorf("--pcap-buffer-mib must be between %d and %d", minPCAPBufferMiB, maxPCAPBufferMiB)
 	}
 	if diskLimitMiB < 64 {
 		return errors.New("invalid resource or result limits")
@@ -418,6 +422,7 @@ func run(args []string) (runErr error) {
 			"unsupported_content":              []string{"HTTP/3", "WebSocket payload", "Go TLS", "generic JSSE"},
 			"preflight":                        checks,
 			"collector_memory_mib":             collectorMemoryMiB,
+			"pcap_buffer_mib":                  pcapBufferMiB,
 			"collector_cpu_percent":            collectorCPUPercent,
 			"probe_drain_timeout_ms":           drainTimeout.Milliseconds(),
 			"stop_timeout_ms":                  stopTimeout.Milliseconds(),

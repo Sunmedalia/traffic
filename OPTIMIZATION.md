@@ -90,6 +90,15 @@ python3 scripts/impact.py \
 - **PCAP 写盘移出抓包循环**。实时采集改由每接口一个后台写入器负责编码、缓冲写、每秒 flush 及 64 MiB 轮换时的 fsync；队列上限 8192 包或 16 MiB。写入器跟不上时丢包并按秒汇总记录 `pcap/write_queue_overflow/packets`，不再阻塞 `ReadPacketData` 导致内核环形缓冲无归属丢包。写入失败仍使采集失败退出。离线导入保持同步写入，不丢包；导入的磁盘检查由每 1 MiB 改为每 16 MiB 或每秒，避免大文件导入时反复遍历会话目录。
 - **统一停止预算**。新增 `--stop-timeout`（默认 30s，不小于 `--drain-timeout`，最大 5 分钟），覆盖取消后的抓包源、探针辅助进程及原始证据写入器排空。超时记录 `collector/stop_budget_exceeded/shutdowns`，`stop_reason=stop_budget_exceeded`，`drain_state=unverified`，并写入 manifest 的 `stop_timeout_ms`；采集器随后写出失败状态并以非零状态退出，线程和记录器共用一个等待截止时刻，超时后不再执行第二次记录器关闭。状态及缺口文件的操作系统写盘不属于可取消等待，磁盘本身永久阻塞仍不具备硬实时退出保证。
 
+## 证据保真、抓包缓冲与明文队列（当前源码，未发布）
+
+- **畸形请求不再丢失**：本地还原改用 `session.ReadRequest`。net/http 拒绝的请求（非法百分号转义如 `%zz`/`%u002e`、URL 控制字符、重复且不一致的 `Content-Length`、非法头名、请求行残缺）在头部完整时按宽松方式读取，保留为事务并标注 `lenient_request_parse` 及 `malformed_header_line`、`ambiguous_content_length`、`conflicting_transfer_framing` 等原因；同一连接后续请求和响应配对不再被作废。TLS 明文分帧、规则字段、gzip 视图和可信代理来源解析共用同一读取逻辑。重复 `Content-Length` 取第一个值并标注歧义，分析无法确定服务端实际采用哪一个。
+- **保存原始字节**：请求和响应保存解析器实际消费的原始字节，不再经 `httputil.Dump*` 重新序列化（原先会规范化头名大小写、重排头部、改写换行、丢弃无法表示的头，绝对 URI 请求还会丢失 `Host` 头）。超过正文上限时，Content-Length 正文仍按原上限截断；chunked 报文额外保留至多 64 KiB 的分块编码字节。
+- **内核抓包缓冲**：libpcap 改为显式激活并设置缓冲，默认 32 MiB（原默认 2 MiB，在 256 KiB snaplen 下只有 8 个 TPACKET_V3 块，约等于千兆流量 16 ms），可用 `--pcap-buffer-mib` 调整并写入 manifest。缓冲为每接口内核内存，可能不计入 `--collector-memory-mib`。
+- **eCapture 明文队列私有化**：新补丁 `ecapture-v2.9.1-private-eventq.patch` 支持 `--ecaptureq unix:///DIR/SOCK`，只在当前用户拥有、无组/其他权限的目录内绑定 0600 套接字，且不替换已有路径。带 `private_eventq_v1` 特性的随包 eCapture 由采集器在新建的 0700 临时目录中启动，连接后用 `SO_PEERCRED` 校验对端 PID 必须是本次启动的探针。原回环 TCP 队列任何本机用户都可订阅全站明文，且存在端口抢占窗口；未带该特性的旧 eCapture 仍回退 TCP，并在 status 中记录警告。
+
+本节仅有单元与本地集成回归（含真实回环抓包和子进程 Unix 队列排空），未做实机高负载或长压验证，不宣称已消除内核丢包。
+
 ## 尚未完成的计划项
 
 1. eCapture 内核侧动态 PID/启动身份及端口过滤已实现；ARM64、Ubuntu x64 原始传输反向验证均通过，包括动态撤销、空 PID 白名单、损坏配置拒绝采集及合法配置恢复；仍需其他 ABI 和高负载验证。旧探针保留用户态过滤回退。

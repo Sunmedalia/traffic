@@ -142,7 +142,11 @@ type winDivertPacketHandle struct {
 
 func openLivePacket(ctx context.Context, iface string) (packetHandle, error) {
 	if !strings.HasPrefix(iface, "windivert") {
-		return pcap.OpenLive(iface, captureSnapshotLength(), false, 100*time.Millisecond)
+		handle, err := openPCAPLive(iface)
+		if err != nil {
+			return nil, err
+		}
+		return handle, nil
 	}
 	path := winDivertPath()
 	if path == "" {

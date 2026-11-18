@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+
+	"github.com/Sunmedalia/traffic/internal/session"
 )
 
 // Frames waits for complete HTTP bodies before passing hook fragments to the parser.
@@ -138,7 +140,7 @@ func (f *Frames) feed(key string, payload []byte, head ...bool) ([][]byte, bool)
 					}
 				}
 			} else {
-				if request, err := http.ReadRequest(br); err == nil {
+				if request, _, err := session.ReadRequest(br); err == nil {
 					contentLength = request.ContentLength
 				}
 			}
@@ -210,7 +212,9 @@ func (f *Frames) feed(key string, payload []byte, head ...bool) ([][]byte, bool)
 			continue
 		}
 		reader := bytes.NewReader(b)
-		br := bufio.NewReader(reader)
+		// Size the reader to hold a whole header block so a request that
+		// net/http rejects can still be framed leniently.
+		br := bufio.NewReaderSize(reader, min(max(len(b), 4096), 32768+4))
 		var body io.ReadCloser
 		var err error
 		advanceResponse := false
@@ -227,7 +231,7 @@ func (f *Frames) feed(key string, payload []byte, head ...bool) ([][]byte, bool)
 			}
 		} else {
 			var r *http.Request
-			r, err = http.ReadRequest(br)
+			r, _, err = session.ReadRequest(br)
 			if err == nil {
 				body = r.Body
 			}
@@ -291,7 +295,7 @@ type frameLength struct {
 }
 
 func knownHTTPFrameLength(header []byte, head bool) (frameLength, bool) {
-	reader, release := borrowHTTPReader(bytes.NewReader(header), min(4096, len(header)))
+	reader, release := borrowHTTPReader(bytes.NewReader(header), min(32768, len(header)))
 	defer release()
 	length := int64(-1)
 	advance := false
@@ -310,7 +314,7 @@ func knownHTTPFrameLength(header []byte, head bool) (frameLength, bool) {
 		}
 		advance = response.StatusCode >= 200 || response.StatusCode == 101
 	} else {
-		request, err := http.ReadRequest(reader)
+		request, _, err := session.ReadRequest(reader)
 		if err != nil || len(request.TransferEncoding) > 0 {
 			return frameLength{}, false
 		}

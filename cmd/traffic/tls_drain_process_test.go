@@ -36,11 +36,19 @@ func TestHelperECaptureProbeProcess(t *testing.T) {
 			break
 		}
 	}
-	hostPort := strings.TrimSuffix(strings.TrimPrefix(wsURL, "ws://"), "/")
+	if urlFile := os.Getenv("TRAFFIC_FAKE_ECAPTURE_URL_FILE"); urlFile != "" {
+		_ = os.WriteFile(urlFile, []byte(wsURL), 0600)
+	}
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	listener, err := net.Listen("tcp", hostPort)
+	var listener net.Listener
+	var err error
+	if socket, ok := strings.CutPrefix(wsURL, "unix://"); ok {
+		listener, err = net.Listen("unix", socket)
+	} else {
+		listener, err = net.Listen("tcp", strings.TrimSuffix(strings.TrimPrefix(wsURL, "ws://"), "/"))
+	}
 	if err != nil {
 		os.Exit(1)
 	}
@@ -79,7 +87,20 @@ func TestCaptureTLSSubprocessEndToEndDrain(t *testing.T) {
 		t.Skipf("loopback tcp dial unavailable in current sandbox: %v", dialErr)
 	}
 	dialCheck.Close()
+	runCaptureTLSSubprocessDrain(t, false)
+}
 
+// A private_eventq_v1 build must be read over its private Unix socket.
+func TestCaptureTLSSubprocessPrivateQueueDrain(t *testing.T) {
+	if !privateECaptureQueueSupported {
+		t.Skip("private eCapture queue requires Linux")
+	}
+	if url := runCaptureTLSSubprocessDrain(t, true); !strings.HasPrefix(url, "unix:///") {
+		t.Fatalf("probe was given %q", url)
+	}
+}
+
+func runCaptureTLSSubprocessDrain(t *testing.T, privateQueue bool) string {
 	oldPorts, oldDrain, oldStop := capturePorts, drainTimeout, stopTimeout
 	capturePorts = map[int]bool{443: true}
 	drainTimeout = 3 * time.Second
@@ -102,10 +123,14 @@ func TestCaptureTLSSubprocessEndToEndDrain(t *testing.T) {
 		t.Fatal(err)
 	}
 	scriptPath := filepath.Join(t.TempDir(), "fake-ecapture.sh")
-	script := fmt.Sprintf("#!/bin/sh\nexport TRAFFIC_FAKE_ECAPTURE_SUBPROCESS=1\nexport TRAFFIC_FAKE_ECAPTURE_PID_FILE=%q\nexport TRAFFIC_FAKE_ECAPTURE_TARGET_PID=%d\nexec %q -test.run=^TestHelperECaptureProbeProcess$ -- \"$@\"\n",
-		pidFile, targetPID, exe)
+	urlFile := filepath.Join(t.TempDir(), "queue.url")
+	script := fmt.Sprintf("#!/bin/sh\nexport TRAFFIC_FAKE_ECAPTURE_SUBPROCESS=1\nexport TRAFFIC_FAKE_ECAPTURE_PID_FILE=%q\nexport TRAFFIC_FAKE_ECAPTURE_TARGET_PID=%d\nexport TRAFFIC_FAKE_ECAPTURE_URL_FILE=%q\nexec %q -test.run=^TestHelperECaptureProbeProcess$ -- \"$@\"\n",
+		pidFile, targetPID, urlFile, exe)
 	if err := os.WriteFile(scriptPath, []byte(script), 0700); err != nil {
 		t.Fatal(err)
+	}
+	if privateQueue {
+		writeQueueFeature(t, scriptPath)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -159,4 +184,9 @@ func TestCaptureTLSSubprocessEndToEndDrain(t *testing.T) {
 	if s.stats.DrainState != "confirmed" {
 		t.Fatalf("expected confirmed DrainState, got %+v", s.stats)
 	}
+	url, err := os.ReadFile(urlFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(url)
 }
