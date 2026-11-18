@@ -28,11 +28,14 @@ type h2Message struct {
 }
 type h2Stream struct {
 	request, response h2Message
+	requestAt         time.Time
+	responseAt        time.Time
 	record            Transaction
 }
 type h2Direction struct {
 	decoder      *hpack.Decoder
 	buffer       []byte
+	frameAt      time.Time
 	block        []byte
 	stream       uint32
 	end          bool
@@ -74,7 +77,7 @@ func (p *HTTPProcessor) closeHTTP2Locked(key, reason string) {
 func (p *HTTPProcessor) saveHTTP2(c *h2Connection, id uint32, s *h2Stream, incomplete bool, reason string) {
 	t := s.record
 	if t.ID == "" {
-		t = Transaction{ID: fmt.Sprintf("h2-%x", serial.Add(1)), Time: c.meta.first, Source: c.source, Client: c.meta.client, LocalEndpoint: c.meta.local, PID: c.meta.pid, TargetID: c.meta.targetID, Backend: c.meta.backend, Service: c.meta.service, Connection: c.meta.connection, Protocol: "HTTP/2.0", StreamID: id}
+		t = Transaction{ID: fmt.Sprintf("h2-%x", serial.Add(1)), Time: s.requestAt, Source: c.source, Client: c.meta.client, LocalEndpoint: c.meta.local, PID: c.meta.pid, TargetID: c.meta.targetID, Backend: c.meta.backend, Service: c.meta.service, Connection: c.meta.connection, Protocol: "HTTP/2.0", StreamID: id}
 		if t.Time.IsZero() {
 			t.Time = time.Now().UTC()
 		}
@@ -102,6 +105,7 @@ func (p *HTTPProcessor) saveHTTP2(c *h2Connection, id uint32, s *h2Stream, incom
 	}
 	if len(s.response.headers) > 0 {
 		t.Response = renderHTTP2(s.response, fmt.Sprintf("HTTP/2.0 %d %s", t.Status, http.StatusText(t.Status)))
+		t.ResponseTime = s.responseAt
 	}
 	t.Truncated = s.request.truncated || s.response.truncated
 	t.Incomplete = t.Incomplete || incomplete || c.meta.incomplete
@@ -141,23 +145,16 @@ func (p *HTTPProcessor) ingestHTTP2(key string, request bool, data []byte, meta 
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	if now.Sub(p.h2lastSweep) >= 5*time.Second {
-		for old, c := range p.h2 {
-			if now.Sub(c.updated) > time.Minute {
-				p.closeHTTP2Locked(old, "http2_idle_expiry")
-			}
-		}
-		p.h2lastSweep = now
-	}
-
 	c := p.h2[key]
 	if c == nil {
 		if len(p.h2) >= 256 {
-			oldest := ""
-			var stamp time.Time
+			var oldest string
+			var selected *h2Connection
 			for k, candidate := range p.h2 {
-				if oldest == "" || candidate.updated.Before(stamp) {
-					oldest, stamp = k, candidate.updated
+				idle := len(candidate.streams) == 0
+				if selected == nil || (idle && len(selected.streams) != 0) ||
+					(idle == (len(selected.streams) == 0) && candidate.updated.Before(selected.updated)) {
+					oldest, selected = k, candidate
 				}
 			}
 			p.s.gap("http2", oldest, "connection_limit", "connections", 1)
@@ -171,7 +168,9 @@ func (p *HTTPProcessor) ingestHTTP2(key string, request bool, data []byte, meta 
 		c.meta = meta
 		c.meta.connection = key
 	}
-	c.updated = now
+	if now.After(c.updated) {
+		c.updated = now
+	}
 	side := 0
 	if !request {
 		side = 1
@@ -205,10 +204,22 @@ func (p *HTTPProcessor) ingestHTTP2(key string, request bool, data []byte, meta 
 		fail("buffer_limit")
 		return
 	}
+	frameAt := meta.first
+	if frameAt.IsZero() {
+		frameAt = now
+	}
+	if len(d.buffer) == 0 {
+		d.frameAt = frameAt
+	}
 	d.buffer = append(d.buffer, data...)
 	c.bytes += len(data)
 	p.h2bytes += len(data)
-	consume := func(n int) { d.buffer = d.buffer[n:]; c.bytes -= n; p.h2bytes -= n }
+	consume := func(n int) {
+		d.buffer = d.buffer[n:]
+		d.frameAt = frameAt
+		c.bytes -= n
+		p.h2bytes -= n
+	}
 	if !d.initialized {
 		if request && !d.preface {
 			if len(d.buffer) < len(h2Preface) {
@@ -299,6 +310,9 @@ func (p *HTTPProcessor) ingestHTTP2(key string, request bool, data []byte, meta 
 				return
 			}
 		case *http2.HeadersFrame:
+			if request && stream.requestAt.IsZero() {
+				stream.requestAt = d.frameAt
+			}
 			d.stream = id
 			d.end = f.StreamEnded()
 			fragment := f.HeaderBlockFragment()
@@ -334,6 +348,9 @@ func (p *HTTPProcessor) ingestHTTP2(key string, request bool, data []byte, meta 
 			p.h2bytes += n
 			message.truncated = message.truncated || n < len(data)
 			message.ended = f.StreamEnded()
+			if !request && now.After(stream.responseAt) {
+				stream.responseAt = now
+			}
 		case *http2.RSTStreamFrame:
 			if stream != nil {
 				if len(stream.request.headers) > 0 {
@@ -406,6 +423,9 @@ func (p *HTTPProcessor) ingestHTTP2(key string, request bool, data []byte, meta 
 					p.h2bytes += total
 				}
 				message.ended = d.end
+				if !request && now.After(stream.responseAt) {
+					stream.responseAt = now
+				}
 			}
 			d.decoder.SetEmitFunc(func(hpack.HeaderField) {})
 			c.bytes -= len(d.block)
@@ -471,6 +491,13 @@ func (p *HTTPProcessor) processHTTP2Reader(br *bufio.Reader, key, client, source
 		p.ingestHTTP2(key, true, b, meta, source)
 	}
 	for {
+		if _, err := br.Peek(1); err != nil {
+			return
+		}
+		meta.first = time.Now().UTC()
+		if timed, ok := r.(interface{ CaptureTime() time.Time }); ok {
+			meta.first = timed.CaptureTime()
+		}
 		header := make([]byte, 9)
 		_, err := io.ReadFull(br, header)
 		if err != nil {
@@ -492,6 +519,10 @@ func (p *HTTPProcessor) processHTTP2Reader(br *bufio.Reader, key, client, source
 		}
 		if state, ok := r.(interface{ Incomplete() bool }); ok {
 			meta.incomplete = state.Incomplete()
+		}
+		meta.updated = meta.first
+		if stream, ok := r.(*queuedStream); ok {
+			meta.updated = stream.latest
 		}
 		p.ingestHTTP2(key, request, append(header, payload...), meta, source)
 	}

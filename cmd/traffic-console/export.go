@@ -77,11 +77,20 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 	remote, remoteErr := netip.ParseAddrPort(peer)
 	local, localErr := netip.ParseAddrPort(t.LocalEndpoint)
 	hasEndpoints := remoteErr == nil && localErr == nil && remote.Port() != 0 && local.Port() != 0
+	first, last := t.Time.Add(-time.Minute), t.Time.Add(time.Minute)
+	packetSource, hasPacketSource := strings.CutPrefix(t.Source, "pcap:")
 	packetScope := "TCP connection endpoints within 60 seconds of transaction time; may include other transactions or reused connections with the same endpoints"
+	if hasEndpoints && hasPacketSource && t.ResponseTime.After(last) {
+		last = t.ResponseTime
+		packetScope = "TCP connection endpoints from 60 seconds before transaction time through the observed response; may include other transactions or reused connections with the same endpoints"
+	}
 	if !hasEndpoints {
 		packetScope = "packet selection unavailable because the transaction lacks both transport endpoints"
 	}
 	note := map[string]any{"schema_version": 1, "source": t.Source, "protocol": t.Protocol, "stream_id": t.StreamID, "integrity_reasons": t.IntegrityReasons, "incomplete": t.Incomplete, "truncated": t.Truncated, "capture_coverage": session.CoverageWarning, "packet_scope": packetScope, "tls_plaintext_source": "process hook; network PCAP remains encrypted"}
+	if hasEndpoints {
+		note["packet_window_start"], note["packet_window_end"] = first, last
+	}
 	var reconstructed *Stats
 	if s.analysis != nil {
 		reconstructed = s.analysis.Reconstruction
@@ -162,8 +171,6 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 		if err != nil {
 			return err
 		}
-		first, last := t.Time.Add(-time.Minute), t.Time.Add(time.Minute)
-		packetSource, hasPacketSource := strings.CutPrefix(t.Source, "pcap:")
 		for i, name := range files {
 			if hasPacketSource && filepath.Base(session.PacketSegmentGroup(name)) != packetSource {
 				continue

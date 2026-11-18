@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -99,6 +100,85 @@ func h2Headers(t *testing.T, encoder *hpack.Encoder, block *bytes.Buffer, framer
 	}
 	if err := framer.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block.Bytes(), EndHeaders: true, EndStream: end}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestHTTP1StopsPairingAfterQueueLimit(t *testing.T) {
+	for _, reason := range []string{"pipeline_limit", "response_queue_limit"} {
+		t.Run(reason, func(t *testing.T) {
+			s, err := openStore(t.TempDir(), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.db.Close()
+			p := newHTTP(s)
+			const response = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none"
+			process := func(key, message string) {
+				r := capturedReader{Reader: bytes.NewReader([]byte(message)), complete: true}
+				p.process(r, key, "client", "test", 0, false)
+			}
+			if reason == "response_queue_limit" {
+				for range http1PipelineLimit + 1 {
+					process("limited", response)
+				}
+			}
+			for i := 1; i <= http1PipelineLimit+2; i++ {
+				process("limited", fmt.Sprintf("GET /%d HTTP/1.1\r\nHost: test\r\n\r\n", i))
+			}
+			process("limited", response)
+			process("other", "GET /other HTTP/1.1\r\nHost: test\r\n\r\n")
+			process("other", response)
+			p.finish()
+			rows := readRecords(t, s)
+			for i := 1; i <= http1PipelineLimit+2; i++ {
+				row := rows[fmt.Sprintf("/%d", i)]
+				if row.Status != 0 || len(row.Response) != 0 || !row.Incomplete || !slices.Contains(row.IntegrityReasons, reason) {
+					t.Fatalf("request %d has unsafe pairing result: %+v", i, row)
+				}
+			}
+			if row := rows["/other"]; row.Status != 200 || row.Incomplete || !bytes.HasSuffix(row.Response, []byte("one")) {
+				t.Fatalf("unrelated connection lost its response: %+v", row)
+			}
+			if s.stats.GapCounts["http1/"+reason+"/connections"] != 1 {
+				t.Fatalf("unexpected gaps: %v", s.stats.GapCounts)
+			}
+		})
+	}
+}
+
+func TestHTTP2HookKeepsIdleConnection(t *testing.T) {
+	s, err := openStore(t.TempDir(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.db.Close()
+	p, frames := newHTTP(s), &Frames{}
+	var client, server, block bytes.Buffer
+	client.WriteString(h2Preface)
+	request, response := http2.NewFramer(&client, nil), http2.NewFramer(&server, nil)
+	if err := request.WriteSettings(); err != nil {
+		t.Fatal(err)
+	}
+	if err := response.WriteSettings(); err != nil {
+		t.Fatal(err)
+	}
+	reqEncoder, respEncoder := hpack.NewEncoder(&block), hpack.NewEncoder(&block)
+	at := time.Unix(1600000000, 0)
+	meta := frameContext{connection: "slow", local: "127.0.0.1:443", first: at, updated: at}
+	h2Headers(t, reqEncoder, &block, request, 1, true, hpack.HeaderField{Name: ":method", Value: "GET"}, hpack.HeaderField{Name: ":path", Value: "/slow"})
+	frames.ingest("slow/read", client.Bytes(), meta, false, p)
+	frames.ingest("slow/write", server.Bytes(), meta, false, p)
+	server.Reset()
+
+	late := at.Add(62 * time.Second)
+	frames.expire(late, false, p, "")
+	meta.first, meta.updated = late, late
+	h2Headers(t, respEncoder, &block, response, 1, true, hpack.HeaderField{Name: ":status", Value: "200"})
+	frames.ingest("slow/write", server.Bytes(), meta, false, p)
+	p.finish()
+	row := readRecords(t, s)["/slow"]
+	if row.Status != 200 || row.Incomplete || !row.Time.Equal(at) || !row.ResponseTime.Equal(late) || len(s.stats.GapCounts) != 0 {
+		t.Fatalf("bad slow HTTP/2 reconstruction: %+v, gaps=%v", row, s.stats.GapCounts)
 	}
 }
 func TestHTTP2MultiplexingHPACKAndTruncation(t *testing.T) {
@@ -206,6 +286,30 @@ func TestTLSLargeBodyDrainsBeforeNextRequest(t *testing.T) {
 	}
 	if frames.buffered != 0 || len(frames.drains) != 0 {
 		t.Fatal("drain retained data", frames.buffered)
+	}
+}
+
+func TestHTTP2HookDirectionsStayWithinCapacity(t *testing.T) {
+	p, frames := newHTTP(&Store{}), &Frames{}
+	var opening bytes.Buffer
+	opening.WriteString(h2Preface)
+	if err := http2.NewFramer(&opening, nil).WriteSettings(); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Unix(1600000000, 0)
+	for i := range 4100 {
+		now := start.Add(time.Duration(i) * time.Second)
+		key := fmt.Sprintf("conn-%d", i)
+		frames.expire(now, false, p, "")
+		frames.ingest(key+"/read", opening.Bytes(), frameContext{
+			connection: key, local: "127.0.0.1:443", first: now, updated: now,
+		}, false, p)
+	}
+	if len(frames.contexts) != 4000 || len(frames.http2) != 4000 || len(frames.touched) != 4000 {
+		t.Fatalf("HTTP/2 state counts: contexts=%d markers=%d indexed=%d", len(frames.contexts), len(frames.http2), len(frames.touched))
+	}
+	if frames.http2["conn-0/read"] || !frames.http2["conn-4099/read"] {
+		t.Fatal("HTTP/2 eviction did not keep the newest direction")
 	}
 }
 

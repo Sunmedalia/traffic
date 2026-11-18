@@ -32,6 +32,7 @@ type queuedStream struct {
 	closed     bool
 	store      *Store
 	observed   atomic.Int64
+	latest     time.Time
 }
 
 func (s *queuedStream) Reassembled(rs []tcpassembly.Reassembly) {
@@ -96,6 +97,9 @@ func (s *queuedStream) Read(b []byte) (int, error) {
 		s.reserved = int64(len(chunk.data))
 		if !chunk.seen.IsZero() {
 			s.observed.Store(chunk.seen.UnixNano())
+			if chunk.seen.After(s.latest) {
+				s.latest = chunk.seen.UTC()
+			}
 		}
 	}
 	n := copy(b, s.current)

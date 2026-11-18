@@ -119,7 +119,9 @@ func (f *Frames) ingest(key string, payload []byte, meta frameContext, head bool
 			if !capturePorts[port] {
 				request = !request
 			}
-			p.ingestHTTP2("tls:"+meta.connection, request, chunk, meta, "tls-hook")
+			h2meta := meta
+			h2meta.first = now
+			p.ingestHTTP2("tls:"+meta.connection, request, chunk, h2meta, "tls-hook")
 			continue
 		}
 		p.process(capturedReader{bytes.NewReader(chunk), meta.first, meta.local, true, meta.targetID, meta.backend, meta.service}, "tls:"+meta.connection, meta.client, "tls-hook", meta.pid, gap)
@@ -134,6 +136,11 @@ func (f *Frames) expire(now time.Time, all bool, p *HTTPProcessor, connection st
 	var expired []partial
 	f.mu.Lock()
 	for key, meta := range f.contexts {
+		// HTTP/2 keeps its framing and HPACK state across idle periods;
+		// connection count and buffered bytes are bounded separately.
+		if !all && f.http2[key] {
+			continue
+		}
 		if (connection == "" || meta.connection == connection) && (all || now.Sub(meta.updated) >= time.Minute) {
 			expired = append(expired, partial{f.buffers[key], meta})
 			f.remove(key)

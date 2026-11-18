@@ -40,6 +40,7 @@ type Transaction struct {
 	SchemaVersion    int                 `json:"schema_version"`
 	ID               string              `json:"id"`
 	Time             time.Time           `json:"time"`
+	ResponseTime     time.Time           `json:"response_time,omitzero"`
 	Source           string              `json:"source"`
 	Client           string              `json:"client"`
 	PeerClient       string              `json:"peer_client,omitempty"`
