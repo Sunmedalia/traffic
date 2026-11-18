@@ -5,7 +5,9 @@ const selectedPorts = new Set(__PORTS__);
 const profiles = __PROFILES__;
 const library = __LIBRARY__;
 const configuredLimit = Math.max(__REQUEST_LIMIT__, __RESPONSE_LIMIT__);
-const copyLimit = (configuredLimit > 0 ? configuredLimit : 16 * 1024 * 1024) + 65536;
+// Base64 plus JSON must fit the collector's 2 MiB helper line limit.
+const maxPayload = 1024 * 1024;
+const copyLimit = configuredLimit > 0 ? Math.min(configuredLimit + 65536, maxPayload) : maxPayload;
 const listeners = [];
 const originals = new Map();
 const connections = new Map();
@@ -67,18 +69,14 @@ function connection(ssl, getFD, fallback, module) {
     const key = module + ':' + ssl;
     const existing = connections.get(key);
     if (existing !== undefined && existing.fd === fd) {
-        return existing.ignored ? null : existing;
+        return existing;
     }
     const local = Socket.localAddress(fd);
     const remote = Socket.peerAddress(fd);
     if (local === null || remote === null) { dropped++; return null; }
-    if (!selectedPorts.has(local.port) && !selectedPorts.has(remote.port)) {
-        if (connections.size >= 4096) connections.delete(connections.keys().next().value);
-        connections.set(key, {fd, ignored: true});
-        return null;
-    }
-    if (connections.size >= 4096) connections.delete(connections.keys().next().value);
-    const state = {id: String(++sequence), fd, ignored: false, local: endpoint(local), remote: endpoint(remote)};
+    if (!selectedPorts.has(local.port) && !selectedPorts.has(remote.port)) return null;
+    if (existing === undefined && connections.size >= 4096) { dropped++; return null; }
+    const state = {id: String(++sequence), fd, local: endpoint(local), remote: endpoint(remote)};
     connections.set(key, state);
     return state;
 }
@@ -140,6 +138,7 @@ function install(module) {
                     const length = extended ? (Process.pointerSize === 8 ? Number(this.resultSize.readU64()) : this.resultSize.readU32()) : status;
                     if (length <= 0) return;
                     const count = Math.min(length, this.capacity);
+                    if (events.length >= 256 || queuedBytes + count > 8 * 1024 * 1024) { dropped++; return; }
                     const data = this.buffer.readByteArray(count);
                     enqueue({type: 'data', connection: this.state.id, direction, local: this.state.local, client: this.state.remote, incomplete: length > count}, data);
                     captured++;
@@ -161,7 +160,7 @@ hook(winsock.getExportByName('closesocket'), {
         if (stopping) return;
         const fd = args[0].toInt32();
         for (const [key, state] of connections) {
-            if (state.fd === fd) { if (!state.ignored) enqueue({type: 'close', connection: state.id}); connections.delete(key); }
+            if (state.fd === fd) { enqueue({type: 'close', connection: state.id}); connections.delete(key); }
         }
     }
 });
