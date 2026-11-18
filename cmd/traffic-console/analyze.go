@@ -21,7 +21,7 @@ import (
 	"sort"
 )
 
-const analysisEngineVersion = 3
+const analysisEngineVersion = 4
 
 type analysisReport struct {
 	IntegrityWarnings []string      `json:"integrity_warnings,omitempty"`

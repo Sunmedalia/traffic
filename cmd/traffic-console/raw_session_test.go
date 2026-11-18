@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -516,7 +517,23 @@ func TestAnalyzeStatusTUIAndExportSurfaceStalledCaptureWarnings(t *testing.T) {
 	if err := exportEvidence(store, txRecord, txRaw, zipPath); err != nil {
 		t.Fatal(err)
 	}
-	if fi, err := os.Stat(zipPath); err != nil || fi.Size() == 0 {
-		t.Fatalf("missing exported zip: %v", err)
+	evidence, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer evidence.Close()
+	manifest, err := evidence.Open("evidence.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manifest.Close()
+	var note struct {
+		Warnings []string `json:"session_integrity_warnings"`
+	}
+	if err := json.NewDecoder(manifest).Decode(&note); err != nil {
+		t.Fatal(err)
+	}
+	if len(note.Warnings) < 3 {
+		t.Fatalf("evidence manifest missing integrity warnings: %v", note.Warnings)
 	}
 }
