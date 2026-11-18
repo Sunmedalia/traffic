@@ -94,6 +94,8 @@ func Build(ctx context.Context, dir string, db *sql.DB, options Options) (sessio
 			return s.stats, err
 		}
 		p.wg.Wait()
+		// Interface groups have independent TCP assemblers and connection keys.
+		p.finish()
 	}
 	if err = replayEvents(ctx, dir, s, p); err != nil {
 		p.finish()
@@ -258,6 +260,9 @@ func replayEvents(ctx context.Context, dir string, s *Store, p *HTTPProcessor) e
 			}
 			source.frames.expire(event.Time, true, p, key)
 			p.invalidate("tls:"+key, "recorded_connection_close")
+			p.mu.Lock()
+			delete(p.pairingLost, "tls:"+key)
+			p.mu.Unlock()
 		case "iis":
 			if event.IIS == nil || source.iis == nil {
 				return errors.New("invalid IIS raw event")

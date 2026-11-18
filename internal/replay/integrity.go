@@ -1,9 +1,10 @@
 package replay
 
 import (
-	"github.com/Sunmedalia/traffic/internal/session"
 	"strings"
 	"time"
+
+	"github.com/Sunmedalia/traffic/internal/session"
 )
 
 func (s *Store) gap(backend, connection, reason, unit string, count uint64) {
@@ -46,6 +47,48 @@ func (p *HTTPProcessor) invalidateLocked(connection, reason string) {
 	}
 	delete(p.responses, connection)
 }
+
+// Once a FIFO entry is lost, a later response cannot safely match any
+// subsequent request on the same connection generation.
+func (p *HTTPProcessor) loseHTTP1PairingLocked(connection, reason string) {
+	if p.http1PairingLossLocked(connection) != "" {
+		return
+	}
+	p.s.gap("http1", connection, reason, "connections", 1)
+	p.invalidateLocked(connection, reason)
+	if len(p.pairingLost) >= 8192 {
+		const limit = "pairing_state_limit"
+		p.s.gap("http1", "", limit, "sessions", 1)
+		p.pairingStopped = true
+		for key := range p.pending {
+			p.invalidateLocked(key, limit)
+		}
+		for key := range p.responses {
+			p.invalidateLocked(key, limit)
+		}
+		clear(p.requestMethods)
+		clear(p.pairingLost)
+	} else {
+		if p.pairingLost == nil {
+			p.pairingLost = make(map[string]string)
+		}
+		p.pairingLost[connection] = reason
+	}
+	p.signalRequestLocked()
+}
+
+func (p *HTTPProcessor) http1PairingLossLocked(connection string) string {
+	if p.pairingStopped {
+		return "pairing_state_limit"
+	}
+	return p.pairingLost[connection]
+}
+
+func (p *HTTPProcessor) signalRequestLocked() {
+	close(p.requestReady)
+	p.requestReady = make(chan struct{})
+}
+
 func (p *HTTPProcessor) finish() {
 	p.finishHTTP2()
 	p.mu.Lock()
@@ -56,6 +99,9 @@ func (p *HTTPProcessor) finish() {
 	for key := range p.responses {
 		p.invalidateLocked(key, "orphan_response_at_stop")
 	}
+	clear(p.requestMethods)
+	clear(p.pairingLost)
+	p.pairingStopped = false
 }
 
 func (p *HTTPProcessor) invalidatePrefix(prefix, reason string) {
@@ -74,6 +120,13 @@ func (p *HTTPProcessor) invalidatePrefix(prefix, reason string) {
 	for key := range p.requestMethods {
 		if strings.HasPrefix(key, prefix) {
 			delete(p.requestMethods, key)
+		}
+	}
+	if reason == "probe_source_ended" {
+		for key := range p.pairingLost {
+			if strings.HasPrefix(key, prefix) {
+				delete(p.pairingLost, key)
+			}
 		}
 	}
 }

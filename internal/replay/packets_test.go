@@ -17,6 +17,9 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
+	"github.com/google/gopacket/tcpassembly"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -182,6 +185,9 @@ func TestOfflineReassemblyKeepsIdleConnections(t *testing.T) {
 	for i, url := range []string{"/slow", "/other", "/reuse"} {
 		checkReplayTransaction(t, records[i], url, nil)
 	}
+	if want := unrelatedAt.Add(time.Second); !records[0].ResponseTime.Equal(want) {
+		t.Fatalf("slow response packet timestamp = %s, want %s", records[0].ResponseTime, want)
+	}
 }
 
 func TestOfflineReassemblyReportsMissingSequence(t *testing.T) {
@@ -220,8 +226,79 @@ func TestOfflineReassemblyReusesClosedStreamSlots(t *testing.T) {
 		}
 	}
 	p.wg.Wait()
-	if len(p.slots) != 0 || factory.active != 0 || len(s.stats.GapCounts) != 0 {
+	if len(p.slots) != 0 || len(factory.directions) != 0 || len(s.stats.GapCounts) != 0 {
 		t.Fatalf("streams did not drain cleanly: %v", s.stats.GapCounts)
+	}
+}
+
+func TestOfflineReassemblyBoundsAssemblerDirections(t *testing.T) {
+	s := &Store{}
+	p := newHTTP(s)
+	p.slots = make(chan struct{}, 2)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	f := &streamFactory{ctx: ctx, budget: semaphore.NewWeighted(packetQueueBudget), p: p, source: "pcap:test"}
+	assembler := tcpassembly.NewAssembler(tcpassembly.NewStreamPool(f))
+	network := gopacket.NewFlow(layers.EndpointIPv4, []byte{192, 0, 2, 1}, []byte{192, 0, 2, 2})
+	at := time.Unix(1600000000, 0)
+	send := func(port layers.TCPPort, syn bool) {
+		tcp := &layers.TCP{SrcPort: port, DstPort: 80, Seq: 100, SYN: syn, FIN: !syn}
+		if !syn {
+			tcp.Seq++
+		}
+		tcp.SetInternalPortsForTesting()
+		f.assemble(assembler, network, tcp, at)
+	}
+	for port := layers.TCPPort(40000); port < 40020; port++ {
+		send(port, true)
+	}
+	send(40000, false)
+	send(40002, true)
+	closed := assembler.FlushAll()
+	p.wg.Wait()
+	if closed != 2 || len(f.directions) != 0 || f.rejected != 18 {
+		t.Fatalf("retained at EOF=%d remaining=%d rejected=%d", closed, len(f.directions), f.rejected)
+	}
+}
+
+func TestOfflineHTTP2UsesPerStreamTimestamps(t *testing.T) {
+	input, write, closePCAP := writeReplayPCAP(t)
+	at := time.Unix(1600000000, 0)
+	var client, server, block bytes.Buffer
+	client.WriteString(h2Preface)
+	request, response := http2.NewFramer(&client, nil), http2.NewFramer(&server, nil)
+	if err := request.WriteSettings(); err != nil {
+		t.Fatal(err)
+	}
+	if err := response.WriteSettings(); err != nil {
+		t.Fatal(err)
+	}
+	reqEncoder, respEncoder := hpack.NewEncoder(&block), hpack.NewEncoder(&block)
+	write(at, 40000, false, 100, true, nil)
+	write(at, 40000, true, 200, true, nil)
+	cseq, sseq := uint32(101), uint32(201)
+	for i, url := range []string{"/one", "/three"} {
+		stamp := at.Add(time.Duration(i) * 20 * time.Second)
+		id := uint32(2*i + 1)
+		h2Headers(t, reqEncoder, &block, request, id, true, hpack.HeaderField{Name: ":method", Value: "GET"}, hpack.HeaderField{Name: ":path", Value: url})
+		h2Headers(t, respEncoder, &block, response, id, true, hpack.HeaderField{Name: ":status", Value: "200"})
+		write(stamp, 40000, false, cseq, false, client.Bytes())
+		write(stamp.Add(time.Second), 40000, true, sseq, false, server.Bytes())
+		cseq, sseq = cseq+uint32(client.Len()), sseq+uint32(server.Len())
+		client.Reset()
+		server.Reset()
+	}
+	closePCAP()
+	records, gaps := replayTestPCAP(t, input)
+	if len(records) != 2 || len(gaps) != 0 {
+		t.Fatalf("got %d records and gaps %v", len(records), gaps)
+	}
+	for i, url := range []string{"/one", "/three"} {
+		want := at.Add(time.Duration(i) * 20 * time.Second)
+		r := records[i]
+		if r.URL != url || r.Status != 200 || r.Incomplete || !r.Time.Equal(want) || !r.ResponseTime.Equal(want.Add(time.Second)) {
+			t.Fatalf("%s: status=%d incomplete=%t timestamps=%s/%s, want request %s", r.URL, r.Status, r.Incomplete, r.Time, r.ResponseTime, want)
+		}
 	}
 }
 

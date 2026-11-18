@@ -18,13 +18,13 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-type discardStream struct{ factory *streamFactory }
+type discardStream struct{}
 
 func (discardStream) Reassembled([]tcpassembly.Reassembly) {}
-func (s discardStream) ReassemblyComplete() {
-	if s.factory != nil {
-		s.factory.discarded--
-	}
+func (discardStream) ReassemblyComplete()                  {}
+
+type packetDirection struct {
+	network, transport gopacket.Flow
 }
 
 type streamGeneration struct {
@@ -39,8 +39,25 @@ type streamFactory struct {
 	generations map[string]*streamGeneration
 	p           *HTTPProcessor
 	source      string
-	active      int
-	discarded   int
+	directions  map[packetDirection]struct{}
+	rejected    uint64
+}
+
+func (f *streamFactory) assemble(assembler *tcpassembly.Assembler, n gopacket.Flow, tcp *layers.TCP, at time.Time) {
+	direction := packetDirection{n, tcp.TransportFlow()}
+	if _, known := f.directions[direction]; !known {
+		// ACKs and bare FIN/RST cannot open a new assembler direction.
+		if !tcp.SYN && len(tcp.Payload) == 0 {
+			return
+		}
+		if len(f.directions) >= cap(f.p.slots) {
+			// Reject before tcpassembly allocates a connection, even if
+			// thousands of new directions share the same timestamp.
+			f.rejected++
+			return
+		}
+	}
+	assembler.AssembleWithTimestamp(n, tcp, at)
 }
 
 func (f *streamFactory) New(n, t gopacket.Flow) tcpassembly.Stream {
@@ -56,16 +73,6 @@ func (f *streamFactory) New(n, t gopacket.Flow) tcpassembly.Stream {
 		g = &streamGeneration{directions: map[string]bool{}, id: serial.Add(1)}
 	}
 	key := fmt.Sprintf("%s/%s/%d", f.source, base, g.id)
-	if f.active == cap(f.p.slots) {
-		// An open stream may need later packets to finish, so waiting
-		// for all active readers here could deadlock the assembler.
-		f.p.s.gap("pcap", key, "stream_limit", "directions", 1)
-		f.p.s.mu.Lock()
-		f.p.s.stats.QueueDropped++
-		f.p.s.mu.Unlock()
-		f.discarded++
-		return discardStream{factory: f}
-	}
 	// Readers whose input is already closed can finish without new packets.
 	select {
 	case f.p.slots <- struct{}{}:
@@ -84,12 +91,16 @@ func (f *streamFactory) New(n, t gopacket.Flow) tcpassembly.Stream {
 	f.generations[base] = g
 	g.directions[client] = true
 	g.active++
-	f.active++
+	if f.directions == nil {
+		f.directions = make(map[packetDirection]struct{})
+	}
+	direction := packetDirection{n, t}
+	f.directions[direction] = struct{}{}
 	r := queuedStream{
 		ctx: f.ctx, budget: f.budget, chunks: make(chan streamChunk, 256),
 		store: f.p.s, server: server, connection: key, abort: &g.abort, processor: f.p,
 		onClose: func() {
-			f.active--
+			delete(f.directions, direction)
 			g.active--
 			if g.active == 0 && len(g.directions) == 2 && f.generations[base] == g {
 				delete(f.generations, base)
@@ -113,6 +124,12 @@ func replayPacketFiles(ctx context.Context, s *Store, p *HTTPProcessor, paths []
 	assembler.MaxBufferedPagesPerConnection = 64
 	defer func() {
 		assembler.FlushAll()
+		if factory.rejected > 0 {
+			s.gap("pcap", source, "stream_limit", "packets", factory.rejected)
+			s.mu.Lock()
+			s.stats.QueueDropped += factory.rejected
+			s.mu.Unlock()
+		}
 		if err == nil {
 			err = ctx.Err()
 		}
@@ -184,14 +201,14 @@ func replayPacketFiles(ctx context.Context, s *Store, p *HTTPProcessor, paths []
 			}
 			packet := packetio.Decode(data, reader.Link)
 			if tcp, ok := packet.Layer(layers.LayerTypeTCP).(*layers.TCP); ok && packet.NetworkLayer() != nil && (len(capturePorts) == 0 || capturePorts[int(tcp.SrcPort)] || capturePorts[int(tcp.DstPort)]) {
-				assembler.AssembleWithTimestamp(packet.NetworkLayer().NetworkFlow(), tcp, ci.Timestamp)
+				factory.assemble(assembler, packet.NetworkLayer().NetworkFlow(), tcp, ci.Timestamp)
 			}
 			if last.IsZero() || ci.Timestamp.Sub(last) > time.Second {
 				cutoff := ci.Timestamp.Add(-time.Minute)
 				// Flush expired out-of-order data without closing a
 				// contiguous stream just because its peer is idle.
 				assembler.FlushWithOptions(tcpassembly.FlushOptions{T: cutoff})
-				if factory.active+factory.discarded >= cap(p.slots)*3/4 {
+				if len(factory.directions) >= cap(p.slots)*3/4 {
 					_, closed := assembler.FlushOlderThan(cutoff)
 					if closed > 0 {
 						s.gap("pcap", source, "stream_idle_eviction", "directions", uint64(closed))
