@@ -149,8 +149,9 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 		}
 		if event.Sequence > 0 {
 			if lastSequence > 0 && event.Sequence != lastSequence+1 {
-				s.gap(backend, target.ID, "transport_sequence_gap", "events", 1)
-				if err := p.record(source, backend, target, session.RawEvent{Type: "loss", Reason: "transport_sequence_gap"}); err != nil {
+				reason, unit, count := sequenceDiscontinuity(lastSequence, event.Sequence)
+				s.gap(backend, target.ID, reason, unit, count)
+				if err := p.record(source, backend, target, session.RawEvent{Type: "loss", Reason: reason, Unit: unit, Count: count}); err != nil {
 					return err
 				}
 			}

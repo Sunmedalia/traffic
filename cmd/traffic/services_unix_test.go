@@ -49,12 +49,21 @@ func TestServiceDiscoveryAndPIDIdentity(t *testing.T) {
 	if len(generic) != 1 || generic[0].Service != "openssl" || generic[0].Library != "/custom/libssl.so" {
 		t.Fatalf("generic %+v", generic)
 	}
-	if groupFor(apache[0]).PID != 0 {
+	if groupFor(apache[0], false).PID != 0 {
 		t.Fatal("non-root workers should share one library probe")
 	}
 	apache[0].UID = 0
-	if groupFor(apache[0]).PID != 12 {
+	if groupFor(apache[0], false).PID != 12 {
 		t.Fatal("root probe must target PID")
+	}
+	worker := apache[0]
+	worker.PID, worker.ID = 24, "another-root-worker"
+	if groupFor(apache[0], true) != groupFor(worker, true) || groupFor(worker, true).PID != 0 {
+		t.Fatal("kernel-scoped workers should share the root group")
+	}
+	worker.Service = "nginx"
+	if groupFor(apache[0], true) == groupFor(worker, true) {
+		t.Fatal("root probe group should preserve the service scope")
 	}
 }
 

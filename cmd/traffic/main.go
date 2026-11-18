@@ -618,7 +618,11 @@ func maintain(s *Store) error {
 
 func checkDisk(s *Store) error {
 	var total int64
-	err := filepath.Walk(s.dir, func(_ string, i os.FileInfo, e error) error {
+	err := filepath.Walk(s.dir, func(path string, i os.FileInfo, e error) error {
+		// Scope and status are atomically replaced while this walk is in flight.
+		if path != s.dir && errors.Is(e, os.ErrNotExist) {
+			return nil
+		}
 		if e != nil {
 			return e
 		}

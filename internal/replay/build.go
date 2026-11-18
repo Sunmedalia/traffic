@@ -1,12 +1,12 @@
 package replay
 
 import (
-	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -78,11 +78,8 @@ func Build(ctx context.Context, dir string, db *sql.DB, options Options) (sessio
 	}
 	groups := map[string][]string{}
 	for _, file := range files {
-		base := strings.TrimSuffix(filepath.Base(file), ".pcap")
-		if index := strings.LastIndex(base, "-"); index >= 0 {
-			base = base[:index]
-		}
-		groups[base] = append(groups[base], file)
+		group := session.PacketSegmentGroup(file)
+		groups[group] = append(groups[group], file)
 	}
 	var keys []string
 	for key := range groups {
@@ -91,7 +88,7 @@ func Build(ctx context.Context, dir string, db *sql.DB, options Options) (sessio
 	sort.Strings(keys)
 	for _, key := range keys {
 		sort.Strings(groups[key])
-		if err = replayPacketFiles(ctx, s, p, groups[key], "pcap:"+key); err != nil {
+		if err = replayPacketFiles(ctx, s, p, groups[key], "pcap:"+filepath.Base(key)); err != nil {
 			p.wg.Wait()
 			return s.stats, err
 		}
@@ -120,12 +117,14 @@ func Build(ctx context.Context, dir string, db *sql.DB, options Options) (sessio
 }
 
 type eventSource struct {
-	backend   string
-	target    session.Target
-	frames    Frames
-	iis       *iisAssembler
-	uncertain bool
-	last      time.Time
+	backend             string
+	target              session.Target
+	frames              Frames
+	iis                 *iisAssembler
+	affected            map[string]bool
+	sawLoss             bool
+	uncertaintyOverflow bool
+	last                time.Time
 }
 
 func replayEvents(ctx context.Context, dir string, s *Store, p *HTTPProcessor) error {
@@ -138,9 +137,10 @@ func replayEvents(ctx context.Context, dir string, s *Store, p *HTTPProcessor) e
 	}
 	defer file.Close()
 	sources := map[string]*eventSource{}
-	finish := func(key string, source *eventSource) error {
+	affectedCount := 0
+	finish := func(key string, source *eventSource, reason string) error {
 		source.frames.expire(source.last, true, p, "")
-		p.invalidatePrefix("tls:"+key+"/", "probe_source_ended")
+		p.invalidatePrefix("tls:"+key+"/", reason)
 		if source.iis != nil {
 			return source.iis.finish()
 		}
@@ -148,19 +148,31 @@ func replayEvents(ctx context.Context, dir string, s *Store, p *HTTPProcessor) e
 	}
 	defer func() {
 		for key, source := range sources {
-			if err := finish(key, source); err != nil {
+			if err := finish(key, source, "probe_source_ended"); err != nil {
 				s.fail(err)
 			}
 		}
 	}()
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 65536), 4<<20)
-	for scanner.Scan() {
+	lines := session.NewJSONLines(file, 4<<20)
+	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		var event session.RawEvent
-		if err = json.Unmarshal(scanner.Bytes(), &event); err != nil {
+		switch err := lines.Next(&event); err {
+		case nil:
+		case io.EOF:
+			return nil
+		case session.ErrTruncatedJSONLine:
+			s.gap("tls", "", "truncated_raw_tail", "records", 1)
+			for key, source := range sources {
+				if err := finish(key, source, "truncated_raw_tail"); err != nil {
+					return err
+				}
+				delete(sources, key)
+			}
+			return nil
+		default:
 			return fmt.Errorf("raw TLS event: %w", err)
 		}
 		if event.Version != 1 || event.Source == "" {
@@ -197,17 +209,51 @@ func replayEvents(ctx context.Context, dir string, s *Store, p *HTTPProcessor) e
 		key := event.Source + "/" + event.Connection
 		switch event.Type {
 		case "end":
-			if err = finish(event.Source, source); err != nil {
+			if err = finish(event.Source, source, "probe_source_ended"); err != nil {
 				return err
 			}
+			affectedCount -= len(source.affected)
 			delete(sources, event.Source)
 		case "loss":
-			if err = finish(event.Source, source); err != nil {
+			source.sawLoss = true
+			prefix := "tls:" + event.Source + "/"
+			if source.affected == nil {
+				source.affected = make(map[string]bool)
+			}
+			mark := func(key string) {
+				if source.affected[key] {
+					return
+				}
+				if affectedCount >= 8192 {
+					if !source.uncertaintyOverflow {
+						s.gap(source.backend, event.Source, "loss_tracking_limit", "sources", 1)
+					}
+					source.uncertaintyOverflow = true
+					return
+				}
+				affectedCount++
+				source.affected[key] = true
+			}
+			for _, meta := range source.frames.contexts {
+				mark("tls:" + meta.connection)
+			}
+			p.forPendingConnections(prefix, mark)
+			if err = finish(event.Source, source, "recorded_probe_loss"); err != nil {
 				return err
 			}
-			source.uncertain = true
-			s.gap(source.backend, event.Source, "recorded_probe_loss", "events", event.Count)
+			reason, unit := event.Reason, event.Unit
+			if reason == "" {
+				reason = "recorded_probe_loss"
+			}
+			if unit == "" {
+				unit = "events"
+			}
+			s.gap(source.backend, event.Source, reason, unit, event.Count)
 		case "close":
+			if source.affected["tls:"+key] {
+				affectedCount--
+				delete(source.affected, "tls:"+key)
+			}
 			source.frames.expire(event.Time, true, p, key)
 			p.invalidate("tls:"+key, "recorded_connection_close")
 		case "iis":
@@ -222,12 +268,20 @@ func replayEvents(ctx context.Context, dir string, s *Store, p *HTTPProcessor) e
 				return errors.New("invalid raw event direction")
 			}
 			source.frames.expire(event.Time, false, p, "")
-			source.frames.ingest(key+event.Direction, event.Data, frameContext{first: event.Time, updated: event.Time, connection: key, client: event.Client, local: event.Local, backend: replayBackend(source.backend), service: source.target.Service, pid: source.target.PID, targetID: source.target.ID, incomplete: event.Incomplete || source.uncertain}, false, p)
+			truncated := event.OriginalLength > len(event.Data)
+			// v0.1.3 eCapture marked every later event after a transport loss.
+			// The recorded boundary supplies the actual connection scope.
+			incomplete := event.Incomplete && (source.backend != "ecapture" || !source.sawLoss || event.OriginalLength > 0)
+			source.frames.ingest(key+event.Direction, event.Data, frameContext{first: event.Time, updated: event.Time, connection: key, client: event.Client, local: event.Local, backend: replayBackend(source.backend), service: source.target.Service, pid: source.target.PID, targetID: source.target.ID, incomplete: truncated || incomplete || source.affected["tls:"+key] || source.uncertaintyOverflow}, false, p)
+			if truncated {
+				s.gap(source.backend, key, "single_call_truncated", "bytes", uint64(event.OriginalLength-len(event.Data)))
+				source.frames.expire(event.Time, true, p, key)
+				p.invalidate("tls:"+key, "single_call_truncated")
+			}
 		default:
 			return fmt.Errorf("unknown raw TLS event type %q", event.Type)
 		}
 	}
-	return scanner.Err()
 }
 
 func replayBackend(backend string) string {

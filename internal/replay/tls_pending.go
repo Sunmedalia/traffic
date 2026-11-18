@@ -50,6 +50,7 @@ func (f *Frames) ingest(key string, payload []byte, meta frameContext, head bool
 	}
 	if previous, ok := f.contexts[key]; ok {
 		meta.first = previous.first
+		meta.incomplete = meta.incomplete || previous.incomplete
 	} else {
 		if meta.first.IsZero() {
 			meta.first = now

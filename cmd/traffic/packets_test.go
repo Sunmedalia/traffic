@@ -15,7 +15,7 @@ import (
 func TestPacketRingWindowsDeviceAndLargeFrame(t *testing.T) {
 	dir := t.TempDir()
 	device := `\Device\NPF_{010DBF10-606E-4FF7-9B78-CEEB459A8EB8}`
-	ring := packetRing{dir: dir, iface: device, link: layers.LinkTypeNull, snaplen: uint32(captureSnapshotLength())}
+	ring := packetRing{dir: dir, iface: device, link: uint32(layers.LinkTypeNull), snaplen: uint32(captureSnapshotLength())}
 	// CentOS 7 loopback produces Ethernet frames of 65549 bytes. Npcap's
 	// 65539-byte loopback frames fit inside this same capture budget.
 	data := bytes.Repeat([]byte{1}, 65549)
@@ -49,7 +49,7 @@ func TestPacketRingWindowsDeviceAndLargeFrame(t *testing.T) {
 
 func TestPacketRingFlushesBufferedTailAtRotationAndClose(t *testing.T) {
 	dir := t.TempDir()
-	ring := packetRing{dir: dir, iface: "lo", link: layers.LinkTypeEthernet, snaplen: uint32(captureSnapshotLength())}
+	ring := packetRing{dir: dir, iface: "lo", link: uint32(layers.LinkTypeEthernet), snaplen: uint32(captureSnapshotLength())}
 	payload := []byte("small buffered packet")
 	info := gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: len(payload), Length: len(payload)}
 	if err := ring.write(info, payload); err != nil {
@@ -89,7 +89,7 @@ func TestPacketRingFlushesBufferedTailAtRotationAndClose(t *testing.T) {
 
 func TestPacketSegmentsNeverOverwriteEarlierEvidence(t *testing.T) {
 	dir := t.TempDir()
-	ring := packetRing{dir: dir, iface: "lo", link: layers.LinkTypeEthernet, snaplen: 65535}
+	ring := packetRing{dir: dir, iface: "lo", link: uint32(layers.LinkTypeEthernet), snaplen: 65535}
 	data := []byte("retained evidence")
 	ci := gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: len(data), Length: len(data)}
 	for i := 0; i < 20; i++ {
@@ -110,7 +110,7 @@ func TestPacketSegmentsNeverOverwriteEarlierEvidence(t *testing.T) {
 func TestPacketWriterPersistsInOrderOffCaptureLoop(t *testing.T) {
 	dir := t.TempDir()
 	s := &Store{}
-	ring := &packetRing{dir: dir, iface: "lo", link: layers.LinkTypeEthernet, snaplen: uint32(captureSnapshotLength())}
+	ring := &packetRing{dir: dir, iface: "lo", link: uint32(layers.LinkTypeEthernet), snaplen: uint32(captureSnapshotLength())}
 	w := newPacketWriter(s, "lo", ring)
 	for i := 0; i < 100; i++ {
 		data := []byte{byte(i), 1, 2, 3}
@@ -151,7 +151,7 @@ func TestPacketWriterPersistsInOrderOffCaptureLoop(t *testing.T) {
 func TestPacketWriterShedsWithExplicitGapWhenQueueFull(t *testing.T) {
 	s := &Store{}
 	// Do not start the consumer yet, so the two-slot queue fills.
-	ring := &packetRing{dir: t.TempDir(), iface: "eth0", link: layers.LinkTypeEthernet, snaplen: uint32(captureSnapshotLength())}
+	ring := &packetRing{dir: t.TempDir(), iface: "eth0", link: uint32(layers.LinkTypeEthernet), snaplen: uint32(captureSnapshotLength())}
 	w := &packetWriter{store: s, iface: "eth0", ring: ring, queue: make(chan packetWriteItem, 2), done: make(chan struct{})}
 	data := make([]byte, 64)
 	info := gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: len(data), Length: len(data)}
@@ -179,7 +179,7 @@ func TestPacketWriterShedsWithExplicitGapWhenQueueFull(t *testing.T) {
 
 func TestPacketWriterReportsWriteFailure(t *testing.T) {
 	s := &Store{}
-	ring := &packetRing{dir: filepath.Join(t.TempDir(), "missing"), iface: "eth0", link: layers.LinkTypeEthernet, snaplen: uint32(captureSnapshotLength())}
+	ring := &packetRing{dir: filepath.Join(t.TempDir(), "missing"), iface: "eth0", link: uint32(layers.LinkTypeEthernet), snaplen: uint32(captureSnapshotLength())}
 	w := newPacketWriter(s, "eth0", ring)
 	data := []byte("x")
 	_ = w.write(gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: 1, Length: 1}, data)

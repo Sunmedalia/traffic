@@ -143,9 +143,10 @@ type probeGroup struct {
 	UID, PID int
 	Library  string
 	Identity string
+	Service  string
 }
 
-func groupFor(t session.Target) probeGroup {
+func groupFor(t session.Target, kernelScoped bool) probeGroup {
 	library := t.Library
 	if actual, err := filepath.EvalSymlinks(library); err == nil {
 		library = actual
@@ -153,13 +154,18 @@ func groupFor(t session.Target) probeGroup {
 	g := probeGroup{UID: t.UID, Library: library}
 	// Never trace every root-owned process implicitly.
 	if t.UID == 0 {
-		g.PID = t.PID
-		g.Identity = t.ID
+		if kernelScoped {
+			g.Service = t.Service
+		} else {
+			g.PID = t.PID
+			g.Identity = t.ID
+		}
 	}
 	return g
 }
 
 func captureServices(ctx context.Context, s *Store, p *eventRecorder, bin, library, service string, pid int, javaAttach bool, javaAgent, javaHelper string, javaPID int) {
+	kernelScoped := probeCapability(bin, "feature:pid_scope_v1")
 	var mu sync.RWMutex
 	targets := map[int]session.Target{}
 	targetGroups := map[int]probeGroup{}
@@ -194,14 +200,6 @@ func captureServices(ctx context.Context, s *Store, p *eventRecorder, bin, libra
 			}
 		}
 		mu.Unlock()
-		mu.Lock()
-		targets = map[int]session.Target{}
-		targetGroups = map[int]probeGroup{}
-		for _, t := range current {
-			targets[t.PID] = t
-			targetGroups[t.PID] = groupFor(t)
-		}
-		mu.Unlock()
 		eligible := map[string]bool{}
 		for i := range current {
 			eligible[current[i].ID] = s.checkTarget(current[i]).Status == "candidate"
@@ -209,10 +207,20 @@ func captureServices(ctx context.Context, s *Store, p *eventRecorder, bin, libra
 				current[i].State = "unavailable"
 			}
 		}
+		mu.Lock()
+		targets = map[int]session.Target{}
+		targetGroups = map[int]probeGroup{}
+		for _, t := range current {
+			if eligible[t.ID] {
+				targets[t.PID] = t
+				targetGroups[t.PID] = groupFor(t, kernelScoped)
+			}
+		}
+		mu.Unlock()
 		wanted := map[probeGroup]bool{}
 		for _, t := range current {
 			if eligible[t.ID] && t.Library != "" {
-				wanted[groupFor(t)] = true
+				wanted[groupFor(t, kernelScoped)] = true
 			}
 		}
 		mu.Lock()
@@ -273,7 +281,7 @@ func captureServices(ctx context.Context, s *Store, p *eventRecorder, bin, libra
 			if t.Library == "" {
 				continue
 			}
-			group := groupFor(t)
+			group := groupFor(t, kernelScoped)
 			if started[group] != nil {
 				continue
 			}
@@ -359,7 +367,7 @@ func captureServices(ctx context.Context, s *Store, p *eventRecorder, bin, libra
 				continue
 			}
 			if current[i].Library != "" {
-				state := states[groupFor(current[i])]
+				state := states[groupFor(current[i], kernelScoped)]
 				if state == "" {
 					state = "starting"
 				}
