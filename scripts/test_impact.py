@@ -115,16 +115,20 @@ class ImpactChecks(unittest.TestCase):
         def header(index):
             return f'x-Traffic-Test-Id: run-before-{index}\r\n'.encode()
 
-        def transaction(index, *, paired=True, truncated=False, response_index=None):
+        def transaction(index, *, paired=True, truncated=False, response_index=None, chunked=False):
             body = json.dumps({"marker": f"run-before-{index}", "message": "xxx"}).encode()
             if response_index is None:
                 response_body = body
             else:
                 response_body = body.replace(f"-{index}".encode(), f"-{response_index}".encode())
             echo = json.dumps({"body": response_body.decode()}).encode()
+            response_head = b"HTTP/1.1 200 OK\r\n"
+            if chunked:
+                response_head += b"Transfer-Encoding: chunked\r\n"
+                echo = f"{len(echo):x}\r\n".encode() + echo + b"\r\n0\r\n\r\n"
             return {"id": str(index), "backend": "openssl-preload", "truncated": truncated,
                     "request": b64(b"POST /api/echo HTTP/1.1\r\n" + header(index) + b"\r\n" + body),
-                    "response": b64(b"HTTP/1.1 200 OK\r\n\r\n" + (echo[:-8] if truncated else echo))
+                    "response": b64(response_head + b"\r\n" + (echo[:-8] if truncated else echo))
                     if paired else "",
                     "status": 200 if paired else 0}
 
@@ -147,7 +151,7 @@ class ImpactChecks(unittest.TestCase):
             with db:
                 db.execute('CREATE TABLE requests(data BLOB)')
                 db.executemany('INSERT INTO requests VALUES (?)', [(json.dumps(row),) for row in [
-                    transaction(2), transaction(2), transaction(3, paired=False),
+                    transaction(2), transaction(2, chunked=True), transaction(3, paired=False),
                     transaction(4, truncated=True), transaction(7, response_index=3)]])
             db.close()
             with (root / 'reader.log').open('w') as log:
@@ -158,7 +162,8 @@ class ImpactChecks(unittest.TestCase):
             expected = {'not_dispatched': (1, 8), 'business_failed': (1, 7), 'raw_missing': (1, 6),
                         'reconstruction_missing': (2, 6), 'raw_seen_reconstruction_missing': (1, 5),
                         'raw_duplicate': (1, 5), 'offline_duplicate': (1, 4),
-                        'unpaired': (2, 4), 'body_truncated': (1, 4), 'unexpected_raw': (1, 6)}
+                        'unpaired': (2, 4), 'body_truncated': (1, 4), 'unexpected_raw': (1, 6),
+                        'offline_body_or_status_mismatch': (0, 4)}
             for name, (count, denominator) in expected.items():
                 self.assertEqual((metrics[name]['count'], metrics[name]['denominator']), (count, denominator), name)
                 self.assertEqual(metrics[name]['ratio'], count / denominator, name)

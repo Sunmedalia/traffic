@@ -1,5 +1,7 @@
 """Join the synthetic load ledger, raw request headers and the offline index."""
 import base64
+import http.client
+import io
 import json
 import re
 import sqlite3
@@ -11,6 +13,7 @@ from pathlib import Path
 
 
 HEADER = rb'^(?i:X-Traffic-Test-ID):[ \t]*'
+CHUNKED = re.compile(rb'^Transfer-Encoding:[ \t]*chunked[ \t]*\r?$', re.IGNORECASE | re.MULTILINE)
 
 
 def line_tail(data):
@@ -105,8 +108,23 @@ def offline_rows(session):
             yield json.loads(data)
 
 
-def http_message(data):
-    head, separator, body = base64.b64decode(data or '', validate=True).partition(b'\r\n\r\n')
+def http_message(data, *, response=False, truncated=False):
+    wire = base64.b64decode(data or '', validate=True)
+    head, separator, body = wire.partition(b'\r\n\r\n')
+    if response and separator and CHUNKED.search(head):
+        class BufferedResponse(io.BytesIO):
+            def makefile(self, *_args):
+                return self
+
+        with http.client.HTTPResponse(BufferedResponse(wire)) as message:
+            try:
+                message.begin()
+                body = message.read()
+            except (OSError, ValueError, http.client.HTTPException):
+                # A limit-hit reconstruction can retain the original header
+                # with dechunked, truncated entity bytes appended after it.
+                if not truncated:
+                    body = b''
     return head, body if separator else b''
 
 
@@ -120,8 +138,9 @@ def decoded_json(value):
 def offline_observations(rows, pattern, response_pattern, body_bytes):
     padding = 'x' * body_bytes
     for row in rows:
+        truncated = bool(row.get('truncated'))
         head, request = http_message(row.get('request'))
-        _, response = http_message(row.get('response'))
+        _, response = http_message(row.get('response'), response=True, truncated=truncated)
         match = pattern.search(head)
         echo = decoded_json(response)
         echoed_body = echo.get('body') if isinstance(echo, dict) else None
@@ -132,7 +151,6 @@ def offline_observations(rows, pattern, response_pattern, body_bytes):
                 yield response_id, 'response_only', row.get('backend', 'unknown'), row['id']
             continue
         marker = match[1].decode('ascii')
-        truncated = bool(row.get('truncated'))
         # A truncated body can hide the response identity without losing the
         # response half. Report truncation and an absent/mismatched pair separately.
         unpaired = (not row.get('status') or not row.get('response') or
