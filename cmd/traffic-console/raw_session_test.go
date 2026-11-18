@@ -312,3 +312,123 @@ func TestRawDiscoveryAndSummaryCachesFollowAnalysisGeneration(t *testing.T) {
 		t.Fatal(third)
 	}
 }
+
+func TestAnalyzeStatusTUIAndExportSurfaceStalledCaptureWarnings(t *testing.T) {
+	started := time.Date(2026, 11, 18, 2, 48, 59, 0, time.UTC)
+	pktTime := started.Add(190 * time.Millisecond)
+	stopped := started.Add(75 * time.Second)
+	target := &session.Target{PID: 6092, ID: "6092:133000", Service: "iis", Ports: []int{443}}
+	events := []session.RawEvent{
+		{Version: 1, Source: "iis-1", Type: "source", Backend: "iis", Target: target, Time: pktTime},
+		{Version: 1, Source: "iis-1", Type: "iis", Time: pktTime, IIS: &session.IISEvent{Type: "request", ID: "req-1", Connection: "c1", Method: "GET", URL: "/?n=1", Client: "127.0.0.1:50001", Local: "127.0.0.1:443", Time: pktTime}},
+		{Version: 1, Source: "iis-1", Type: "iis", Time: pktTime, IIS: &session.IISEvent{Type: "request-end", ID: "req-1"}},
+		{Version: 1, Source: "iis-1", Type: "iis", Time: pktTime, IIS: &session.IISEvent{Type: "response", ID: "req-1", Status: 200}},
+		{Version: 1, Source: "iis-1", Type: "iis", Time: pktTime, IIS: &session.IISEvent{Type: "response-body", ID: "req-1", Data: []byte("ok")}},
+		{Version: 1, Source: "iis-1", Type: "iis", Time: pktTime, IIS: &session.IISEvent{Type: "response-end", ID: "req-1"}},
+	}
+	dir := rawTestSession(t, events)
+
+	// Write a PCAP with a single early packet and a v0.1.3-style status.json that froze after 0.19s.
+	pktDir := filepath.Join(dir, "packets")
+	if err := os.MkdirAll(pktDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Minimal valid Raw IPv4 TCP SYN packet (40 bytes) so replayPacketFiles records timestamps.
+	rawPkt := []byte{
+		0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 0x40, 0x06, 0x7c, 0xcd,
+		127, 0, 0, 1, 127, 0, 0, 1,
+		0xc3, 0x51, 0x01, 0xbb, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x02, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
+	}
+	var pcapBuf bytes.Buffer
+	pcapHeader := []byte{
+		0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+		0xff, 0xff, 0x00, 0x00, 101, 0x00, 0x00, 0x00, // LinkTypeRaw = 101
+	}
+	pcapBuf.Write(pcapHeader)
+	recHdr := make([]byte, 16)
+	sec := uint32(pktTime.Unix())
+	usec := uint32(pktTime.Nanosecond() / 1000)
+	recHdr[0], recHdr[1], recHdr[2], recHdr[3] = byte(sec), byte(sec>>8), byte(sec>>16), byte(sec>>24)
+	recHdr[4], recHdr[5], recHdr[6], recHdr[7] = byte(usec), byte(usec>>8), byte(usec>>16), byte(usec>>24)
+	recHdr[8] = byte(len(rawPkt))
+	recHdr[12] = byte(len(rawPkt))
+	pcapBuf.Write(recHdr)
+	pcapBuf.Write(rawPkt)
+	if err := os.WriteFile(filepath.Join(pktDir, "windivert-000000000001.pcap"), pcapBuf.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	status := session.Stats{
+		Started:    started,
+		Stopped:    stopped,
+		State:      "stopped",
+		Packets:    105,
+		DrainState: "confirmed",
+		StopReason: "duration",
+		GapCounts:  map[string]uint64{"pcap/drop_counter_unavailable/sources": 1},
+		ProbeExits: map[string]session.ProbeExit{
+			"6092:133000": {
+				HookBased:         true,
+				DataDrained:       true,
+				HooksRemoved:      true,
+				ScriptUnloaded:    false,
+				TransportDetached: false,
+				RuntimeState:      "hooks_removed_runtime_lingering",
+			},
+		},
+	}
+	statusBytes, _ := json.Marshal(status)
+	if err := os.WriteFile(filepath.Join(dir, "status.json"), statusBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	rs, err := rulesFromYAML(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := analyzeSessionRules(context.Background(), dir, "", rs, time.Minute, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Reconstruction == nil || report.Reconstruction.Packets != 1 || report.Reconstruction.LastPacketAt.IsZero() {
+		t.Fatalf("expected reconstructed packet timestamps, got %+v", report.Reconstruction)
+	}
+	if len(report.IntegrityWarnings) < 3 {
+		t.Fatalf("expected >=3 integrity warnings on stalled session, got %v", report.IntegrityWarnings)
+	}
+
+	store, err := openStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.db.Close()
+	snap, err := loadTUISnapshot(context.Background(), store, tuiFilter{}, false, 0, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Stats.IntegrityWarnings) < 3 {
+		t.Fatalf("TUI snapshot missing integrity warnings: %v", snap.Stats.IntegrityWarnings)
+	}
+	m := tuiModel{store: store, snapshot: snap}
+	lvl, reasons := m.tuiHealth()
+	if lvl < 1 || len(reasons) == 0 {
+		t.Fatalf("TUI health failed to flag stalled session: level=%d reasons=%v", lvl, reasons)
+	}
+
+	var txID string
+	var txRaw []byte
+	if err := store.db.QueryRow("SELECT id, data FROM requests LIMIT 1").Scan(&txID, &txRaw); err != nil {
+		t.Fatal(err)
+	}
+	var txRecord Transaction
+	if err := json.Unmarshal(txRaw, &txRecord); err != nil {
+		t.Fatal(err)
+	}
+	zipPath := filepath.Join(t.TempDir(), "evidence.zip")
+	if err := exportEvidence(store, txRecord, txRaw, zipPath); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(zipPath); err != nil || fi.Size() == 0 {
+		t.Fatalf("missing exported zip: %v", err)
+	}
+}

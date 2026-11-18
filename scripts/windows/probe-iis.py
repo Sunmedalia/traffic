@@ -164,14 +164,18 @@ def main():
                 if script_unloaded:
                     hooks_removed = True
                 done = threading.Event()
-                if script_unloaded:
+                if not detached.is_set():
                     def detach_session():
                         try:
                             session.detach()
+                        except Exception as error:
+                            unload_errors.append(str(error))
                         finally:
                             done.set()
                     threading.Thread(target=detach_session, daemon=True).start()
-                transport_detached = done.wait(1) if script_unloaded else False
+                    transport_detached = done.wait(1) or detached.is_set()
+                else:
+                    transport_detached = True
                 output.write(json.dumps({"type": "host_summary", "queue_dropped": dropped,
                                          "hooks_removed": hooks_removed, "script_unloaded": script_unloaded,
                                          "transport_detached": transport_detached,

@@ -21,23 +21,41 @@ import (
 	"sort"
 )
 
-const analysisEngineVersion = 2
+const analysisEngineVersion = 3
 
 type analysisReport struct {
-	Reconstructed  bool          `json:"reconstructed"`
-	RequestLimit   int           `json:"request_limit"`
-	ResponseLimit  int           `json:"response_limit"`
-	Reconstruction *Stats        `json:"reconstruction,omitempty"`
-	EngineVersion  int           `json:"engine_version"`
-	Completed      time.Time     `json:"completed"`
-	Transactions   uint64        `json:"transactions"`
-	Alerts         uint64        `json:"alerts"`
-	RulesSHA256    string        `json:"rules_sha256"`
-	Rules          []Rule        `json:"rules"`
-	ScanWindow     time.Duration `json:"scan_window_ns"`
-	ScanPaths      int           `json:"scan_paths"`
-	Source         string        `json:"source_signature"`
-	Delivery       *Stats        `json:"delivery,omitempty"`
+	IntegrityWarnings []string      `json:"integrity_warnings,omitempty"`
+	Reconstructed     bool          `json:"reconstructed"`
+	RequestLimit      int           `json:"request_limit"`
+	ResponseLimit     int           `json:"response_limit"`
+	Reconstruction    *Stats        `json:"reconstruction,omitempty"`
+	EngineVersion     int           `json:"engine_version"`
+	Completed         time.Time     `json:"completed"`
+	Transactions      uint64        `json:"transactions"`
+	Alerts            uint64        `json:"alerts"`
+	RulesSHA256       string        `json:"rules_sha256"`
+	Rules             []Rule        `json:"rules"`
+	ScanWindow        time.Duration `json:"scan_window_ns"`
+	ScanPaths         int           `json:"scan_paths"`
+	Source            string        `json:"source_signature"`
+	Delivery          *Stats        `json:"delivery,omitempty"`
+}
+
+func sessionIntegrityWarnings(dir string, reconstructed *Stats) []string {
+	statusPath := filepath.Join(dir, "status.json")
+	b, err := os.ReadFile(statusPath)
+	if err != nil {
+		return nil
+	}
+	var capture Stats
+	if json.Unmarshal(b, &capture) != nil {
+		return nil
+	}
+	var modTime time.Time
+	if info, err := os.Stat(statusPath); err == nil {
+		modTime = info.ModTime().UTC()
+	}
+	return session.ComputeIntegrityWarnings(capture, reconstructed, modTime)
 }
 
 // A cheap freshness check keeps opening large sessions independent of body size.
@@ -273,6 +291,7 @@ func analyzeConfigured(ctx context.Context, dir, webhookURL string, rs []Rule, w
 	}{analysisEngineVersion, rs, window, paths, limits.RequestLimit, limits.ResponseLimit})
 	hash := sha256.Sum256(ruleData)
 	report.RulesSHA256 = hex.EncodeToString(hash[:])
+	report.IntegrityWarnings = sessionIntegrityWarnings(dir, report.Reconstruction)
 	report.Completed = time.Now().UTC()
 	data, err := json.Marshal(report)
 	if err != nil {

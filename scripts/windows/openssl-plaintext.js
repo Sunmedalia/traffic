@@ -4,7 +4,10 @@
 const selectedPorts = new Set(__PORTS__);
 const profiles = __PROFILES__;
 const library = __LIBRARY__;
-const copyLimit = Math.max(__REQUEST_LIMIT__, __RESPONSE_LIMIT__) + 65536;
+const configuredLimit = Math.max(__REQUEST_LIMIT__, __RESPONSE_LIMIT__);
+// Base64 plus JSON must fit the collector's 2 MiB helper line limit.
+const maxPayload = 1024 * 1024;
+const copyLimit = configuredLimit > 0 ? Math.min(configuredLimit + 65536, maxPayload) : maxPayload;
 const listeners = [];
 const originals = new Map();
 const connections = new Map();
@@ -63,18 +66,18 @@ function connection(ssl, getFD, fallback, module) {
     let fd = getFD(ssl);
     if (fd < 0 && fallback !== null) fd = fallback(ssl);
     if (fd < 0) { dropped++; return null; }
+    const key = module + ':' + ssl;
+    const existing = connections.get(key);
+    if (existing !== undefined && existing.fd === fd) {
+        return existing;
+    }
     const local = Socket.localAddress(fd);
     const remote = Socket.peerAddress(fd);
     if (local === null || remote === null) { dropped++; return null; }
     if (!selectedPorts.has(local.port) && !selectedPorts.has(remote.port)) return null;
-    const key = module + ':' + ssl;
-    const signature = fd + '/' + endpoint(local) + '/' + endpoint(remote);
-    let state = connections.get(key);
-    if (state === undefined || state.signature !== signature) {
-        if (connections.size >= 4096) { dropped++; return null; }
-        state = {id: String(++sequence), fd, signature, local: endpoint(local), remote: endpoint(remote)};
-        connections.set(key, state);
-    }
+    if (existing === undefined && connections.size >= 4096) { dropped++; return null; }
+    const state = {id: String(++sequence), fd, local: endpoint(local), remote: endpoint(remote)};
+    connections.set(key, state);
     return state;
 }
 function resolve(module) {
@@ -122,7 +125,6 @@ function install(module) {
                     this.buffer = args[1];
                     this.capacity = Math.min(extended ? Number(args[2].toString()) : args[2].toUInt32(), copyLimit);
                     this.resultSize = extended ? args[3] : null;
-                    if (direction === 'write') this.copy = this.buffer.readByteArray(this.capacity);
                 } catch (error) { this.state = null; dropped++; }
             },
             onLeave(result) {
@@ -136,7 +138,8 @@ function install(module) {
                     const length = extended ? (Process.pointerSize === 8 ? Number(this.resultSize.readU64()) : this.resultSize.readU32()) : status;
                     if (length <= 0) return;
                     const count = Math.min(length, this.capacity);
-                    const data = direction === 'write' ? this.copy.slice(0, count) : this.buffer.readByteArray(count);
+                    if (events.length >= 256 || queuedBytes + count > 8 * 1024 * 1024) { dropped++; return; }
+                    const data = this.buffer.readByteArray(count);
                     enqueue({type: 'data', connection: this.state.id, direction, local: this.state.local, client: this.state.remote, incomplete: length > count}, data);
                     captured++;
                 } catch (error) { dropped++; }

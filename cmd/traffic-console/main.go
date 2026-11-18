@@ -195,6 +195,9 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		for _, w := range report.IntegrityWarnings {
+			fmt.Fprintf(os.Stderr, "⚠ 完整性告警：%s\n", w)
+		}
 		emit(report)
 		return nil
 	}
@@ -205,8 +208,13 @@ func run(args []string) error {
 		}
 		var status map[string]any
 		if json.Unmarshal(b, &status) == nil {
+			var reconstructed *Stats
 			if report, err := readAnalysisReport(*dir); err == nil {
 				status["analysis"] = report
+				reconstructed = report.Reconstruction
+			}
+			if warnings := sessionIntegrityWarnings(*dir, reconstructed); len(warnings) > 0 {
+				status["integrity_warnings"] = warnings
 			}
 			if info, e := os.Stat(filepath.Join(*dir, "status.json")); e == nil && time.Since(info.ModTime()) > 5*time.Second && status["state"] == "running" {
 				checked, note := readTUIStatus(*dir)

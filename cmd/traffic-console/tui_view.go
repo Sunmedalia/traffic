@@ -51,6 +51,9 @@ func (m tuiModel) tuiHealth() (int, []string) {
 	if s.ProbeFailures > 0 {
 		warn(1, fmt.Sprintf("探针传输失败 %d 次", s.ProbeFailures))
 	}
+	if len(s.IntegrityWarnings) > 0 {
+		warn(1, fmt.Sprintf("完整性告警 %d 项", len(s.IntegrityWarnings)))
+	}
 	if len(s.Errors) > 0 {
 		warn(1, fmt.Sprintf("采集错误 %d 条", len(s.Errors)))
 	}
@@ -92,6 +95,13 @@ func (m tuiModel) healthContent() string {
 	lines := []string{tuiWarn.Bold(true).Render("⚠ 完整性未验证"), session.CoverageWarning, ""}
 	if m.snapshot.StatusWarning != "" {
 		lines = append(lines, tuiDanger.Render(m.snapshot.StatusWarning), "")
+	}
+	if len(s.IntegrityWarnings) > 0 {
+		lines = append(lines, tuiWarn.Bold(true).Render(fmt.Sprintf("完整性风险提示 (%d)", len(s.IntegrityWarnings))))
+		for _, w := range s.IntegrityWarnings {
+			lines = append(lines, tuiWarn.Render("• "+cleanTUIText(w)))
+		}
+		lines = append(lines, "")
 	}
 	lines = append(lines,
 		tuiAccent.Render("采集"),

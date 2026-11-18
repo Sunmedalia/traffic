@@ -3,12 +3,10 @@ package main
 import (
 	"context"
 	"encoding/binary"
-	"encoding/xml"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 	"unsafe"
@@ -124,41 +122,25 @@ func windowsTLSLibrary(pid int) string {
 
 // IIS listeners belong to HTTP.sys, not to the individual worker process.
 // Bindings describe candidate service ports without inventing worker ownership.
-func iisPorts() []int {
+func iisConfigData() []byte {
 	path := filepath.Join(os.Getenv("SystemRoot"), "System32", "inetsrv", "config", "applicationHost.config")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
-	var config struct {
-		Bindings []struct {
-			Protocol string `xml:"protocol,attr"`
-			Info     string `xml:"bindingInformation,attr"`
-		} `xml:"system.applicationHost>sites>site>bindings>binding"`
-	}
-	if xml.Unmarshal(data, &config) != nil {
-		return nil
-	}
-	set := map[int]bool{}
-	for _, binding := range config.Bindings {
-		if binding.Protocol != "http" && binding.Protocol != "https" {
-			continue
-		}
-		parts := strings.Split(binding.Info, ":")
-		if len(parts) < 3 {
-			continue
-		}
-		port, err := strconv.Atoi(parts[len(parts)-2])
-		if err == nil {
-			set[port] = true
-		}
-	}
-	var ports []int
-	for port := range set {
-		ports = append(ports, port)
-	}
-	sort.Ints(ports)
-	return ports
+	return data
+}
+
+func iisPorts() []int {
+	return parseIISBindingPorts(iisConfigData(), "http", "https")
+}
+
+func iisHTTPSPorts() []int {
+	return parseIISBindingPorts(iisConfigData(), "https")
+}
+
+func iisHasSelectedHTTPSPort(selected map[int]bool) bool {
+	return iisPortsMatchHTTPS(iisPorts(), iisHTTPSPorts(), selected)
 }
 
 func discoverTargets(root, service string, selectedPID int, library string) []session.Target {

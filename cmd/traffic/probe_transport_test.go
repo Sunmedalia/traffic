@@ -11,10 +11,17 @@ import (
 type fakeProbeReader struct {
 	messages chan []byte
 	stopped  chan struct{}
+	idle     chan struct{}
 	once     sync.Once
 }
 
 func (r *fakeProbeReader) ReadMessage() (int, []byte, error) {
+	if len(r.messages) == 0 {
+		select {
+		case r.idle <- struct{}{}:
+		default:
+		}
+	}
 	select {
 	case data, ok := <-r.messages:
 		if !ok {
@@ -75,10 +82,14 @@ func TestProbeTransportShedsAndRecoversWithinBounds(t *testing.T) {
 		for i := 0; i < total; i++ {
 			r.messages <- make([]byte, size)
 		}
+		r.idle = make(chan struct{}, 1)
 		tr := startProbeTransport(r)
-		deadline := time.Now().Add(time.Second)
-		for tr.shedMessages.Load() == 0 && time.Now().Before(deadline) {
-			time.Sleep(time.Millisecond)
+		defer tr.close()
+		// The next read starts after the receiver accounts for the entire burst.
+		select {
+		case <-r.idle:
+		case <-time.After(time.Second):
+			t.Fatal("probe receiver did not process the burst")
 		}
 		if tr.overflows.Load() != 1 || tr.shedMessages.Load() == 0 {
 			t.Fatal("overflow was silent", tr.overflows.Load(), tr.shedMessages.Load())

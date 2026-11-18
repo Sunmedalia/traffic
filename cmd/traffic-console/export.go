@@ -72,7 +72,14 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 			return e
 		}
 	}
+	var reconstructed *Stats
+	if s.analysis != nil {
+		reconstructed = s.analysis.Reconstruction
+	}
 	note := map[string]any{"schema_version": 1, "source": t.Source, "protocol": t.Protocol, "stream_id": t.StreamID, "integrity_reasons": t.IntegrityReasons, "incomplete": t.Incomplete, "truncated": t.Truncated, "capture_coverage": session.CoverageWarning, "packet_scope": "transport peer endpoint and 120-second window; may include other requests on the same connection; original packets may have rotated", "tls_plaintext_source": "process hook; network PCAP remains encrypted"}
+	if warnings := sessionIntegrityWarnings(s.dir, reconstructed); len(warnings) > 0 {
+		note["session_integrity_warnings"] = warnings
+	}
 	info, _ := json.MarshalIndent(note, "", "  ")
 	if e = add("evidence.json", info); e != nil {
 		return e
