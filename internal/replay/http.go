@@ -16,7 +16,6 @@ type HTTPProcessor struct {
 	h2mu           sync.Mutex
 	h2             map[string]*h2Connection
 	h2bytes        int
-	h2lastSweep    time.Time
 	s              *Store
 	mu             sync.Mutex
 	pending        map[string][]Transaction
@@ -25,22 +24,30 @@ type HTTPProcessor struct {
 	requestMethods map[string][]string
 	requestReady   chan struct{}
 	responseCount  int
+	pairingLost    map[string]string
+	pairingStopped bool
 	wg             sync.WaitGroup
 	slots          chan struct{}
 }
 
 type responseData struct {
 	raw        []byte
+	observed   time.Time
 	status     int
 	truncated  bool
 	incomplete bool
 }
 
+const (
+	http1ConnectionLimit = 2000
+	http1PipelineLimit   = 100
+)
+
 func newHTTP(s *Store) *HTTPProcessor {
 	return &HTTPProcessor{s: s, requestMethods: map[string][]string{}, requestReady: make(chan struct{}), pending: map[string][]Transaction{}, responses: map[string][]responseData{}, slots: make(chan struct{}, 2000)}
 }
 func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int, incomplete bool) {
-	_, packetReplay := r.(*queuedStream)
+	packetStream, _ := r.(*queuedStream)
 	bufferSize := 32768
 	if frame, ok := r.(interface{ FramingComplete() bool }); ok && frame.FramingComplete() {
 		if sized, ok := r.(interface{ Len() int }); ok && sized.Len() > 0 {
@@ -81,6 +88,12 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			return
 		}
 		if strings.HasPrefix(string(prefix), "HTTP/") {
+			p.mu.Lock()
+			blocked := p.http1PairingLossLocked(key) != ""
+			p.mu.Unlock()
+			if blocked {
+				return
+			}
 			var request *http.Request
 			if _, serial := r.(interface{ FramingComplete() bool }); serial {
 				// TLS frames are consumed by one event loop. Waiting here for a
@@ -109,6 +122,10 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			if closeErr := resp.Body.Close(); e == nil {
 				e = closeErr
 			}
+			var observed time.Time
+			if packetStream != nil {
+				observed = packetStream.latest
+			}
 			if state, ok := r.(interface{ FramingComplete() bool }); ok && state.FramingComplete() && len(body) > responseLimit {
 				e = nil
 			}
@@ -123,11 +140,18 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				raw = append(headers, body...)
 			}
 			p.mu.Lock()
+			if p.http1PairingLossLocked(key) != "" {
+				p.mu.Unlock()
+				return
+			}
 			if state, ok := r.(interface{ Aborted() bool }); ok && state.Aborted() {
 				p.mu.Unlock()
 				return
 			}
 			queue := p.pending[key]
+			if state, ok := r.(interface{ Incomplete() bool }); ok {
+				incomplete = incomplete || state.Incomplete()
+			}
 			if len(queue) > 0 {
 				t := queue[0]
 				if err := p.s.restorePending(&t); err != nil {
@@ -140,11 +164,9 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 					p.pending[key] = queue[1:]
 				}
 				t.Response = raw
+				t.ResponseTime = observed
 				t.Status = resp.StatusCode
 				t.Truncated = t.Truncated || truncated
-				if state, ok := r.(interface{ Incomplete() bool }); ok {
-					incomplete = incomplete || state.Incomplete()
-				}
 				t.Incomplete = t.Incomplete || e != nil || incomplete
 				if err := p.s.save(t); err != nil {
 					p.s.fail(err)
@@ -152,11 +174,12 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			}
 			if len(queue) == 0 {
 				rs := p.responses[key]
-				if len(rs) < 100 && p.responseCount < 2000 && p.responseBytes+int64(len(raw)) <= 8<<20 {
+				if len(rs) < http1PipelineLimit && p.responseCount < http1ConnectionLimit && p.responseBytes+int64(len(raw)) <= 8<<20 {
 					p.responseBytes += int64(len(raw))
 					p.responseCount++
-					p.responses[key] = append(rs, responseData{raw, resp.StatusCode, truncated, e != nil || incomplete})
+					p.responses[key] = append(rs, responseData{raw: raw, observed: observed, status: resp.StatusCode, truncated: truncated, incomplete: e != nil || incomplete})
 				} else {
+					p.loseHTTP1PairingLocked(key, "response_queue_limit")
 					p.s.mu.Lock()
 					p.s.stats.QueueDropped++
 					p.s.mu.Unlock()
@@ -183,21 +206,17 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			// Publish the method before reading the request body. Responses can
 			// run on another packet stream, and HEAD framing needs this method.
 			p.mu.Lock()
-			if len(p.requestMethods) >= 2000 && len(p.requestMethods[key]) == 0 {
-				for old := range p.requestMethods {
-					p.s.gap("http1", old, "method_queue_limit", "connections", 1)
-					p.invalidateLocked(old, "method_queue_limit")
-					break
-				}
-			}
 			methods := p.requestMethods[key]
-			if len(methods) >= 100 {
-				methods = methods[1:]
-			}
-			if len(p.responses[key]) == 0 {
-				p.requestMethods[key] = append(methods, req.Method)
-				close(p.requestReady)
-				p.requestReady = make(chan struct{})
+			if len(p.responses[key]) == 0 && p.http1PairingLossLocked(key) == "" {
+				switch {
+				case len(methods) >= http1PipelineLimit:
+					p.loseHTTP1PairingLocked(key, "pipeline_limit")
+				case len(methods) == 0 && len(p.requestMethods) >= http1ConnectionLimit:
+					p.loseHTTP1PairingLocked(key, "method_queue_limit")
+				default:
+					p.requestMethods[key] = append(methods, req.Method)
+					p.signalRequestLocked()
+				}
 			}
 			p.mu.Unlock()
 			body, e := io.ReadAll(io.LimitReader(req.Body, int64(requestLimit)+1))
@@ -243,34 +262,19 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				p.mu.Unlock()
 				return
 			}
-			// Packets from another connection can be parsed before this
-			// connection's response, regardless of their capture timestamps.
-			if !packetReplay {
-				for k, items := range p.pending {
-					if len(items) > 0 && captured.Sub(items[len(items)-1].Time) > time.Minute {
-						p.s.gap("http1", k, "response_timeout", "connections", 1)
-						p.invalidateLocked(k, "response_timeout")
-					}
+			q, rs := p.pending[key], p.responses[key]
+			if p.http1PairingLossLocked(key) == "" {
+				switch {
+				case len(q) >= http1PipelineLimit:
+					p.loseHTTP1PairingLocked(key, "pipeline_limit")
+				case len(q) == 0 && len(rs) == 0 && len(p.pending) >= http1ConnectionLimit:
+					p.loseHTTP1PairingLocked(key, "pending_connection_limit")
 				}
 			}
-			if len(p.pending) >= 2000 {
-				oldest := ""
-				var stamp time.Time
-				for candidate, items := range p.pending {
-					if len(items) > 0 && (oldest == "" || items[0].Time.Before(stamp)) {
-						oldest, stamp = candidate, items[0].Time
-					}
-				}
-				p.s.gap("http1", oldest, "pending_connection_limit", "connections", 1)
-				p.invalidateLocked(oldest, "pending_connection_limit")
-			}
-			q := p.pending[key]
-			if len(q) >= 100 {
-				p.s.gap("http1", key, "pipeline_limit", "connections", 1)
-				p.invalidateLocked(key, "pipeline_limit")
-				q = nil
-			}
-			if rs := p.responses[key]; len(rs) > 0 {
+			if reason := p.http1PairingLossLocked(key); reason != "" {
+				t.Incomplete = true
+				t.IntegrityReasons = append(t.IntegrityReasons, reason)
+			} else if len(rs) > 0 {
 				rd := rs[0]
 				p.responseBytes -= int64(len(rd.raw))
 				p.responseCount--
@@ -280,11 +284,11 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 					p.responses[key] = rs[1:]
 				}
 				t.Response = rd.raw
+				t.ResponseTime = rd.observed
 				t.Status = rd.status
 				t.Truncated = t.Truncated || rd.truncated
 				t.Incomplete = t.Incomplete || rd.incomplete
-			}
-			if len(t.Response) == 0 {
+			} else {
 				p.pending[key] = append(q, Transaction{ID: t.ID, Time: t.Time, Method: t.Method, Source: t.Source, Client: t.Client, Connection: t.Connection, PID: t.PID, Host: t.Host})
 			}
 			if err := p.s.save(t); err != nil {
@@ -341,10 +345,16 @@ func (p *HTTPProcessor) responseRequest(key string) *http.Request {
 		p.mu.Lock()
 		methods := p.requestMethods[key]
 		ready := p.requestReady
-		p.mu.Unlock()
-		if len(methods) > 0 {
-			return &http.Request{Method: methods[0]}
+		if p.http1PairingLossLocked(key) != "" {
+			p.mu.Unlock()
+			return nil
 		}
+		if len(methods) > 0 {
+			method := methods[0]
+			p.mu.Unlock()
+			return &http.Request{Method: method}
+		}
+		p.mu.Unlock()
 		select {
 		case <-ready:
 		case <-deadline.C:

@@ -95,14 +95,14 @@ func TestEvidenceEndpointMatching(t *testing.T) {
 	}
 }
 func TestExportPacketScopeAndHashes(t *testing.T) {
-	for _, folder := range []string{"legacy", "organized"} {
+	for _, folder := range []string{"legacy", "organized", "slow-response"} {
 		t.Run(folder, func(t *testing.T) {
 			s := tuiTestStore(t)
 			if err := os.WriteFile(filepath.Join(s.dir, "capture.lock"), nil, 0600); err != nil {
 				t.Fatal(err)
 			}
 			entry := "packets-test.pcap"
-			if folder == "organized" {
+			if folder != "legacy" {
 				if err := os.MkdirAll(filepath.Join(s.dir, "packets"), 0700); err != nil {
 					t.Fatal(err)
 				}
@@ -125,6 +125,11 @@ func TestExportPacketScopeAndHashes(t *testing.T) {
 				port  layers.TCPPort
 				stamp time.Time
 			}{{12345, now}, {9999, now}, {12345, now.Add(-61 * time.Second)}, {12345, now.Add(61 * time.Second)}}
+			if folder == "slow-response" {
+				samples = append(samples, samples[0], samples[0])
+				samples[len(samples)-2].stamp = now.Add(62 * time.Second)
+				samples[len(samples)-1].stamp = now.Add(63 * time.Second)
+			}
 			for _, sample := range samples {
 				data := evidencePacket(t, false, sample.port)
 				if folder == "organized" {
@@ -149,6 +154,10 @@ func TestExportPacketScopeAndHashes(t *testing.T) {
 				t.Fatal(err)
 			}
 			transaction := Transaction{ID: "packet-scope", Time: now, Client: "198.51.100.1:0", PeerClient: "192.0.2.1:12345", LocalEndpoint: "192.0.2.2:80", ClientSource: "x-forwarded-for"}
+			if folder == "slow-response" {
+				transaction.Source = "pcap:any"
+				transaction.ResponseTime = now.Add(62 * time.Second)
+			}
 			raw, err := json.Marshal(transaction)
 			if err != nil {
 				t.Fatal(err)
@@ -200,6 +209,20 @@ func TestExportPacketScopeAndHashes(t *testing.T) {
 			}
 			if folder == "organized" && len(data) != 65539 {
 				t.Fatalf("large packet length %d", len(data))
+			}
+			if folder == "slow-response" {
+				for _, second := range []time.Duration{61, 62} {
+					_, capture, err := reader.ReadPacketData()
+					if err != nil || !capture.Timestamp.Equal(now.Add(second*time.Second)) {
+						t.Fatalf("packet after %ds timestamp=%s, err=%v", second, capture.Timestamp, err)
+					}
+				}
+				var note struct {
+					End time.Time `json:"packet_window_end"`
+				}
+				if err := json.Unmarshal(contents["evidence.json"], &note); err != nil || !note.End.Equal(transaction.ResponseTime) {
+					t.Fatalf("packet window end=%s, err=%v", note.End, err)
+				}
 			}
 			if _, _, err = reader.ReadPacketData(); err != io.EOF {
 				t.Fatalf("unexpected extra packet: %v", err)

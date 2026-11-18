@@ -109,8 +109,11 @@ func (f *Frames) feed(key string, payload []byte, head ...bool) ([][]byte, bool)
 		return nil, false
 	}
 	if bytes.HasPrefix(b, []byte(h2Preface)) || (len(b) >= 9 && b[0] == 0 && b[3] <= 9) {
-		f.http2[key] = true
 		f.remove(key)
+		// Only the sniffing buffer is finished. Keep the direction in
+		// the capacity index for as long as its protocol marker survives.
+		f.touched[key] = f.clock
+		f.http2[key] = true
 		return [][]byte{b}, false
 	}
 	headerEnd := bytes.Index(b, []byte("\r\n\r\n"))
