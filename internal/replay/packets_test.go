@@ -231,6 +231,57 @@ func TestOfflineReassemblyReusesClosedStreamSlots(t *testing.T) {
 	}
 }
 
+func TestOfflineReassemblyReleasesPairingLossAfterBothDirectionsDrain(t *testing.T) {
+	s := &Store{}
+	p := newHTTP(s)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	f := &streamFactory{ctx: ctx, budget: semaphore.NewWeighted(packetQueueBudget), p: p, source: "pcap:test"}
+	n := gopacket.NewFlow(layers.EndpointIPv4, []byte{192, 0, 2, 1}, []byte{192, 0, 2, 2})
+	port := gopacket.NewFlow(layers.EndpointTCPPort, []byte{0x9c, 0x40}, []byte{0, 80})
+	for range 8193 {
+		req := f.New(n, port).(*queuedStream)
+		p.mu.Lock()
+		p.loseHTTP1PairingLocked(req.connection, "pipeline_limit")
+		p.mu.Unlock()
+		req.ReassemblyComplete()
+		p.wg.Wait()
+		// A peer can appear after the first direction has drained. It
+		// still belongs to the original generation and must not pair.
+		resp := f.New(n.Reverse(), port.Reverse()).(*queuedStream)
+		p.mu.Lock()
+		reason := p.http1PairingLossLocked(resp.connection)
+		p.mu.Unlock()
+		resp.ReassemblyComplete()
+		p.wg.Wait()
+		if resp.connection != req.connection || reason != "pipeline_limit" {
+			t.Fatalf("late peer lost generation or guard: key=%s request=%s reason=%q", resp.connection, req.connection, reason)
+		}
+	}
+	if len(p.pairingLost) != 0 || p.pairingStopped {
+		t.Fatalf("drained generations left %d loss markers and stopped pairing=%t", len(p.pairingLost), p.pairingStopped)
+	}
+}
+
+func TestOfflineReassemblyRetiresReplacedOneSidedGeneration(t *testing.T) {
+	p := newHTTP(&Store{})
+	f := &streamFactory{ctx: t.Context(), budget: semaphore.NewWeighted(packetQueueBudget), p: p, source: "pcap:test"}
+	n := gopacket.NewFlow(layers.EndpointIPv4, []byte{192, 0, 2, 1}, []byte{192, 0, 2, 2})
+	port := gopacket.NewFlow(layers.EndpointTCPPort, []byte{0x9c, 0x40}, []byte{0, 80})
+	first := f.New(n, port).(*queuedStream)
+	p.mu.Lock()
+	p.loseHTTP1PairingLocked(first.connection, "pipeline_limit")
+	p.mu.Unlock()
+	first.ReassemblyComplete()
+	p.wg.Wait()
+	replacement := f.New(n, port).(*queuedStream)
+	replacement.ReassemblyComplete()
+	p.wg.Wait()
+	if replacement.connection == first.connection || len(p.pairingLost) != 0 {
+		t.Fatal("replacing the one-sided generation did not retire its pairing guard")
+	}
+}
+
 func TestOfflineReassemblyBoundsAssemblerDirections(t *testing.T) {
 	s := &Store{}
 	p := newHTTP(s)

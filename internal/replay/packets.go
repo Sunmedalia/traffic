@@ -28,11 +28,29 @@ type packetDirection struct {
 }
 
 type streamGeneration struct {
+	key        string
 	abort      atomic.Bool
 	directions map[string]bool
 	active     int
-	id         uint64
+	workers    atomic.Int32
+	retired    atomic.Bool
 }
+
+func (g *streamGeneration) retire(p *HTTPProcessor) {
+	g.retired.Store(true)
+	if g.workers.Load() == 0 {
+		p.forgetHTTP1Pairing(g.key)
+	}
+}
+
+func (g *streamGeneration) workerDone(p *HTTPProcessor) {
+	// A closed input can still hold queued data. Keep the loss marker
+	// until the generation is unreachable and all parsers have drained.
+	if g.workers.Add(-1) == 0 && g.retired.Load() {
+		p.forgetHTTP1Pairing(g.key)
+	}
+}
+
 type streamFactory struct {
 	ctx         context.Context
 	budget      *semaphore.Weighted
@@ -68,29 +86,37 @@ func (f *streamFactory) New(n, t gopacket.Flow) tcpassembly.Stream {
 	if f.generations == nil {
 		f.generations = map[string]*streamGeneration{}
 	}
-	g := f.generations[base]
+	previous := f.generations[base]
+	g := previous
 	if g == nil || g.directions[client] {
-		g = &streamGeneration{directions: map[string]bool{}, id: serial.Add(1)}
+		g = &streamGeneration{
+			key:        fmt.Sprintf("%s/%s/%d", f.source, base, serial.Add(1)),
+			directions: map[string]bool{},
+		}
 	}
-	key := fmt.Sprintf("%s/%s/%d", f.source, base, g.id)
 	// Readers whose input is already closed can finish without new packets.
 	select {
 	case f.p.slots <- struct{}{}:
 	case <-f.ctx.Done():
 		return discardStream{}
 	}
-	if len(f.generations) >= 4000 && f.generations[base] == nil {
+	if len(f.generations) >= 4000 && previous == nil {
 		// Reclaim closed, one-sided generations without disturbing open
 		// directions that can still receive their peer's first packet.
 		for base, old := range f.generations {
 			if old.active == 0 {
 				delete(f.generations, base)
+				old.retire(f.p)
 			}
 		}
 	}
 	f.generations[base] = g
+	if previous != nil && previous != g {
+		previous.retire(f.p)
+	}
 	g.directions[client] = true
 	g.active++
+	g.workers.Add(1)
 	if f.directions == nil {
 		f.directions = make(map[packetDirection]struct{})
 	}
@@ -98,12 +124,13 @@ func (f *streamFactory) New(n, t gopacket.Flow) tcpassembly.Stream {
 	f.directions[direction] = struct{}{}
 	r := queuedStream{
 		ctx: f.ctx, budget: f.budget, chunks: make(chan streamChunk, 256),
-		store: f.p.s, server: server, connection: key, abort: &g.abort, processor: f.p,
+		store: f.p.s, server: server, connection: g.key, abort: &g.abort, processor: f.p,
 		onClose: func() {
 			delete(f.directions, direction)
 			g.active--
 			if g.active == 0 && len(g.directions) == 2 && f.generations[base] == g {
 				delete(f.generations, base)
+				g.retire(f.p)
 			}
 		},
 	}
@@ -111,8 +138,9 @@ func (f *streamFactory) New(n, t gopacket.Flow) tcpassembly.Stream {
 	go func() {
 		defer f.p.wg.Done()
 		defer func() { <-f.p.slots }()
+		defer g.workerDone(f.p)
 		defer func() { io.Copy(io.Discard, &r) }()
-		f.p.process(&r, key, client, f.source, 0, false)
+		f.p.process(&r, g.key, client, f.source, 0, false)
 	}()
 	return &r
 }

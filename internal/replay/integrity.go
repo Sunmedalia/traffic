@@ -84,6 +84,12 @@ func (p *HTTPProcessor) http1PairingLossLocked(connection string) string {
 	return p.pairingLost[connection]
 }
 
+func (p *HTTPProcessor) forgetHTTP1Pairing(connection string) {
+	p.mu.Lock()
+	delete(p.pairingLost, connection)
+	p.mu.Unlock()
+}
+
 func (p *HTTPProcessor) signalRequestLocked() {
 	close(p.requestReady)
 	p.requestReady = make(chan struct{})

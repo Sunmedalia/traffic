@@ -260,9 +260,7 @@ func replayEvents(ctx context.Context, dir string, s *Store, p *HTTPProcessor) e
 			}
 			source.frames.expire(event.Time, true, p, key)
 			p.invalidate("tls:"+key, "recorded_connection_close")
-			p.mu.Lock()
-			delete(p.pairingLost, "tls:"+key)
-			p.mu.Unlock()
+			p.forgetHTTP1Pairing("tls:" + key)
 		case "iis":
 			if event.IIS == nil || source.iis == nil {
 				return errors.New("invalid IIS raw event")
