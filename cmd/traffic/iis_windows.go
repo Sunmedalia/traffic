@@ -4,8 +4,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"golang.org/x/sys/windows"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,9 +18,13 @@ import (
 	"time"
 
 	"github.com/Sunmedalia/traffic/internal/session"
+	"golang.org/x/sys/windows"
 )
 
+var errUnsupportedWindowsOpenSSL = errors.New("unsupported OpenSSL binary")
+
 func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target session.Target, attached func()) (result error) {
+	nginx := target.Service == "nginx"
 	backend, helper, protocol := "iis", iisProbe, "traffic-iis-v1"
 	if target.Service != "iis" {
 		backend, helper, protocol = "openssl", opensslProbe, "traffic-openssl-v1"
@@ -45,6 +49,9 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 		"--pid", strconv.Itoa(target.PID), "--out", "-", "--runtime-dir", iisRuntime,
 		"--ports", strings.Join(ports, ","), "--request-limit", "0", "--response-limit", "0"}
 	if backend == "openssl" {
+		if nginx {
+			args = append(args, "--drain-on-detach")
+		}
 		if opensslProfile != "" {
 			args = append(args, "--profile", opensslProfile)
 		}
@@ -105,7 +112,35 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 		}
 	}()
 	var lastSequence uint64
-	var probeDrain bool
+	var probeDrain, sequenceGap bool
+	var finalSequence *uint64
+	var hostSummary, identityVerified, attachRejected bool
+	var probeError error
+	stopAfterProbeError := func(err error) {
+		if probeError == nil {
+			probeError = err
+			go stop()
+		}
+	}
+	recordLoss := func(reason, unit string, count uint64) error {
+		s.gap(backend, target.ID, reason, unit, count)
+		return p.record(source, backend, target, session.RawEvent{Type: "loss", Reason: reason, Unit: unit, Count: count})
+	}
+	if nginx {
+		defer func() {
+			if attachRejected && !identityVerified {
+				return
+			}
+			if !hostSummary {
+				recordWindowsProbeExit(s, target.ID, false, false, false, false)
+			}
+			if !hostSummary || !probeDrain {
+				if err := recordLoss("drain_unconfirmed", "shutdowns", 1); result == nil && err != nil {
+					result = err
+				}
+			}
+		}()
+	}
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 4096), 2<<20)
 	for scanner.Scan() {
@@ -117,6 +152,7 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 			HooksRemoved      bool            `json:"hooks_removed"`
 			LastSequence      *uint64         `json:"last_sequence"`
 			QueueDropped      uint64          `json:"queue_dropped"`
+			QueueDroppedBytes uint64          `json:"queue_dropped_bytes"`
 			ScriptUnloaded    bool            `json:"script_unloaded"`
 			TransportDetached bool            `json:"transport_detached"`
 			Diagnostics       map[string]any  `json:"diagnostics"`
@@ -127,15 +163,40 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 		}
 		if message.Type == "summary" && message.LastSequence != nil {
 			probeDrain = lastSequence == *message.LastSequence
+			finalSequence = message.LastSequence
 		}
 		if message.Type == "summary" && backend == "iis" {
 			applyIISProbeSummary(s, message.Diagnostics)
 		}
 		if message.Type == "host_summary" {
-			recordWindowsProbeExit(s, target.ID, probeDrain && message.QueueDropped == 0, message.HooksRemoved, message.ScriptUnloaded, message.TransportDetached)
+			hostSummary = true
+			if nginx && finalSequence != nil && *finalSequence > lastSequence {
+				if err := recordLoss("drain_sequence_mismatch", "messages", *finalSequence-lastSequence); err != nil {
+					return err
+				}
+			}
+			// An accounted host drop can match the final sequence while proving data was lost.
+			dataDrained := probeDrain && message.QueueDropped == 0 && !sequenceGap
+			recordWindowsProbeExit(s, target.ID, dataDrained, message.HooksRemoved, message.ScriptUnloaded, message.TransportDetached)
 		}
 		if message.Type == "attach_error" || message.Type == "error" {
-			return fmt.Errorf("Windows TLS helper: %s %s", message.Message, message.Description)
+			err := fmt.Errorf("Windows TLS helper: %s %s", message.Message, message.Description)
+			if !nginx {
+				return err
+			}
+			attachRejected = attachRejected || message.Type == "attach_error"
+			stopAfterProbeError(err)
+		}
+		if nginx && message.Type == "host_loss" {
+			if message.LastSequence != nil && *message.LastSequence > lastSequence {
+				lastSequence = *message.LastSequence
+			}
+			if message.QueueDroppedBytes > 0 {
+				s.gap(backend, target.ID, "probe_queue_loss", "bytes", message.QueueDroppedBytes)
+			}
+			if err := p.openssl(source, backend, target, opensslEvent{Type: "loss", Count: message.QueueDropped}); err != nil {
+				return err
+			}
 		}
 		if (message.Type == "summary" || message.Type == "host_summary") && message.HooksRemoved {
 			detached.Store(true)
@@ -143,15 +204,19 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 		if message.Type != "send" {
 			continue
 		}
-		var event opensslEvent
-		if err := json.Unmarshal(message.Payload, &event); err != nil {
+		var payload struct {
+			opensslEvent
+			Code string `json:"code"`
+		}
+		if err := json.Unmarshal(message.Payload, &payload); err != nil {
 			return err
 		}
+		event := payload.opensslEvent
 		if event.Sequence > 0 {
-			if lastSequence > 0 && event.Sequence != lastSequence+1 {
+			if (nginx || lastSequence > 0) && event.Sequence != lastSequence+1 {
+				sequenceGap = nginx
 				reason, unit, count := sequenceDiscontinuity(lastSequence, event.Sequence)
-				s.gap(backend, target.ID, reason, unit, count)
-				if err := p.record(source, backend, target, session.RawEvent{Type: "loss", Reason: reason, Unit: unit, Count: count}); err != nil {
+				if err := recordLoss(reason, unit, count); err != nil {
 					return err
 				}
 			}
@@ -159,7 +224,25 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 			lastSequence = event.Sequence
 		}
 		if event.Type == "error" {
-			return fmt.Errorf("Windows TLS probe: %s", event.Message)
+			err := fmt.Errorf("Windows TLS probe: %s", event.Message)
+			if !nginx {
+				return err
+			}
+			if payload.Code == "unsupported_openssl" {
+				attachRejected = true
+				err = fmt.Errorf("%w: %s", errUnsupportedWindowsOpenSSL, event.Message)
+			}
+			stopAfterProbeError(err)
+			continue
+		}
+		// Frida pins the process at attach time. Once its identity is verified,
+		// the same session can still deliver queued messages after the PID exits.
+		if nginx && !identityVerified {
+			live, err := processIdentity("", target.PID)
+			if err != nil || live != target.ID {
+				return fmt.Errorf("Windows TLS target identity changed")
+			}
+			identityVerified = true
 		}
 		if event.Type == "ready" {
 			if event.Protocol != protocol {
@@ -174,12 +257,14 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 			}
 			continue
 		}
-		live, err := processIdentity("", target.PID)
-		if err != nil || live != target.ID {
-			if ctx.Err() != nil {
-				return nil
+		if !nginx {
+			live, err := processIdentity("", target.PID)
+			if err != nil || live != target.ID {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return fmt.Errorf("Windows TLS target identity changed")
 			}
-			return fmt.Errorf("Windows TLS target identity changed")
 		}
 		if backend == "iis" {
 			var apiEvent iisEvent
@@ -202,6 +287,9 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 	}
 	finishRead()
 	<-finished
+	if probeError != nil {
+		return probeError
+	}
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -220,11 +308,61 @@ func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, ser
 	httpOnlyNotified := make(map[string]bool)
 	var mu sync.Mutex
 	var running sync.WaitGroup
+	var currentTargets []session.Target
+	publish := func() {
+		// The store's snapshot must not share a backing array with discovery.
+		targets := append([]session.Target(nil), currentTargets...)
+		attached, unavailable, httpOnly := 0, 0, 0
+		nginxUnavailable := false
+		mu.Lock()
+		for index := range targets {
+			target := &targets[index]
+			target.State = workers[target.ID].state
+			switch target.State {
+			case "attached":
+				attached++
+			case "unavailable":
+				unavailable++
+				nginxUnavailable = nginxUnavailable || target.Service == "nginx"
+			case "http-only":
+				httpOnly++
+			}
+		}
+		mu.Unlock()
+		state := "starting"
+		switch {
+		case len(targets) == 0:
+			state = "no-targets"
+		case attached == len(targets):
+			state = "attached"
+		case attached > 0:
+			state = "partial"
+		case unavailable > 0:
+			state = "unavailable"
+		case httpOnly == len(targets):
+			state = "http-only"
+		}
+		s.mu.Lock()
+		s.stats.Targets = targets
+		s.stats.TLS = state
+		if state == "unavailable" && nginxUnavailable && !s.stats.PlaintextObserved {
+			s.stats.TLSCoverage = "unavailable"
+		} else if s.stats.TLSCoverage == "unavailable" {
+			s.stats.TLSCoverage = "unverified"
+		}
+		s.mu.Unlock()
+	}
 	defer func() {
 		for _, worker := range workers {
 			worker.cancel()
 		}
 		running.Wait()
+		for _, target := range currentTargets {
+			if target.Service == "nginx" {
+				publish()
+				break
+			}
+		}
 	}()
 	refresh := func() {
 		targets := discoverTargets("", service, pid, library)
@@ -243,7 +381,12 @@ func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, ser
 				continue
 			}
 			if (target.Service == "iis" && iisProbe == "") || (target.Service != "iis" && opensslProbe == "") {
-				workers[target.ID] = &worker{cancel: func() {}, state: "http-only"}
+				state := "http-only"
+				if target.Service == "nginx" {
+					state = "unavailable"
+					s.gap("windows-probe", target.ID, "probe_unavailable", "attempts", 1)
+				}
+				workers[target.ID] = &worker{cancel: func() {}, state: state}
 				continue
 			}
 			if target.Service == "iis" && !iisHasSelectedHTTPSPort(capturePorts) {
@@ -256,6 +399,9 @@ func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, ser
 			}
 			if s.checkTarget(target).Status != "candidate" {
 				workers[target.ID] = &worker{cancel: func() {}, state: "unavailable"}
+				if target.Service == "nginx" {
+					s.gap("windows-probe", target.ID, "probe_unavailable", "attempts", 1)
+				}
 				continue
 			}
 			child, cancel := context.WithCancel(ctx)
@@ -273,15 +419,43 @@ func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, ser
 						case <-time.After(time.Second << (attempt - 1)):
 						}
 					}
-					mu.Lock()
-					worker.state = "starting"
-					mu.Unlock()
-					err = captureWindowsProbe(child, s, p, target, func() { mu.Lock(); worker.state = "attached"; mu.Unlock() })
+					nginx := target.Service == "nginx"
+					if !nginx {
+						mu.Lock()
+						worker.state = "starting"
+						mu.Unlock()
+					}
+					ready := false
+					err = captureWindowsProbe(child, s, p, target, func() {
+						ready = true
+						mu.Lock()
+						worker.state = "attached"
+						mu.Unlock()
+					})
+					if nginx && (err != nil || !ready) {
+						mu.Lock()
+						worker.state = "unavailable"
+						mu.Unlock()
+						if !ready {
+							s.gap("windows-probe", target.ID, "probe_unavailable", "attempts", 1)
+						}
+						if err != nil {
+							s.problem(fmt.Errorf("nginx PID %d probe attempt %d: %w", target.PID, attempt+1, err))
+						}
+						if child.Err() != nil || err == nil || errors.Is(err, errUnsupportedWindowsOpenSSL) {
+							return
+						}
+						s.gap("windows-probe", target.ID, "probe_restart", "attempts", 1)
+						continue
+					}
 					if child.Err() != nil || err == nil {
 						break
 					}
 					s.problem(fmt.Errorf("%s PID %d probe attempt %d: %w", target.Service, target.PID, attempt+1, err))
 					s.gap("windows-probe", target.ID, "probe_restart", "attempts", 1)
+				}
+				if target.Service == "nginx" {
+					return
 				}
 				mu.Lock()
 				worker.state = "stopped"
@@ -294,43 +468,8 @@ func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, ser
 				}
 			}(target)
 		}
-		attached, unavailable, httpOnly := 0, 0, 0
-		mu.Lock()
-		for index := range targets {
-			targets[index].State = workers[targets[index].ID].state
-			if targets[index].State == "attached" {
-				attached++
-			}
-			if targets[index].State == "unavailable" {
-				unavailable++
-			}
-			if targets[index].State == "http-only" {
-				httpOnly++
-			}
-		}
-		mu.Unlock()
-		state := "starting"
-		if len(targets) == 0 {
-			state = "no-targets"
-		} else if attached == 0 && unavailable == 0 && httpOnly == len(targets) {
-			state = "http-only"
-		}
-		if attached > 0 {
-			state = "attached"
-			if attached < len(targets) {
-				state = "partial"
-			}
-		}
-		if unavailable > 0 {
-			state = "unavailable"
-			if attached > 0 {
-				state = "partial"
-			}
-		}
-		s.mu.Lock()
-		s.stats.Targets = targets
-		s.stats.TLS = state
-		s.mu.Unlock()
+		currentTargets = targets
+		publish()
 	}
 	refresh()
 	ticker := time.NewTicker(time.Second)

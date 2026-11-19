@@ -2,6 +2,27 @@
   {
     "module": "nginx.exe",
     "arch": "ia32",
+    "version": "nginx.org 1.27.4 Windows",
+    "source": "https://nginx.org/download/nginx-1.27.4.zip",
+    "sha256": "2444e0aa10cd31a955cc4446dd0f19669fcaca04f197dfa1a90c3a7d7a5a49d6",
+    "functions": {
+      "SSL_read": {
+        "rva": 1028816,
+        "bytes": "8b44240c85c0792ee873710700"
+      },
+      "SSL_write": {
+        "rva": 1029808,
+        "bytes": "8b44240c85c0792ee8936d0700"
+      },
+      "SSL_get_fd": {
+        "rva": 1026160,
+        "bytes": "b804000000e8f6551d008b4424088b40"
+      }
+    }
+  },
+  {
+    "module": "nginx.exe",
+    "arch": "ia32",
     "version": "nginx.org 1.28.0 Windows",
     "source": "https://nginx.org/download/nginx-1.28.0.zip",
     "sha256": "53530836391897ea218d8040acdd467cd4832efab597e534d7c670e0e6c94b3c",

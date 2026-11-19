@@ -77,6 +77,13 @@ func ComputeIntegrityWarnings(capture Stats, reconstructed *Stats, statusModTime
 		}
 	}
 
+	if count := capture.GapCounts["windows-probe/probe_unavailable/attempts"]; count > 0 {
+		add(fmt.Sprintf("Windows nginx 明文探针有 %d 次附加未就绪，期间的 HTTPS 请求可能无法还原", count))
+	}
+	if count := capture.GapCounts["openssl/drain_unconfirmed/shutdowns"]; count > 0 {
+		add(fmt.Sprintf("Windows nginx 明文探针有 %d 次退出未确认排空，进程内及传输中的尾部事件和字节数未知", count))
+	}
+
 	capturedReq := capture.ProbeReceiveMatches + capture.ProbeRecoveredReceives
 	if capture.ProbeSendMatches > capturedReq {
 		add(fmt.Sprintf("IIS 探针收发计数失衡：响应完成 %d 次，但请求侧仅捕获/恢复 %d 次，至少遗漏 %d 条请求明文", capture.ProbeSendMatches, capturedReq, capture.ProbeSendMatches-capturedReq))
