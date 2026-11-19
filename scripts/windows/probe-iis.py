@@ -30,7 +30,10 @@ def main():
     parser.add_argument("--request-limit", type=int, default=0)
     parser.add_argument("--response-limit", type=int, default=0)
     parser.add_argument("--control-stdin", action="store_true")
+    parser.add_argument("--drain-on-detach", action="store_true")
     args = parser.parse_args()
+    if args.drain_on_detach and (args.backend != "openssl" or str(args.out) != "-"):
+        parser.error("--drain-on-detach requires OpenSSL and stdout output")
     if args.pid <= 0 or args.duration < 0:
         parser.error("PID must be positive and duration must not be negative")
     ports = [int(port) for port in args.ports.split(",")]
@@ -48,6 +51,9 @@ def main():
 
     messages = queue.Queue(maxsize=256)
     dropped = 0
+    reported_drops = 0
+    dropped_bytes = 0
+    dropped_sequence = 0
     dropped_lock = threading.Lock()
     detached = threading.Event()
     stop = threading.Event()
@@ -59,18 +65,23 @@ def main():
         threading.Thread(target=read_control, daemon=True).start()
 
     def receive(message, data):
-        nonlocal dropped, queued_bytes
+        nonlocal dropped, dropped_bytes, dropped_sequence, queued_bytes
         size = len(data or b"")
         with dropped_lock:
-            if queued_bytes + size > 8 << 20:
-                dropped += 1
-                return
-            try:
-                messages.put_nowait((message, data))
-            except queue.Full:
-                dropped += 1
-                return
-            queued_bytes += size
+            # Keep the loss boundary after all previously accepted messages.
+            if not (args.drain_on_detach and dropped > reported_drops) and queued_bytes + size <= 8 << 20:
+                try:
+                    messages.put_nowait((message, data))
+                except queue.Full:
+                    pass
+                else:
+                    queued_bytes += size
+                    return
+            dropped += 1
+            if args.drain_on_detach:
+                dropped_bytes += size
+                if message.get("type") == "send":
+                    dropped_sequence = message["payload"].get("sequence", dropped_sequence)
 
     if str(args.out) == "-":
         sys.stdout.reconfigure(encoding="utf-8", line_buffering=True, write_through=True)
@@ -87,7 +98,37 @@ def main():
             raise SystemExit(f"Attach failed: {error}. Check that the target identity can read --runtime-dir.") from error
         script = None
         size = 0
-        reported_drops = 0
+
+        def forward(message, data):
+            nonlocal size, queued_bytes
+            with dropped_lock:
+                queued_bytes -= len(data or b"")
+            if data is not None and message.get("type") == "send":
+                message["payload"]["data_b64"] = base64.b64encode(data).decode("ascii")
+            line = json.dumps(message, ensure_ascii=False) + "\n"
+            size += len(line.encode("utf-8"))
+            if str(args.out) != "-" and size > 16 << 20:
+                return False
+            output.write(line)
+            output.flush()
+            return True
+
+        def report_drops():
+            nonlocal reported_drops, dropped_bytes, dropped_sequence
+            with dropped_lock:
+                if dropped == reported_drops or (args.drain_on_detach and not messages.empty()):
+                    return
+                count = dropped - reported_drops
+                reported_drops = dropped
+                if args.drain_on_detach:
+                    event = {"type": "host_loss", "queue_dropped": count, "queue_dropped_bytes": dropped_bytes,
+                             "last_sequence": dropped_sequence}
+                    dropped_bytes = dropped_sequence = 0
+                else:
+                    event = {"type": "send", "payload": {"type": "loss", "count": count}}
+            output.write(json.dumps(event) + "\n")
+            output.flush()
+
         try:
             session.on("detached", lambda *_: detached.set())
             source_path = Path(__file__).with_name("openssl-plaintext.js") if args.backend == "openssl" else (Path(__file__).with_name("iis-plaintext.js") if args.plaintext else Path(__file__).with_suffix(".js"))
@@ -102,53 +143,42 @@ def main():
             script.on("message", receive)
             script.load()
             deadline = time.monotonic() + args.duration if args.duration else None
-            size = 0
-            reported_drops = 0
             while not detached.is_set() and not stop.is_set():
+                if args.drain_on_detach:
+                    report_drops()
                 if deadline is not None and time.monotonic() >= deadline:
                     break
                 try:
                     message, data = messages.get(timeout=0.25)
                 except queue.Empty:
                     continue
-                with dropped_lock:
-                    queued_bytes -= len(data or b"")
-                    new_drops = dropped - reported_drops
-                    reported_drops = dropped
-                if new_drops:
-                    output.write(json.dumps({"type": "send", "payload": {"type": "loss", "count": new_drops}}) + "\n")
-                if data is not None and message.get("type") == "send":
-                    message["payload"]["data_b64"] = base64.b64encode(data).decode("ascii")
-                line = json.dumps(message, ensure_ascii=False) + "\n"
-                size += len(line.encode("utf-8"))
-                if str(args.out) != "-" and size > 16 << 20:
+                if not args.drain_on_detach:
+                    report_drops()
+                if not forward(message, data):
                     output.write(json.dumps({"type": "disk_limit", "plaintext_verified": False}) + "\n")
                     break
-                output.write(line)
-                output.flush()
         finally:
+            summary = None
             try:
-                if script is not None and not detached.is_set():
-                    summary = script.exports_sync.finish()
-                    while True:
-                        try:
-                            message, data = messages.get_nowait()
-                        except queue.Empty:
-                            break
-                        if data is not None and message.get("type") == "send":
-                            message["payload"]["data_b64"] = base64.b64encode(data).decode("ascii")
-                        line = json.dumps(message, ensure_ascii=False) + "\n"
-                        size += len(line.encode("utf-8"))
-                        if str(args.out) != "-" and size > 16 << 20:
-                            dropped += 1
-                            continue
-                        output.write(line)
-                    if dropped > reported_drops:
-                        output.write(json.dumps({"type": "send", "payload": {"type": "loss", "count": dropped - reported_drops}}) + "\n")
-                    output.write(json.dumps(summary, ensure_ascii=False) + "\n")
-                    output.flush()
+                try:
+                    if script is not None and not detached.is_set():
+                        summary = script.exports_sync.finish()
+                finally:
+                    if summary is not None or args.drain_on_detach:
+                        while True:
+                            try:
+                                message, data = messages.get_nowait()
+                            except queue.Empty:
+                                break
+                            if not forward(message, data):
+                                with dropped_lock:
+                                    dropped += 1
+                        report_drops()
+                    if summary is not None:
+                        output.write(json.dumps(summary, ensure_ascii=False) + "\n")
+                        output.flush()
             finally:
-                hooks_removed = bool(locals().get("summary", {}).get("hooks_removed"))
+                hooks_removed = bool((summary or {}).get("hooks_removed"))
                 unloaded = threading.Event()
                 unload_errors = []
                 def unload_script():

@@ -528,7 +528,15 @@ IIS 探针动态附加 `w3wp.exe`，在 HTTP Server API 收发边界复制明文
 .\traffic.exe capture --service openssl --pid 1234 --ports 9443 --libssl libssl-3-x64.dll
 ```
 
-官方 Windows nginx 静态链接 OpenSSL，内置 profile 按二进制 SHA-256 和函数入口匹配；其他静态版本需要 `--openssl-profile`。辅助脚本目录需同时保留 `probe-openssl.py`、`probe-iis.py`、`openssl-plaintext.js` 和 `openssl-profiles.json`。动态附加只覆盖附加后进入的调用，附加前已阻塞的读取和半截消息可能漏采。Windows 的完整验收脚本为 `scripts/windows/verify-iis.py` 和 `scripts/windows/verify-middleware.py`。
+Windows nginx 探针优先检查 OpenSSL 导出符号。没有导出符号的静态构建通过 profile 匹配 `nginx.exe` 的架构、SHA-256 和函数入口。内置 profile 支持以下构建：
+
+- Windows x86（32 位）为 nginx.org 的 1.27.4 和 1.28.0。
+- Windows x86-64（64 位）为 [iliweii/nginx-rtmp-win64 的 1.28.1 构建](https://github.com/iliweii/nginx-rtmp-win64/tree/8e9a9c842da0edff6d5ab36069e478cbfef8c2f7)。
+
+其他无导出符号的静态构建需要提供匹配的 `--openssl-profile`。使用 `--service nginx` 时，进程的可执行文件名应为 `nginx.exe`。辅助脚本目录需同时保留 `probe-openssl.py`、`probe-iis.py`、`openssl-plaintext.js` 和 `openssl-profiles.json`。动态附加只覆盖附加后进入的调用，附加前已阻塞的读取和半截消息可能漏采。Windows 的完整验收脚本为 `scripts/windows/verify-iis.py` 和 `scripts/windows/verify-middleware.py`。
+
+- nginx 探针就绪后目标显示 `attached`。没有可用探针时查看 `tls=unavailable` 和 `probe_unavailable` 缺口。`plaintext_observed=true` 表示至少一条非空 nginx TLS 明文事件已进入证据队列。请求数以 console 重建结果为准。
+- worker 退出时，helper 会转发已收到的尾部事件。可量化的宿主队列丢弃以消息数和有效载荷字节数记录为 `probe_queue_loss`。没有最终序列确认时，每次退出记录一条 `drain_unconfirmed/shutdowns`，进程内及传输中的剩余事件和字节数未知。
 
 ## 构建（分平台）
 

@@ -167,7 +167,7 @@ hook(winsock.getExportByName('closesocket'), {
 const timer = setInterval(flush, 50);
 // A process may load its TLS DLL later. Go exposes ready only after hooks exist.
 const readinessDeadline = setTimeout(() => {
-    if (installed.length === 0) send({type: 'error', message: 'No supported OpenSSL exports or matching static binary profile. Check --libssl and --openssl-profile.'});
+    if (installed.length === 0) send({type: 'error', code: 'unsupported_openssl', message: 'No supported OpenSSL exports or matching static binary profile. Check --libssl and --openssl-profile.'});
 }, 10000);
 const readyTimer = setInterval(() => {
     if (installed.length === 0) return;

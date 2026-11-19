@@ -429,6 +429,15 @@ func TestRecorderMultiSourceConcurrencyAndExactLossAccounting(t *testing.T) {
 	if s.stats.PlaintextObserved {
 		t.Fatal("shed IIS request falsely set PlaintextObserved=true")
 	}
+	nginxTarget := session.Target{PID: 902, ID: "902:nginx", Service: "nginx"}
+	if err := recorder.openssl("windows-openssl/902:nginx", "openssl", nginxTarget, opensslEvent{
+		Type: "data", Connection: "1", Direction: "read", Local: "127.0.0.1:443", Client: "192.0.2.1:9999", Data: filler,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if s.stats.PlaintextObserved {
+		t.Fatal("shed nginx data falsely set PlaintextObserved=true")
+	}
 	if err := recorder.iis("windows-iis-1/900:iis", iisTarget, iisEvent{Type: "probe-gap", Reason: "unrecovered_receive", Kind: "receive", Count: 3}); err != nil {
 		t.Fatal(err)
 	}
@@ -593,6 +602,36 @@ func TestRecorderMultiSourceConcurrencyAndExactLossAccounting(t *testing.T) {
 	}
 	if journalSum := sumGapJournalReason(t, dir, "evidence_queue_shed"); journalSum != s.stats.QueueDropped {
 		t.Fatalf("gaps.jsonl sum=%d != queue_dropped=%d", journalSum, s.stats.QueueDropped)
+	}
+}
+
+func TestRecorderObservesOnlySelectedNonemptyNginxPlaintext(t *testing.T) {
+	oldPorts := capturePorts
+	capturePorts = map[int]bool{443: true}
+	defer func() { capturePorts = oldPorts }()
+	s := &Store{dir: t.TempDir()}
+	recorder := newRecorder(s)
+	t.Cleanup(func() {
+		if err := recorder.close(); err != nil {
+			t.Error(err)
+		}
+	})
+	target := session.Target{PID: 900, ID: "900:nginx", Service: "nginx"}
+	for _, test := range []struct {
+		event opensslEvent
+		want  bool
+	}{
+		{event: opensslEvent{Type: "close", Connection: "1"}},
+		{event: opensslEvent{Type: "data", Direction: "read", Local: "127.0.0.1:8443", Client: "127.0.0.1:60000", Data: []byte("filtered")}},
+		{event: opensslEvent{Type: "data", Direction: "read", Local: "127.0.0.1:443", Client: "127.0.0.1:60000"}},
+		{event: opensslEvent{Type: "data", Direction: "read", Local: "127.0.0.1:443", Client: "127.0.0.1:60000", Data: []byte("observed")}, want: true},
+	} {
+		if err := recorder.openssl("windows-openssl/900:nginx", "openssl", target, test.event); err != nil {
+			t.Fatal(err)
+		}
+		if s.stats.PlaintextObserved != test.want {
+			t.Fatalf("plaintext_observed=%v for event %+v", s.stats.PlaintextObserved, test.event)
+		}
 	}
 }
 

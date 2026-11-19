@@ -23,6 +23,7 @@ type Store struct {
 	lastTLSEventNano   atomic.Int64
 	probeGapTotals     map[string]uint64
 	iisAttached        bool
+	iisPlaintext       bool
 	checkMu            sync.Mutex
 	checks             map[string]captureCheck
 	probeCheck         func(session.Target) captureCheck

@@ -327,6 +327,11 @@ func (r *eventRecorder) openssl(source, backend string, target session.Target, e
 	if err != nil {
 		return err
 	}
+	if accepted && target.Service == "nginx" && backend == "openssl" && event.Type == "data" && len(event.Data) > 0 {
+		r.store.mu.Lock()
+		r.store.stats.PlaintextObserved = true
+		r.store.mu.Unlock()
+	}
 	if accepted && truncatedBytes > 0 {
 		r.store.gap(backend, target.ID, "single_call_truncated", "bytes", truncatedBytes)
 	}
@@ -394,6 +399,7 @@ func (r *eventRecorder) iis(source string, target session.Target, event iisEvent
 	}
 	if accepted && event.Type == "request" {
 		r.store.mu.Lock()
+		r.store.iisPlaintext = true
 		r.store.stats.PlaintextObserved = true
 		r.store.stats.AttachWindowSuspect = false
 		r.store.mu.Unlock()
