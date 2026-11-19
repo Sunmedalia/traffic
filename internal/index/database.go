@@ -2,11 +2,12 @@ package index
 
 import (
 	"database/sql"
-	"github.com/Sunmedalia/traffic/internal/session"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+
+	"github.com/Sunmedalia/traffic/internal/session"
 )
 
 // OpenDB opens the v1 session index. Readers always use SQLite mode=ro.
@@ -23,20 +24,11 @@ func OpenDB(dir string, write bool) (*sql.DB, error) {
 	if write {
 		mode = "rwc"
 	}
-	absolute, err := filepath.Abs(filepath.Join(dir, "index.sqlite"))
+	dsn, err := IndexDSN(dir, mode)
 	if err != nil {
 		return nil, err
 	}
-	databasePath := filepath.ToSlash(absolute)
-	if runtime.GOOS == "windows" {
-		databasePath = "/" + databasePath
-	}
-	databaseURL := url.URL{Scheme: "file", Path: databasePath}
-	query := databaseURL.Query()
-	query.Set("mode", mode)
-	query.Set("_busy_timeout", "5000")
-	databaseURL.RawQuery = query.Encode()
-	db, err := sql.Open(Driver, databaseURL.String())
+	db, err := sql.Open(Driver, dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -52,4 +44,22 @@ func OpenDB(dir string, write bool) (*sql.DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+// IndexDSN is the SQLite URL of the v1 session index in dir.
+func IndexDSN(dir, mode string) (string, error) {
+	absolute, err := filepath.Abs(filepath.Join(dir, "index.sqlite"))
+	if err != nil {
+		return "", err
+	}
+	databasePath := filepath.ToSlash(absolute)
+	if runtime.GOOS == "windows" {
+		databasePath = "/" + databasePath
+	}
+	databaseURL := url.URL{Scheme: "file", Path: databasePath}
+	query := databaseURL.Query()
+	query.Set("mode", mode)
+	query.Set("_busy_timeout", "5000")
+	databaseURL.RawQuery = query.Encode()
+	return databaseURL.String(), nil
 }

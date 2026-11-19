@@ -36,7 +36,7 @@ func (w *webServer) handleRuleHits(rw http.ResponseWriter, r *http.Request) {
 	defer s.db.Close()
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	rows, err := s.db.QueryContext(ctx, `SELECT COALESCE(json_extract(hit.value,'$.rule'),''),COALESCE(max(json_extract(hit.value,'$.severity')),''),count(DISTINCT requests.id),min(requests.time),max(requests.time) FROM requests, json_each(CAST(requests.data AS TEXT),'$.alerts') hit WHERE alert>0 GROUP BY 1 ORDER BY 3 DESC,1`)
+	rows, err := s.db.QueryContext(ctx, `SELECT COALESCE(json_extract(hit.value,'$.rule'),''),COALESCE(max(json_extract(hit.value,'$.severity')),''),count(DISTINCT entries.id),min(entries.time),max(entries.time) FROM entries, json_each(entries.alerts) hit WHERE entries.alert>0 GROUP BY 1 ORDER BY 3 DESC,1`)
 	if err != nil {
 		webError(rw, http.StatusInternalServerError, err)
 		return
@@ -56,7 +56,7 @@ func (w *webServer) handleRuleHits(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var total, alerted int
-	if err = s.db.QueryRowContext(ctx, "SELECT count(*),COALESCE(sum(alert>0),0) FROM requests").Scan(&total, &alerted); err != nil {
+	if err = s.db.QueryRowContext(ctx, "SELECT count(*),COALESCE(sum(alert>0),0) FROM entries").Scan(&total, &alerted); err != nil {
 		webError(rw, http.StatusInternalServerError, err)
 		return
 	}
@@ -163,7 +163,7 @@ func (w *webServer) ruleTestTransaction(rw http.ResponseWriter, ctx context.Cont
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	var b []byte
-	err = s.db.QueryRowContext(queryCtx, "SELECT data FROM requests WHERE id=?", rid).Scan(&b)
+	err = s.db.QueryRowContext(queryCtx, "SELECT data FROM records WHERE id=?", rid).Scan(&b)
 	if err == sql.ErrNoRows {
 		webError(rw, http.StatusNotFound, errors.New("该记录不存在或已被保留期清理"))
 		return t, false

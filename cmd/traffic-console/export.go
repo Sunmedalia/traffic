@@ -31,7 +31,7 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 		}
 		defer fresh.db.Close()
 		s = fresh
-		if err = s.db.QueryRow("SELECT data FROM requests WHERE id=?", t.ID).Scan(&b); err != nil {
+		if err = s.db.QueryRow("SELECT data FROM records WHERE id=?", t.ID).Scan(&b); err != nil {
 			return err
 		}
 		t = Transaction{}

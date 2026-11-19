@@ -85,7 +85,7 @@ func TestRawTLSIsReconstructedAndCanBeReanalyzedWithLargerLimits(t *testing.T) {
 	}
 	// A reader pins the old generation, so its counters and rows stay consistent.
 	var oldAlerts int
-	if err = reader.db.QueryRow("SELECT sum(alert) FROM requests").Scan(&oldAlerts); err != nil || oldAlerts != 0 {
+	if err = reader.db.QueryRow("SELECT sum(alert) FROM records").Scan(&oldAlerts); err != nil || oldAlerts != 0 {
 		t.Fatal("old reader mixed generations", oldAlerts, err)
 	}
 	current, err := openStore(dir)
@@ -95,7 +95,7 @@ func TestRawTLSIsReconstructedAndCanBeReanalyzedWithLargerLimits(t *testing.T) {
 	defer current.db.Close()
 	var raw []byte
 	var record Transaction
-	if err = current.db.QueryRow("SELECT data FROM requests").Scan(&raw); err != nil {
+	if err = current.db.QueryRow("SELECT data FROM records").Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
 	if err = json.Unmarshal(raw, &record); err != nil {
@@ -110,6 +110,25 @@ func TestRawTLSIsReconstructedAndCanBeReanalyzedWithLargerLimits(t *testing.T) {
 	}
 	if _, err = os.Stat(filepath.Join(dir, "index.sqlite")); !os.IsNotExist(err) {
 		t.Fatal("console wrote a capture-side index")
+	}
+	if builds, _ := filepath.Glob(filepath.Join(dir, ".analysis-build-*")); len(builds) != 0 {
+		t.Fatal("analysis build left in session", builds)
+	}
+	// Generations from engine 4 only carry results; they stay readable.
+	current.db.Close()
+	downgradeAnalysis(t, dir)
+	legacy, err := openStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacy.db.Close()
+	var severity int
+	var rule string
+	if err = legacy.db.QueryRow("SELECT severity,rule FROM entries").Scan(&severity, &rule); err != nil || severity != 3 || rule != "LOCAL-TAIL" {
+		t.Fatal("legacy raw generation entries", severity, rule, err)
+	}
+	if err = legacy.db.QueryRow("SELECT data FROM records").Scan(&raw); err != nil || !bytes.Contains(raw, []byte("LOCAL-TAIL")) {
+		t.Fatal("legacy raw generation records", err)
 	}
 }
 
@@ -157,7 +176,7 @@ func TestRawBackendMetadataAndLossBoundary(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer store.db.Close()
-			rows, err := store.db.Query("SELECT data FROM requests")
+			rows, err := store.db.Query("SELECT data FROM records")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -193,19 +212,28 @@ func TestRawBackendMetadataAndLossBoundary(t *testing.T) {
 }
 
 func TestCancelledPublishKeepsPreviousGeneration(t *testing.T) {
-	dir, source := t.TempDir(), t.TempDir()
-	if err := os.WriteFile(filepath.Join(source, "analysis.sqlite"), []byte("generation"), 0600); err != nil {
-		t.Fatal(err)
+	dir := t.TempDir()
+	build := func() string {
+		name, err := createAnalysisBuild(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile(filepath.Join(dir, name), []byte("generation"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return name
 	}
-	if err := publishAnalysis(context.Background(), dir, source); err != nil {
+	if err := publishAnalysis(context.Background(), dir, build()); err != nil {
 		t.Fatal(err)
 	}
 	before, _ := os.ReadFile(filepath.Join(dir, analysisPointer))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := publishAnalysis(ctx, dir, source); err != context.Canceled {
+	cancelled := build()
+	if err := publishAnalysis(ctx, dir, cancelled); err != context.Canceled {
 		t.Fatal("cancelled publication succeeded", err)
 	}
+	removeAnalysisBuild(dir, cancelled)
 	after, _ := os.ReadFile(filepath.Join(dir, analysisPointer))
 	if !bytes.Equal(before, after) {
 		t.Fatal("cancelled publication changed pointer")
@@ -213,6 +241,12 @@ func TestCancelledPublishKeepsPreviousGeneration(t *testing.T) {
 	files, _ := filepath.Glob(filepath.Join(dir, "analysis-*.sqlite"))
 	if len(files) != 1 {
 		t.Fatal("failed generation not removed", files)
+	}
+	if builds, _ := filepath.Glob(filepath.Join(dir, ".analysis-build-*")); len(builds) != 0 {
+		t.Fatal("abandoned build left behind", builds)
+	}
+	if err := publishAnalysis(context.Background(), dir, "../analysis.sqlite"); err == nil {
+		t.Fatal("publication accepted a path outside the build namespace")
 	}
 }
 
@@ -385,7 +419,7 @@ func TestRawReplayRecoversNewHTTP2AfterLoss(t *testing.T) {
 	for _, url := range []string{"/old", "/fresh"} {
 		var raw []byte
 		var transaction Transaction
-		if err := store.db.QueryRow("SELECT data FROM requests WHERE json_extract(data, '$.url')=?", url).Scan(&raw); err != nil {
+		if err := store.db.QueryRow("SELECT data FROM records WHERE json_extract(data, '$.url')=?", url).Scan(&raw); err != nil {
 			t.Fatal(err)
 		}
 		if err := json.Unmarshal(raw, &transaction); err != nil {
@@ -506,7 +540,7 @@ func TestAnalyzeStatusTUIAndExportSurfaceStalledCaptureWarnings(t *testing.T) {
 
 	var txID string
 	var txRaw []byte
-	if err := store.db.QueryRow("SELECT id, data FROM requests LIMIT 1").Scan(&txID, &txRaw); err != nil {
+	if err := store.db.QueryRow("SELECT id, data FROM records LIMIT 1").Scan(&txID, &txRaw); err != nil {
 		t.Fatal(err)
 	}
 	var txRecord Transaction

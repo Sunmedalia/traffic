@@ -78,7 +78,7 @@ func TestLocalAnalysisPreservesEvidenceAndSupportsReanalysis(t *testing.T) {
 	defer reader.db.Close()
 	var raw []byte
 	var record Transaction
-	if err = reader.db.QueryRow("SELECT data FROM requests WHERE id='attack'").Scan(&raw); err != nil {
+	if err = reader.db.QueryRow("SELECT data FROM records WHERE id='attack'").Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
 	if err = json.Unmarshal(raw, &record); err != nil {
@@ -186,7 +186,7 @@ func TestReanalysisReplacesLegacyAlertsWithEmptyResults(t *testing.T) {
 	}
 	defer reader.db.Close()
 	var count int
-	if err = reader.db.QueryRow("SELECT count(*) FROM requests WHERE alert>0").Scan(&count); err != nil || count != 0 {
+	if err = reader.db.QueryRow("SELECT count(*) FROM records WHERE alert>0").Scan(&count); err != nil || count != 0 {
 		t.Fatal("legacy alerts visible after reanalysis", count, err)
 	}
 	var raw []byte

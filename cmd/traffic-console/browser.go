@@ -242,10 +242,7 @@ func discoverSessions(ctx context.Context, roots []string, caches ...*discoveryC
 				}
 				checkCtx, cancel := context.WithTimeout(ctx, time.Second)
 				// Validate the schema, even for an empty or legacy session without a manifest.
-				rows, queryErr := s.db.QueryContext(checkCtx, "SELECT id,time,client,alert,data FROM requests LIMIT 0")
-				if rows != nil {
-					rows.Close()
-				}
+				queryErr := checkStoreSchema(checkCtx, s.db)
 				cancel()
 				s.db.Close()
 				err = queryErr

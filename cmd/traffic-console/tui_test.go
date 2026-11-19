@@ -31,7 +31,7 @@ func putTUITransaction(t *testing.T, s *Store, transaction Transaction) {
 		t.Fatal(err)
 	}
 }
-func tuiTestStore(t *testing.T) *Store {
+func tuiTestStore(t testing.TB) *Store {
 	t.Helper()
 	dir := t.TempDir()
 	db, err := index.OpenDB(dir, true)

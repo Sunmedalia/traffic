@@ -396,7 +396,7 @@ sessions/web-01/2026-11-11/15-04-05-nginx/
 
 当前源码已将 TCP/HTTP 还原、请求响应配对、索引及检测移到本地分析器（尚未发布；v0.1.2 包仍采用旧流程）。`capture` 和 `import` 只保存原始流量；先停止采集，再执行 `traffic-console analyze --session DIR`。新原始会话在分析前没有可查询的请求表，Web 可在打开会话后通过「分析」按钮启动任务。
 
-每次分析从原始 PCAP 和 `tls/stream.jsonl` 重建事务，再按采集时间执行内置及本次追加的规则。结果存入不可变的 `analysis-*.sqlite`，包括本地还原正文、索引、告警、规则内容/指纹和完成时间；`analysis-current.json` 原子切换当前结果。原始流量和状态文件保持只读，失败或取消保留上次完整结果。旧版 `index.sqlite` 会话继续使用原索引，支持本地规则重算。
+每次分析从原始 PCAP 和 `tls/stream.jsonl` 重建事务，再按采集时间执行内置及本次追加的规则。结果存入不可变的 `analysis-*.sqlite`，包括本地还原正文、索引、告警、规则内容/指纹和完成时间；`analysis-current.json` 原子切换当前结果。原始流量和状态文件保持只读，失败或取消保留上次完整结果。构建中的结果库是会话目录内隐藏的 `.analysis-build-*.sqlite`，成功后改名为新的 `analysis-*.sqlite`；异常退出遗留的构建文件在之后一次成功分析时清理超过一天的部分。分析引擎 v5 起，列表、筛选与统计所需字段单独成列，不再逐条解析含正文的 JSON；更早版本的分析结果仍可直接查看，重新分析后获得同样的查询速度。旧版 `index.sqlite` 会话继续使用原索引，支持本地规则重算。
 
 TUI、Web、JSON 查询及导出读取同一代分析结果；Web 和 TUI 每次刷新读取最新结果。源文件大小或修改时间变化会使结果失效，需重新分析；这项快速检查不代替证据哈希校验。导出包含 `analysis.json`，原始会话另含 `reconstructed-event.json`，旧会话使用 `captured-event.json` 区分原索引记录。
 
