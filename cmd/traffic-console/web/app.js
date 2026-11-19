@@ -73,7 +73,8 @@ const state = {
   selected: null,
   detail: null,
   detailError: '',
-  detailTab: saved('detail-tab', 'request'),
+  detailTab: 'request',
+  sidebarCollapsed: saved('sidebar-collapsed', '0') === '1',
   pretty: saved('pretty', '1') === '1',
   paused: false,
   utc: saved('tz', 'local') === 'utc',
@@ -293,7 +294,8 @@ function show(view) {
   $('session-tabs').hidden = $('session-analyze').hidden = $('live').hidden = view !== 'session';
   if (view !== 'session') $('session-analysis').close();
   if (view !== 'session') $('pause').hidden = true;
-  $('mainnav').hidden = view === 'gate';
+  $('sidebar-toggle').hidden = view === 'gate';
+  renderSidebar();
   const section = view === 'session' ? 'sessions' : view;
   for (const link of document.querySelectorAll('[data-nav]')) {
     if (link.dataset.nav === section) link.setAttribute('aria-current', 'page');
@@ -386,6 +388,16 @@ function route() {
 }
 
 // ---- chrome ----
+
+function renderSidebar() {
+  const button = $('sidebar-toggle');
+  const expanded = !state.sidebarCollapsed;
+  $('mainnav').hidden = button.hidden || !expanded;
+  button.setAttribute('aria-expanded', String(expanded));
+  const label = expanded ? '收起侧边栏' : '展开侧边栏';
+  button.setAttribute('aria-label', label);
+  button.title = label;
+}
 
 const currentSession = () => state.sessions.find((s) => s.id === state.sid);
 
@@ -931,6 +943,8 @@ async function showDetail(id, quiet) {
   if (!quiet) {
     state.selected = id;
     state.detailError = '';
+    state.detailTab = 'request';
+    setDetailMetaExpanded(false);
     if (state.detail && state.detail.transaction.id !== id) state.detail = null;
     $('detail').hidden = $('splitter').hidden = false;
     $('split').classList.add('open');

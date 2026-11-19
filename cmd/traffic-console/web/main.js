@@ -54,6 +54,12 @@ function bind() {
     route();
     pollAnalysisJob();
   });
+  $('sidebar-toggle').addEventListener('click', () => {
+    state.sidebarCollapsed = !state.sidebarCollapsed;
+    save('sidebar-collapsed', state.sidebarCollapsed ? '1' : '0');
+    renderSidebar();
+    if (state.sid) renderTimelines();
+  });
   $('rescan').addEventListener('click', () => loadSessions(true));
   $('sessions-search').addEventListener('input', renderSessions);
   $('pause').addEventListener('click', togglePause);
@@ -122,6 +128,7 @@ function bind() {
   $('page-first').addEventListener('click', () => changePage(0));
   $('page-prev').addEventListener('click', () => changePage(state.page - 1));
   $('page-next').addEventListener('click', () => changePage(state.page + 1));
+  $('detail-meta-toggle').addEventListener('click', () => setDetailMetaExpanded($('detail-meta').hidden));
   $('detail-close').addEventListener('click', () => go({ id: null }, true));
   $('detail-prev').addEventListener('click', () => moveSelection(-1));
   $('detail-next').addEventListener('click', () => moveSelection(1));

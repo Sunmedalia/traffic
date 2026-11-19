@@ -162,7 +162,7 @@ main > section { flex: 1; min-height: 0; }
 .empty button { margin-top: 10px; }
 
 /* ---- tabs ---- */
-.session { display: flex; flex-direction: column; }
+.session { container: session / inline-size; display: flex; flex-direction: column; }
 .tabs { display: flex; gap: 2px; padding: 0 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
 .tabs button { display: inline-flex; align-items: center; gap: 6px; background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 9px 12px 8px; color: var(--muted); }
 .tabs button:hover { background: none; color: var(--text); }
@@ -333,7 +333,9 @@ table.data td.url { max-width: 0; }
 .method { font: 700 12px var(--mono); color: var(--accent); }
 .status { font: 600 12px var(--mono); }
 .rule { cursor: pointer; padding: 0 7px; border-radius: 4px; border: 0; min-height: 20px; font: 600 11px/20px var(--mono); }
-.detail-url { margin-top: 8px; font: 12.5px/1.5 var(--mono); overflow-wrap: anywhere; max-height: 7.5em; overflow: auto; }
+.detail-context { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+#detail-meta-toggle { margin-left: auto; font-size: 12px; }
+.detail-url { min-width: 0; font: 12.5px/1.5 var(--mono); overflow-wrap: anywhere; max-height: 7.5em; overflow: auto; }
 .detail-url .host { color: var(--muted); }
 mark { background: var(--mark); color: inherit; border-radius: 2px; box-shadow: 0 0 0 1px color-mix(in srgb, var(--high) 55%, transparent); }
 .meta { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 6px 16px; margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line); max-height: 30%; overflow: auto; }
@@ -414,6 +416,10 @@ button.mini:hover:not(:disabled) { color: var(--accent); border-color: var(--acc
 .decoder-out { padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); max-height: 60vh; overflow: auto; }
 
 /* ---- workspace navigation ---- */
+.sidebar-toggle { display: inline-grid; place-items: center; }
+.sidebar-icon { display: block; position: relative; width: 15px; height: 13px; border: 1px solid currentColor; border-radius: 2px; }
+.sidebar-icon::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 4px; border-right: 1px solid currentColor; }
+.sidebar-toggle[aria-expanded="true"] .sidebar-icon::before { background: var(--faint); }
 .sidebar { flex: 0 0 112px; display: flex; flex-direction: column; gap: 4px; padding: 10px 8px; border-right: 1px solid var(--line); background: var(--panel); }
 .sidebar a { padding: 6px 10px; border-radius: 6px; color: var(--muted); text-decoration: none; white-space: nowrap; }
 .sidebar a:hover { color: var(--text); background: var(--panel-2); }
@@ -552,6 +558,8 @@ button.danger { color: var(--high); }
 }
 @media (max-width: 1240px) {
   .grid.three, .grid.two { grid-template-columns: minmax(0, 1fr); }
+}
+@container session (max-width: 1128px) {
   .split.open { grid-template-columns: minmax(0, 1fr); }
   .split.open .pane.rows, .split.open .splitter { display: none; }
   .hint-drag { display: none; }
@@ -564,7 +572,11 @@ button.danger { color: var(--high); }
   .top { flex-wrap: wrap; padding: 7px 10px; gap: 2px; }
   .session-tabs button { padding-inline: 7px; }
   .workspace { flex-direction: column; }
-  .sidebar { flex: none; flex-direction: row; padding: 4px 10px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .sidebar-toggle { display: inline-grid; place-items: center; }
+.sidebar-icon { display: block; position: relative; width: 15px; height: 13px; border: 1px solid currentColor; border-radius: 2px; }
+.sidebar-icon::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 4px; border-right: 1px solid currentColor; }
+.sidebar-toggle[aria-expanded="true"] .sidebar-icon::before { background: var(--faint); }
+.sidebar { flex: none; flex-direction: row; padding: 4px 10px; border-right: 0; border-bottom: 1px solid var(--line); }
   .sidebar a { padding: 3px 8px; }
   .brand { letter-spacing: .12em; margin-right: 6px; }
   .search kbd, #tz, #theme, .crumb .host, .crumb .sep.h, .crumb .started { display: none; }
@@ -591,5 +603,6 @@ button.danger { color: var(--high); }
   .detail-actions { grid-area: 2 / 1 / auto / -1; margin-left: 0; gap: 4px; }
   .detail-actions button, .detail-actions .button { padding-inline: 5px; }
   .detail-tools { margin-left: 0; justify-content: flex-end; }
+  .detail-context { flex-wrap: wrap; gap: 2px 8px; }
   .meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

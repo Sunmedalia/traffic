@@ -10,6 +10,9 @@
 </head>
 <body>
 <header class="top">
+  <button type="button" class="ghost icon sidebar-toggle" id="sidebar-toggle" aria-controls="mainnav" aria-expanded="true" aria-label="收起侧边栏" hidden>
+    <span class="sidebar-icon" aria-hidden="true"></span>
+  </button>
   <a class="brand" href="#/" title="会话列表"><span class="brand-mark" aria-hidden="true"></span>TRAFFIC</a>
   <nav class="tabs session-tabs" id="session-tabs" role="tablist" aria-label="会话视图" hidden>
     <button type="button" role="tab" data-tab="overview" title="概览（快捷键 1）">概览</button>
@@ -194,9 +197,12 @@
               </div>
               <button type="button" class="ghost icon" id="detail-close" title="关闭（Esc）" aria-label="关闭详情">✕</button>
             </div>
-            <div class="detail-url" id="detail-url"></div>
+            <div class="detail-context">
+              <div class="detail-url" id="detail-url"></div>
+              <button type="button" class="ghost" id="detail-meta-toggle" aria-controls="detail-meta" aria-expanded="false" hidden>展开记录信息</button>
+            </div>
           </header>
-          <dl class="meta" id="detail-meta"></dl>
+          <dl class="meta" id="detail-meta" hidden></dl>
           <div class="detail-body" id="detail-body" tabindex="-1"></div>
         </aside>
       </div>

@@ -275,9 +275,17 @@ function availableTabs(data) {
   return DETAIL_TABS.filter(([key]) => (key !== 'decoded' || data.decoded_view || data.response_decoded_view) && (key !== 'alerts' || alerts));
 }
 
+function setDetailMetaExpanded(expanded) {
+  const button = $('detail-meta-toggle');
+  $('detail-meta').hidden = !expanded;
+  button.setAttribute('aria-expanded', String(expanded));
+  button.textContent = expanded ? '收起记录信息' : '展开记录信息';
+}
+
 function renderDetail() {
   const data = state.detail;
   const body = $('detail-body');
+  $('detail-meta-toggle').hidden = !data;
   const controls = ['detail-curl', 'detail-export', 'detail-copy', 'pretty'];
   if (!data) {
     $('detail-test').removeAttribute('href');
@@ -374,7 +382,6 @@ function decodeSelection() {
 
 function setDetailTab(key) {
   state.detailTab = key;
-  save('detail-tab', key);
   $('detail-body').scrollTop = 0;
   renderDetail();
 }
