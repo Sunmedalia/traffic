@@ -299,7 +299,11 @@ func captureWindowsProbe(ctx context.Context, s *Store, p *eventRecorder, target
 	return fmt.Errorf("Windows TLS helper stopped unexpectedly; see %s", log.Name())
 }
 
-func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, service string, pid int, library string) {
+func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, discover func() []session.Target) {
+	probesDisabled := iisProbe == "" && opensslProbe == ""
+	if probesDisabled {
+		s.problem(errors.New("Windows HTTPS probes are disabled; enable --iis-probe or --openssl-probe for plaintext capture"))
+	}
 	type worker struct {
 		cancel context.CancelFunc
 		state  string
@@ -317,8 +321,11 @@ func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, ser
 		mu.Lock()
 		for index := range targets {
 			target := &targets[index]
-			target.State = workers[target.ID].state
-			switch target.State {
+			state := workers[target.ID].state
+			if !probesDisabled || target.Service == "nginx" {
+				target.State = state
+			}
+			switch state {
 			case "attached":
 				attached++
 			case "unavailable":
@@ -331,6 +338,8 @@ func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, ser
 		mu.Unlock()
 		state := "starting"
 		switch {
+		case probesDisabled:
+			state = "unavailable"
 		case len(targets) == 0:
 			state = "no-targets"
 		case attached == len(targets):
@@ -365,7 +374,7 @@ func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, ser
 		}
 	}()
 	refresh := func() {
-		targets := discoverTargets("", service, pid, library)
+		targets := discover()
 		wanted := make(map[string]bool)
 		for _, target := range targets {
 			wanted[target.ID] = true
@@ -472,7 +481,11 @@ func captureWindowsServices(ctx context.Context, s *Store, p *eventRecorder, ser
 		publish()
 	}
 	refresh()
-	ticker := time.NewTicker(time.Second)
+	refreshInterval := time.Second
+	if probesDisabled {
+		refreshInterval = 2 * time.Second
+	}
+	ticker := time.NewTicker(refreshInterval)
 	defer ticker.Stop()
 	for {
 		select {

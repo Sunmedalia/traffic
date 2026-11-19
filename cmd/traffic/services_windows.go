@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 	"unsafe"
 
 	"github.com/Sunmedalia/traffic/internal/session"
@@ -211,23 +210,7 @@ func discoverTargets(root, service string, selectedPID int, library string) []se
 }
 
 func captureServices(ctx context.Context, s *Store, p *eventRecorder, _, library, service string, pid int, _ bool, _, _ string, _ int) {
-	if iisProbe != "" || opensslProbe != "" {
-		captureWindowsServices(ctx, s, p, service, pid, library)
-		return
-	}
-	s.problem(fmt.Errorf("Windows HTTPS probes are disabled; enable --iis-probe or --openssl-probe for plaintext capture"))
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for {
-		targets := discoverTargets("", service, pid, library)
-		s.mu.Lock()
-		s.stats.TLS = "unavailable"
-		s.stats.Targets = targets
-		s.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
+	captureWindowsServices(ctx, s, p, func() []session.Target {
+		return discoverTargets("", service, pid, library)
+	})
 }

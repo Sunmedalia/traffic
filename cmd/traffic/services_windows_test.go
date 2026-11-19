@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"testing"
+
+	"github.com/Sunmedalia/traffic/internal/session"
 )
 
 func TestWindowsProcessIdentity(t *testing.T) {
@@ -75,5 +78,32 @@ func TestWindowsMiddlewareDiscovery(t *testing.T) {
 	targets := discoverTargets("", "openssl", os.Getpid(), "custom-ssl.dll")
 	if len(targets) != 1 || targets[0].Service != "openssl" || targets[0].Library != "custom-ssl.dll" {
 		t.Fatalf("generic OpenSSL discovery: %+v", targets)
+	}
+}
+
+func TestWindowsNginxCoverageWithoutProbeHelpers(t *testing.T) {
+	previousIIS, previousOpenSSL := iisProbe, opensslProbe
+	iisProbe, opensslProbe = "", ""
+	t.Cleanup(func() { iisProbe, opensslProbe = previousIIS, previousOpenSSL })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s := &Store{stats: session.Stats{TLSCoverage: "unverified"}}
+	captureWindowsServices(ctx, s, nil, func() []session.Target {
+		return []session.Target{
+			{ID: "1:nginx", Service: "nginx", State: "https-unverified"},
+			{ID: "2:apache", Service: "apache", State: "https-unverified"},
+		}
+	})
+
+	if s.stats.TLS != "unavailable" || s.stats.TLSCoverage != "unavailable" {
+		t.Fatalf("TLS=%q, coverage=%q", s.stats.TLS, s.stats.TLSCoverage)
+	}
+	if s.stats.GapCounts["windows-probe/probe_unavailable/attempts"] != 1 {
+		t.Fatalf("expected one nginx availability gap, got %v", s.stats.GapCounts)
+	}
+	targets := s.stats.Targets
+	if len(targets) != 2 || targets[0].State != "unavailable" || targets[1].State != "https-unverified" {
+		t.Fatalf("unexpected target states: %+v", targets)
 	}
 }
