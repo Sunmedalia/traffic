@@ -92,7 +92,7 @@ func (r *eventRecorder) ensureWriterLocked() error {
 			r.store.gap("raw-tls", "", reason, "errors", 1)
 			return hardErr
 		}
-		sink = file
+		sink = newEvidenceFile(file)
 	}
 	cfg := defaultEvidenceWriterConfig(r.policy)
 	if r.writerCfg != nil {

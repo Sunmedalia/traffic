@@ -99,6 +99,10 @@ python3 scripts/impact.py \
 
 本节仅有单元与本地集成回归（含真实回环抓包和子进程 Unix 队列排空），未做实机高负载或长压验证，不宣称已消除内核丢包。
 
+- **证据页缓存不再占满采集器内存预算（Linux）**：cgroup v2 把采集器写入文件的页缓存计入其 `memory.max`（`--collector-memory-mib`，默认 256）。PCAP 分段和 `tls/stream.jsonl` 写入后不会再被读取，但会持续占用页缓存，约写入 200 MiB 后 cgroup 触顶；内核随后在采集器自身的内存分配中回收脏页并节流，原始证据写入器积压超出 4 MiB 预算。默认 `strict` 策略下采集随即以 `raw-tls/evidence_queue_overflow` 停止，`drop` 策略下之后的事件几乎全部丢弃。现在两类证据文件每写满 8 MiB 用 `sync_file_range` 提前回写，并对上一窗口等待落盘后 `posix_fadvise(DONTNEED)` 释放；`Sync`（如分段轮换）后释放整个文件。设备 EIO/ENOSPC 仍按写入失败处理，文件系统不支持这些提示时仅不释放缓存。
+
+  2026-11-19 在 Debian 13（6.12，2 vCPU，3.7 GiB）本机 nginx 1.26.3 + OpenSSL 3.5 实验站上，以 `impact-load` 1,000 请求/秒 HTTPS POST（2 KiB 正文）、默认参数采集：修复前 4 轮均在启动后 19–22 秒、会话约 200 MiB 时出现证据积压（`strict` 停采 1 次、`drop` 丢弃 895–4,063 条）；修复后 3 轮各 40 秒、各 40,000 请求、会话约 437 MiB 均无缺口、排空 `confirmed`，cgroup 页缓存保持 16–29 MiB、`memory.max` 事件为 0。回环 HTTPS 饱和压测（约 16 万包/秒）的 `pcap/write_queue_overflow` 由 39,974 包降至 436 包。`scripts/verify.py` 126 条验收通过。单机回环样本不代替跨机流量、长压和其他发行版验收。
+
 ## 本地分析查询与结果发布（当前源码，未发布）
 
 本节只涉及 `traffic-console`，不改变采集器、原始证据或会话布局 v3。
