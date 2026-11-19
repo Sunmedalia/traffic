@@ -182,27 +182,25 @@
             <div class="detail-tools">
               <button type="button" class="ghost" id="decode-selection" title="解码选中的文本，未选中时解码 URL（d）" hidden>解码 URL</button>
               <label class="check" id="pretty-wrap"><input type="checkbox" id="pretty" checked>格式化正文</label>
-              <button type="button" class="ghost" id="detail-copy">复制</button>
-            </div>
-          </div>
-          <header class="detail-head">
-            <div class="detail-line">
-              <span id="detail-pills"></span>
-              <div class="detail-actions">
-                <button type="button" class="ghost icon" id="detail-prev" title="上一条（k）" aria-label="上一条">↑</button>
-                <button type="button" class="ghost icon" id="detail-next" title="下一条（j）" aria-label="下一条">↓</button>
-                <a class="button" id="detail-test" title="在规则页用这条请求测试规则">测试规则</a>
-                <button type="button" id="detail-curl" title="复制为 cURL 命令">复制 cURL</button>
+              <div class="detail-copy-actions">
+                <button type="button" class="ghost" id="detail-copy">复制</button>
                 <button type="button" id="detail-export" title="下载请求、响应与关联网络包">导出证据</button>
               </div>
-              <button type="button" class="ghost icon" id="detail-close" title="关闭（Esc）" aria-label="关闭详情">✕</button>
+              <div class="detail-record-actions">
+                <button type="button" class="ghost" id="detail-meta-toggle" aria-controls="detail-record" aria-expanded="false" hidden>展开记录信息</button>
+                <button type="button" class="ghost icon" id="detail-prev" title="上一条（k）" aria-label="上一条">↑</button>
+                <button type="button" class="ghost icon" id="detail-next" title="下一条（j）" aria-label="下一条">↓</button>
+              </div>
             </div>
-            <div class="detail-context">
+            <button type="button" class="ghost icon" id="detail-close" title="关闭（Esc）" aria-label="关闭详情">✕</button>
+          </div>
+          <div class="detail-record" id="detail-record" hidden>
+            <div class="detail-summary">
+              <span id="detail-pills"></span>
               <div class="detail-url" id="detail-url"></div>
-              <button type="button" class="ghost" id="detail-meta-toggle" aria-controls="detail-meta" aria-expanded="false" hidden>展开记录信息</button>
             </div>
-          </header>
-          <dl class="meta" id="detail-meta" hidden></dl>
+            <dl class="meta" id="detail-meta"></dl>
+          </div>
           <div class="detail-body" id="detail-body" tabindex="-1"></div>
         </aside>
       </div>

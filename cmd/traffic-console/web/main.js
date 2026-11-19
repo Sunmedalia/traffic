@@ -128,12 +128,11 @@ function bind() {
   $('page-first').addEventListener('click', () => changePage(0));
   $('page-prev').addEventListener('click', () => changePage(state.page - 1));
   $('page-next').addEventListener('click', () => changePage(state.page + 1));
-  $('detail-meta-toggle').addEventListener('click', () => setDetailMetaExpanded($('detail-meta').hidden));
+  $('detail-meta-toggle').addEventListener('click', () => setDetailMetaExpanded($('detail-record').hidden));
   $('detail-close').addEventListener('click', () => go({ id: null }, true));
   $('detail-prev').addEventListener('click', () => moveSelection(-1));
   $('detail-next').addEventListener('click', () => moveSelection(1));
   $('detail-export').addEventListener('click', exportEvidence);
-  $('detail-curl').addEventListener('click', () => state.detail && copyText(curlCommand(state.detail), ' cURL 命令'));
   $('detail-copy').addEventListener('click', () => copyText(detailText() || '', '当前内容'));
   $('decode-selection').addEventListener('mousedown', (event) => event.preventDefault());
   $('decode-selection').addEventListener('click', decodeSelection);
@@ -173,6 +172,15 @@ function bind() {
     split.style.removeProperty('--detail-w');
     save('detail-width', '');
   });
+
+  // Keep the selected view and copy action in sync when the panes become a pair.
+  let showingMessagePair = false;
+  new ResizeObserver(() => {
+    const pair = detailShowsMessagePair();
+    if (pair === showingMessagePair) return;
+    showingMessagePair = pair;
+    if (!$('detail').hidden && state.detail) renderDetail();
+  }).observe($('detail'));
 
   let resizing = 0;
   window.addEventListener('resize', () => {

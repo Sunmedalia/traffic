@@ -255,43 +255,37 @@ function renderDecoder(data, needles) {
     h('p', { class: 'hint' }, '高亮的按钮表示当前结果可以用这种方式解码。解码只在浏览器中进行，不改动采集数据。'));
 }
 
-function curlCommand(data) {
-  const t = data.transaction;
-  const message = splitHttp(data.request_text || '');
-  const quote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
-  const host = headerValue(message, 'host') || t.host || 'HOST';
-  const tls = /tls|ssl|https/i.test(`${t.source} ${t.backend}`) || /:443$/.test(t.local_endpoint || '');
-  const lines = [`curl -i -X ${t.method || 'GET'} ${quote(`${tls ? 'https' : 'http'}://${host}${t.url || '/'}`)}`];
-  for (const [name, value] of message.headers) {
-    if (value == null || /^(host|content-length|connection|transfer-encoding)$/i.test(name)) continue;
-    lines.push(`  -H ${quote(`${name}: ${value}`)}`);
-  }
-  if (message.body) lines.push(`  --data-raw ${quote(message.body)}`);
-  return lines.join(' \\\n');
+function detailShowsMessagePair() {
+  return getComputedStyle($('detail-tabs')).getPropertyValue('--show-message-pair').trim() === '1';
 }
 
 function availableTabs(data) {
   const alerts = (data.transaction.alerts || []).length;
-  return DETAIL_TABS.filter(([key]) => (key !== 'decoded' || data.decoded_view || data.response_decoded_view) && (key !== 'alerts' || alerts));
+  const pair = detailShowsMessagePair();
+  return DETAIL_TABS.filter(([key]) => (key !== 'response' || !pair)
+    && (key !== 'decoded' || data.decoded_view || data.response_decoded_view)
+    && (key !== 'alerts' || alerts));
 }
 
 function setDetailMetaExpanded(expanded) {
   const button = $('detail-meta-toggle');
-  $('detail-meta').hidden = !expanded;
+  $('detail-record').hidden = !expanded;
   button.setAttribute('aria-expanded', String(expanded));
   button.textContent = expanded ? '收起记录信息' : '展开记录信息';
 }
+
+let evidenceExporting = false;
 
 function renderDetail() {
   const data = state.detail;
   const body = $('detail-body');
   $('detail-meta-toggle').hidden = !data;
-  const controls = ['detail-curl', 'detail-export', 'detail-copy', 'pretty'];
+  $('detail-export').disabled = !data || evidenceExporting;
+  const controls = ['detail-copy', 'pretty'];
   if (!data) {
-    $('detail-test').removeAttribute('href');
     $('decode-selection').hidden = $('pretty-wrap').hidden = $('detail-copy').hidden = true;
     for (const id of controls) $(id).disabled = true;
-    set($('detail-pills'), state.detailError ? '无法显示' : '正在加载…');
+    set($('detail-pills'));
     set($('detail-url'));
     set($('detail-meta'));
     set($('detail-tabs'));
@@ -300,8 +294,6 @@ function renderDetail() {
   }
   for (const id of controls) $(id).disabled = false;
   const t = data.transaction;
-  const lastRules = saved('rule-file', '');
-  $('detail-test').href = (lastRules && lastRules !== NEW_RULE ? ruleHash(lastRules) : '#/rules') + `?sid=${state.sid}&rid=${encodeURIComponent(t.id)}`;
   const alerts = t.alerts || [];
   const needles = [...new Set(alerts.map((a) => a.match).filter(Boolean))];
   set($('detail-pills'),
@@ -347,14 +339,15 @@ function renderDetail() {
     const request = data.request_text ? splitHttp(data.request_text) : null;
     const form = request && /x-www-form-urlencoded/i.test(headerValue(request, 'content-type')) ? rawPairs(request.body, '&') : [];
     const cookies = request ? rawPairs(headerValue(request, 'cookie'), /;\s*/) : [];
-    const pane = (key, title, ...content) => h('section', { class: 'message-pane', 'data-active': String(tab === key), 'aria-label': title },
-      h('h3', { class: 'message-label' }, title), content);
+    const pane = (key, title, content, copyButton) => h('section', { class: 'message-pane', 'data-active': String(tab === key), 'aria-label': title },
+      h('div', { class: 'message-label' }, h('h3', {}, title), copyButton), content);
     set(body, h('div', { class: 'message-pair' },
       pane('request', '请求',
         request ? [httpView(data.request_text, needles), paramsBlock('表单参数（原文）', form, needles, '表单参数'),
           paramsBlock('Cookie（原文）', cookies, needles, 'Cookie')] : h('p', { class: 'hint' }, '没有保存请求内容。')),
       pane('response', '响应', data.response_text ? httpView(data.response_text, [])
-        : h('p', { class: 'hint' }, t.status ? '没有保存响应内容。' : '还没有采集到响应。会话仍在采集时，响应到达后会自动出现。'))));
+        : h('p', { class: 'hint' }, t.status ? '没有保存响应内容。' : '还没有采集到响应。会话仍在采集时，响应到达后会自动出现。'),
+        data.response_text ? h('button', { type: 'button', class: 'mini', onclick: () => copyText(data.response_text, '响应') }, '复制响应') : null)));
     body.querySelectorAll('.message-pane').forEach((pane, i) => { pane.scrollTop = messageScroll[i] || 0; });
   } else if (tab === 'decoder') {
     set(body, renderDecoder(data, needles));
@@ -397,7 +390,8 @@ function detailText() {
 }
 
 async function exportEvidence() {
-  if (!state.detail) return;
+  if (!state.detail || evidenceExporting) return;
+  evidenceExporting = true;
   const id = state.detail.transaction.id;
   const button = $('detail-export');
   button.disabled = true;
@@ -415,7 +409,8 @@ async function exportEvidence() {
   } catch (error) {
     if (error.status !== 401) toast('导出失败：' + error.message, true);
   } finally {
-    button.disabled = false;
+    evidenceExporting = false;
+    button.disabled = !state.detail;
     button.textContent = '导出证据';
   }
 }

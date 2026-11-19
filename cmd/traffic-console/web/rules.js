@@ -187,7 +187,6 @@ async function openRuleFile(name) {
     const file = name ? await api('rules/' + encodeURIComponent(name)) : null;
     if (seq !== ruleUI.seq) return;
     Object.assign(ruleUI, { selected: name, revision: file ? file.revision : '', dirty: false, hash: ruleHash(name) });
-    save('rule-file', name);
     $('rules-name').value = name || '内置规则';
     setEditor(file ? file.content : builtinYAML());
     if (!file) {
