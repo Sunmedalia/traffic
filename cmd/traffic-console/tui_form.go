@@ -13,11 +13,11 @@ import (
 )
 
 type tuiFormField struct {
-	label, hint string
-	values      []string
-	names       []string
-	choice      int
-	input       textinput.Model
+	label  string
+	values []string
+	names  []string
+	choice int
+	input  textinput.Model
 }
 type tuiForm struct {
 	fields []tuiFormField

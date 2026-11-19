@@ -401,8 +401,6 @@ func captureServices(ctx context.Context, s *Store, p *eventRecorder, bin, libra
 	}
 }
 
-func listeningPorts(root, dir string) []int { return listeningPortsSnapshot(root, dir, nil) }
-
 // A network table belongs to a namespace, not a process. Share one immutable
 // snapshot per discovery pass, but resolve FD ownership separately per process.
 // Never cache across refreshes: ports and worker/library identities can change.
