@@ -325,8 +325,9 @@ function renderDetail() {
 
   const tabs = availableTabs(data);
   const tab = tabs.some(([key]) => key === state.detailTab) ? state.detailTab : 'request';
+  const paired = !tabs.some(([key]) => key === 'response');
   set($('detail-tabs'), ...tabs.map(([key, label]) => h('button', { type: 'button', role: 'tab', 'aria-selected': String(key === tab), onclick: () => setDetailTab(key) },
-    label, key === 'alerts' ? h('span', { class: 'badge alert' }, String(alerts.length)) : null)));
+    key === 'request' && paired ? '请求/响应' : label, key === 'alerts' ? h('span', { class: 'badge alert' }, String(alerts.length)) : null)));
   $('pretty-wrap').hidden = tab !== 'request' && tab !== 'response';
   $('decode-selection').hidden = tab === 'decoder' || tab === 'alerts';
   $('detail-copy').hidden = tab === 'alerts';
