@@ -63,7 +63,7 @@ flowchart LR
 
 本地结果写入不可变的 `analysis-*.sqlite`，由 `analysis-current.json` 原子选择当前版本。新会话的本地结果包括还原正文、索引、告警和规则快照；旧会话仅追加告警分析，不改原索引。失败或取消保留上次完整结果；PCAP、TLS 原始事件及采集状态保持只读。请求与响应正文的本地还原、检测上限默认各 1 MiB，可用 `analyze --request-limit 2097152 --response-limit 2097152` 调大后重跑，最大各 16 MiB。提高上限可重新读取原始流量，无法补回实际漏采的字节。
 
-Web 顶部导航的「规则」页（`#/rules`）支持新建、导入、编辑、实时校验、保存、下载和删除 YAML 文件，并预览解析出的规则；「分析」页（`#/analysis`）选择规则和会话执行 / 停止后台分析，并列出最近任务，完成后页面自动更新告警。规则默认存放在程序旁的 `rules/`（源码 `bin/` 构建使用项目根目录），可用 `traffic-console web --rules-dir /path/to/rules` 指定。内置规则只读，自定义文件按需追加，修改文件后需重新分析。[规则目录说明](rules/README.md)
+Web 侧边栏的「会话规则」（`#/rules`）支持新建、导入、编辑、实时校验、保存、下载和删除 YAML 文件，并预览解析出的规则；打开会话后，点击顶栏的「分析」可选择规则、启动或停止后台任务，并查看该会话的最近任务。完成后页面自动更新告警。规则默认存放在程序旁的 `rules/`（源码 `bin/` 构建使用项目根目录），可用 `traffic-console web --rules-dir /path/to/rules` 指定。内置规则只读，自定义文件按需追加，修改文件后需重新分析。[规则目录说明](rules/README.md)
 
 `--request-limit`、`--response-limit`、`--rules`、`--scan-window`、`--scan-paths`、`--alert-webhook` 已移到 `traffic-console analyze`；规则校验改用 `traffic-console rules check FILE`。`--retention` 已删除；`--no-detect` 仅保留为采集器兼容参数。**升级后请先执行 `traffic-console analyze`，再浏览新采集的会话。**
 

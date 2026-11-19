@@ -8,7 +8,7 @@
 async function tick() {
   if (!state.token || document.hidden) return;
   if (!state.sid) {
-    if (!$('view-sessions').hidden || !$('view-analysis').hidden) await loadSessions();
+    if (!$('view-sessions').hidden) await loadSessions();
     return;
   }
   if (state.paused || state.busy) return;
@@ -52,6 +52,7 @@ function bind() {
     state.error = '';
     renderBanner();
     route();
+    pollAnalysisJob();
   });
   $('rescan').addEventListener('click', () => loadSessions(true));
   $('sessions-search').addEventListener('input', renderSessions);
@@ -184,7 +185,7 @@ function togglePause() {
 }
 
 function onKey(event) {
-  if (event.ctrlKey || event.metaKey || event.altKey || $('help').open) return;
+  if (event.ctrlKey || event.metaKey || event.altKey || $('help').open || $('session-analysis').open) return;
   const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(event.target.tagName);
   if (event.key === 'Escape') {
     if (typing) event.target.blur();
@@ -198,7 +199,7 @@ function onKey(event) {
   }
   if (!state.sid) {
     if (event.key === '/') {
-      const search = !$('view-rules').hidden ? 'rules-search' : !$('view-analysis').hidden ? 'analysis-search' : 'sessions-search';
+      const search = !$('view-rules').hidden ? 'rules-search' : 'sessions-search';
       $(search).focus();
       event.preventDefault();
     }
@@ -233,6 +234,7 @@ async function boot() {
   applyTheme();
   bind();
   bindRules();
+  bindAnalysis();
   // The launch URL carries the token in the fragment so it never reaches server logs.
   const launch = /^#token=([\w-]+)$/.exec(location.hash);
   try {
@@ -251,7 +253,7 @@ async function boot() {
     history.replaceState(null, '', `#/s/${usable[0].id}/overview`);
   }
   route();
-  if (state.token && $('view-analysis').hidden) pollAnalysisJob();
+  pollAnalysisJob();
 }
 
 boot();

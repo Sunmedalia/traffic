@@ -11,13 +11,13 @@
 <body>
 <header class="top">
   <a class="brand" href="#/" title="会话列表"><span class="brand-mark" aria-hidden="true"></span>TRAFFIC</a>
-  <nav class="mainnav" id="mainnav" aria-label="主导航" hidden>
-    <a href="#/" data-nav="sessions">会话</a>
-    <a href="#/rules" data-nav="rules">规则</a>
-    <a href="#/analysis" data-nav="analysis">分析<span class="dot running" id="nav-job" hidden></span></a>
+  <nav class="tabs session-tabs" id="session-tabs" role="tablist" aria-label="会话视图" hidden>
+    <button type="button" role="tab" data-tab="overview" title="概览（快捷键 1）">概览</button>
+    <button type="button" role="tab" data-tab="requests" title="请求（快捷键 2）">请求<span class="badge" id="count-requests"></span></button>
+    <button type="button" role="tab" data-tab="alerts" title="告警（快捷键 3）">告警<span class="badge alert" id="count-alerts"></span></button>
   </nav>
-  <nav class="crumb" id="crumb" aria-label="当前会话" hidden></nav>
   <div class="spacer"></div>
+  <button type="button" id="session-analyze" hidden aria-haspopup="dialog" title="用内置或自定义规则分析当前会话"><span class="dot running" id="nav-job" hidden></span>分析</button>
   <span class="live" id="live" hidden></span>
   <button type="button" class="ghost" id="pause" hidden title="暂停或恢复自动刷新（空格）">暂停</button>
   <button type="button" class="ghost" id="tz" title="切换时间显示的时区"></button>
@@ -26,6 +26,11 @@
 </header>
 <div class="banner" id="banner" role="status" hidden></div>
 
+<div class="workspace">
+  <nav class="sidebar" id="mainnav" aria-label="主导航" hidden>
+    <a href="#/" data-nav="sessions">会话</a>
+    <a href="#/rules" data-nav="rules" id="session-rules">会话规则</a>
+  </nav>
 <main>
   <section id="view-gate" class="gate" hidden>
     <form id="gate-form">
@@ -52,13 +57,9 @@
   </section>
 
   <section id="view-session" class="session" hidden>
-    <nav class="tabs" role="tablist">
-      <button type="button" role="tab" data-tab="overview" title="概览（快捷键 1）">概览</button>
-      <button type="button" role="tab" data-tab="requests" title="请求（快捷键 2）">请求<span class="badge" id="count-requests"></span></button>
-      <button type="button" role="tab" data-tab="alerts" title="告警（快捷键 3）">告警<span class="badge alert" id="count-alerts"></span></button>
-      <span class="spacer"></span>
-      <a class="tab-action" id="session-analyze" title="用内置或自定义规则重新分析这个会话">重新分析</a>
-    </nav>
+    <div class="session-context">
+      <nav class="crumb" id="crumb" aria-label="当前会话"></nav>
+    </div>
 
     <div id="tab-overview" class="overview" hidden>
       <div class="page">
@@ -173,27 +174,29 @@
         </div>
         <div class="splitter" id="splitter" role="separator" aria-orientation="vertical" title="拖动调整宽度" hidden></div>
         <aside class="detail" id="detail" hidden>
+          <div class="detail-tabs">
+            <nav class="tabs small" role="tablist" id="detail-tabs" aria-label="报文视图"></nav>
+            <div class="detail-tools">
+              <button type="button" class="ghost" id="decode-selection" title="解码选中的文本，未选中时解码 URL（d）" hidden>解码 URL</button>
+              <label class="check" id="pretty-wrap"><input type="checkbox" id="pretty" checked>格式化正文</label>
+              <button type="button" class="ghost" id="detail-copy">复制</button>
+            </div>
+          </div>
           <header class="detail-head">
             <div class="detail-line">
               <span id="detail-pills"></span>
-              <span class="spacer"></span>
-              <button type="button" class="ghost icon" id="detail-prev" title="上一条（k）" aria-label="上一条">↑</button>
-              <button type="button" class="ghost icon" id="detail-next" title="下一条（j）" aria-label="下一条">↓</button>
-              <a class="button" id="detail-test" title="在规则页用这条请求测试规则">测试规则</a>
-              <button type="button" id="detail-curl" title="复制为 cURL 命令">复制 cURL</button>
-              <button type="button" id="detail-export" title="下载请求、响应与关联网络包">导出证据</button>
+              <div class="detail-actions">
+                <button type="button" class="ghost icon" id="detail-prev" title="上一条（k）" aria-label="上一条">↑</button>
+                <button type="button" class="ghost icon" id="detail-next" title="下一条（j）" aria-label="下一条">↓</button>
+                <a class="button" id="detail-test" title="在规则页用这条请求测试规则">测试规则</a>
+                <button type="button" id="detail-curl" title="复制为 cURL 命令">复制 cURL</button>
+                <button type="button" id="detail-export" title="下载请求、响应与关联网络包">导出证据</button>
+              </div>
               <button type="button" class="ghost icon" id="detail-close" title="关闭（Esc）" aria-label="关闭详情">✕</button>
             </div>
             <div class="detail-url" id="detail-url"></div>
           </header>
           <dl class="meta" id="detail-meta"></dl>
-          <div class="detail-tabs">
-            <nav class="tabs small" role="tablist" id="detail-tabs"></nav>
-            <span class="spacer"></span>
-            <button type="button" class="ghost" id="decode-selection" title="解码选中的文本，未选中时解码 URL（d）" hidden>解码 URL</button>
-            <label class="check" id="pretty-wrap"><input type="checkbox" id="pretty" checked>格式化正文</label>
-            <button type="button" class="ghost" id="detail-copy">复制</button>
-          </div>
           <div class="detail-body" id="detail-body" tabindex="-1"></div>
         </aside>
       </div>
@@ -219,7 +222,7 @@
         <span class="spacer"></span>
         <button type="button" id="rules-validate" title="校验（Ctrl+Enter）">校验</button>
         <button type="button" class="primary" id="rules-save" title="保存（Ctrl+S）">保存</button>
-        <a class="button" id="rules-analyze" title="带着这份规则去选择会话">用此规则分析</a>
+        <a class="button" id="rules-analyze" title="使用这份规则分析参照会话">用此规则分析</a>
         <button type="button" id="rules-download">下载</button>
         <button type="button" class="danger" id="rules-delete">删除</button>
       </header>
@@ -287,39 +290,30 @@
     </section>
   </section>
 
-  <section id="view-analysis" class="analysis-view" hidden>
-    <div class="page">
-      <div class="section-head">
-        <div>
-          <h1>分析</h1>
-          <p class="muted">在本地重新还原 TCP/HTTP 并匹配规则。原始流量只读，分析成功后替换该会话上次的告警结果；中途停止会保留上次完整结果。</p>
-        </div>
-      </div>
-      <section class="card job" id="job-card"></section>
-      <section class="card">
-        <header class="card-head wrap">
-          <h2>选择会话</h2>
-          <span class="spacer"></span>
-          <label class="inline">规则<select id="analysis-rule" aria-label="选择分析规则"></select></label>
-          <input type="search" id="analysis-search" placeholder="按名称、主机或目录查找" spellcheck="false" aria-label="查找会话">
-        </header>
-        <div class="table-wrap"><table class="data analysis-table">
-          <thead><tr><th>会话</th><th class="extra">主机</th><th>状态</th><th class="num">请求</th><th class="num">告警</th><th class="extra">开始</th><th></th></tr></thead>
-          <tbody id="analysis-sessions"></tbody>
-        </table></div>
-        <div class="blank" id="analysis-sessions-empty" hidden></div>
-      </section>
-      <section class="card">
-        <header class="card-head"><h2>最近任务</h2><span class="muted">本次服务运行期间最近 20 次</span></header>
-        <div class="table-wrap"><table class="data history-table">
-          <thead><tr><th>开始</th><th>会话</th><th>规则</th><th>结果</th><th class="num">事务</th><th class="num">告警</th><th class="num">耗时</th><th></th></tr></thead>
-          <tbody id="analysis-history"></tbody>
-        </table></div>
-        <div class="blank" id="analysis-history-empty" hidden>还没有分析任务。</div>
-      </section>
-    </div>
-  </section>
 </main>
+</div>
+
+<dialog id="session-analysis" aria-labelledby="analysis-title">
+  <header><h1 id="analysis-title">分析会话</h1><button type="button" class="ghost icon" id="analysis-close" aria-label="关闭分析">✕</button></header>
+  <div class="analysis-content">
+    <p class="analysis-session" id="analysis-session"></p>
+    <p class="muted">分析成功后更新当前会话的告警。停止分析会保留上次完整结果。</p>
+    <div class="analysis-controls">
+      <label class="inline">规则<select id="analysis-rule" aria-label="选择分析规则"></select></label>
+      <button type="button" class="primary" id="analysis-start">开始分析</button>
+    </div>
+    <p class="muted" id="analysis-status" role="status" hidden></p>
+    <p class="analysis-error" id="analysis-error" role="alert" hidden></p>
+    <section class="card job" id="job-card" hidden></section>
+    <section class="card" id="analysis-history-card" hidden>
+      <div class="card-head"><h2>此会话的最近任务</h2></div>
+      <div class="table-wrap"><table class="data history-table">
+        <thead><tr><th>开始</th><th>规则</th><th>结果</th><th class="num">事务</th><th class="num">告警</th><th class="num">耗时</th></tr></thead>
+        <tbody id="analysis-history"></tbody>
+      </table></div>
+    </section>
+  </div>
+</dialog>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
 

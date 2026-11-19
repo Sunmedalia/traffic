@@ -2,32 +2,21 @@
 
 // Rule file management and read-only rule testing (#/rules).
 
-// ---- managed rules and local analysis ----
-// Both are routed pages (#/rules, #/analysis) rather than overlays, so they can be
-// linked, reloaded and used side by side with a session in another tab.
 const ruleUI = { files: [], builtins: [], dir: '', loaded: false, selected: null, revision: '', dirty: false, busy: false, seq: 0, hash: '', parsed: null, checkSeq: 0, checking: 0, ptab: saved('rules-ptab', 'rules'), sid: saved('rules-session', ''), hits: null, hitsSeq: 0 };
 // The rule test reruns on every edit once a sample is chosen, like a regex playground.
 const testUI = { source: saved('test-source', 'session'), sample: null, seq: 0, picksSeq: 0, picking: 0, result: null, error: '' };
 const TEST_REQUEST = 'GET /index.php?id=1%20union%20select%201,2 HTTP/1.1\nHost: example.com\nUser-Agent: sqlmap/1.7\n\n';
-const jobUI = { job: null, history: [], poll: 0, completed: '', page: null };
 const RULE_TEMPLATE = '- id: CUSTOM-001\n  version: 1\n  severity: medium\n  field: url\n  pattern: \'(?i)/suspicious-endpoint\'\n';
 const NEW_RULE = '~new';
 const ruleHash = (name) => (name === NEW_RULE ? '#/rules/' + NEW_RULE : name ? '#/rules/' + encodeURIComponent(name) : '#/rules');
 
-function parsePage() {
-  let match = /^#\/rules(?:\/([^?]+))?(?:\?(.*))?$/.exec(location.hash);
-  if (match) {
-    let name = '';
-    try { name = match[1] ? decodeURIComponent(match[1]) : ''; } catch (_) { /* malformed link opens the built-in rules */ }
-    const params = new URLSearchParams(match[2] || '');
-    return { view: 'rules', name, sid: params.get('sid') || '', rid: params.get('rid') || '' };
-  }
-  match = /^#\/analysis(?:\?(.*))?$/.exec(location.hash);
-  if (match) {
-    const params = new URLSearchParams(match[1] || '');
-    return { view: 'analysis', session: params.get('session') || '', rules: params.get('rules') || '' };
-  }
-  return null;
+function parseRulesPage() {
+  const match = /^#\/rules(?:\/([^?]+))?(?:\?(.*))?$/.exec(location.hash);
+  if (!match) return null;
+  let name = '';
+  try { name = match[1] ? decodeURIComponent(match[1]) : ''; } catch (_) { /* malformed link opens the built-in rules */ }
+  const params = new URLSearchParams(match[2] || '');
+  return { name, sid: params.get('sid') || '', rid: params.get('rid') || '' };
 }
 
 function ruleMessage(text, kind = '') {
@@ -47,12 +36,13 @@ function updateRuleControls() {
   $('rules-delete').disabled = ruleUI.busy || !ruleUI.revision;
   $('rules-content').readOnly = builtin || ruleUI.busy;
   $('rules-name').readOnly = !fresh || ruleUI.busy;
-  const ready = builtin || (ruleUI.revision && !ruleUI.dirty);
+  const ready = Boolean(ruleUI.sid && !ruleUI.busy && (builtin || (ruleUI.revision && !ruleUI.dirty)));
   const analyze = $('rules-analyze');
   analyze.classList.toggle('disabled', !ready);
   analyze.setAttribute('aria-disabled', String(!ready));
-  analyze.title = ready ? '带着这份规则去选择会话' : '先保存文件，再用它分析';
-  analyze.href = ready ? '#/analysis' + (builtin ? '' : '?rules=' + encodeURIComponent(ruleUI.selected)) : '';
+  analyze.title = ready ? '使用这份规则分析参照会话' : !ruleUI.sid ? '请选择参照会话' : '先保存文件，再用它分析';
+  if (ready) analyze.href = analysisHref(ruleUI.sid, ruleUI.selected);
+  else analyze.removeAttribute('href');
   const tag = $('rules-state');
   const [label, tone] = builtin ? ['内置 · 只读', ''] : ruleUI.dirty ? ['未保存', 'warn'] : fresh ? ['新文件', 'warn'] : ['已保存', 'ok'];
   tag.textContent = label;
@@ -126,13 +116,13 @@ function renderHitsMeta() {
   if (data.error) return set(node, h('span', { class: 'error' }, '无法统计命中：' + data.error));
   const ids = new Set((ruleUI.parsed || []).map((rule) => rule.id));
   const fired = data.hits.filter((hit) => ids.has(hit.rule)).length;
-  const reanalyze = '#/analysis?session=' + ruleUI.sid + (ruleUI.selected ? '&rules=' + encodeURIComponent(ruleUI.selected) : '');
+  const ready = ruleUI.selected === '' || (ruleUI.revision && !ruleUI.dirty);
   set(node,
     h('span', {}, `${sessionName(ruleUI.sid)} · ${number(data.alerted)} / ${number(data.total)} 条请求有告警 · 本文件 ${fired} / ${ids.size} 条规则有命中`),
     data.completed ? h('span', { class: 'muted' }, ' · 分析于 ' + formatTime(data.completed, 'dayclock')) : null,
     !data.analyzed ? h('span', { class: 'muted' }, ' · 旧版索引，未记录分析规则') : null,
     data.note ? h('span', { class: 'warn' }, ' · ' + data.note) : null,
-    h('a', { class: 'link', href: reanalyze }, ' 重新分析'));
+    ready ? h('a', { class: 'link', href: analysisHref(ruleUI.sid, ruleUI.selected) }, ' 重新分析') : null);
 }
 
 async function loadRuleHits(force) {
@@ -160,6 +150,7 @@ function renderRuleSessions() {
   if (!ruleUI.sid && usable.length) ruleUI.sid = usable[0].id;
   set(select, h('option', { value: '' }, usable.length ? '不选择' : '没有可用会话'), usable.map((s) => h('option', { value: s.id }, `${s.name}${s.host ? ' · ' + s.host : ''}`)));
   select.value = ruleUI.sid;
+  updateRuleControls();
 }
 
 function builtinYAML() {
@@ -445,16 +436,20 @@ function chooseTestSample(sample) {
 
 async function routeRules(page) {
   const name = page.name;
+  const hash = page.sid || name === NEW_RULE ? ruleHash(name) : location.hash;
+  if (page.sid) {
+    history.replaceState(null, '', hash);
+    ruleUI.sid = page.sid;
+    save('rules-session', page.sid);
+  }
   renderRuleSessions();
   setPreviewTab(page.rid ? 'test' : ruleUI.ptab);
   // Keep unsaved work when the route already points at it (reload of the same hash, back to it).
   if (ruleUI.dirty && location.hash.split('?')[0] === ruleUI.hash) updateRuleControls();
   else if (name === NEW_RULE) newRuleFile();
   else await openRuleFile(name);
+  if (location.hash !== hash) return;
   if (page.sid && page.rid) {
-    ruleUI.sid = page.sid;
-    save('rules-session', page.sid);
-    if (location.hash !== ruleUI.hash) history.replaceState(null, '', ruleUI.hash);
     setTestSource('session');
     chooseTestSample({ source: 'session', sid: page.sid, rid: page.rid });
   }
@@ -524,6 +519,7 @@ function bindRules() {
   $('rules-session').addEventListener('change', () => {
     ruleUI.sid = $('rules-session').value;
     save('rules-session', ruleUI.sid);
+    updateRuleControls();
     loadRuleHits();
     if (testUI.source === 'session') loadTestPicks();
   });
@@ -539,19 +535,6 @@ function bindRules() {
       if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); chooseTestSample({ source: 'manual' }); }
     });
   }
-
-  $('analysis-search').addEventListener('input', renderAnalysisSessions);
-  $('analysis-rule').addEventListener('change', () => { save('analysis-rule', $('analysis-rule').value); renderAnalysisSessions(); });
-  $('analysis-sessions').addEventListener('click', (event) => {
-    const button = event.target.closest('button[data-analyze]');
-    if (button) startRuleAnalysis(button.dataset.analyze);
-  });
-  $('job-card').addEventListener('click', async (event) => {
-    if (!event.target.closest('#job-cancel')) return;
-    event.target.disabled = true;
-    try { await mutate('analysis', 'DELETE', { id: jobUI.job.id }); toast('正在停止分析，等待当前操作结束'); }
-    catch (error) { toast(error.message, true); }
-  });
 }
 
 // A hash change that would leave unsaved rule edits asks first and otherwise restores the editor's URL.

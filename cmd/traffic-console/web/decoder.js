@@ -280,6 +280,8 @@ function renderDetail() {
   const body = $('detail-body');
   const controls = ['detail-curl', 'detail-export', 'detail-copy', 'pretty'];
   if (!data) {
+    $('detail-test').removeAttribute('href');
+    $('decode-selection').hidden = $('pretty-wrap').hidden = $('detail-copy').hidden = true;
     for (const id of controls) $(id).disabled = true;
     set($('detail-pills'), state.detailError ? '无法显示' : '正在加载…');
     set($('detail-url'));
@@ -329,20 +331,23 @@ function renderDetail() {
   $('decode-selection').hidden = tab === 'decoder' || tab === 'alerts';
   $('detail-copy').hidden = tab === 'alerts';
 
+  const showMessages = tab === 'request' || tab === 'response';
+  $('detail-copy').textContent = showMessages ? (tab === 'request' ? '复制请求' : '复制响应') : '复制';
   const scroll = body.scrollTop;
-  if (tab === 'request') {
-    if (!data.request_text) set(body, h('p', { class: 'hint' }, '没有保存请求内容。'));
-    else {
-      const message = splitHttp(data.request_text);
-      const query = (t.url || '').split('#')[0].split(/\?(.*)/s)[1] || '';
-      const form = /x-www-form-urlencoded/i.test(headerValue(message, 'content-type')) ? rawPairs(message.body, '&') : [];
-      const cookies = rawPairs(headerValue(message, 'cookie') || '', /;\s*/);
-      set(body, ...[paramsBlock('查询参数（原文）', rawPairs(query, '&'), needles, '查询参数'), paramsBlock('表单参数（原文）', form, needles, '表单参数'),
-        paramsBlock('Cookie（原文）', cookies, needles, 'Cookie'), httpView(data.request_text, needles)].filter(Boolean));
-    }
-  } else if (tab === 'response') {
-    set(body, data.response_text ? httpView(data.response_text, [])
-      : h('p', { class: 'hint' }, t.status ? '没有保存响应内容。' : '还没有采集到响应。会话仍在采集时，响应到达后会自动出现。'));
+  const messageScroll = Array.from(body.querySelectorAll('.message-pane'), (pane) => pane.scrollTop);
+  if (showMessages) {
+    const request = data.request_text ? splitHttp(data.request_text) : null;
+    const form = request && /x-www-form-urlencoded/i.test(headerValue(request, 'content-type')) ? rawPairs(request.body, '&') : [];
+    const cookies = request ? rawPairs(headerValue(request, 'cookie'), /;\s*/) : [];
+    const pane = (key, title, ...content) => h('section', { class: 'message-pane', 'data-active': String(tab === key), 'aria-label': title },
+      h('h3', { class: 'message-label' }, title), content);
+    set(body, h('div', { class: 'message-pair' },
+      pane('request', '请求',
+        request ? [httpView(data.request_text, needles), paramsBlock('表单参数（原文）', form, needles, '表单参数'),
+          paramsBlock('Cookie（原文）', cookies, needles, 'Cookie')] : h('p', { class: 'hint' }, '没有保存请求内容。')),
+      pane('response', '响应', data.response_text ? httpView(data.response_text, [])
+        : h('p', { class: 'hint' }, t.status ? '没有保存响应内容。' : '还没有采集到响应。会话仍在采集时，响应到达后会自动出现。'))));
+    body.querySelectorAll('.message-pane').forEach((pane, i) => { pane.scrollTop = messageScroll[i] || 0; });
   } else if (tab === 'decoder') {
     set(body, renderDecoder(data, needles));
   } else if (tab === 'decoded') {
