@@ -40,5 +40,26 @@
         "bytes": "b804000000e8f655"
       }
     }
+  },
+  {
+    "module": "nginx.exe",
+    "arch": "x64",
+    "version": "iliweii/nginx-rtmp-win64 1.28.1 Windows",
+    "source": "https://raw.githubusercontent.com/iliweii/nginx-rtmp-win64/8e9a9c842da0edff6d5ab36069e478cbfef8c2f7/nginx.exe",
+    "sha256": "fc0710cc3275d32df0e056a58e4d04b95ad13edb89b68bafaa9c218ade194996",
+    "functions": {
+      "SSL_read": {
+        "rva": 913408,
+        "bytes": "56534883ec784889d34585c0"
+      },
+      "SSL_write": {
+        "rva": 915120,
+        "bytes": "5756534883c4804889cb4889d6"
+      },
+      "SSL_get_fd": {
+        "rva": 910752,
+        "bytes": "4883ec38ba00010000488b4910"
+      }
+    }
   }
 ]
