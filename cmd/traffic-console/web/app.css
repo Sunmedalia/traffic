@@ -573,11 +573,7 @@ button.danger { color: var(--high); }
   .top { flex-wrap: wrap; padding: 7px 10px; gap: 2px; }
   .session-tabs button { padding-inline: 7px; }
   .workspace { flex-direction: column; }
-  .sidebar-toggle { display: inline-grid; place-items: center; }
-.sidebar-icon { display: block; position: relative; width: 15px; height: 13px; border: 1px solid currentColor; border-radius: 2px; }
-.sidebar-icon::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 4px; border-right: 1px solid currentColor; }
-.sidebar-toggle[aria-expanded="true"] .sidebar-icon::before { background: var(--faint); }
-.sidebar { flex: none; flex-direction: row; padding: 4px 10px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .sidebar { flex: none; flex-direction: row; padding: 4px 10px; border-right: 0; border-bottom: 1px solid var(--line); }
   .sidebar a { padding: 3px 8px; }
   .brand { letter-spacing: .12em; margin-right: 6px; }
   .search kbd, #tz, #theme, .crumb .host, .crumb .sep.h, .crumb .started { display: none; }
