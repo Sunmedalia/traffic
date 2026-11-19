@@ -8,7 +8,7 @@
 async function tick() {
   if (!state.token || document.hidden) return;
   if (!state.sid) {
-    if (!$('view-sessions').hidden || !$('view-analysis').hidden) await loadSessions();
+    if (!$('view-sessions').hidden) await loadSessions();
     return;
   }
   if (state.paused || state.busy) return;
@@ -52,6 +52,13 @@ function bind() {
     state.error = '';
     renderBanner();
     route();
+    pollAnalysisJob();
+  });
+  $('sidebar-toggle').addEventListener('click', () => {
+    state.sidebarCollapsed = !state.sidebarCollapsed;
+    save('sidebar-collapsed', state.sidebarCollapsed ? '1' : '0');
+    renderSidebar();
+    if (state.sid) renderTimelines();
   });
   $('rescan').addEventListener('click', () => loadSessions(true));
   $('sessions-search').addEventListener('input', renderSessions);
@@ -121,11 +128,11 @@ function bind() {
   $('page-first').addEventListener('click', () => changePage(0));
   $('page-prev').addEventListener('click', () => changePage(state.page - 1));
   $('page-next').addEventListener('click', () => changePage(state.page + 1));
+  $('detail-meta-toggle').addEventListener('click', () => setDetailMetaExpanded($('detail-record').hidden));
   $('detail-close').addEventListener('click', () => go({ id: null }, true));
   $('detail-prev').addEventListener('click', () => moveSelection(-1));
   $('detail-next').addEventListener('click', () => moveSelection(1));
   $('detail-export').addEventListener('click', exportEvidence);
-  $('detail-curl').addEventListener('click', () => state.detail && copyText(curlCommand(state.detail), ' cURL 命令'));
   $('detail-copy').addEventListener('click', () => copyText(detailText() || '', '当前内容'));
   $('decode-selection').addEventListener('mousedown', (event) => event.preventDefault());
   $('decode-selection').addEventListener('click', decodeSelection);
@@ -166,6 +173,15 @@ function bind() {
     save('detail-width', '');
   });
 
+  // Keep the selected view and copy action in sync when the panes become a pair.
+  let showingMessagePair = false;
+  new ResizeObserver(() => {
+    const pair = detailShowsMessagePair();
+    if (pair === showingMessagePair) return;
+    showingMessagePair = pair;
+    if (!$('detail').hidden && state.detail) renderDetail();
+  }).observe($('detail'));
+
   let resizing = 0;
   window.addEventListener('resize', () => {
     clearTimeout(resizing);
@@ -184,7 +200,7 @@ function togglePause() {
 }
 
 function onKey(event) {
-  if (event.ctrlKey || event.metaKey || event.altKey || $('help').open) return;
+  if (event.ctrlKey || event.metaKey || event.altKey || $('help').open || $('session-analysis').open) return;
   const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(event.target.tagName);
   if (event.key === 'Escape') {
     if (typing) event.target.blur();
@@ -198,7 +214,7 @@ function onKey(event) {
   }
   if (!state.sid) {
     if (event.key === '/') {
-      const search = !$('view-rules').hidden ? 'rules-search' : !$('view-analysis').hidden ? 'analysis-search' : 'sessions-search';
+      const search = !$('view-rules').hidden ? 'rules-search' : 'sessions-search';
       $(search).focus();
       event.preventDefault();
     }
@@ -233,6 +249,7 @@ async function boot() {
   applyTheme();
   bind();
   bindRules();
+  bindAnalysis();
   // The launch URL carries the token in the fragment so it never reaches server logs.
   const launch = /^#token=([\w-]+)$/.exec(location.hash);
   try {
@@ -251,7 +268,7 @@ async function boot() {
     history.replaceState(null, '', `#/s/${usable[0].id}/overview`);
   }
   route();
-  if (state.token && $('view-analysis').hidden) pollAnalysisJob();
+  pollAnalysisJob();
 }
 
 boot();

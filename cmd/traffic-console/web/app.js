@@ -73,7 +73,8 @@ const state = {
   selected: null,
   detail: null,
   detailError: '',
-  detailTab: saved('detail-tab', 'request'),
+  detailTab: 'request',
+  sidebarCollapsed: saved('sidebar-collapsed', '0') === '1',
   pretty: saved('pretty', '1') === '1',
   paused: false,
   utc: saved('tz', 'local') === 'utc',
@@ -261,7 +262,7 @@ function parseHash() {
     const value = (params.get(key) || '').trim();
     if (value) filter[key] = value;
   }
-  return { sid: match[1], tab: match[2] || 'overview', filter, id: params.get('id') || null };
+  return { sid: match[1], tab: match[2] || 'overview', filter, id: params.get('id') || null, analysis: params.get('analysis') };
 }
 
 function buildHash(route) {
@@ -289,10 +290,12 @@ function go(patch, replace) {
 }
 
 function show(view) {
-  for (const name of ['gate', 'sessions', 'session', 'rules', 'analysis']) $('view-' + name).hidden = name !== view;
-  $('live').hidden = view !== 'session';
+  for (const name of ['gate', 'sessions', 'session', 'rules']) $('view-' + name).hidden = name !== view;
+  $('session-tabs').hidden = $('session-analyze').hidden = $('live').hidden = view !== 'session';
+  if (view !== 'session') $('session-analysis').close();
   if (view !== 'session') $('pause').hidden = true;
-  $('mainnav').hidden = view === 'gate';
+  $('sidebar-toggle').hidden = view === 'gate';
+  renderSidebar();
   const section = view === 'session' ? 'sessions' : view;
   for (const link of document.querySelectorAll('[data-nav]')) {
     if (link.dataset.nav === section) link.setAttribute('aria-current', 'page');
@@ -322,14 +325,19 @@ function leaveSession() {
 function route() {
   if (!state.token) return showGate();
   if (!guardRuleEdits()) return;
-  const page = parsePage();
+  const legacy = /^#\/analysis(?:\?(.*))?$/.exec(location.hash);
+  if (legacy) {
+    const params = new URLSearchParams(legacy[1]);
+    const sid = params.get('session');
+    history.replaceState(null, '', /^[0-9a-f]+$/.test(sid || '') ? analysisHref(sid, params.get('rules') || '') : '#/');
+  }
+  const page = parseRulesPage();
   if (page) {
     if (state.sid) leaveSession();
-    show(page.view);
+    show('rules');
     renderChrome();
     renderBanner();
-    if (page.view === 'rules') routeRules(page);
-    else routeAnalysis(page);
+    routeRules(page);
     schedule();
     return;
   }
@@ -344,6 +352,7 @@ function route() {
     return;
   }
   if (next.sid !== state.sid) {
+    $('session-analysis').close();
     Object.assign(state, { sid: next.sid, stats: null, summary: null, recent: [], timelines: {}, dir: '', warning: '', error: '', auxAt: 0, summaryAt: 0 });
     closeDetail();
     renderBanner();
@@ -371,22 +380,34 @@ function route() {
     showDetail(next.id);
   }
   if (!currentSession()) loadSessions().then(renderChrome);
+  if (next.analysis !== null) {
+    history.replaceState(null, '', buildHash(next));
+    openAnalysis(next.analysis);
+  }
   schedule();
 }
 
 // ---- chrome ----
 
+function renderSidebar() {
+  const button = $('sidebar-toggle');
+  const expanded = !state.sidebarCollapsed;
+  $('mainnav').hidden = button.hidden || !expanded;
+  button.setAttribute('aria-expanded', String(expanded));
+  const label = expanded ? '收起侧边栏' : '展开侧边栏';
+  button.setAttribute('aria-label', label);
+  button.title = label;
+}
+
 const currentSession = () => state.sessions.find((s) => s.id === state.sid);
 
 function renderChrome() {
   const session = currentSession();
-  if (state.sid) $('session-analyze').href = `#/analysis?session=${state.sid}`;
+  if (state.sid) $('session-rules').href = `#/rules?sid=${state.sid}`;
+  else if ($('view-rules').hidden) $('session-rules').href = '#/rules';
+  renderAnalysis();
   const crumb = $('crumb');
   if (state.sid && state.token) {
-    // The main navigation already links back to the session list, so the
-    // breadcrumb only identifies the open session: host, name and start
-    // time. Several sessions share default names such as "capture", so the
-    // start time is what tells them apart.
     const started = session && session.started ? formatTime(session.started) : '';
     crumb.hidden = false;
     set(crumb,
@@ -397,7 +418,7 @@ function renderChrome() {
   } else {
     crumb.hidden = true;
     set(crumb);
-    const page = !$('view-rules').hidden ? '规则' : !$('view-analysis').hidden ? '分析' : '';
+    const page = !$('view-rules').hidden ? '会话规则' : '';
     document.title = page ? `${page} · Traffic` : 'Traffic 流量分析';
   }
   for (const button of document.querySelectorAll('[data-tab]')) {
@@ -439,7 +460,7 @@ async function loadSessions(force) {
       renderBanner();
     }
     renderSessions();
-    renderAnalysisSessions();
+    renderAnalysis();
     return true;
   } catch (error) {
     if (!state.sid) fail(error, '扫描会话失败');
@@ -922,6 +943,8 @@ async function showDetail(id, quiet) {
   if (!quiet) {
     state.selected = id;
     state.detailError = '';
+    state.detailTab = 'request';
+    setDetailMetaExpanded(false);
     if (state.detail && state.detail.transaction.id !== id) state.detail = null;
     $('detail').hidden = $('splitter').hidden = false;
     $('split').classList.add('open');
@@ -995,6 +1018,5 @@ function paramsBlock(title, list, needles, prefix) {
     h('dt', {}, name),
     h('dd', {}, h('span', { class: 'value' }, marked(value, needles)),
       h('span', { class: 'acts' },
-        value ? h('button', { type: 'button', class: 'mini', title: '在解码工具中打开这个值', onclick: () => openDecoder(`${prefix} ${name}`, value) }, '解码') : null,
-        prefix === '查询参数' ? h('button', { type: 'button', class: 'mini', title: '筛选带这个参数的请求', onclick: () => setFilter({ param: name }) }, '筛选') : null))])));
+        value ? h('button', { type: 'button', class: 'mini', title: '在解码工具中打开这个值', onclick: () => openDecoder(`${prefix} ${name}`, value) }, '解码') : null))])));
 }
