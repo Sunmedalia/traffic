@@ -40,10 +40,23 @@ func TestReceiveHookDoesNotProveRecordedPlaintext(t *testing.T) {
 	}
 	s.fatal = nil
 	s.stats.Errors = nil
+	s.iisPlaintext = true
 	s.stats.PlaintextObserved = true
 	finishIISObservability(s, true)
 	if s.fatal != nil {
 		t.Fatal(s.fatal)
+	}
+}
+
+func TestNginxPlaintextDoesNotSatisfyIISRequirement(t *testing.T) {
+	s := &Store{iisAttached: true, stats: session.Stats{PlaintextObserved: true}}
+	applyIISProbeSummary(s, map[string]any{"send_matches": 3, "unmatched_completions": 10})
+	if !s.stats.AttachWindowSuspect {
+		t.Fatal("nginx plaintext masked the IIS attach window")
+	}
+	finishIISObservability(s, true)
+	if s.fatal == nil || !strings.Contains(s.fatal.Error(), "--require-plaintext") {
+		t.Fatalf("nginx plaintext satisfied the IIS request requirement: %v", s.fatal)
 	}
 }
 

@@ -399,6 +399,7 @@ func (r *eventRecorder) iis(source string, target session.Target, event iisEvent
 	}
 	if accepted && event.Type == "request" {
 		r.store.mu.Lock()
+		r.store.iisPlaintext = true
 		r.store.stats.PlaintextObserved = true
 		r.store.stats.AttachWindowSuspect = false
 		r.store.mu.Unlock()
