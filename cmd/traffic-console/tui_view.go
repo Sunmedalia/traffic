@@ -618,18 +618,18 @@ func (m tuiModel) listView(width, height int) string {
 	if pages > 1 {
 		prev, next := tuiMuted.Render("‹ 上一页"), tuiMuted.Render("下一页 ›")
 		if m.page > 0 {
-			prev = tuiHit("key:p", tuiAccent.UnsetBold().Render("‹ 上一页"))
+			prev = tuiHit("page:prev", tuiAccent.UnsetBold().Render("‹ 上一页"))
 		}
 		if m.page+1 < pages {
-			next = tuiHit("key:n", tuiAccent.UnsetBold().Render("下一页 ›"))
+			next = tuiHit("page:next", tuiAccent.UnsetBold().Render("下一页 ›"))
 		}
 		pager += "  " + prev + "  " + next
 	}
 	if !m.following() && !m.paused {
 		if m.page == 0 && m.snapshot.Newer > 0 {
-			pager += tuiMuted.Render(" · ") + tuiHit("key:g", tuiAccent.Render(fmt.Sprintf("↑ 新增 %s 条，按 g 回到最新", tuiCount(uint64(m.snapshot.Newer)))))
+			pager += tuiMuted.Render(" · ") + tuiHit("page:newest", tuiAccent.Render(fmt.Sprintf("↑ 新增 %s 条，按 g 回到最新", tuiCount(uint64(m.snapshot.Newer)))))
 		} else if m.page > 0 {
-			pager += tuiMuted.Render(" · ") + tuiHit("key:g", tuiMuted.Render("按 g 回到最新"))
+			pager += tuiMuted.Render(" · ") + tuiHit("page:newest", tuiMuted.Render("按 g 回到最新"))
 		}
 	}
 	lines = append(lines, termansi.Truncate(pager, width, "…"))
@@ -891,7 +891,9 @@ const tuiHelpText = `快捷键（与网页版一致的键位优先）
         空格 暂停或恢复    r 立即刷新    z 切换本地时间 / UTC
 鼠标    点击页面、标签、行、筛选条件和底部快捷键    滚轮滚动    右键返回上一层
         列表右侧滚动条可拖动，点击滚动条空白处翻到该位置
-        概览中单击显示简要信息，双击进入；时间线拖动或单击选中，双击选中处查看
+        单击列表行在右侧打开详情，再单击同一行收起；拖动列表与详情间的分隔线调整宽度，双击分隔线恢复各占一半
+        页脚「‹ 上一页」「下一页 ›」在打开详情时也可翻页，详情保持不变
+        概览中单击显示简要信息，再点一次同一行进入；时间线拖动或单击选中，再点一次选中处查看
         列表时间线拖动后直接筛选，单击选中一格，再点一次查看
         点击筛选条件可去掉该条件    M 关闭或开启鼠标（关闭后可用终端直接选取文字）
 退出    q 或 Ctrl+C`
@@ -923,7 +925,12 @@ func (m tuiModel) render() string {
 		content = m.export.view()
 	case m.split():
 		listWidth := m.listWidth()
-		content = lipgloss.JoinHorizontal(lipgloss.Top, lipgloss.NewStyle().Width(listWidth).Render(m.listView(listWidth-1, contentHeight)), tuiMuted.Render(strings.TrimSuffix(strings.Repeat(" │ \n", contentHeight), "\n")), m.viewport.View())
+		// The divider can be dragged to change the widths.
+		divider := tuiHit("divider", " │ ")
+		if m.splitDrag {
+			divider = tuiHit("divider", tuiAccent.Render(" ┃ "))
+		}
+		content = lipgloss.JoinHorizontal(lipgloss.Top, lipgloss.NewStyle().Width(listWidth).Render(m.listView(listWidth-1, contentHeight)), tuiMuted.Render(strings.TrimSuffix(strings.Repeat(divider+"\n", contentHeight), "\n")), m.viewport.View())
 	case m.tab == tabOverview && !m.details:
 		content = m.overviewView(width, contentHeight)
 	case m.tab == tabAlerts && !m.details:

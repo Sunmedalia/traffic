@@ -25,6 +25,12 @@ const (
 // Frame rows outside the content area: identity, tabs, filters, notice, keys.
 const tuiChrome = 5
 
+// The narrowest list and detail a dragged divider leaves.
+const (
+	tuiMinList   = 30
+	tuiMinDetail = 50
+)
+
 type tuiTick time.Time
 type tuiLoaded struct {
 	Version     uint64
@@ -102,7 +108,10 @@ type tuiModel struct {
 	scrollDrag                           *tuiScrollDrag
 	lastClick                            string // zone of the last click, for double clicks
 	lastClickAt                          time.Time
+	armed                                string // overview zone whose summary a click showed; clicking it again opens it
 	msgLayout, listShare                 int
+	listRatio                            int  // list width in per mille after a divider drag; 0 follows listShare
+	splitDrag                            bool // the divider between list and detail is held
 	paramSelected                        int
 	detailID, errorText, flash           string
 	alertView                            int
@@ -246,6 +255,10 @@ func (m tuiModel) split() bool        { return m.details && m.width >= 120 && m.
 
 // listWidth is the list's share of a split detail: half, then a third.
 func (m tuiModel) listWidth() int {
+	if m.listRatio > 0 {
+		// A dragged divider keeps its proportion, leaving both sides usable.
+		return max(tuiMinList, min(m.width-tuiMinDetail-3, m.width*m.listRatio/1000))
+	}
 	if m.listShare == 1 {
 		return m.width / 3
 	}
@@ -300,6 +313,15 @@ func (m *tuiModel) closeDetail() {
 	m.snapshot.Detail = nil
 	m.snapshot.DetailMissing = false
 }
+
+// hideDetail closes the detail and returns to the list.
+func (m *tuiModel) hideDetail() tea.Cmd {
+	m.closeDetail()
+	m.listFree = false
+	m.viewport.GotoTop()
+	m.resize()
+	return m.changed()
+}
 func (m *tuiModel) applyFilter(filter tuiFilter) tea.Cmd {
 	m.drill = nil
 	m.timelineFocus, m.timelineAnchor = false, 0
@@ -340,6 +362,27 @@ func (m *tuiModel) stepDetail(step int) tea.Cmd {
 		return nil
 	}
 	m.pickDetail = true
+	return m.changed()
+}
+
+// gotoPage shows another list page. Page 0 with the cursor on the newest
+// record resumes following. Beside an open detail the list pages on its own
+// and the detail stays.
+func (m *tuiModel) gotoPage(page int) tea.Cmd {
+	if page < 0 || page > 0 && page*100 >= m.snapshot.Count {
+		return nil
+	}
+	changed := page != m.page || page == 0 && m.snapshot.Newer > 0
+	m.page, m.listTop = page, 0
+	if !m.details {
+		m.selected = 0
+	} else if changed {
+		// The open record is on another page; keep the list where it was asked to be.
+		m.selected, m.listFree = 0, true
+	}
+	if !changed {
+		return nil
+	}
 	return m.changed()
 }
 
@@ -485,6 +528,7 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	m.flash = ""
 	m.listFree = false
+	m.armed = ""
 	if key == "q" {
 		return m, tea.Quit
 	}
@@ -539,10 +583,7 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.details {
-			m.closeDetail()
-			m.viewport.GotoTop()
-			m.resize()
-			return m, m.changed()
+			return m, m.hideDetail()
 		}
 		if m.timelineFocus {
 			m.timelineFocus, m.timelineAnchor = false, 0
@@ -600,26 +641,13 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		m.selected = min(max(0, len(m.snapshot.Rows)-1), m.selected+1)
 	case "home", "g":
-		// Back to the newest record, which resumes following.
-		pageChanged := m.page != 0
-		m.page, m.selected = 0, 0
-		if pageChanged || m.snapshot.Newer > 0 {
-			return m, m.changed()
-		}
+		return m, m.gotoPage(0)
 	case "end", "G":
 		m.selected = max(0, len(m.snapshot.Rows)-1)
 	case "pgdown", "right", "n":
-		if (m.page+1)*100 < m.snapshot.Count {
-			m.page++
-			m.selected = 0
-			return m, m.changed()
-		}
+		return m, m.gotoPage(m.page + 1)
 	case "pgup", "left", "p":
-		if m.page > 0 {
-			m.page--
-			m.selected = 0
-			return m, m.changed()
-		}
+		return m, m.gotoPage(m.page - 1)
 	case "enter":
 		if len(m.snapshot.Rows) > m.selected {
 			return m, m.openDetail(m.snapshot.Rows[m.selected])
@@ -693,6 +721,7 @@ func (m *tuiModel) updateDetailKey(msg tea.KeyPressMsg) (tea.Cmd, bool) {
 			m.flash = "终端不足 120 列，详情已占满全屏"
 			return nil, true
 		}
+		m.listRatio = 0
 		if key == ">" {
 			m.listShare = min(2, m.listShare+1)
 		} else {
