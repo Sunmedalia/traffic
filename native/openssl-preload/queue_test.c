@@ -126,9 +126,14 @@ int main(void) {
 
     close(fd);
     assert(unlink(destination) == 0);
+    /* Reserve both slots before publishing "bad". The worker snapshots the
+     * queue tail when the transmission fails; a slot reserved after that
+     * snapshot is delivered normally instead of being counted as lost, so
+     * publishing first would race the worker. */
     pthread_mutex_lock(&connection_mutex[0]);
-    assert(send_event("bad", 3));
+    struct queued_event *bad = reserve();
     struct queued_event *pending = reserve();
+    publish(bad, "bad");
     pthread_mutex_unlock(&connection_mutex[0]);
     uint64_t deadline = monotonic_milliseconds() + 2000;
     int failed = 0;
@@ -166,9 +171,15 @@ int main(void) {
     assert(send_event("pre", 3));
     struct timeval poll_timeout = {0, 10000};
     assert(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &poll_timeout, sizeof(poll_timeout)) == 0);
+    /* The worker releases a slot before it sends, so an empty queue does not
+     * mean "pre" has been delivered. Wait until it is in the receive queue;
+     * shutting down earlier would discard or refuse it. */
+    char peeked[8];
     uint64_t wait_queued = monotonic_milliseconds() + 1000;
-    while (queue_length() > 0 && monotonic_milliseconds() < wait_queued)
-        usleep(1000);
+    while (recv(fd, peeked, sizeof(peeked), MSG_PEEK) <= 0 &&
+           monotonic_milliseconds() < wait_queued)
+        ;
+    assert(recv(fd, peeked, sizeof(peeked), MSG_PEEK) == 3);
     assert(shutdown(fd, SHUT_RD) == 0);
     assert(unlink(destination) == 0);
     expect_message(fd, "pre");
