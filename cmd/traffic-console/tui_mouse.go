@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	termansi "github.com/charmbracelet/x/ansi"
@@ -188,9 +189,19 @@ func tuiButton(key, label string) string {
 
 // tuiTimelineDrag follows a press on the timeline until the button is released.
 type tuiTimelineDrag struct {
-	start int
-	again bool // the press landed on the column that was already the selection
+	start  int
+	again  bool // the press landed on the column that was already the selection
+	inside bool // the press landed inside a selected span, which it keeps unless dragged
+	moved  bool
+	double bool
 }
+
+// tuiScrollDrag follows a press on the list scrollbar; grab is where the
+// thumb was taken, counted from its top cell.
+type tuiScrollDrag struct{ grab int }
+
+// tuiDoubleClick is the longest gap between the clicks of a double click.
+const tuiDoubleClick = 400 * time.Millisecond
 
 func (m tuiModel) zones() []tuiHitZone {
 	_, zones := tuiHitScan(m.render())
@@ -231,19 +242,36 @@ func (m *tuiModel) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		switch mouse.Button {
 		case tea.MouseLeft:
 			id := m.hitAt(mouse.X, mouse.Y)
+			now := time.Now()
+			double := id != "" && id == m.lastClick && now.Sub(m.lastClickAt) < tuiDoubleClick
+			m.lastClick, m.lastClickAt = id, now
+			if double {
+				m.lastClick = "" // a third click starts over
+			}
 			m.flash = ""
-			return m, m.click(id)
+			return m, m.click(id, double)
 		case tea.MouseRight, tea.MouseBackward:
 			// Right click goes back a level, like Esc.
 			return m.updateKey(tuiKeyMsg("esc"))
 		}
 	case tea.MouseMotionMsg:
-		if m.drag != nil {
-			if col := m.timelineColumnAt(mouse.X); col >= 0 {
-				m.blockSelected[blockTimeline] = col
+		if m.scrollDrag != nil {
+			m.dragScrollbar(mouse.Y)
+		}
+		if d := m.drag; d != nil {
+			col := m.timelineColumnAt(mouse.X)
+			if col < 0 || d.inside && !d.moved && col == d.start {
+				return m, nil
 			}
+			if d.inside && !d.moved {
+				// Dragging from inside a span starts a new one.
+				m.timelineAnchor = d.start + 1
+			}
+			d.moved = true
+			m.blockSelected[blockTimeline] = col
 		}
 	case tea.MouseReleaseMsg:
+		m.scrollDrag = nil
 		if m.drag != nil {
 			return m, m.endDrag()
 		}
@@ -263,7 +291,7 @@ func (m *tuiModel) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 }
 
 // click runs the action of a zone.
-func (m *tuiModel) click(id string) tea.Cmd {
+func (m *tuiModel) click(id string, double bool) tea.Cmd {
 	if m.help {
 		m.help = false
 		return nil
@@ -319,7 +347,10 @@ func (m *tuiModel) click(id string) tea.Cmd {
 		}
 		return m.openDetail(m.snapshot.Rows[n])
 	case "tl":
-		m.startDrag(n)
+		m.startDrag(n, double)
+		return nil
+	case "sb":
+		m.pressScrollbar(n)
 		return nil
 	case "aview":
 		if m.alertView != n {
@@ -335,10 +366,16 @@ func (m *tuiModel) click(id string) tea.Cmd {
 	case "block":
 		m.block, m.timelineAnchor = n, 0
 	case "ov":
+		// On the overview a click shows a summary and a double click opens,
+		// so a stray click does not leave the page.
 		block, item, _ := strings.Cut(arg, ":")
 		m.block, _ = strconv.Atoi(block)
 		m.blockSelected[m.block], _ = strconv.Atoi(item)
-		return m.updateOverviewKey("enter")
+		m.timelineAnchor = 0
+		if double {
+			return m.updateOverviewKey("enter")
+		}
+		m.flash = m.overviewBrief(m.block, m.blockSelected[m.block])
 	case "dtab":
 		m.setDetailTab(n)
 	case "param":
@@ -357,37 +394,114 @@ func (m *tuiModel) click(id string) tea.Cmd {
 	return nil
 }
 
+func (m tuiModel) overviewPage() bool { return m.tab == tabOverview && !m.details }
+
 // startDrag begins a timeline selection on the pressed column.
-func (m *tuiModel) startDrag(col int) {
+func (m *tuiModel) startDrag(col int, double bool) {
 	focused := m.timelineFocus
-	if m.tab == tabOverview && !m.details {
+	if m.overviewPage() {
 		focused = m.block == blockTimeline
 		m.block = blockTimeline
 	} else {
 		m.timelineFocus = true
 	}
+	d := &tuiTimelineDrag{start: col, double: double}
+	m.drag = d
 	cursor := m.blockSelected[blockTimeline]
-	again := focused && m.timelineAnchor == 0 && cursor == col
+	if focused && m.timelineAnchor > 0 {
+		if from, to := min(cursor, m.timelineAnchor-1), max(cursor, m.timelineAnchor-1); col >= from && col <= to {
+			d.inside = true
+			return
+		}
+	}
+	d.again = focused && m.timelineAnchor == 0 && cursor == col
 	m.blockSelected[blockTimeline], m.timelineAnchor = col, col+1
-	m.drag = &tuiTimelineDrag{start: col, again: again}
 }
 
-// endDrag keeps a click as a one-column selection and applies a dragged
-// span, or a second click on the same column, like a drag on the web timeline.
+// endDrag finishes a press on the timeline. On a list a dragged span, or a
+// second click on the selection, applies it like a drag on the web timeline.
+// The overview only selects: a double click or Enter opens the requests.
 func (m *tuiModel) endDrag() tea.Cmd {
 	d := m.drag
 	m.drag = nil
-	if m.blockSelected[blockTimeline] == d.start {
+	clicked := !d.moved && (d.inside || m.blockSelected[blockTimeline] == d.start)
+	if clicked && !d.inside {
 		m.timelineAnchor = 0
-		if !d.again {
-			return nil
-		}
 	}
-	if m.tab == tabOverview && !m.details {
-		return m.updateOverviewKey("enter")
+	apply := !clicked || d.inside || d.again
+	if m.overviewPage() {
+		if clicked && d.double {
+			return m.updateOverviewKey("enter")
+		}
+		m.flash = "已选中时间段 · 双击选中处或按 Enter 查看这段时间的请求"
+		return nil
+	}
+	if !apply {
+		return nil
 	}
 	cmd, _ := m.updateListTimeline("enter")
 	return cmd
+}
+
+// scrollListTo moves the list window. Beside a detail the list scrolls on
+// its own; a full list keeps the cursor on a visible row.
+func (m *tuiModel) scrollListTo(top int) {
+	_, visible := m.listLayout(m.listBox())
+	m.listTop = max(0, min(len(m.snapshot.Rows)-visible, top))
+	if m.split() {
+		m.listFree = true
+		return
+	}
+	m.selected = max(m.listTop, min(m.listTop+visible-1, m.selected))
+	m.selected = min(m.selected, max(0, len(m.snapshot.Rows)-1))
+}
+
+// tuiThumb places the scrollbar thumb for n rows with visible shown from top.
+func tuiThumb(n, visible, top int) (int, int) {
+	if n <= visible {
+		return 0, visible
+	}
+	thumb := max(1, visible*visible/n)
+	return (top*(visible-thumb) + (n-visible)/2) / (n - visible), thumb
+}
+
+// tuiThumbTop is the first row shown when the thumb starts at cell.
+func tuiThumbTop(n, visible, thumb, cell int) int {
+	if visible <= thumb {
+		return 0
+	}
+	return (cell*(n-visible) + (visible-thumb)/2) / (visible - thumb)
+}
+
+// pressScrollbar grabs the thumb, or pages the list to the pressed cell like
+// a click on a scrollbar track.
+func (m *tuiModel) pressScrollbar(cell int) {
+	_, visible := m.listLayout(m.listBox())
+	n := len(m.snapshot.Rows)
+	start, thumb := tuiThumb(n, visible, m.listStart(visible))
+	grab := cell - start
+	if grab < 0 || grab >= thumb {
+		grab = thumb / 2
+		m.scrollListTo(tuiThumbTop(n, visible, thumb, cell-grab))
+	}
+	m.scrollDrag = &tuiScrollDrag{grab: grab}
+}
+
+// dragScrollbar follows the pointer while the thumb is held.
+func (m *tuiModel) dragScrollbar(y int) {
+	top := -1
+	for _, z := range m.zones() {
+		if z.id == "sb:0" {
+			top = z.y
+		}
+	}
+	if top < 0 {
+		return
+	}
+	_, visible := m.listLayout(m.listBox())
+	n := len(m.snapshot.Rows)
+	_, thumb := tuiThumb(n, visible, m.listStart(visible))
+	m.scrollListTo(tuiThumbTop(n, visible, thumb, y-top-m.scrollDrag.grab))
 }
 
 // wheel scrolls whatever is under the pointer.
@@ -410,9 +524,7 @@ func (m *tuiModel) wheel(x, y, step int) tea.Cmd {
 		return nil
 	case m.split() && x < m.listWidth():
 		// Scroll the list beside a detail without changing the open record.
-		_, visible := m.listLayout(m.listBox())
-		m.listTop = max(0, min(len(m.snapshot.Rows)-visible, m.listTop+3*step))
-		m.listFree = true
+		m.scrollListTo(m.listTop + 3*step)
 		return nil
 	case m.details || !m.listTab():
 		if step < 0 {
@@ -423,10 +535,7 @@ func (m *tuiModel) wheel(x, y, step int) tea.Cmd {
 		return nil
 	}
 	// A list scrolls by three rows and keeps the cursor on a visible row.
-	_, visible := m.listLayout(m.listBox())
-	m.listTop = max(0, min(len(m.snapshot.Rows)-visible, m.listTop+3*step))
-	m.selected = max(m.listTop, min(m.listTop+visible-1, m.selected))
-	m.selected = min(m.selected, max(0, len(m.snapshot.Rows)-1))
+	m.scrollListTo(m.listTop + 3*step)
 	return nil
 }
 

@@ -32,7 +32,10 @@ type Rule struct {
 
 var builtinRules = []Rule{
 	{ID: "SQLI-001", Version: 1, Severity: "high", Field: "request", Pattern: `(?i)(union\s+(all\s+)?select\b|\bor\s+['"]?\d+['"]?\s*=\s*['"]?\d+|\b(sleep|benchmark)\s*\()`},
-	{ID: "CMD-001", Version: 1, Severity: "high", Field: "request", Pattern: "(?i)([;|&]\\s*(id|whoami|cat|curl|wget|bash|sh)\\b|\\$\\([^)]*\\)|`[^`]+`)"},
+	// A command after a separator must be followed by a space, the end or a
+	// shell metacharacter, so parameters named like commands (&id=5, &cat=3)
+	// are not taken for command injection.
+	{ID: "CMD-001", Version: 2, Severity: "high", Field: "request", Pattern: "(?i)([;|&]\\s*(id|whoami|cat|curl|wget|bash|sh)(\\s|$|[;|&<>`$)'\"])|\\$\\([^)]*\\)|`[^`]+`)"},
 	{ID: "PATH-001", Version: 1, Severity: "high", Field: "request", Pattern: `(?i)(\.\.[/\\]){2,}`},
 	{ID: "FILE-001", Version: 1, Severity: "medium", Field: "url", Pattern: `(?i)(/\.env([?/#]|$)|/\.git/|/wp-config\.php|/etc/passwd|/WEB-INF/web\.xml)`},
 	{ID: "XSS-001", Version: 1, Severity: "high", Field: "request", Pattern: `(?i)(<\s*script\b|<[^>]+\bon[a-z]+\s*=|javascript\s*:)`},
