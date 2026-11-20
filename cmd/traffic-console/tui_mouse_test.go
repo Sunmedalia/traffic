@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	termansi "github.com/charmbracelet/x/ansi"
@@ -196,9 +197,14 @@ func TestTUIMouseTimelineDrag(t *testing.T) {
 func TestTUIMouseOverviewAndParams(t *testing.T) {
 	m := tuiSummaryModel(t)
 	runLoad(m, m.load())
+	// A click on the overview only describes the row; a double click opens it.
+	runLoad(m, clickZone(t, m, fmt.Sprintf("ov:%d:0", blockRules)))
+	if m.tab != tabOverview || m.block != blockRules || !strings.Contains(m.flash, "双击") {
+		t.Fatalf("single click left the overview or showed no summary: %q", m.flash)
+	}
 	runLoad(m, clickZone(t, m, fmt.Sprintf("ov:%d:0", blockRules)))
 	if m.tab != tabAlerts || m.filter.Rule == "" || m.drill == nil {
-		t.Fatalf("rule click did not drill %+v", m.filter)
+		t.Fatalf("double click did not drill %+v", m.filter)
 	}
 
 	d := tuiDetailModel(t)
@@ -220,5 +226,92 @@ func TestTUIMouseOverviewAndParams(t *testing.T) {
 	d.Update(tea.MouseWheelMsg{X: 5, Y: 10, Button: tea.MouseWheelDown})
 	if d.viewport.YOffset() <= before && d.viewport.TotalLineCount() > d.viewport.Height() {
 		t.Fatal("wheel did not scroll the detail")
+	}
+}
+
+func TestTUIOverviewBriefs(t *testing.T) {
+	m := tuiSummaryModel(t)
+	runLoad(m, m.load())
+	for block, want := range map[int]string{blockRules: "规则 ", blockClients: "来源 ", blockLevels: "危告警", blockStatus: "响应 ", blockRecent: "双击打开详情"} {
+		if brief := m.overviewBrief(block, 0); !strings.Contains(brief, want) {
+			t.Errorf("block %d brief %q", block, brief)
+		}
+	}
+	// Clicks far apart are two single clicks.
+	runLoad(m, clickZone(t, m, fmt.Sprintf("ov:%d:0", blockRecent)))
+	m.lastClickAt = m.lastClickAt.Add(-time.Second)
+	runLoad(m, clickZone(t, m, fmt.Sprintf("ov:%d:0", blockRecent)))
+	if m.details || m.tab != tabOverview {
+		t.Fatal("slow clicks counted as a double click")
+	}
+	// The overview timeline selects on click and drag, and opens on a double click.
+	n := m.blockLen(blockTimeline)
+	last := zoneOf(t, m, fmt.Sprintf("tl:%d", n-1))
+	m.Update(tea.MouseClickMsg{X: last.x0, Y: last.y, Button: tea.MouseLeft})
+	m.Update(tea.MouseMotionMsg{X: zoneOf(t, m, "tl:0").x0, Y: last.y, Button: tea.MouseLeft})
+	m.Update(tea.MouseReleaseMsg{X: 0, Y: last.y, Button: tea.MouseLeft})
+	if m.tab != tabOverview || m.timelineAnchor == 0 {
+		t.Fatal("overview drag should only select")
+	}
+	inside := zoneOf(t, m, "tl:0")
+	for i := 0; i < 2; i++ {
+		_, cmd := m.Update(tea.MouseClickMsg{X: inside.x0, Y: inside.y, Button: tea.MouseLeft})
+		runLoad(m, cmd)
+		_, cmd = m.Update(tea.MouseReleaseMsg{X: inside.x0, Y: inside.y, Button: tea.MouseLeft})
+		runLoad(m, cmd)
+		if i == 0 && (m.tab != tabOverview || m.timelineAnchor == 0) {
+			t.Fatal("a click inside the span should keep it")
+		}
+	}
+	if m.tab != tabRequests || m.filter.Since == "" || m.filter.Until == "" {
+		t.Fatalf("double click did not open the span %+v", m.filter)
+	}
+}
+
+func TestTUIListScrollbar(t *testing.T) {
+	m := tuiSummaryModel(t)
+	m.tab, m.alertView = tabRequests, viewList
+	for i := 0; i < 100; i++ {
+		m.snapshot.Rows = append(m.snapshot.Rows, tuiRow{ID: fmt.Sprint(i), URL: fmt.Sprintf("/r%d", i)})
+	}
+	m.snapshot.Count = 100
+	m.resize()
+	_, visible := m.listLayout(m.listBox())
+	first, lastCell := zoneOf(t, m, "sb:0"), zoneOf(t, m, fmt.Sprintf("sb:%d", visible-1))
+	if first.x0 != m.width-1 || lastCell.y != first.y+visible-1 {
+		t.Fatalf("scrollbar at %+v .. %+v", first, lastCell)
+	}
+	if start, thumb := tuiThumb(100, visible, 0); start != 0 || thumb != visible*visible/100 {
+		t.Fatalf("thumb %d+%d", start, thumb)
+	}
+	if start, thumb := tuiThumb(100, visible, 100-visible); start+thumb != visible {
+		t.Fatal("thumb does not reach the end at the bottom")
+	}
+	// A click on the track pages there; dragging the thumb to the end shows the last row.
+	m.Update(tea.MouseClickMsg{X: lastCell.x0, Y: lastCell.y, Button: tea.MouseLeft})
+	m.Update(tea.MouseReleaseMsg{X: lastCell.x0, Y: lastCell.y, Button: tea.MouseLeft})
+	if m.listTop == 0 || m.selected < m.listTop || m.selected >= m.listTop+visible {
+		t.Fatalf("track click top %d selected %d", m.listTop, m.selected)
+	}
+	m.Update(tea.MouseClickMsg{X: first.x0, Y: first.y, Button: tea.MouseLeft})
+	m.Update(tea.MouseReleaseMsg{X: first.x0, Y: first.y, Button: tea.MouseLeft})
+	start, _ := tuiThumb(100, visible, m.listTop)
+	m.Update(tea.MouseClickMsg{X: first.x0, Y: first.y + start, Button: tea.MouseLeft})
+	m.Update(tea.MouseMotionMsg{X: first.x0, Y: first.y + visible + 5, Button: tea.MouseLeft})
+	m.Update(tea.MouseReleaseMsg{X: first.x0, Y: first.y + visible + 5, Button: tea.MouseLeft})
+	if m.listTop != 100-visible || !strings.Contains(termansi.Strip(m.listView(m.listBox())), "/r99") {
+		t.Fatalf("drag to the end left top at %d", m.listTop)
+	}
+	m.Update(tea.MouseClickMsg{X: first.x0, Y: first.y + visible - 1, Button: tea.MouseLeft})
+	m.Update(tea.MouseMotionMsg{X: first.x0, Y: first.y - 3, Button: tea.MouseLeft})
+	m.Update(tea.MouseReleaseMsg{X: first.x0, Y: first.y - 3, Button: tea.MouseLeft})
+	if m.listTop != 0 {
+		t.Fatalf("drag to the top left top at %d", m.listTop)
+	}
+	// Rows still fit the width beside the bar.
+	for _, line := range strings.Split(m.listView(m.listBox()), "\n") {
+		if termansi.StringWidth(line) > m.width {
+			t.Fatalf("row overflows: %q", termansi.Strip(line))
+		}
 	}
 }

@@ -99,6 +99,9 @@ type tuiModel struct {
 	noMouse, listFree                    bool
 	listTop                              int // first list row drawn
 	drag                                 *tuiTimelineDrag
+	scrollDrag                           *tuiScrollDrag
+	lastClick                            string // zone of the last click, for double clicks
+	lastClickAt                          time.Time
 	msgLayout, listShare                 int
 	paramSelected                        int
 	detailID, errorText, flash           string

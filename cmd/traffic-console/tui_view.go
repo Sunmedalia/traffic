@@ -524,6 +524,12 @@ func (m tuiModel) listView(width, height int) string {
 	top := len(lines)
 	lines = append(lines, tuiMuted.Render(termansi.Truncate(header+"URL", width, "…")))
 	start := m.listStart(visible)
+	// A scrollbar takes the last column when the page has more rows than fit.
+	bar := tuiScrollbar(len(m.snapshot.Rows), visible, start)
+	rowWidth := width
+	if bar != nil {
+		rowWidth = width - 1
+	}
 	for i := start; i < min(len(m.snapshot.Rows), start+visible); i++ {
 		r := m.snapshot.Rows[i]
 		status := "待响应"
@@ -566,7 +572,7 @@ func (m tuiModel) listView(width, height int) string {
 		for _, c := range cells {
 			used += c.width
 		}
-		urlWidth := max(1, width-used)
+		urlWidth := max(1, rowWidth-used)
 		urlStyle := lipgloss.NewStyle()
 		if r.Severity == "high" {
 			urlStyle = tuiDanger
@@ -578,14 +584,22 @@ func (m tuiModel) listView(width, height int) string {
 				line.WriteString(tuiCell(c.text, c.width))
 			}
 			line.WriteString(tuiCell(url, urlWidth))
-			lines = append(lines, tuiHit(fmt.Sprintf("row:%d", i), tuiSelected.Render(termansi.Truncate(line.String(), width, ""))))
+			row := tuiHit(fmt.Sprintf("row:%d", i), tuiSelected.Render(termansi.Truncate(line.String(), rowWidth, "")))
+			if bar != nil {
+				row += bar[i-start]
+			}
+			lines = append(lines, row)
 			continue
 		}
 		for _, c := range cells {
 			line.WriteString(c.style.Render(tuiCell(c.text, c.width)))
 		}
 		line.WriteString(urlStyle.Render(termansi.Truncate(url, urlWidth, "…")))
-		lines = append(lines, tuiHit(fmt.Sprintf("row:%d", i), tuiCell(termansi.Truncate(line.String(), width, ""), width)))
+		row := tuiHit(fmt.Sprintf("row:%d", i), tuiCell(termansi.Truncate(line.String(), rowWidth, ""), rowWidth))
+		if bar != nil {
+			row += bar[i-start]
+		}
+		lines = append(lines, row)
 	}
 	if len(m.snapshot.Rows) == 0 {
 		if m.filter != (tuiFilter{}) {
@@ -620,6 +634,24 @@ func (m tuiModel) listView(width, height int) string {
 	}
 	lines = append(lines, termansi.Truncate(pager, width, "…"))
 	return strings.Join(lines, "\n")
+}
+
+// tuiScrollbar draws one clickable cell per visible row, with the thumb over
+// the rows shown. It is nil when every row fits.
+func tuiScrollbar(n, visible, top int) []string {
+	if n <= visible {
+		return nil
+	}
+	start, thumb := tuiThumb(n, visible, top)
+	cells := make([]string, visible)
+	for i := range cells {
+		cell := tuiMuted.Render("│")
+		if i >= start && i < start+thumb {
+			cell = tuiAccent.UnsetBold().Render("█")
+		}
+		cells[i] = tuiHit(fmt.Sprintf("sb:%d", i), cell)
+	}
+	return cells
 }
 
 // clientText hides the client port on medium widths.
@@ -858,7 +890,9 @@ const tuiHelpText = `快捷键（与网页版一致的键位优先）
 刷新    光标在第一页第一行时跟随最新记录，离开后列表定格
         空格 暂停或恢复    r 立即刷新    z 切换本地时间 / UTC
 鼠标    点击页面、标签、行、筛选条件和底部快捷键    滚轮滚动    右键返回上一层
-        拖动时间线选一段时间，单击选中一格，再点一次查看
+        列表右侧滚动条可拖动，点击滚动条空白处翻到该位置
+        概览中单击显示简要信息，双击进入；时间线拖动或单击选中，双击选中处查看
+        列表时间线拖动后直接筛选，单击选中一格，再点一次查看
         点击筛选条件可去掉该条件    M 关闭或开启鼠标（关闭后可用终端直接选取文字）
 退出    q 或 Ctrl+C`
 

