@@ -95,12 +95,14 @@ type tuiModel struct {
 	busy, pending, paused, details, help bool
 	stale, pickDetail                    bool
 	raw, metaOpen                        bool
+	msgLayout, listShare                 int
 	detailID, errorText, flash           string
 	alertView                            int
 	aggSelected                          [viewList]int
 	block                                int
 	blockSelected                        [blockCount]int
 	timelineAnchor                       int // selection start + 1; 0 when none
+	timelineFocus                        bool
 	summary                              *tuiSummary
 	summaryKey                           string
 	summaryAt                            time.Time
@@ -232,11 +234,19 @@ func (m *tuiModel) load() tea.Cmd {
 }
 func (m *tuiModel) changed() tea.Cmd  { m.version++; return m.load() }
 func (m tuiModel) contentHeight() int { return max(1, m.height-tuiChrome) }
-func (m tuiModel) split() bool        { return m.details && m.width >= 120 }
+func (m tuiModel) split() bool        { return m.details && m.width >= 120 && m.listShare < 2 }
+
+// listWidth is the list's share of a split detail: half, then a third.
+func (m tuiModel) listWidth() int {
+	if m.listShare == 1 {
+		return m.width / 3
+	}
+	return m.width / 2
+}
 func (m *tuiModel) resize() {
 	width := max(1, m.width)
 	if m.split() {
-		width = max(1, m.width-m.width/2-3)
+		width = max(1, m.width-m.listWidth()-3)
 	}
 	m.viewport.KeyMap = tuiViewportKeys()
 	m.viewport.SetWidth(width)
@@ -264,6 +274,7 @@ func (m *tuiModel) switchTab(tab int) tea.Cmd {
 	}
 	m.lists[m.tab] = tuiListState{m.page, m.selected}
 	m.drill = nil
+	m.timelineFocus, m.timelineAnchor = false, 0
 	m.tab = tab
 	m.page, m.selected = m.lists[tab].page, m.lists[tab].selected
 	m.closeDetail()
@@ -283,6 +294,7 @@ func (m *tuiModel) closeDetail() {
 }
 func (m *tuiModel) applyFilter(filter tuiFilter) tea.Cmd {
 	m.drill = nil
+	m.timelineFocus, m.timelineAnchor = false, 0
 	m.filter = filter
 	m.page, m.selected = 0, 0
 	m.lists = [tuiTabCount]tuiListState{}
@@ -511,6 +523,10 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.resize()
 			return m, m.changed()
 		}
+		if m.timelineFocus {
+			m.timelineFocus, m.timelineAnchor = false, 0
+			return m, nil
+		}
 		if m.tab == tabOverview && m.timelineAnchor > 0 {
 			m.timelineAnchor = 0
 			return m, nil
@@ -552,6 +568,9 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.details || !m.listTab() {
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
+		return m, cmd
+	}
+	if cmd, ok := m.updateListTimeline(key); ok {
 		return m, cmd
 	}
 	switch key {
@@ -632,6 +651,30 @@ func (m *tuiModel) updateDetailKey(msg tea.KeyPressMsg) (tea.Cmd, bool) {
 		return nil, true
 	case "Y":
 		return m.copyContent(), true
+	case "L":
+		m.msgLayout = (m.msgLayout + 1) % layoutCount
+		if m.activeDetailTab() != m.detailTab && m.detailTab == detailResponse {
+			m.detailTab = detailRequest
+		}
+		m.flash = "请求与响应：" + tuiLayoutNames[m.msgLayout]
+		if m.pairLayout() != m.msgLayout {
+			m.flash += fmt.Sprintf("（详情宽度不足 %d 列，暂按上下显示，按 > 加宽详情）", tuiSideMinWidth)
+		}
+		m.updateContent()
+		return nil, true
+	case "<", ">":
+		if m.width < 120 {
+			m.flash = "终端不足 120 列，详情已占满全屏"
+			return nil, true
+		}
+		if key == ">" {
+			m.listShare = min(2, m.listShare+1)
+		} else {
+			m.listShare = max(0, m.listShare-1)
+		}
+		m.flash = []string{"列表与详情各占一半", "详情占三分之二", "详情全屏，按 < 显示列表"}[m.listShare]
+		m.resize()
+		return nil, true
 	}
 	return nil, false
 }
@@ -639,6 +682,10 @@ func (m *tuiModel) updateDetailKey(msg tea.KeyPressMsg) (tea.Cmd, bool) {
 // detailTabs lists the tabs this record offers, like the web detail pane.
 func (m tuiModel) detailTabs() []int {
 	tabs := []int{detailRequest, detailResponse, detailDecoder}
+	if m.msgLayout != layoutSingle {
+		// The request tab shows both messages, as the web pair view does.
+		tabs = []int{detailRequest, detailDecoder}
+	}
 	t := m.snapshot.Detail
 	if t == nil || t.ID != m.detailID {
 		return tabs
@@ -743,4 +790,34 @@ func (m *tuiModel) toggleFromRow(key string) tea.Cmd {
 		m.tab = tabRequests
 	}
 	return m.applyFilter(filter)
+}
+
+// updateListTimeline lets t select a time range on the list timeline, like
+// dragging across the web list's timeline.
+func (m *tuiModel) updateListTimeline(key string) (tea.Cmd, bool) {
+	timeline := m.listTimeline()
+	if key == "t" {
+		if timeline == nil || m.split() {
+			m.flash = "时间线还没有数据"
+			return nil, true
+		}
+		m.timelineFocus = !m.timelineFocus
+		m.timelineAnchor = 0
+		m.blockSelected[blockTimeline] = len(m.timelineColumns(timeline, m.timelinePlot())) - 1
+		return nil, true
+	}
+	if !m.timelineFocus || timeline == nil {
+		return nil, false
+	}
+	switch key {
+	case "enter":
+		filter := m.filter
+		filter.Since, filter.Until = m.timelineSelection(timeline)
+		filter.UntilExclusive = true
+		return m.applyFilter(filter), true
+	case "left", "right", "h", "l", "shift+left", "shift+right", "H", "L", "home", "end", "g", "G", "pgup", "pgdown":
+		m.moveTimeline(key, len(m.timelineColumns(timeline, m.timelinePlot())))
+		return nil, true
+	}
+	return nil, false
 }

@@ -206,6 +206,10 @@ func tuiKey(s string) tea.KeyPressMsg {
 		return tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift}
 	case "backspace":
 		return tea.KeyPressMsg{Code: tea.KeyBackspace}
+	case "shift+left":
+		return tea.KeyPressMsg{Code: tea.KeyLeft, Mod: tea.ModShift}
+	case "end":
+		return tea.KeyPressMsg{Code: tea.KeyEnd}
 	}
 	panic(s)
 }
@@ -435,6 +439,7 @@ func TestTUILayoutAndDetailTabs(t *testing.T) {
 				m.currentDecoder()
 			}
 			m.metaOpen = tab%2 == 0
+			m.msgLayout = tab % layoutCount
 			m.updateContent()
 			content := m.View().Content
 			if lipgloss.Width(content) > size.Width || lipgloss.Height(content) > size.Height {
@@ -481,6 +486,12 @@ func TestTUILayoutAndDetailTabs(t *testing.T) {
 	m.height = 40
 	m.detailTab = 0
 	m.resize()
+	// The split pane is narrower than a side-by-side pair, so the messages stack.
+	if m.pairLayout() != layoutStack || !strings.Contains(m.viewport.GetContent(), "response") {
+		t.Fatal("response not shown with the request")
+	}
+	m.msgLayout = layoutSingle
+	m.updateContent()
 	m.Update(tuiKey("tab"))
 	if m.detailTab != detailResponse || !strings.Contains(m.viewport.GetContent(), "response") {
 		t.Fatal("response tab not shown")
@@ -845,9 +856,83 @@ func TestTUITimelineColumns(t *testing.T) {
 	if len(columns) != 7 || total != 30 {
 		t.Fatalf("merged columns %d total %d", len(columns), total)
 	}
-	bars := m.timelineBars(&o.Timeline, 60, 2, false, true)
-	if len(bars) != 4 || !strings.Contains(termansi.Strip(bars[2]), "▲") {
-		t.Fatalf("bars %q", bars)
+	tuiUseUTC.Store(true)
+	defer tuiUseUTC.Store(false)
+	chart := m.renderTimeline(&o.Timeline, 67, 2, false, 2, 4)
+	plain := make([]string, len(chart))
+	for i, line := range chart {
+		plain[i] = termansi.Strip(line)
+		if lipgloss.Width(line) > 67 {
+			t.Fatalf("chart line %d overflows: %q", i, plain[i])
+		}
+	}
+	// Two bar rows with the peak on the y axis, an axis with ticks and the selection, and round labels.
+	if len(chart) != 4 || !strings.HasPrefix(plain[0], "    3 ┤") || !strings.Contains(plain[2], "┬") || !strings.Contains(plain[2], "━") {
+		t.Fatalf("chart %q", plain)
+	}
+	if !strings.Contains(plain[3], "10:05") || !strings.Contains(plain[3], "10:10") || strings.Contains(plain[3], "10:07") {
+		t.Fatalf("ticks %q", plain[3])
+	}
+	if ticks := timelineTicks(columns[0].from, columns[6].to, []int{0, 10, 20, 30, 40, 50, 60, 70}, columns); len(ticks) == 0 {
+		t.Fatal("no ticks for a merged timeline")
+	}
+	if tuiCompact(123456) != "123k" || tuiCompact(12345) != "12.3k" || tuiCompact(999) != "999" {
+		t.Fatal("compact counts")
+	}
+}
+
+func TestTUIListTimelineSelection(t *testing.T) {
+	m := tuiSummaryModel(t)
+	runLoad(m, m.switchTab(tabRequests))
+	if m.listTimeline() == nil || !strings.Contains(m.listView(120, 25), "t 选择时间范围") {
+		t.Fatal("list timeline missing")
+	}
+	m.filter.Keyword = ""
+	m.Update(tuiKey("t"))
+	if !m.timelineFocus || !strings.Contains(termansi.Strip(m.listView(120, 25)), "选中") {
+		t.Fatal("t did not focus the timeline")
+	}
+	m.Update(tuiKey("left"))
+	_, cmd := m.Update(tuiKey("enter"))
+	if m.timelineFocus || m.filter.Since == "" || m.filter.Until == "" || !m.filter.UntilExclusive || m.tab != tabRequests {
+		t.Fatalf("range not applied %+v", m.filter)
+	}
+	runLoad(m, cmd)
+	m.Update(tuiKey("t"))
+	m.Update(tuiKey("esc"))
+	if m.timelineFocus || m.filter.Since == "" {
+		t.Fatal("esc should leave the timeline and keep the filter")
+	}
+}
+
+func TestTUIDetailWidth(t *testing.T) {
+	m := tuiDetailModel(t)
+	m.width, m.height = 160, 40
+	m.resize()
+	if !m.split() || m.viewport.Width() != 160-80-3 {
+		t.Fatalf("half split %d", m.viewport.Width())
+	}
+	m.Update(tuiKey(">"))
+	if m.viewport.Width() != 160-53-3 || m.pairLayout() != layoutSide {
+		t.Fatalf("two thirds %d", m.viewport.Width())
+	}
+	m.Update(tuiKey(">"))
+	if m.split() || m.viewport.Width() != 160 {
+		t.Fatal("detail not full screen")
+	}
+	content := m.View().Content
+	if lipgloss.Width(content) > 160 || lipgloss.Height(content) > 40 {
+		t.Fatal("full detail overflows")
+	}
+	m.Update(tuiKey("<"))
+	m.Update(tuiKey("<"))
+	m.Update(tuiKey("<"))
+	if m.listShare != 0 || !m.split() {
+		t.Fatal("< did not restore the list")
+	}
+	split := termansi.Strip(m.View().Content)
+	if strings.Count(split, "│") < 20 {
+		t.Fatal("split divider not drawn on every row")
 	}
 }
 
@@ -921,6 +1006,46 @@ func TestTUIDetailParity(t *testing.T) {
 		if !strings.Contains(content, want) {
 			t.Fatalf("request tab misses %q:\n%s", want, content)
 		}
+	}
+	// Request and response share one tab, side by side, when the pane is wide enough.
+	if tabs := m.detailTabs(); len(tabs) != 3 || tabs[2] != detailAlerts {
+		t.Fatalf("pair tabs %v", tabs)
+	}
+	pair := strings.Split(termansi.Strip(m.viewport.GetContent()), "\n")
+	sideBySide := false
+	for i, line := range pair {
+		if strings.HasPrefix(line, "请求") && strings.Contains(line, " │ 响应") {
+			sideBySide = i+1 < len(pair) && strings.Contains(pair[i+1], "POST /login") && strings.Contains(pair[i+1], "HTTP/1.1 200 OK")
+		}
+	}
+	if !sideBySide || !strings.Contains(termansi.Strip(m.viewport.GetContent()), "请求/响应") {
+		t.Fatalf("request and response not side by side:\n%s", termansi.Strip(m.viewport.GetContent()))
+	}
+	for _, line := range strings.Split(m.viewport.GetContent(), "\n") {
+		if lipgloss.Width(line) > m.viewport.Width() {
+			t.Fatalf("pair line overflows: %q", termansi.Strip(line))
+		}
+	}
+	if _, cmd := m.Update(tuiKey("Y")); cmd == nil || !strings.Contains(m.flash, "请求和响应") {
+		t.Fatalf("pair copy: %q", m.flash)
+	}
+	m.Update(tuiKey("L"))
+	content = termansi.Strip(m.viewport.GetContent())
+	if m.msgLayout != layoutStack || !strings.Contains(content, "── 请求 ") || !strings.Contains(content, "── 响应 ") || strings.Index(content, "── 响应 ") < strings.Index(content, "Cookie（原文）") {
+		t.Fatalf("stacked layout:\n%s", content)
+	}
+	// A narrow pane falls back from side by side to stacked.
+	m.msgLayout = layoutSide
+	m.width = 80
+	m.resize()
+	if m.pairLayout() != layoutStack || !strings.Contains(m.viewport.GetContent(), "宽度不足") {
+		t.Fatal("narrow pane did not stack")
+	}
+	m.width = 100
+	m.msgLayout = layoutStack
+	m.Update(tuiKey("L"))
+	if m.msgLayout != layoutSingle {
+		t.Fatal("L did not reach the single layout")
 	}
 	if tabs := m.detailTabs(); len(tabs) != 4 || tabs[3] != detailAlerts {
 		t.Fatalf("tabs %v", tabs)

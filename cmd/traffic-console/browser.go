@@ -132,6 +132,8 @@ type sessionBrowser struct {
 	refresh                 time.Duration
 	filter                  tuiFilter
 	rulesDir                string
+	// Layout choices carry over to the next opened session.
+	msgLayout, listShare int
 	// autoOpened is set after the first scan, which opens a lone session as the web page does.
 	autoOpened bool
 }
@@ -342,6 +344,7 @@ func (m *sessionBrowser) closeSession() {
 		m.childCancel = nil
 	}
 	if m.child != nil {
+		m.msgLayout, m.listShare = m.child.msgLayout, m.child.listShare
 		m.child.store.db.Close()
 		m.child = nil
 	}
@@ -364,7 +367,7 @@ func (m *sessionBrowser) openSession(dir string) error {
 	m.closeSession()
 	m.childCancel = cancel
 	m.lastDir = dir
-	m.child = &tuiModel{ctx: ctx, store: s, refresh: m.refresh, rulesDir: m.rulesDir, filter: m.filter, snapshot: snapshot, title: sessionTitle(dir), width: m.width, height: m.height, viewport: viewport.New(), alertView: viewList}
+	m.child = &tuiModel{ctx: ctx, store: s, refresh: m.refresh, rulesDir: m.rulesDir, filter: m.filter, snapshot: snapshot, title: sessionTitle(dir), width: m.width, height: m.height, viewport: viewport.New(), alertView: viewList, msgLayout: m.msgLayout, listShare: m.listShare}
 	m.child.resize()
 	return nil
 }

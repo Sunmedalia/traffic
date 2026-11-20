@@ -90,7 +90,7 @@ func (m tuiModel) blockLen(block int) int {
 	}
 	switch block {
 	case blockTimeline:
-		return len(m.timelineColumns(&o.Timeline, m.timelineWidth()))
+		return len(m.timelineColumns(&o.Timeline, m.timelinePlot()))
 	case blockRules:
 		return len(o.Summary.Rules)
 	case blockClients:
@@ -152,10 +152,9 @@ func (m *tuiModel) updateOverviewKey(key string) tea.Cmd {
 		// The overview covers the whole session, so a jump starts from one condition.
 		switch m.block {
 		case blockTimeline:
-			columns := m.timelineColumns(&o.Timeline, m.timelineWidth())
-			from, to := m.timelineRange(len(columns))
+			since, until := m.timelineSelection(&o.Timeline)
 			m.timelineAnchor = 0
-			return m.drillTo(tabRequests, tuiFilter{Since: columns[from].from.UTC().Format(indexTimeFormat), Until: columns[to].to.UTC().Format(indexTimeFormat), UntilExclusive: true})
+			return m.drillTo(tabRequests, tuiFilter{Since: since, Until: until, UntilExclusive: true})
 		case blockRules:
 			return m.drillTo(tabAlerts, tuiFilter{Rule: o.Summary.Rules[selected].Name})
 		case blockClients:
@@ -183,188 +182,11 @@ func (m *tuiModel) updateOverviewKey(key string) tea.Cmd {
 		}
 	}
 	if m.block == blockTimeline {
-		n := m.blockLen(blockTimeline)
-		cursor := &m.blockSelected[blockTimeline]
-		switch key {
-		case "shift+left", "shift+right", "H", "L":
-			if m.timelineAnchor == 0 {
-				m.timelineAnchor = *cursor + 1
-			}
-		case "left", "right", "h", "l", "home", "end":
-			m.timelineAnchor = 0
-		case "esc":
-			m.timelineAnchor = 0
-			return nil
-		}
-		switch key {
-		case "left", "h", "shift+left", "H":
-			*cursor--
-		case "right", "l", "shift+right", "L":
-			*cursor++
-		case "home", "g":
-			*cursor = 0
-		case "end", "G":
-			*cursor = n - 1
-		}
-		*cursor = max(0, min(n-1, *cursor))
+		m.moveTimeline(key, m.blockLen(blockTimeline))
 		return nil
 	}
 	tuiMove(&m.blockSelected[m.block], key, m.blockLen(m.block), 5)
 	return nil
-}
-
-// timelineRange is the selected column span, or the cursor column alone.
-func (m tuiModel) timelineRange(n int) (int, int) {
-	cursor := max(0, min(n-1, m.blockSelected[blockTimeline]))
-	if m.timelineAnchor == 0 {
-		return cursor, cursor
-	}
-	anchor := max(0, min(n-1, m.timelineAnchor-1))
-	return min(anchor, cursor), max(anchor, cursor)
-}
-
-type tuiTimelineColumn struct {
-	from, to         time.Time
-	requests, alerts int
-}
-
-func (m tuiModel) timelineWidth() int { return max(10, m.width) }
-
-// timelineColumns spreads the buckets over at most width columns. Short
-// timelines get one column per bucket; long ones merge neighbouring buckets.
-func (m tuiModel) timelineColumns(data *sessionTimeline, width int) []tuiTimelineColumn {
-	if data == nil || data.Total == 0 || len(data.Buckets) == 0 {
-		return nil
-	}
-	step := time.Duration(max(1, data.Granularity)) * time.Second
-	start, err := time.Parse(time.RFC3339, data.Buckets[0].Time)
-	if err != nil {
-		return nil
-	}
-	last, err := time.Parse(time.RFC3339, data.Buckets[len(data.Buckets)-1].Time)
-	if err != nil {
-		return nil
-	}
-	n := min(2000, int(last.Sub(start)/step)+1)
-	cols := max(1, min(n, width))
-	columns := make([]tuiTimelineColumn, cols)
-	for i := range columns {
-		lo, hi := i*n/cols, (i+1)*n/cols
-		columns[i].from, columns[i].to = start.Add(time.Duration(lo)*step), start.Add(time.Duration(hi)*step)
-	}
-	for _, bucket := range data.Buckets {
-		at, err := time.Parse(time.RFC3339, bucket.Time)
-		if err != nil {
-			continue
-		}
-		index := int(at.Sub(start) / step)
-		if index < 0 || index >= n {
-			continue
-		}
-		c := &columns[index*cols/n]
-		c.requests += bucket.Requests
-		c.alerts += bucket.Alerts
-	}
-	return columns
-}
-
-// timelineBars draws stacked eighth blocks, alerting requests in red. A
-// cursor row below the bars marks the selected span when focused.
-func (m tuiModel) timelineBars(data *sessionTimeline, width, height int, alertsOnly, focused bool) []string {
-	columns := m.timelineColumns(data, width)
-	if len(columns) == 0 {
-		return []string{tuiMuted.Render("这个范围内没有请求")}
-	}
-	// Spread the leftover cells so the bars span the full width.
-	widths := make([]int, len(columns))
-	for i := range widths {
-		widths[i] = max(1, (i+1)*width/len(columns)-i*width/len(columns))
-	}
-	peak := 1
-	for _, c := range columns {
-		peak = max(peak, c.requests)
-	}
-	units := func(n int) int {
-		if n == 0 {
-			return 0
-		}
-		return max(1, n*height*8/peak)
-	}
-	blocks := []rune(" ▁▂▃▄▅▆▇█")
-	lines := make([]string, 0, height+2)
-	for row := height - 1; row >= 0; row-- {
-		var b strings.Builder
-		base := row * 8
-		for i, c := range columns {
-			cw := widths[i]
-			total, hit := units(c.requests), units(c.alerts)
-			if alertsOnly {
-				hit = total
-			}
-			fill := max(0, min(8, total-base))
-			cell := strings.Repeat(string(blocks[fill]), cw)
-			switch {
-			case fill == 0:
-				b.WriteString(cell)
-			case hit > base:
-				b.WriteString(tuiDanger.Render(cell))
-			default:
-				b.WriteString(tuiBar.Render(cell))
-			}
-		}
-		lines = append(lines, b.String())
-	}
-	if focused {
-		from, to := m.timelineRange(len(columns))
-		var b strings.Builder
-		for i := range columns {
-			if i >= from && i <= to {
-				b.WriteString(tuiAccent.Render(strings.Repeat("▲", widths[i])))
-			} else {
-				b.WriteString(tuiMuted.Render(strings.Repeat("─", widths[i])))
-			}
-		}
-		lines = append(lines, b.String())
-	}
-	// Axis labels at the start, middle and end, like the web chart.
-	style := m.timelineStyle(data, columns)
-	labels := []string{tuiFormatTime(columns[0].from, style), tuiFormatTime(columns[len(columns)/2].from, style), tuiFormatTime(columns[len(columns)-1].to, style)}
-	used := 0
-	for _, w := range widths {
-		used += w
-	}
-	axis := labels[0]
-	middle := used/2 - lipgloss.Width(labels[1])/2
-	if middle > lipgloss.Width(axis)+1 && middle+lipgloss.Width(labels[1])+lipgloss.Width(labels[2])+1 < used {
-		axis += strings.Repeat(" ", middle-lipgloss.Width(axis)) + labels[1]
-	}
-	if gap := used - lipgloss.Width(axis) - lipgloss.Width(labels[2]); gap > 0 {
-		axis += strings.Repeat(" ", gap) + labels[2]
-	}
-	return append(lines, tuiMuted.Render(termansi.Truncate(axis, width, "")))
-}
-
-func (m tuiModel) timelineStyle(data *sessionTimeline, columns []tuiTimelineColumn) string {
-	if data.Granularity >= 86400 {
-		return "date"
-	}
-	if tuiIn(columns[0].from).YearDay() != tuiIn(columns[len(columns)-1].to).YearDay() {
-		return "dayclock"
-	}
-	return "clock"
-}
-
-func tuiFormatTime(t time.Time, style string) string {
-	t = tuiIn(t)
-	switch style {
-	case "date":
-		return t.Format("2006-01-02")
-	case "dayclock":
-		return t.Format("01-02 15:04")
-	case "clock":
-		return t.Format("15:04:05")
-	}
-	return t.Format("2006-01-02 15:04:05")
 }
 
 func tuiDuration(seconds int) string {
@@ -474,7 +296,7 @@ func (m tuiModel) overviewView(width, height int) string {
 		lines = append(lines, section...)
 		lines = append(lines, "")
 	}
-	addBlock([]int{blockTimeline}, m.timelineBlock(width))
+	addBlock([]int{blockTimeline}, m.timelineBlock(width, max(3, min(7, (height-12)/4))))
 	columns := func(width int, blocks ...[]string) []string {
 		n := len(blocks)
 		colWidth := (width - 3*(n-1)) / n
@@ -539,31 +361,6 @@ func (m tuiModel) blockTitle(block int, extra string) string {
 		title += "  " + tuiMuted.Render(extra)
 	}
 	return title
-}
-
-func (m tuiModel) timelineBlock(width int) []string {
-	data := &m.overview.Timeline
-	focused := m.block == blockTimeline
-	info := ""
-	columns := m.timelineColumns(data, width)
-	if len(columns) > 0 {
-		info = fmt.Sprintf("每格 %s · %s 起 · %s 请求 %s 含告警", tuiDuration(int(columns[0].to.Sub(columns[0].from).Seconds())), tuiFormatTime(columns[0].from, ""), tuiBar.Render("█"), tuiDanger.Render("█"))
-		if focused {
-			from, to := m.timelineRange(len(columns))
-			requests, alerts := 0, 0
-			for _, c := range columns[from : to+1] {
-				requests += c.requests
-				alerts += c.alerts
-			}
-			style := m.timelineStyle(data, columns)
-			info = fmt.Sprintf("%s – %s · %s 请求", tuiFormatTime(columns[from].from, style), tuiFormatTime(columns[to].to, style), tuiCount(uint64(requests)))
-			if alerts > 0 {
-				info += " · " + tuiDanger.Render(tuiCount(uint64(alerts))+" 含告警")
-			}
-			info += " · ←→ 移动 · Shift+←→ 选范围 · Enter 查看这段请求"
-		}
-	}
-	return append([]string{m.blockTitle(blockTimeline, info)}, m.timelineBars(data, width, 4, false, focused)...)
 }
 
 // barBlock is a web bar list: label, proportional bar and count.

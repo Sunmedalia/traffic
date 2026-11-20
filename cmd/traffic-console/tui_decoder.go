@@ -487,12 +487,12 @@ func (m *tuiModel) updateDecoderKey(key string) (tea.Cmd, bool) {
 	d := m.currentDecoder()
 	sources := m.decodeSources()
 	switch key {
-	case "left", "right", "h", "l", "<", ">", ",", ".":
+	case "left", "right", "h", "l":
 		if len(sources) == 0 {
 			return nil, true
 		}
 		step := 1
-		if key == "left" || key == "h" || key == "<" || key == "," {
+		if key == "left" || key == "h" {
 			step = -1
 		}
 		next := (d.source + step + len(sources)) % len(sources)
@@ -654,6 +654,9 @@ func (m *tuiModel) copyContent() tea.Cmd {
 	switch m.activeDetailTab() {
 	case detailRequest:
 		text, label = m.requestText(), "请求"
+		if m.msgLayout != layoutSingle && len(t.Response) > 0 {
+			text, label = text+"\n\n"+m.responseText(), "请求和响应"
+		}
 	case detailResponse:
 		text, label = m.responseText(), "响应"
 	case detailDecoded:

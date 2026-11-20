@@ -211,36 +211,145 @@ func (m tuiModel) prettyBody(body string) string {
 }
 
 // httpView prints a message with styled header names and an optional JSON indent.
-func (m tuiModel) httpView(text string) string {
-	message := tuiSplitHTTP(cleanTUIText(text))
-	var b strings.Builder
-	b.WriteString(tuiBold.Render(m.highlightBody(message.start)) + "\n")
-	for _, h := range message.headers {
-		if h[1] == "\x00" {
-			b.WriteString(m.highlightBody(h[0]) + "\n")
-			continue
-		}
-		b.WriteString(tuiAccent.UnsetBold().Render(h[0]) + ": " + m.highlightBody(h[1]) + "\n")
-	}
-	if message.body != "" {
-		b.WriteString("\n" + m.highlightBody(m.prettyBody(message.body)))
-	}
-	return b.String()
+// wrapPlain wraps uncoloured text to width so styles can be applied per line.
+func wrapPlain(text string, width int) []string {
+	return strings.Split(termansi.Hardwrap(text, max(1, width), true), "\n")
 }
 
-func (m tuiModel) paramsBlock(title string, pairs [][2]string) string {
+// messageLines prints an HTTP message wrapped to width, with styled header
+// names and an optional JSON indent. Lines are styled after wrapping so they
+// can sit beside another column.
+func (m tuiModel) messageLines(text string, width int) []string {
+	message := tuiSplitHTTP(cleanTUIText(text))
+	lines := []string{}
+	for _, line := range wrapPlain(message.start, width) {
+		lines = append(lines, tuiBold.Render(m.highlightBody(line)))
+	}
+	header := tuiAccent.UnsetBold()
+	for _, h := range message.headers {
+		if h[1] == "\x00" {
+			for _, line := range wrapPlain(h[0], width) {
+				lines = append(lines, m.highlightBody(line))
+			}
+			continue
+		}
+		for i, line := range wrapPlain(h[0]+": "+h[1], width) {
+			if i == 0 && len(line) > len(h[0]) {
+				line = header.Render(h[0]) + m.highlightBody(line[len(h[0]):])
+			} else {
+				line = m.highlightBody(line)
+			}
+			lines = append(lines, line)
+		}
+	}
+	if message.body != "" {
+		lines = append(lines, "")
+		for _, line := range wrapPlain(m.prettyBody(message.body), width) {
+			lines = append(lines, m.highlightBody(line))
+		}
+	}
+	return lines
+}
+
+func (m tuiModel) paramsLines(title string, pairs [][2]string, width int) []string {
 	if len(pairs) == 0 {
-		return ""
+		return nil
 	}
-	width := 8
+	nameWidth := 8
 	for _, p := range pairs {
-		width = max(width, min(24, lipgloss.Width(tuiLine(p[0]))+2))
+		nameWidth = max(nameWidth, min(24, lipgloss.Width(tuiLine(p[0]))+2))
 	}
-	lines := []string{"\n", tuiBold.Render(title) + tuiMuted.Render("  d 后用 ←→ 选择可解码的参数")}
+	nameWidth = min(nameWidth, max(4, width/3))
+	lines := []string{"", tuiBold.Render(title) + tuiMuted.Render("  d 后用 ←→ 选择可解码的参数")}
 	for _, p := range pairs[:min(len(pairs), 200)] {
-		lines = append(lines, tuiAccent.UnsetBold().Render(tuiCell(tuiLine(p[0]), width))+m.highlightBody(tuiLine(p[1])))
+		for i, line := range wrapPlain(tuiLine(p[1]), max(1, width-nameWidth)) {
+			name := strings.Repeat(" ", nameWidth)
+			if i == 0 {
+				name = tuiAccent.UnsetBold().Render(tuiCell(tuiLine(p[0]), nameWidth))
+			}
+			lines = append(lines, name+m.highlightBody(line))
+		}
 	}
-	return strings.Join(lines, "\n")
+	return lines
+}
+
+// requestLines is the request side: the message plus its form and cookie parameters.
+func (m tuiModel) requestLines(width int) []string {
+	t := m.snapshot.Detail
+	if len(t.Request) == 0 {
+		return []string{tuiMuted.Render("没有保存请求内容。")}
+	}
+	text := m.requestText()
+	lines := m.messageLines(text, width)
+	message := tuiSplitHTTP(text)
+	if strings.Contains(strings.ToLower(message.header("content-type")), "x-www-form-urlencoded") {
+		lines = append(lines, m.paramsLines("表单参数（原文）", tuiPairs(message.body, tuiAmp), width)...)
+	}
+	return append(lines, m.paramsLines("Cookie（原文）", tuiPairs(message.header("cookie"), tuiSemi), width)...)
+}
+func (m tuiModel) responseLines(width int) []string {
+	t := m.snapshot.Detail
+	switch {
+	case len(t.Response) > 0:
+		return m.messageLines(m.responseText(), width)
+	case t.Status != 0:
+		return []string{tuiMuted.Render("没有保存响应内容。")}
+	}
+	return wrapPlain("还没有采集到响应。会话仍在采集时，响应到达后会自动出现。", width)
+}
+
+// Request and response layouts in the detail pane.
+const (
+	layoutSide = iota
+	layoutStack
+	layoutSingle
+	layoutCount
+)
+
+var tuiLayoutNames = [layoutCount]string{"左右", "上下", "单独"}
+
+// tuiSideMinWidth is the narrowest pane that still shows two readable columns.
+const tuiSideMinWidth = 90
+
+// pairLayout is the layout in effect: side by side falls back to stacked
+// when the pane is too narrow.
+func (m tuiModel) pairLayout() int {
+	if m.msgLayout == layoutSide && m.viewport.Width() < tuiSideMinWidth {
+		return layoutStack
+	}
+	return m.msgLayout
+}
+
+// pairLines shows request and response together, like the web message pair.
+func (m tuiModel) pairLines(width int) []string {
+	title := func(name string) string { return tuiAccent.Render(name) }
+	if m.pairLayout() == layoutSide {
+		col := (width - 3) / 2
+		left, right := m.requestLines(col), m.responseLines(col)
+		lines := []string{tuiCell(title("请求"), col) + tuiMuted.Render(" │ ") + title("响应")}
+		for i := 0; i < max(len(left), len(right)); i++ {
+			l, r := "", ""
+			if i < len(left) {
+				l = left[i]
+			}
+			if i < len(right) {
+				r = right[i]
+			}
+			lines = append(lines, tuiCell(l, col)+tuiMuted.Render(" │ ")+r)
+		}
+		return lines
+	}
+	rule := func(name string) string {
+		return title("── "+name+" ") + tuiMuted.Render(strings.Repeat("─", max(0, width-lipgloss.Width(name)-4)))
+	}
+	lines := []string{}
+	if m.msgLayout == layoutSide {
+		lines = append(lines, tuiMuted.Render(fmt.Sprintf("详情宽度不足 %d 列，按上下显示 · > 加宽详情", tuiSideMinWidth)))
+	}
+	lines = append(lines, rule("请求"))
+	lines = append(lines, m.requestLines(width)...)
+	lines = append(lines, "", rule("响应"))
+	return append(lines, m.responseLines(width)...)
 }
 
 func (m tuiModel) detailContent() string {
@@ -337,6 +446,9 @@ func (m tuiModel) detailContent() string {
 	active := m.activeDetailTab()
 	for _, tab := range m.detailTabs() {
 		name := tuiDetailNames[tab]
+		if tab == detailRequest && m.msgLayout != layoutSingle {
+			name = "请求/响应"
+		}
 		if tab == detailAlerts {
 			name += fmt.Sprintf(" %d", len(t.Alerts))
 		}
@@ -351,30 +463,18 @@ func (m tuiModel) detailContent() string {
 	if m.raw {
 		format = "f 格式化 JSON"
 	}
-	b.WriteString(tuiMuted.Render(" [ ] 切换 · " + format + " · Y 复制"))
+	b.WriteString(tuiMuted.Render(" [ ] 切换 · L 排版 " + tuiLayoutNames[m.msgLayout] + " · " + format + " · Y 复制"))
 	b.WriteString("\n\n")
 	switch active {
 	case detailRequest:
-		if len(t.Request) == 0 {
-			b.WriteString("没有保存请求内容。")
-			break
+		width := m.viewport.Width()
+		if m.msgLayout == layoutSingle {
+			b.WriteString(strings.Join(m.requestLines(width), "\n"))
+		} else {
+			b.WriteString(strings.Join(m.pairLines(width), "\n"))
 		}
-		text := m.requestText()
-		b.WriteString(m.httpView(text))
-		message := tuiSplitHTTP(text)
-		if strings.Contains(strings.ToLower(message.header("content-type")), "x-www-form-urlencoded") {
-			b.WriteString(m.paramsBlock("表单参数（原文）", tuiPairs(message.body, tuiAmp)))
-		}
-		b.WriteString(m.paramsBlock("Cookie（原文）", tuiPairs(message.header("cookie"), tuiSemi)))
 	case detailResponse:
-		switch {
-		case len(t.Response) > 0:
-			b.WriteString(m.httpView(m.responseText()))
-		case t.Status != 0:
-			b.WriteString("没有保存响应内容。")
-		default:
-			b.WriteString("还没有采集到响应。会话仍在采集时，响应到达后会自动出现。")
-		}
+		b.WriteString(strings.Join(m.responseLines(m.viewport.Width()), "\n"))
 	case detailDecoder:
 		b.WriteString(m.decoderContent())
 	case detailDecoded:
@@ -443,9 +543,10 @@ func (m tuiModel) listView(width, height int) string {
 	}
 	lines := []string{}
 	// The web list shows the filtered timeline above the table.
-	if timeline := m.listTimeline(); timeline != nil && height >= 10 && !m.split() {
-		lines = append(lines, m.timelineBars(timeline, width, 1, m.tab == tabAlerts, false)[0])
-		height--
+	if timeline := m.listTimeline(); timeline != nil && !m.split() && (height >= 10 && !m.timelineFocus || height >= 16) {
+		strip := m.listTimelineView(timeline, width)
+		lines = append(lines, strip...)
+		height -= len(strip)
 	}
 	top := len(lines)
 	lines = append(lines, tuiMuted.Render(termansi.Truncate(header+"URL", width, "…")))
@@ -718,17 +819,19 @@ func (m tuiModel) keysLine() string {
 	case m.details && m.activeDetailTab() == detailDecoder:
 		return "←→ 换来源 · Enter 解码 · Backspace 撤销 · X 十六进制 · w 手动输入 · Y 复制结果 · [ ] 切标签 · Esc 返回"
 	case m.details:
-		return "j/k 上下一条 · ↑↓ 滚动 · [ ] 切标签 · d 解码 · f 格式化 · i 记录信息 · / 查找 · c/m/H/S 筛选 · e 导出 · Y 复制 · Esc 返回"
+		return "j/k 上下一条 · ↑↓ 滚动 · [ ] 切标签 · L 排版 · < > 宽度 · d 解码 · f 格式化 · i 记录信息 · / 查找 · c/m/H/S 筛选 · e 导出 · Y 复制 · Esc 返回"
 	case m.aggView():
 		return "↑↓ 选择 · Enter 查看逐条 · v 切换视图 · / 筛选 · x 清空 · A 分析 · s 会话 · ? 帮助"
 	case m.tab == tabOverview && m.block == blockTimeline:
 		return "←→ 移动 · Shift+←→ 选范围 · Enter 查看这段请求 · Tab 切换区块 · A 分析 · r 刷新 · s 会话 · ? 帮助"
 	case m.tab == tabOverview:
 		return "Tab 切换区块 · ↑↓ 选择 · Enter 查看对应请求 · A 分析 · 空格 暂停 · r 刷新 · s 会话 · ? 帮助 · q 退出"
+	case m.listTab() && m.timelineFocus:
+		return "←→ 移动 · Shift+←→ 选范围 · Enter 只看这段时间 · t 或 Esc 退出时间线"
 	case m.listTab() && m.drill != nil:
 		return "Esc 返回上一层 · ↑↓ 选择 · Enter 详情 · c/m/H 按选中行筛选 · x 清空 · e 导出 · v 切换视图 · ? 帮助"
 	case m.listTab():
-		return "↑↓ 选择 · Enter 详情 · n/p 翻页 · / 筛选 · c/m/H 按选中行筛选 · x 清空 · e 导出 · g 最新 · 空格 暂停 · A 分析 · s 会话 · ? 帮助"
+		return "↑↓ 选择 · Enter 详情 · n/p 翻页 · / 筛选 · t 时间线 · c/m/H 按选中行筛选 · x 清空 · e 导出 · g 最新 · 空格 暂停 · A 分析 · s 会话 · ? 帮助"
 	}
 	return "1-4 切换页面 · ↑↓ 滚动 · / 筛选 · 空格 暂停 · r 刷新 · A 分析 · s 会话 · ? 帮助 · q 退出"
 }
@@ -738,12 +841,15 @@ const tuiHelpText = `快捷键（与网页版一致的键位优先）
 页面    1 概览   2 请求   3 告警   4 采集健康   s 回到会话列表
 概览    Tab 切换区块，Enter 查看对应请求：规则、级别 → 告警；来源、状态 → 请求
         时间线 ←→ 移动，Shift+←→ 选一段时间，Enter 查看这段时间的请求
+列表    t 进入列表上方的时间线，选一段时间后 Enter 只看这段时间，t / Esc 退出
 告警    v 在逐条、按规则、按来源三种视图间切换，聚合行上 Enter 查看逐条
 移动    ↑↓ / j k 选择    g 回到最新并恢复跟随    G 本页末尾
         n p / ← → / PgDn PgUp 翻页
 层级    Enter 打开详情或下钻    Esc 关闭弹层、关闭详情、退出下钻
 详情    j / k 下一条、上一条    ↑↓ PgUp PgDn 滚动    [ ] 或 Tab 切换标签
-        标签：请求、响应、解码、解压正文、检测依据
+        标签：请求/响应、解码、解压正文、检测依据
+        L 切换请求与响应排版：左右 / 上下 / 单独（单独时请求、响应分两个标签）
+        < > 调整列表与详情宽度：各半 / 详情三分之二 / 详情全屏
         d 打开解码工具    f 切换 JSON 格式化    i 展开记录信息
         / 在当前标签中查找，n / N 跳到下一处、上一处，Esc 清除
         Y 复制当前标签内容    y 复制请求 ID
@@ -773,7 +879,7 @@ func (m tuiModel) View() tea.View {
 	case m.export != nil:
 		content = m.export.view()
 	case m.split():
-		listWidth := width / 2
+		listWidth := m.listWidth()
 		content = lipgloss.JoinHorizontal(lipgloss.Top, lipgloss.NewStyle().Width(listWidth).Render(m.listView(listWidth-1, contentHeight)), tuiMuted.Render(strings.TrimSuffix(strings.Repeat(" │ \n", contentHeight), "\n")), m.viewport.View())
 	case m.tab == tabOverview && !m.details:
 		content = m.overviewView(width, contentHeight)
