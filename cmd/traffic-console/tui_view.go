@@ -578,7 +578,9 @@ func (m tuiModel) listView(width, height int) string {
 			urlStyle = tuiDanger
 		}
 		var line strings.Builder
-		if i == m.selected {
+		// Beside a detail only the open record is marked, so a page without
+		// it shows no selection rather than a wrong one.
+		if i == m.selected && (!m.details || r.ID == m.detailID) {
 			// Selection is drawn uncolored so the reverse video spans the whole row.
 			for _, c := range cells {
 				line.WriteString(tuiCell(c.text, c.width))

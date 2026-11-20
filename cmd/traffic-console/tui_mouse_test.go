@@ -343,10 +343,17 @@ func TestTUIPagerBesideDetail(t *testing.T) {
 	if !m.split() {
 		t.Fatal("detail should open beside the list")
 	}
+	if !strings.Contains(m.listView(m.listBox()), "\x1b[7m") {
+		t.Fatal("the open record is not marked in the list")
+	}
 	detail, first := m.detailID, m.snapshot.Rows[0].ID
 	runLoad(m, clickZone(t, m, "page:next"))
 	if m.page != 1 || m.snapshot.Rows[0].ID == first || !m.details || m.detailID != detail {
 		t.Fatalf("page %d details %v", m.page, m.details)
+	}
+	// The open record is not on this page, so no row is marked as selected.
+	if strings.Contains(m.listView(m.listBox()), "\x1b[7m") {
+		t.Fatal("a row on another page is drawn as the open record")
 	}
 	runLoad(m, clickZone(t, m, "page:next"))
 	runLoad(m, clickZone(t, m, "page:prev"))

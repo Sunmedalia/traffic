@@ -485,6 +485,9 @@ func (m *tuiModel) dragDivider(x int) {
 		return
 	}
 	width := max(tuiMinList, min(m.width-tuiMinDetail-3, x-1))
+	if width == m.listWidth() {
+		return // re-wrapping a large detail on every motion event is costly
+	}
 	m.listRatio = max(1, (width*1000+m.width-1)/m.width)
 	m.resize()
 }
