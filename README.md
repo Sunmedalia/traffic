@@ -75,14 +75,14 @@ flowchart LR
 
 | 平台 | 采集器 `traffic` | 分析器 `traffic-console` |
 | :--- | :--- | :--- |
-| Ubuntu x64 / ARM64 | `traffic-v0.1.6-ubuntu-{amd64,arm64}.tar.gz` | `traffic-console-v0.1.6-ubuntu-{amd64,arm64}.tar.gz` |
-| CentOS 7+ x64 / ARM64 | `traffic-v0.1.6-centos7-{amd64,arm64}.tar.gz` | `traffic-console-v0.1.6-centos7-{amd64,arm64}.tar.gz` |
-| Windows x64 | `traffic-v0.1.6-windows-amd64.zip` | `traffic-console-v0.1.6-windows-amd64.zip` |
+| Ubuntu x64 / ARM64 | `traffic-v0.1.7-ubuntu-{amd64,arm64}.tar.gz` | `traffic-console-v0.1.7-ubuntu-{amd64,arm64}.tar.gz` |
+| CentOS 7+ x64 / ARM64 | `traffic-v0.1.7-centos7-{amd64,arm64}.tar.gz` | `traffic-console-v0.1.7-centos7-{amd64,arm64}.tar.gz` |
+| Windows x64 | `traffic-v0.1.7-windows-amd64.zip` | `traffic-console-v0.1.7-windows-amd64.zip` |
 
 ```bash
 # Ubuntu x64；CentOS 改用 centos7-amd64 文件名
-tar -xzf traffic-v0.1.6-ubuntu-amd64.tar.gz
-cd traffic-v0.1.6-ubuntu-amd64
+tar -xzf traffic-v0.1.7-ubuntu-amd64.tar.gz
+cd traffic-v0.1.7-ubuntu-amd64
 ./traffic --cn-help
 sudo ./traffic doctor
 sudo ./traffic capture --ports 80,443 --duration 60s
@@ -103,7 +103,7 @@ HTTPS 能力取决于目标与内核：CentOS 7 原生内核不具备 CO-RE BTF�
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential libpcap-dev git
-git clone --branch v0.1.6 https://github.com/Sunmedalia/traffic.git
+git clone --branch v0.1.7 https://github.com/Sunmedalia/traffic.git
 cd traffic
 ./scripts/build-linux.sh
 ```
@@ -236,9 +236,6 @@ Linux ARM64/x64、CentOS 7、Windows 的实机样本覆盖范围各不相同，�
 
 </details>
 
-> [!NOTE]
-> 上述终端界面（时间线选择、请求/响应同屏、参数标签、解码工具、分析面板）已合入 `main`，随 v0.1.6 之后的下一个版本发布。
-
 ### 🌐 Web
 
 ```bash
@@ -297,7 +294,7 @@ sessions/<host>/<date>/<session>/
 | 📘 [使用手册](docs/guide.md) | 后端、规则、终端与 Web、Windows、参数、停止与回滚、故障排查 |
 | ✅ [验证记录](VALIDATION.md) | 实机环境、构建哈希、成功与失败样本 |
 | 📈 [优化进度](OPTIMIZATION.md) | 已实现机制、性能门槛与待完成项目 |
-| 🏷️ [发布说明](https://github.com/Sunmedalia/traffic/releases) | 各版本下载包、升级变化和已知限制（早期版本另见 [docs/releases](docs/releases)） |
+| 🏷️ [v0.1.7 发布说明](docs/releases/v0.1.7.md) | 本版变化与已知限制；历史版本见 [docs/releases](docs/releases) 与 [Releases](https://github.com/Sunmedalia/traffic/releases) |
 | ⚖️ [第三方组件](THIRD_PARTY_NOTICES.md) | 依赖、探针与许可证说明 |
 
 ```bash
