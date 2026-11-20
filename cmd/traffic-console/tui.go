@@ -96,6 +96,9 @@ type tuiModel struct {
 	busy, pending, paused, details, help bool
 	stale, pickDetail                    bool
 	raw, metaOpen                        bool
+	noMouse, listFree                    bool
+	listTop                              int // first list row drawn
+	drag                                 *tuiTimelineDrag
 	msgLayout, listShare                 int
 	paramSelected                        int
 	detailID, errorText, flash           string
@@ -344,7 +347,15 @@ func (m *tuiModel) refreshNow() tea.Cmd {
 }
 
 func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	model, cmd := m.update(msg)
+	m.keepListCursor()
+	return model, cmd
+}
+
+func (m *tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.MouseMsg:
+		return m.updateMouse(msg)
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.resize()
@@ -470,6 +481,7 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, m.updateDecoderModal(msg)
 	}
 	m.flash = ""
+	m.listFree = false
 	if key == "q" {
 		return m, tea.Quit
 	}
@@ -507,6 +519,9 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "A":
 		return m, m.openAnalysis()
+	case "M":
+		m.toggleMouse()
+		return m, nil
 	case "1", "2", "3", "4":
 		return m, m.switchTab(int(key[0] - '1'))
 	case "x":

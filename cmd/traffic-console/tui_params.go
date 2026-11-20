@@ -4,6 +4,7 @@ package main
 // as captured. Enter opens the selected value in the decoder.
 
 import (
+	"fmt"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -69,12 +70,13 @@ func (m tuiModel) paramsContent(width int) []string {
 		}
 	}
 	nameWidth = min(nameWidth, max(4, width/3))
-	lines := []string{tuiMuted.Render("↑↓ 选择参数 · Enter 在解码工具中打开 · Y 复制全部参数")}
+	lines := []string{tuiMuted.Render(tuiHints("↑↓ 选择参数 · 点击或 Enter 在解码工具中打开 · Y 复制全部参数"))}
 	index := 0
 	for _, g := range groups {
 		lines = append(lines, "", tuiBold.Render(g.title)+tuiMuted.Render("  "+tuiCount(uint64(len(g.pairs)))+" 个"))
 		for _, p := range g.pairs {
 			selected := index == m.paramSelected
+			id := fmt.Sprintf("param:%d", index)
 			index++
 			value := tuiLine(p[1])
 			if value == "" {
@@ -91,12 +93,12 @@ func (m tuiModel) paramsContent(width int) []string {
 					if i == 0 {
 						marker = tuiParamMarker
 					}
-					lines = append(lines, tuiSelected.Render(tuiCell(marker+name+termansi.Strip(line), width)))
+					lines = append(lines, tuiHit(id, tuiSelected.Render(tuiCell(marker+name+termansi.Strip(line), width))))
 				default:
 					if i == 0 {
 						name = tuiAccent.UnsetBold().Render(name)
 					}
-					lines = append(lines, "  "+name+m.highlightBody(line))
+					lines = append(lines, tuiHit(id, "  "+name+m.highlightBody(line)))
 				}
 			}
 		}

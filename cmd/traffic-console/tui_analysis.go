@@ -254,11 +254,11 @@ func (m tuiModel) analysisView(height int) string {
 		if i > 0 {
 			name = "内置 + " + name
 		}
+		line := "  " + tuiLine(name)
 		if i == a.choice {
-			lines = append(lines, tuiSelected.Render("▸ "+tuiLine(name)))
-		} else {
-			lines = append(lines, "  "+tuiLine(name))
+			line = tuiSelected.Render("▸ " + tuiLine(name))
 		}
+		lines = append(lines, tuiHit(fmt.Sprintf("arule:%d", i), tuiCell(line, max(1, m.width))))
 	}
 	if m.rulesDir != "" {
 		lines = append(lines, tuiMuted.Render("规则目录 "+tuiLine(m.rulesDir)))
@@ -294,6 +294,14 @@ func (m tuiModel) analysisView(height int) string {
 			lines = append(lines, tuiMuted.Render("已停止，会话保留上次完整的分析结果。"))
 		}
 	}
+	buttons := []string{}
+	if m.analysisBlocked() == "" {
+		buttons = append(buttons, tuiButton("enter", "开始分析"))
+	}
+	if m.analysisRunning() && !a.cancelling {
+		buttons = append(buttons, tuiButton("x", "停止分析"))
+	}
+	lines = append(lines, "", strings.Join(append(buttons, tuiButton("esc", "关闭")), "  "))
 	if len(a.history) > 1 {
 		lines = append(lines, "", tuiBold.Render("此会话的最近任务"), tuiMuted.Render(tuiCell("开始", 14)+tuiCell("规则", 24)+tuiCell("结果", 10)+tuiCell("事务", 10)+tuiCell("告警", 8)+"耗时"))
 		for _, job := range a.history[1:] {

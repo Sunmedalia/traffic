@@ -357,6 +357,7 @@ func (m tuiModel) blockTitle(block int, extra string) string {
 	} else {
 		title = tuiBold.Render("  " + title)
 	}
+	title = tuiHit(fmt.Sprintf("block:%d", block), title)
 	if extra != "" {
 		title += "  " + tuiMuted.Render(extra)
 	}
@@ -403,7 +404,7 @@ func (m tuiModel) barBlock(block, width int) []string {
 		if block == m.block && i == selected {
 			row = tuiSelected.Render(tuiCell(termansi.Strip(row), width))
 		}
-		lines = append(lines, row)
+		lines = append(lines, tuiHit(fmt.Sprintf("ov:%d:%d", block, i), tuiCell(row, width)))
 	}
 	return lines
 }
@@ -470,14 +471,14 @@ func (m tuiModel) stackBlock(block, width int) []string {
 		if block == m.block && i == selected {
 			row = tuiSelected.Render(tuiCell(termansi.Strip(row), width))
 		}
-		lines = append(lines, row)
+		lines = append(lines, tuiHit(fmt.Sprintf("ov:%d:%d", block, i), tuiCell(row, width)))
 	}
 	return lines
 }
 
 func (m tuiModel) recentBlock(width int) []string {
 	o := m.overview
-	lines := []string{m.blockTitle(blockRecent, "Enter 打开详情 · 3 查看全部")}
+	lines := []string{m.blockTitle(blockRecent, "Enter 打开详情 · ") + tuiMuted.Render(tuiHints("3 查看全部"))}
 	if len(o.Recent) == 0 {
 		return append(lines, tuiMuted.Render("  没有告警。规则命中的请求会出现在这里。"))
 	}
@@ -488,7 +489,7 @@ func (m tuiModel) recentBlock(width int) []string {
 		if m.block == blockRecent && i == selected {
 			row = tuiSelected.Render(tuiCell(termansi.Strip(row), width))
 		}
-		lines = append(lines, termansi.Truncate(row, width, "…"))
+		lines = append(lines, tuiHit(fmt.Sprintf("ov:%d:%d", blockRecent, i), tuiCell(row, width)))
 	}
 	return lines
 }
@@ -527,7 +528,7 @@ func (m tuiModel) factsBlock(width int) []string {
 	if len(s.Errors) > 0 {
 		errors = tuiDanger.Render(fmt.Sprintf("%d 条", len(s.Errors)))
 	}
-	lines := []string{tuiBold.Render("  采集状态") + "  " + tuiMuted.Render("按 4 查看全部")}
+	lines := []string{tuiBold.Render("  采集状态") + "  " + tuiHit("tab:3", tuiMuted.Render("按 4 查看全部"))}
 	for _, row := range [][2]string{{"状态", tuiStateBadge(s.State)}, {"开始时间", started}, {"停止时间", stopped}, {"最后收包", last}, {"数据排空", tuiLine(drain)}, {"服务探针", strings.Join(probes, tuiMuted.Render(" · "))}, {"采集错误", errors}} {
 		lines = append(lines, termansi.Truncate(label(row[0])+row[1], width, "…"))
 	}

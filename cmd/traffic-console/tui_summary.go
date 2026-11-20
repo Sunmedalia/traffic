@@ -67,13 +67,13 @@ func (m tuiModel) alertsView(width, height int) string {
 	names := [alertViewCount]string{"按规则", "按来源", "逐条"}
 	parts := []string{}
 	for i, name := range names {
+		part := tuiMuted.Render(" " + name + " ")
 		if i == m.alertView {
-			parts = append(parts, tuiAccent.Render("["+name+"]"))
-		} else {
-			parts = append(parts, tuiMuted.Render(" "+name+" "))
+			part = tuiAccent.Render("[" + name + "]")
 		}
+		parts = append(parts, tuiHit(fmt.Sprintf("aview:%d", i), part))
 	}
-	selector := tuiSpread(tuiMuted.Render("视图 ")+strings.Join(parts, " "), tuiMuted.Render("v 切换视图"), width)
+	selector := tuiSpread(tuiMuted.Render("视图 ")+strings.Join(parts, " "), tuiMuted.Render(tuiHints("v 切换视图")), width)
 	height = max(1, height-1)
 	if m.alertView == viewList {
 		return selector + "\n" + m.listView(width, height)
@@ -140,7 +140,7 @@ func (m tuiModel) aggTable(width, height int) string {
 		if i == selected {
 			row = tuiSelected.Render(tuiCell(termansi.Strip(row), width))
 		}
-		lines = append(lines, termansi.Truncate(row, width, "…"))
+		lines = append(lines, tuiHit(fmt.Sprintf("agg:%d", i), tuiCell(row, width)))
 	}
 	for len(lines) < height-1 {
 		lines = append(lines, "")

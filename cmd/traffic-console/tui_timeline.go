@@ -249,7 +249,7 @@ func (m tuiModel) renderTimeline(data *sessionTimeline, width, height int, alert
 			if i >= from && i <= to {
 				style = style.Background(tuiTimelineSelected)
 			}
-			b.WriteString(style.Render(strings.Repeat(string(blocks[fill]), widths[i])))
+			b.WriteString(tuiHit(fmt.Sprintf("tl:%d", i), style.Render(strings.Repeat(string(blocks[fill]), widths[i]))))
 		}
 		lines = append(lines, b.String())
 	}
@@ -263,12 +263,11 @@ func (m tuiModel) renderTimeline(data *sessionTimeline, width, height int, alert
 	var b strings.Builder
 	b.WriteString(tuiMuted.Render(strings.Repeat(" ", tuiTimelineGutter-1) + "└"))
 	for i := range columns {
-		segment := string(axis[positions[i]:positions[i+1]])
+		segment := tuiMuted.Render(string(axis[positions[i]:positions[i+1]]))
 		if i >= from && i <= to {
-			b.WriteString(tuiAccent.Render(strings.Repeat("━", widths[i])))
-		} else {
-			b.WriteString(tuiMuted.Render(segment))
+			segment = tuiAccent.Render(strings.Repeat("━", widths[i]))
 		}
+		b.WriteString(tuiHit(fmt.Sprintf("tl:%d", i), segment))
 	}
 	lines = append(lines, b.String())
 	labels := []rune(strings.Repeat(" ", plot+tuiTimelineGutter))
@@ -310,7 +309,7 @@ func (m tuiModel) timelineSummary(data *sessionTimeline, focused bool) string {
 	if total > 0 {
 		text += fmt.Sprintf(" · 占 %d%%", (requests*100+total/2)/total)
 	}
-	return text + tuiMuted.Render(" · ←→ 移动 · Shift+←→ 选范围 · Enter 查看 · Esc 取消")
+	return text + tuiMuted.Render(tuiHints(" · 拖动或 Shift+←→ 选范围 · 再点一次或 Enter 查看 · Esc 取消"))
 }
 
 func (m tuiModel) timelineBlock(width, height int) []string {
@@ -338,7 +337,7 @@ func (m tuiModel) listTimelineView(data *sessionTimeline, width int) []string {
 	// One bar row, with the range and the key that opens the selector in the gutter line.
 	columns := m.timelineColumns(data, m.timelinePlot())
 	format := timelineFormat(columns)
-	info := tuiMuted.Render(fmt.Sprintf("时间线  %s – %s · 每格 %s · t 选择时间范围", format(columns[0].from), format(columns[len(columns)-1].to), tuiDuration(int(columns[0].to.Sub(columns[0].from).Seconds()))))
+	info := tuiMuted.Render(fmt.Sprintf("时间线  %s – %s · 每格 %s · ", format(columns[0].from), format(columns[len(columns)-1].to), tuiDuration(int(columns[0].to.Sub(columns[0].from).Seconds()))) + tuiHints("t 选择时间范围"))
 	return []string{termansi.Truncate(info, width, "…"), chart[0]}
 }
 
