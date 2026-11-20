@@ -75,14 +75,14 @@ flowchart LR
 
 | 平台 | 采集器 `traffic` | 分析器 `traffic-console` |
 | :--- | :--- | :--- |
-| Ubuntu x64 / ARM64 | `traffic-v0.1.7-ubuntu-{amd64,arm64}.tar.gz` | `traffic-console-v0.1.7-ubuntu-{amd64,arm64}.tar.gz` |
-| CentOS 7+ x64 / ARM64 | `traffic-v0.1.7-centos7-{amd64,arm64}.tar.gz` | `traffic-console-v0.1.7-centos7-{amd64,arm64}.tar.gz` |
-| Windows x64 | `traffic-v0.1.7-windows-amd64.zip` | `traffic-console-v0.1.7-windows-amd64.zip` |
+| Ubuntu x64 / ARM64 | `traffic-v0.1.8-ubuntu-{amd64,arm64}.tar.gz` | `traffic-console-v0.1.8-ubuntu-{amd64,arm64}.tar.gz` |
+| CentOS 7+ x64 / ARM64 | `traffic-v0.1.8-centos7-{amd64,arm64}.tar.gz` | `traffic-console-v0.1.8-centos7-{amd64,arm64}.tar.gz` |
+| Windows x64 | `traffic-v0.1.8-windows-amd64.zip` | `traffic-console-v0.1.8-windows-amd64.zip` |
 
 ```bash
 # Ubuntu x64；CentOS 改用 centos7-amd64 文件名
-tar -xzf traffic-v0.1.7-ubuntu-amd64.tar.gz
-cd traffic-v0.1.7-ubuntu-amd64
+tar -xzf traffic-v0.1.8-ubuntu-amd64.tar.gz
+cd traffic-v0.1.8-ubuntu-amd64
 ./traffic --cn-help
 sudo ./traffic doctor
 sudo ./traffic capture --ports 80,443 --duration 60s
@@ -103,7 +103,7 @@ HTTPS 能力取决于目标与内核：CentOS 7 原生内核不具备 CO-RE BTF�
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential libpcap-dev git
-git clone --branch v0.1.7 https://github.com/Sunmedalia/traffic.git
+git clone --branch v0.1.8 https://github.com/Sunmedalia/traffic.git
 cd traffic
 ./scripts/build-linux.sh
 ```
@@ -298,7 +298,7 @@ sessions/<host>/<date>/<session>/
 | 📘 [使用手册](docs/guide.md) | 后端、规则、终端与 Web、Windows、参数、停止与回滚、故障排查 |
 | ✅ [验证记录](VALIDATION.md) | 实机环境、构建哈希、成功与失败样本 |
 | 📈 [优化进度](OPTIMIZATION.md) | 已实现机制、性能门槛与待完成项目 |
-| 🏷️ [v0.1.7 发布说明](docs/releases/v0.1.7.md) | 本版变化与已知限制；历史版本见 [docs/releases](docs/releases) 与 [Releases](https://github.com/Sunmedalia/traffic/releases) |
+| 🏷️ [v0.1.8 发布说明](docs/releases/v0.1.8.md) | 本版变化与已知限制；历史版本见 [docs/releases](docs/releases) 与 [Releases](https://github.com/Sunmedalia/traffic/releases) |
 | ⚖️ [第三方组件](THIRD_PARTY_NOTICES.md) | 依赖、探针与许可证说明 |
 
 ```bash
