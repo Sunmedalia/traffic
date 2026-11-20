@@ -2,11 +2,9 @@ package replay
 
 import (
 	"bytes"
-	"context"
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -165,26 +163,6 @@ func (f *Frames) expire(now time.Time, all bool, p *HTTPProcessor, connection st
 		p.s.gap("tls", item.meta.connection, "partial_frame_closed", "fragments", 1)
 		p.invalidate("tls:"+item.meta.connection, "partial_frame_closed")
 	}
-}
-
-func (f *Frames) startExpiry(ctx context.Context, p *HTTPProcessor) func() {
-	lifetime, cancel := context.WithCancel(ctx)
-	var worker sync.WaitGroup
-	worker.Add(1)
-	go func() {
-		defer worker.Done()
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-lifetime.Done():
-				return
-			case now := <-ticker.C:
-				f.expire(now, false, p, "")
-			}
-		}
-	}()
-	return func() { cancel(); worker.Wait(); f.expire(time.Now(), true, p, "") }
 }
 
 func (r capturedReader) LocalEndpoint() string { return r.local }

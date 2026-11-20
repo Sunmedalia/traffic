@@ -431,7 +431,7 @@ func (w *webServer) transaction(rw http.ResponseWriter, r *http.Request) (*Store
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	var b []byte
-	err := s.db.QueryRowContext(ctx, "SELECT data FROM requests WHERE id=?", r.PathValue("rid")).Scan(&b)
+	err := s.db.QueryRowContext(ctx, "SELECT data FROM records WHERE id=?", r.PathValue("rid")).Scan(&b)
 	if err == sql.ErrNoRows {
 		s.db.Close()
 		webError(rw, http.StatusNotFound, errors.New("该记录不存在或已被保留期清理"))
@@ -460,11 +460,8 @@ func (w *webServer) handleRequestMeta(rw http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	var status, alertCount int
 	var incomplete, truncated bool
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(json_extract(CAST(data AS TEXT),'$.status'),0),
- COALESCE(json_extract(CAST(data AS TEXT),'$.incomplete'),0),
- COALESCE(json_extract(CAST(data AS TEXT),'$.truncated'),0),
- COALESCE(json_array_length(json_extract(CAST(data AS TEXT),'$.alerts')),0)
- FROM requests WHERE id=?`, r.PathValue("rid")).Scan(&status, &incomplete, &truncated, &alertCount)
+	err := s.db.QueryRowContext(ctx, `SELECT status,incomplete,truncated,COALESCE(json_array_length(alerts),0)
+ FROM entries WHERE id=?`, r.PathValue("rid")).Scan(&status, &incomplete, &truncated, &alertCount)
 	if err == sql.ErrNoRows {
 		webError(rw, http.StatusNotFound, errors.New("该记录不存在或已被保留期清理"))
 		return

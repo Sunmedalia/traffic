@@ -96,16 +96,20 @@ func (f tuiFilter) where(alertsOnly bool) (string, []any) {
 		prefix = escapeLike(strings.TrimSuffix(prefix, "%")) + "%"
 		args = append(args, f.Client, prefix)
 	}
-	if f.Rule != "" || f.Severity != "" {
-		clauses = append(clauses, `EXISTS (SELECT 1 FROM json_each(CAST(requests.data AS TEXT), '$.alerts') a WHERE (?='' OR json_extract(a.value,'$.rule')=?) AND `+sqlSeverityRank+`>=?)`)
-		args = append(args, f.Rule, f.Rule, severityRank(f.Severity))
+	if f.Rule != "" {
+		clauses = append(clauses, `EXISTS (SELECT 1 FROM json_each(entries.alerts) a WHERE json_extract(a.value,'$.rule')=? AND `+sqlSeverityRank+`>=?)`)
+		args = append(args, f.Rule, severityRank(f.Severity))
+	} else if f.Severity != "" {
+		// The stored maximum rank answers "any alert at least this severe".
+		clauses = append(clauses, "severity>=?")
+		args = append(args, severityRank(f.Severity))
 	}
 	if f.Service != "" {
-		clauses = append(clauses, "json_extract(CAST(data AS TEXT),'$.service')=?")
+		clauses = append(clauses, "service=?")
 		args = append(args, f.Service)
 	}
 	if f.Method != "" {
-		clauses = append(clauses, "json_extract(CAST(data AS TEXT),'$.method')=?")
+		clauses = append(clauses, "method=?")
 		args = append(args, f.Method)
 	}
 	if f.Status != "" {
@@ -118,11 +122,11 @@ func (f tuiFilter) where(alertsOnly bool) (string, []any) {
 			low, _ = strconv.Atoi(f.Status)
 			high = low
 		}
-		clauses = append(clauses, "COALESCE(json_extract(CAST(data AS TEXT),'$.status'),0) BETWEEN ? AND ?")
+		clauses = append(clauses, "status BETWEEN ? AND ?")
 		args = append(args, low, high)
 	}
-	const hostExpr = `json_extract(CAST(data AS TEXT),'$.host')`
-	urlExpr := `json_extract(CAST(data AS TEXT),'$.url')`
+	const hostExpr = `host`
+	urlExpr := `url`
 	if f.Decode > 0 {
 		urlExpr = fmt.Sprintf(`traffic_url_decode(%s,%d)`, urlExpr, f.Decode)
 	}
@@ -139,7 +143,7 @@ func (f tuiFilter) where(alertsOnly bool) (string, []any) {
 	if f.Param != "" {
 		// Parameter names are matched as typed in the stored URL, at the start of
 		// the query or after a separator, with or without a value.
-		raw := `json_extract(CAST(data AS TEXT),'$.url')`
+		raw := `url`
 		name := escapeLike(f.Param)
 		clauses = append(clauses, `(`+raw+` LIKE ? ESCAPE '\' OR `+raw+` LIKE ? ESCAPE '\' OR `+raw+` LIKE ? ESCAPE '\' OR `+raw+` LIKE ? ESCAPE '\' OR `+raw+` LIKE ? ESCAPE '\' OR `+raw+` LIKE ? ESCAPE '\')`)
 		args = append(args, "%?"+name+"=%", "%&"+name+"=%", "%?"+name+"&%", "%&"+name+"&%", "%?"+name, "%&"+name)
@@ -150,7 +154,7 @@ func (f tuiFilter) where(alertsOnly bool) (string, []any) {
 		for _, extension := range staticExtensions {
 			tests = append(tests, path+" LIKE '%."+extension+"'")
 		}
-		clauses = append(clauses, `NOT EXISTS (SELECT 1 FROM (SELECT COALESCE(json_extract(CAST(requests.data AS TEXT),'$.url'),'') AS u) WHERE `+strings.Join(tests, " OR ")+`)`)
+		clauses = append(clauses, `NOT EXISTS (SELECT 1 FROM (SELECT COALESCE(entries.url,'') AS u) WHERE `+strings.Join(tests, " OR ")+`)`)
 	}
 	return strings.Join(clauses, " AND "), args
 }
@@ -188,36 +192,6 @@ func readTUIStatus(dir string) (Stats, string) {
 		return status, "采集心跳超过 5 秒未更新，请检查采集进程"
 	}
 	return status, ""
-}
-
-// decodeTUIRowFields parses the single JSON array produced by the list query.
-func decodeTUIRowFields(raw []byte, row *tuiRow) error {
-	var fields []json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		return err
-	}
-	if len(fields) == 0 {
-		return nil
-	}
-	if len(fields) != 6 {
-		return fmt.Errorf("请求索引字段数量异常: %d", len(fields))
-	}
-	if err := json.Unmarshal(fields[0], &row.Method); err != nil {
-		return err
-	}
-	if err := json.Unmarshal(fields[1], &row.Host); err != nil {
-		return err
-	}
-	if err := json.Unmarshal(fields[2], &row.URL); err != nil {
-		return err
-	}
-	if err := json.Unmarshal(fields[3], &row.Status); err != nil {
-		return err
-	}
-	if err := json.Unmarshal(fields[4], &row.Incomplete); err != nil {
-		return err
-	}
-	return json.Unmarshal(fields[5], &row.Truncated)
 }
 
 // loadTUISnapshot queries summaries in SQLite so bodies are only transferred for an opened detail.
@@ -259,21 +233,18 @@ func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly
 	}
 	defer tx.Rollback()
 	where, args := filter.where(alertsOnly)
-	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM requests WHERE "+where, args...).Scan(&result.Count); err != nil {
+	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM entries WHERE "+where, args...).Scan(&result.Count); err != nil {
 		return result, err
 	}
 	maxPage := (max(result.Count, 1) - 1) / pageSize
 	result.Page = max(0, min(page, maxPage))
-	query := `SELECT id,time,client,
- COALESCE(json_extract(CAST(data AS TEXT),'$.method','$.host','$.url','$.status','$.incomplete','$.truncated'),'[]'),
- CASE COALESCE((SELECT max(` + sqlSeverityRank + `) FROM json_each(CAST(requests.data AS TEXT),'$.alerts') a),0)
- WHEN 3 THEN 'high' WHEN 2 THEN 'medium' WHEN 1 THEN 'low' ELSE '' END,
- COALESCE((SELECT json_extract(a.value,'$.rule') FROM json_each(CAST(requests.data AS TEXT),'$.alerts') a ORDER BY ` + sqlSeverityRank + ` DESC LIMIT 1),'')
- FROM requests WHERE ` + where + ` ORDER BY time DESC,id DESC LIMIT ? OFFSET ?`
+	query := `SELECT id,time,client,method,host,url,status,incomplete,truncated,
+ CASE severity WHEN 3 THEN 'high' WHEN 2 THEN 'medium' WHEN 1 THEN 'low' ELSE '' END,rule
+ FROM entries WHERE ` + where + ` ORDER BY time DESC,id DESC LIMIT ? OFFSET ?`
 	offset := result.Page * pageSize
 	if anchor != nil && result.Page == page {
 		newerArgs := append(append([]any{}, args...), anchor.Time, anchor.Time, anchor.ID)
-		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM requests WHERE "+where+" AND (time>? OR (time=? AND id>?))", newerArgs...).Scan(&result.Newer); err != nil {
+		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM entries WHERE "+where+" AND (time>? OR (time=? AND id>?))", newerArgs...).Scan(&result.Newer); err != nil {
 			return result, err
 		}
 		query = strings.Replace(query, " ORDER BY time DESC,id DESC", " AND (time<? OR (time=? AND id<=?)) ORDER BY time DESC,id DESC", 1)
@@ -287,12 +258,7 @@ func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly
 	}
 	for rows.Next() {
 		var row tuiRow
-		var fields []byte
-		if err = rows.Scan(&row.ID, &row.Time, &row.Client, &fields, &row.Severity, &row.Rule); err != nil {
-			rows.Close()
-			return result, err
-		}
-		if err = decodeTUIRowFields(fields, &row); err != nil {
+		if err = rows.Scan(&row.ID, &row.Time, &row.Client, &row.Method, &row.Host, &row.URL, &row.Status, &row.Incomplete, &row.Truncated, &row.Severity, &row.Rule); err != nil {
 			rows.Close()
 			return result, err
 		}
@@ -312,7 +278,7 @@ func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly
 	}
 	if detailID != "" {
 		var b []byte
-		err = tx.QueryRowContext(ctx, "SELECT data FROM requests WHERE id=?", detailID).Scan(&b)
+		err = tx.QueryRowContext(ctx, "SELECT data FROM records WHERE id=?", detailID).Scan(&b)
 		if err == sql.ErrNoRows {
 			result.DetailMissing = true
 		} else if err != nil {
@@ -360,9 +326,8 @@ func loadTUISummary(ctx context.Context, s *Store, filter tuiFilter) (*tuiSummar
 	defer fresh.db.Close()
 	s = fresh
 	where, args := filter.where(true)
-	// One json_extract with several paths parses each record once.
-	rows, err := s.db.QueryContext(ctx, `SELECT id, time, client, json_extract(CAST(data AS TEXT),'$.alerts','$.method','$.host','$.url')
- FROM requests WHERE `+where+` ORDER BY time DESC, id DESC`, args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,time,client,alerts,method,host,url
+ FROM entries WHERE `+where+` ORDER BY time DESC, id DESC`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -380,21 +345,15 @@ func loadTUISummary(ctx context.Context, s *Store, filter tuiFilter) (*tuiSummar
 	bySource := map[string]*sourceState{}
 	minRank := severityRank(filter.Severity)
 	for rows.Next() {
-		var id, at, client string
-		var fields []byte
-		if err = rows.Scan(&id, &at, &client, &fields); err != nil {
+		var id, at, client, method, host, url string
+		var raw []byte
+		if err = rows.Scan(&id, &at, &client, &raw, &method, &host, &url); err != nil {
 			return nil, err
 		}
-		var parts []json.RawMessage
 		var alerts []Alert
-		var method, host, url string
-		if json.Unmarshal(fields, &parts) != nil || len(parts) != 4 {
+		if json.Unmarshal(raw, &alerts) != nil {
 			continue
 		}
-		json.Unmarshal(parts[0], &alerts)
-		json.Unmarshal(parts[1], &method)
-		json.Unmarshal(parts[2], &host)
-		json.Unmarshal(parts[3], &url)
 		best, highRule, seen := 0, "", map[string]bool{}
 		source := tuiClientHost(client)
 		for _, a := range alerts {

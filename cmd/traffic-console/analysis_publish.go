@@ -86,8 +86,62 @@ func analysisExists(dir string) bool {
 	return err == nil
 }
 
-func publishAnalysis(ctx context.Context, dir, source string) error {
+// analysisBuild names unpublished generations. They are hidden, never
+// selected by the pointer, and removed by publication or failure cleanup.
+var analysisBuild = regexp.MustCompile(`^\.analysis-build-[0-9a-f]{32}\.sqlite$`)
+
+func analysisNonce() (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(nonce[:]), nil
+}
+
+// createAnalysisBuild creates an empty build file inside dir and returns its name.
+func createAnalysisBuild(dir string) (string, error) {
 	if err := validateAnalysisDestination(dir); err != nil {
+		return "", err
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	suffix, err := analysisNonce()
+	if err != nil {
+		return "", err
+	}
+	name := ".analysis-build-" + suffix + ".sqlite"
+	file, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return "", err
+	}
+	return name, file.Close()
+}
+
+// removeAnalysisBuild deletes a build left unpublished; it is a no-op afterwards.
+func removeAnalysisBuild(dir, name string) {
+	if !analysisBuild.MatchString(name) {
+		return
+	}
+	if root, err := os.OpenRoot(dir); err == nil {
+		_ = root.Remove(name)
+		_ = root.Remove(name + "-journal")
+		root.Close()
+	}
+}
+
+// publishAnalysis syncs the finished build named build inside dir, renames it to
+// a fresh immutable generation and atomically points analysis-current.json at it.
+func publishAnalysis(ctx context.Context, dir, build string) error {
+	if !analysisBuild.MatchString(build) {
+		return errors.New("invalid analysis build name")
+	}
+	if err := validateAnalysisDestination(dir); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	root, err := os.OpenRoot(dir)
@@ -95,14 +149,36 @@ func publishAnalysis(ctx context.Context, dir, source string) error {
 		return err
 	}
 	defer root.Close()
-	var nonce [16]byte
-	if _, err = rand.Read(nonce[:]); err != nil {
+	info, err := root.Lstat(build)
+	if err != nil {
 		return err
 	}
-	suffix := hex.EncodeToString(nonce[:])
-	name := "analysis-" + suffix + ".sqlite"
-	dest, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if !info.Mode().IsRegular() {
+		return errors.New("analysis build must be a regular file")
+	}
+	input, err := root.OpenFile(build, os.O_RDWR, 0)
 	if err != nil {
+		return err
+	}
+	err = input.Sync()
+	if closed := input.Close(); err == nil {
+		err = closed
+	}
+	if err != nil {
+		return err
+	}
+	suffix, err := analysisNonce()
+	if err != nil {
+		return err
+	}
+	name := "analysis-" + suffix + ".sqlite"
+	if _, err = root.Lstat(name); !os.IsNotExist(err) {
+		if err == nil {
+			err = os.ErrExist
+		}
+		return err
+	}
+	if err = root.Rename(build, name); err != nil {
 		return err
 	}
 	published := false
@@ -111,23 +187,6 @@ func publishAnalysis(ctx context.Context, dir, source string) error {
 			root.Remove(name)
 		}
 	}()
-	input, err := os.Open(filepath.Join(source, "analysis.sqlite"))
-	if err != nil {
-		dest.Close()
-		return err
-	}
-	defer input.Close()
-	_, err = io.Copy(dest, contextReader{ctx, input})
-	if err == nil {
-		err = dest.Sync()
-	}
-	closed := dest.Close()
-	if err == nil {
-		err = closed
-	}
-	if err != nil {
-		return err
-	}
 	tmp := ".analysis-pointer-" + suffix + ".tmp"
 	file, err := root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
@@ -138,7 +197,7 @@ func publishAnalysis(ctx context.Context, dir, source string) error {
 	if err == nil {
 		err = file.Sync()
 	}
-	closed = file.Close()
+	closed := file.Close()
 	if err == nil {
 		err = closed
 	}
@@ -155,11 +214,16 @@ func publishAnalysis(ctx context.Context, dir, source string) error {
 		return err
 	}
 	published = true
-	// Cleanup only generations older than a day. A brief reader-open retry handles
-	// a concurrent cleanup; already-open immutable readers keep their own snapshot.
+	// Cleanup only generations and abandoned builds older than a day. A brief
+	// reader-open retry handles a concurrent cleanup; already-open immutable
+	// readers keep their own snapshot.
 	entries, _ := os.ReadDir(dir)
 	for _, entry := range entries {
-		if analysisGeneration.MatchString(entry.Name()) && entry.Name() != name {
+		stale := analysisGeneration.MatchString(entry.Name()) && entry.Name() != name
+		if analysisBuild.MatchString(entry.Name()) {
+			stale = true
+		}
+		if stale {
 			info, statErr := entry.Info()
 			if statErr == nil && time.Since(info.ModTime()) > 24*time.Hour {
 				_ = root.Remove(entry.Name())
@@ -167,16 +231,4 @@ func publishAnalysis(ctx context.Context, dir, source string) error {
 		}
 	}
 	return nil
-}
-
-type contextReader struct {
-	ctx    context.Context
-	reader io.Reader
-}
-
-func (r contextReader) Read(p []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, err
-	}
-	return r.reader.Read(p)
 }

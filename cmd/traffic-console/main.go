@@ -237,7 +237,7 @@ func run(args []string) error {
 	}
 	if cmd == "show" || cmd == "export" {
 		var b []byte
-		if e = s.db.QueryRow("SELECT data FROM requests WHERE id=?", id).Scan(&b); e != nil {
+		if e = s.db.QueryRow("SELECT data FROM records WHERE id=?", id).Scan(&b); e != nil {
 			return e
 		}
 		var t Transaction
@@ -261,7 +261,7 @@ func run(args []string) error {
 	if net.ParseIP(*client) != nil && strings.Contains(*client, ":") {
 		prefix = "[" + *client + "]:%"
 	}
-	query := "SELECT data FROM requests WHERE time>=? AND (?='' OR client=? OR client LIKE ?)"
+	query := "SELECT data FROM records WHERE time>=? AND (?='' OR client=? OR client LIKE ?)"
 	if cmd == "events" {
 		query += " AND alert>0"
 	}

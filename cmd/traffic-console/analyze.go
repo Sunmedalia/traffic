@@ -8,20 +8,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/Sunmedalia/traffic/internal/index"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/Sunmedalia/traffic/internal/index"
 	"github.com/Sunmedalia/traffic/internal/replay"
 	"github.com/Sunmedalia/traffic/internal/session"
-	"sort"
 )
 
-const analysisEngineVersion = 4
+// Engine 5 adds the entries table; earlier generations remain readable.
+const analysisEngineVersion = 5
 
 type analysisReport struct {
 	IntegrityWarnings []string      `json:"integrity_warnings,omitempty"`
@@ -116,23 +117,12 @@ func analysisURL(path, mode string) string {
 	return u.String()
 }
 
-func openAnalysisDB(dir string, write bool) (*sql.DB, error) {
-	mode := "ro"
-	if write {
-		if err := validateAnalysisDestination(dir); err != nil {
-			return nil, err
-		}
-		mode = "rwc"
+func openAnalysisDB(dir string) (*sql.DB, error) {
+	path, err := analysisDatabasePath(dir)
+	if err != nil {
+		return nil, err
 	}
-	path := filepath.Join(dir, "analysis.sqlite")
-	if !write {
-		var err error
-		path, err = analysisDatabasePath(dir)
-		if err != nil {
-			return nil, err
-		}
-	}
-	db, err := sql.Open(index.Driver, analysisURL(path, mode))
+	db, err := sql.Open(index.Driver, analysisURL(path, "ro"))
 	if err != nil {
 		return nil, err
 	}
@@ -141,16 +131,24 @@ func openAnalysisDB(dir string, write bool) (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
-	if write {
-		if err = os.Chmod(filepath.Join(dir, "analysis.sqlite"), 0600); err == nil {
-			_, err = db.Exec(`PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
-CREATE TABLE IF NOT EXISTS results(id TEXT PRIMARY KEY, alerts TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS metadata(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);`)
-		}
-		if err != nil {
-			db.Close()
-			return nil, err
-		}
+	return db, nil
+}
+
+// openAnalysisBuild prepares an unpublished generation. A failed build is
+// discarded and publication syncs the file once, so per-transaction journaling
+// and fsync would only slow the build down.
+func openAnalysisBuild(path string) (*sql.DB, error) {
+	db, err := sql.Open(index.Driver, analysisURL(path, "rw"))
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if _, err = db.Exec(`PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF;
+CREATE TABLE results(id TEXT PRIMARY KEY, alerts TEXT NOT NULL);
+CREATE TABLE metadata(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+` + entriesTable); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return db, nil
 }
@@ -198,12 +196,14 @@ func analyzeConfigured(ctx context.Context, dir, webhookURL string, rs []Rule, w
 	if err != nil {
 		return report, err
 	}
-	work, err := os.MkdirTemp("", "traffic-analysis-*")
+	// Building next to the session keeps large analyses off a RAM-backed /tmp
+	// and lets publication rename the file instead of copying it.
+	build, err := createAnalysisBuild(dir)
 	if err != nil {
 		return report, err
 	}
-	defer os.RemoveAll(work)
-	db, err := openAnalysisDB(work, true)
+	defer removeAnalysisBuild(dir, build)
+	db, err := openAnalysisBuild(filepath.Join(dir, build))
 	if err != nil {
 		return report, err
 	}
@@ -228,12 +228,17 @@ func analyzeConfigured(ctx context.Context, dir, webhookURL string, rs []Rule, w
 		return report, err
 	}
 	defer stmt.Close()
+	entries, err := tx.PrepareContext(ctx, "INSERT INTO entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+	if err != nil {
+		return report, err
+	}
+	defer entries.Close()
 	scanner := &scanTracker{clients: map[string]*scanState{}}
 	var rows *sql.Rows
 	if report.Reconstructed {
-		rows, err = tx.QueryContext(ctx, "SELECT data FROM requests ORDER BY time,id")
+		rows, err = tx.QueryContext(ctx, "SELECT id,time,client,data FROM requests ORDER BY time,id")
 	} else {
-		rows, err = source.QueryContext(ctx, "SELECT data FROM requests ORDER BY time,id")
+		rows, err = source.QueryContext(ctx, "SELECT id,time,client,data FROM requests ORDER BY time,id")
 	}
 	if err != nil {
 		return report, err
@@ -241,8 +246,10 @@ func analyzeConfigured(ctx context.Context, dir, webhookURL string, rs []Rule, w
 	defer rows.Close()
 	for rows.Next() {
 		var raw []byte
+		var id string
+		var at, client sql.NullString
 		var record Transaction
-		if err = rows.Scan(&raw); err != nil {
+		if err = rows.Scan(&id, &at, &client, &raw); err != nil {
 			return report, err
 		}
 		if err = json.Unmarshal(raw, &record); err != nil {
@@ -259,7 +266,16 @@ func analyzeConfigured(ctx context.Context, dir, webhookURL string, rs []Rule, w
 		if err != nil {
 			return report, err
 		}
-		if _, err = stmt.ExecContext(ctx, record.ID, string(alerts)); err != nil {
+		if _, err = stmt.ExecContext(ctx, id, string(alerts)); err != nil {
+			return report, err
+		}
+		// Entries are keyed and timed like the source row so list order and
+		// filters match the stored index exactly.
+		values, err := entryValues(id, at.String, client.String, record)
+		if err != nil {
+			return report, err
+		}
+		if _, err = entries.ExecContext(ctx, values...); err != nil {
 			return report, err
 		}
 		report.Transactions++
@@ -273,6 +289,14 @@ func analyzeConfigured(ctx context.Context, dir, webhookURL string, rs []Rule, w
 	}
 	if err = rows.Close(); err != nil {
 		return report, err
+	}
+	if _, err = tx.ExecContext(ctx, entriesIndexes); err != nil {
+		return report, err
+	}
+	if report.Reconstructed {
+		if _, err = tx.ExecContext(ctx, "CREATE VIEW records AS "+recordsSelect("requests", "entries")); err != nil {
+			return report, err
+		}
 	}
 	signature, err := sourceSignature(dir)
 	if err != nil {
@@ -309,7 +333,7 @@ func analyzeConfigured(ctx context.Context, dir, webhookURL string, rs []Rule, w
 	if err = ctx.Err(); err != nil {
 		return report, err
 	}
-	if err = publishAnalysis(ctx, dir, work); err != nil {
+	if err = publishAnalysis(ctx, dir, build); err != nil {
 		return report, err
 	}
 	// Explicitly requested delivery happens only after successful publication.
@@ -322,7 +346,7 @@ func analyzeConfigured(ctx context.Context, dir, webhookURL string, rs []Rule, w
 			return report, err
 		}
 		defer view.db.Close()
-		rows, err := view.db.QueryContext(ctx, "SELECT data FROM requests WHERE alert>0 ORDER BY time,id")
+		rows, err := view.db.QueryContext(ctx, "SELECT data FROM records WHERE alert>0 ORDER BY time,id")
 		if err != nil {
 			return report, err
 		}
@@ -354,7 +378,7 @@ func readAnalysisReport(dir string) (*analysisReport, error) {
 	if err := validateAnalysisDestination(dir); err != nil {
 		return nil, err
 	}
-	db, err := openAnalysisDB(dir, false)
+	db, err := openAnalysisDB(dir)
 	if err != nil {
 		return nil, err
 	}

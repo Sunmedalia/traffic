@@ -87,10 +87,16 @@ func (m *tuiModel) updateExport(msg tea.KeyPressMsg) tea.Cmd {
 			path = absolute
 		}
 		e.running, e.err = true, ""
-		store, id := m.store, e.id
+		dir, id := m.store.dir, e.id
 		return func() tea.Msg {
+			// A fresh reader sees the currently published analysis generation.
+			store, err := openStore(dir)
+			if err != nil {
+				return tuiExported{ID: id, Err: err}
+			}
+			defer store.db.Close()
 			var b []byte
-			if err := store.db.QueryRow("SELECT data FROM requests WHERE id=?", id).Scan(&b); err != nil {
+			if err := store.db.QueryRow("SELECT data FROM records WHERE id=?", id).Scan(&b); err != nil {
 				return tuiExported{ID: id, Err: err}
 			}
 			var t Transaction

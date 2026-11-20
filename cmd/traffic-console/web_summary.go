@@ -51,7 +51,7 @@ func (w *webServer) handleTimeline(rw http.ResponseWriter, r *http.Request) {
 	where, args := filter.where(get("alerts") == "1")
 	var first, last sql.NullString
 	var total int
-	if err = s.db.QueryRowContext(ctx, "SELECT min(time),max(time),count(*) FROM requests WHERE "+where, args...).Scan(&first, &last, &total); err != nil {
+	if err = s.db.QueryRowContext(ctx, "SELECT min(time),max(time),count(*) FROM entries WHERE "+where, args...).Scan(&first, &last, &total); err != nil {
 		webError(rw, http.StatusInternalServerError, err)
 		return
 	}
@@ -73,7 +73,7 @@ func (w *webServer) handleTimeline(rw http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	rows, err := s.db.QueryContext(ctx, "SELECT substr(time,1,?),count(*),COALESCE(sum(alert>0),0) FROM requests WHERE "+where+" GROUP BY 1 ORDER BY 1", append([]any{granularity.Prefix}, args...)...)
+	rows, err := s.db.QueryContext(ctx, "SELECT substr(time,1,?),count(*),COALESCE(sum(alert>0),0) FROM entries WHERE "+where+" GROUP BY 1 ORDER BY 1", append([]any{granularity.Prefix}, args...)...)
 	if err != nil {
 		webError(rw, http.StatusInternalServerError, err)
 		return
@@ -160,14 +160,14 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 	where, args := filter.where(false)
 	result := map[string]any{}
 	var total, alerted int
-	if err = s.db.QueryRowContext(ctx, "SELECT count(*),COALESCE(sum(alert>0),0) FROM requests WHERE "+where, args...).Scan(&total, &alerted); err != nil {
+	if err = s.db.QueryRowContext(ctx, "SELECT count(*),COALESCE(sum(alert>0),0) FROM entries WHERE "+where, args...).Scan(&total, &alerted); err != nil {
 		webError(rw, http.StatusInternalServerError, err)
 		return
 	}
 	result["total"], result["alerted"] = total, alerted
 
 	// The port is stripped so one source address aggregates across connections.
-	clients, err := webCounts(ctx, s.db, `SELECT rtrim(rtrim(client,'0123456789'),':'),count(*),COALESCE(sum(alert>0),0) FROM requests WHERE `+where+` GROUP BY 1 ORDER BY 3 DESC,2 DESC,1 LIMIT 10`, args,
+	clients, err := webCounts(ctx, s.db, `SELECT rtrim(rtrim(client,'0123456789'),':'),count(*),COALESCE(sum(alert>0),0) FROM entries WHERE `+where+` GROUP BY 1 ORDER BY 3 DESC,2 DESC,1 LIMIT 10`, args,
 		func(rows *sql.Rows, item *webCount) error { return rows.Scan(&item.Name, &item.Count, &item.Alerts) })
 	if err != nil {
 		webError(rw, http.StatusInternalServerError, err)
@@ -176,14 +176,14 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 	result["clients"] = clients
 
 	// Rule and severity breakdowns only parse the records that carry alerts.
-	rules, err := webCounts(ctx, s.db, `SELECT COALESCE(json_extract(hit.value,'$.rule'),''),COALESCE(json_extract(hit.value,'$.severity'),''),count(DISTINCT requests.id) FROM requests, json_each(CAST(requests.data AS TEXT),'$.alerts') hit WHERE alert>0 AND `+where+` GROUP BY 1,2 ORDER BY 3 DESC,1 LIMIT 10`, args,
+	rules, err := webCounts(ctx, s.db, `SELECT COALESCE(json_extract(hit.value,'$.rule'),''),COALESCE(json_extract(hit.value,'$.severity'),''),count(DISTINCT entries.id) FROM entries, json_each(entries.alerts) hit WHERE entries.alert>0 AND `+where+` GROUP BY 1,2 ORDER BY 3 DESC,1 LIMIT 10`, args,
 		func(rows *sql.Rows, item *webCount) error { return rows.Scan(&item.Name, &item.Severity, &item.Count) })
 	if err != nil {
 		webError(rw, http.StatusInternalServerError, err)
 		return
 	}
 	result["rules"] = rules
-	severities, err := webCounts(ctx, s.db, `SELECT level,count(*) FROM (SELECT COALESCE((SELECT max(CASE json_extract(hit.value,'$.severity') WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END) FROM json_each(CAST(requests.data AS TEXT),'$.alerts') hit),0) AS level FROM requests WHERE alert>0 AND `+where+`) GROUP BY level`, args,
+	severities, err := webCounts(ctx, s.db, `SELECT severity,count(*) FROM entries WHERE alert>0 AND `+where+` GROUP BY severity`, args,
 		func(rows *sql.Rows, item *webCount) error {
 			var level int
 			if err := rows.Scan(&level, &item.Count); err != nil {
@@ -198,10 +198,10 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 	}
 	result["severities"] = severities
 
-	// Status codes live inside every record body. On a large index this scan is
-	// the expensive part, so it gets a short budget and is omitted when it overruns.
+	// Legacy layouts compute status from every record body. That scan can be
+	// expensive, so it keeps a short budget and is omitted when it overruns.
 	statusCtx, stop := context.WithTimeout(ctx, 1500*time.Millisecond)
-	statuses, err := webCounts(statusCtx, s.db, `SELECT COALESCE(json_extract(CAST(data AS TEXT),'$.status'),0)/100,count(*) FROM requests WHERE `+where+` GROUP BY 1 ORDER BY 1`, args,
+	statuses, err := webCounts(statusCtx, s.db, `SELECT status/100,count(*) FROM entries WHERE `+where+` GROUP BY 1 ORDER BY 1`, args,
 		func(rows *sql.Rows, item *webCount) error {
 			var class int
 			if err := rows.Scan(&class, &item.Count); err != nil {

@@ -19,10 +19,12 @@ const Driver = "sqlite3_traffic"
 // filter scan arbitrarily expensive.
 const MaxURLDecodeRounds = 4
 
+var sqliteDriver = &sqlite3.SQLiteDriver{ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+	return conn.RegisterFunc("traffic_url_decode", URLDecode, true)
+}}
+
 func init() {
-	sql.Register(Driver, &sqlite3.SQLiteDriver{ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-		return conn.RegisterFunc("traffic_url_decode", URLDecode, true)
-	}})
+	sql.Register(Driver, sqliteDriver)
 }
 
 var percentEscape = regexp.MustCompile(`%[0-9a-fA-F]{2}`)
