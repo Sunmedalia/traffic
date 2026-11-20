@@ -215,7 +215,7 @@ func (f *tuiForm) view(height int) string {
 		notes = append(notes, tuiDanger.Render(f.err))
 	}
 	// Show the window of fields around the focused one that fits above the notes.
-	visible := max(1, height-len(lines)-len(notes)-1)
+	visible := max(1, height-len(lines)-len(notes)-3)
 	start := max(0, min(f.index-visible/2, len(f.fields)-visible))
 	for i := start; i < min(len(f.fields), start+visible); i++ {
 		field := f.fields[i]
@@ -225,21 +225,22 @@ func (f *tuiForm) view(height int) string {
 		} else {
 			label = tuiMuted.Render(label)
 		}
+		label = tuiHit(fmt.Sprintf("ffield:%d", i), label)
 		if field.values == nil {
-			lines = append(lines, label+field.input.View())
+			lines = append(lines, label+tuiHit(fmt.Sprintf("ffield:%d", i), field.input.View()))
 			continue
 		}
 		options := []string{}
 		for j, name := range field.names {
+			option := tuiMuted.Render(" " + tuiLine(name) + " ")
 			if j == field.choice {
-				options = append(options, tuiAccent.Render("["+tuiLine(name)+"]"))
-			} else {
-				options = append(options, tuiMuted.Render(" "+tuiLine(name)+" "))
+				option = tuiAccent.Render("[" + tuiLine(name) + "]")
 			}
+			options = append(options, tuiHit(fmt.Sprintf("fopt:%d:%d", i, j), option))
 		}
 		lines = append(lines, label+strings.Join(options, " "))
 	}
-	lines = append(lines, "")
+	lines = append(lines, "", tuiButton("enter", "应用")+"  "+tuiButton("ctrl+r", "清空")+"  "+tuiButton("esc", "取消"))
 	return strings.Join(append(lines, notes...), "\n")
 }
 func (m *tuiModel) updateForm(msg tea.KeyPressMsg) tea.Cmd {

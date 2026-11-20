@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -134,6 +135,7 @@ type sessionBrowser struct {
 	rulesDir                string
 	// Layout choices carry over to the next opened session.
 	msgLayout, listShare int
+	noMouse              bool
 	// autoOpened is set after the first scan, which opens a lone session as the web page does.
 	autoOpened bool
 }
@@ -344,7 +346,7 @@ func (m *sessionBrowser) closeSession() {
 		m.childCancel = nil
 	}
 	if m.child != nil {
-		m.msgLayout, m.listShare = m.child.msgLayout, m.child.listShare
+		m.msgLayout, m.listShare, m.noMouse = m.child.msgLayout, m.child.listShare, m.child.noMouse
 		m.child.store.db.Close()
 		m.child = nil
 	}
@@ -367,7 +369,7 @@ func (m *sessionBrowser) openSession(dir string) error {
 	m.closeSession()
 	m.childCancel = cancel
 	m.lastDir = dir
-	m.child = &tuiModel{ctx: ctx, store: s, refresh: m.refresh, rulesDir: m.rulesDir, filter: m.filter, snapshot: snapshot, title: sessionTitle(dir), width: m.width, height: m.height, viewport: viewport.New(), alertView: viewList, msgLayout: m.msgLayout, listShare: m.listShare}
+	m.child = &tuiModel{ctx: ctx, store: s, refresh: m.refresh, rulesDir: m.rulesDir, filter: m.filter, snapshot: snapshot, title: sessionTitle(dir), width: m.width, height: m.height, viewport: viewport.New(), alertView: viewList, msgLayout: m.msgLayout, listShare: m.listShare, noMouse: m.noMouse}
 	m.child.resize()
 	return nil
 }
@@ -437,6 +439,8 @@ func (m *sessionBrowser) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		_, cmd := m.child.Update(msg.Message)
 		return m, sessionCommand(cmd, m.generation)
+	case tea.MouseMsg:
+		return m.updateMouse(msg)
 	case tea.KeyPressMsg:
 		key := msg.String()
 		if key == "ctrl+c" {
@@ -497,6 +501,9 @@ func (m *sessionBrowser) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.scan()
 			case "z":
 				tuiUseUTC.Store(!tuiUseUTC.Load())
+			case "M":
+				m.noMouse = !m.noMouse
+				m.notice = map[bool]string{true: "已关闭鼠标操作，可用终端直接选取文字；按 M 重新开启", false: "已开启鼠标操作"}[m.noMouse]
 			case "o":
 				m.editing = true
 				m.path.SetWidth(max(1, m.width-6))
@@ -630,10 +637,59 @@ func sessionBadge(entry sessionEntry) string {
 	return tuiStateBadge(entry.Stats.State)
 }
 
+// updateMouse lets a click open a session and the wheel move the cursor. In
+// a session the child handles the mouse, except the s hint that leaves it.
+func (m *sessionBrowser) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	mouse := msg.Mouse()
+	_, click := msg.(tea.MouseClickMsg)
+	if m.child != nil {
+		if click && mouse.Button == tea.MouseLeft && !m.child.modal() && m.child.hitAt(mouse.X, mouse.Y) == "key:s" {
+			return m.Update(tuiKeyMsg("s"))
+		}
+		_, cmd := m.child.Update(msg)
+		return m, sessionCommand(cmd, m.generation)
+	}
+	if m.editing {
+		return m, nil
+	}
+	if _, ok := msg.(tea.MouseWheelMsg); ok {
+		switch mouse.Button {
+		case tea.MouseWheelUp:
+			m.move(-1)
+		case tea.MouseWheelDown:
+			m.move(1)
+		}
+		return m, nil
+	}
+	if !click || mouse.Button != tea.MouseLeft {
+		return m, nil
+	}
+	_, zones := tuiHitScan(m.render())
+	kind, arg, _ := strings.Cut(tuiHitFind(zones, mouse.X, mouse.Y), ":")
+	switch kind {
+	case "sess":
+		m.selected, _ = strconv.Atoi(arg)
+		return m.Update(tuiKeyMsg("enter"))
+	case "key":
+		return m.Update(tuiKeyMsg(arg))
+	}
+	return m, nil
+}
+
 func (m *sessionBrowser) View() tea.View {
 	if m.child != nil {
 		return m.child.View()
 	}
+	frame, _ := tuiHitScan(m.render())
+	view := tea.NewView(frame)
+	view.AltScreen = true
+	if !m.noMouse {
+		view.MouseMode = tea.MouseModeCellMotion
+	}
+	return view
+}
+
+func (m *sessionBrowser) render() string {
 	width, height := max(1, m.width), max(1, m.height)
 	clip := func(s string) string { return termansi.Truncate(s, width, "…") }
 	running := 0
@@ -696,12 +752,13 @@ func (m *sessionBrowser) View() tea.View {
 			line += requests + alerts
 		}
 		line += about[0] + tuiMuted.Render(" · "+tuiLine(about[1])+" · "+about[2])
+		id := fmt.Sprintf("sess:%d", i)
 		if i == m.selected {
 			cursor = len(rows)
-			rows = append(rows, tuiSelected.Render(tuiCell(termansi.Strip(line), width)))
+			rows = append(rows, tuiHit(id, tuiSelected.Render(tuiCell(termansi.Strip(line), width))))
 			continue
 		}
-		rows = append(rows, clip(line))
+		rows = append(rows, tuiHit(id, tuiCell(line, width)))
 	}
 	if len(m.order) == 0 && !m.scanning {
 		if len(m.entries) > 0 {
@@ -718,7 +775,7 @@ func (m *sessionBrowser) View() tea.View {
 	if entry, ok := m.current(); ok {
 		path = entry.Dir
 	}
-	footer := "↑↓ 选择 · Enter 打开 · / 查找 · o 指定目录或文件 · r 重新扫描 · z 本地/UTC · q 退出"
+	footer := "↑↓ 选择 · Enter 打开 · / 查找 · o 指定目录或文件 · r 重新扫描 · z 本地/UTC · M 鼠标 · q 退出"
 	if m.searching {
 		footer = "输入即筛选 · ↑↓ 选择 · Enter 完成 · Esc 清除"
 	}
@@ -728,11 +785,9 @@ func (m *sessionBrowser) View() tea.View {
 		footer = "Enter 识别会话 · Esc 取消"
 		path = ""
 	}
-	frame := content + "\n" + tuiMuted.Render(clip(tuiLine(path))) + "\n" + tuiDanger.Render(clip(tuiLine(m.notice))) + "\n" + tuiMuted.Render(clip(footer))
+	frame := content + "\n" + tuiMuted.Render(clip(tuiLine(path))) + "\n" + tuiDanger.Render(clip(tuiLine(m.notice))) + "\n" + tuiMuted.Render(clip(tuiHints(footer)))
 	if width < 40 || height < 12 {
 		frame = "终端过小，请调整到至少 40 列 × 12 行\nCtrl+C 退出"
 	}
-	view := tea.NewView(lipgloss.NewStyle().MaxWidth(width).MaxHeight(height).Render(frame))
-	view.AltScreen = true
-	return view
+	return lipgloss.NewStyle().MaxWidth(width).MaxHeight(height).Render(frame)
 }

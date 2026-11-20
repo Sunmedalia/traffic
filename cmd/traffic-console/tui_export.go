@@ -61,6 +61,9 @@ func (e *tuiExport) view() string {
 	if e.err != "" {
 		lines = append(lines, "", tuiDanger.Render(e.err))
 	}
+	if !e.running {
+		lines = append(lines, "", tuiButton("enter", "导出")+"  "+tuiButton("esc", "取消"))
+	}
 	return strings.Join(lines, "\n")
 }
 func (m *tuiModel) updateExport(msg tea.KeyPressMsg) tea.Cmd {

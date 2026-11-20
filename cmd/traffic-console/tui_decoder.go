@@ -585,7 +585,7 @@ func (m tuiModel) decoderContent() string {
 	if d.source >= 0 {
 		position = fmt.Sprintf("%d/%d", d.source+1, len(sources))
 	}
-	fmt.Fprintf(&b, "%s ‹ %s › %s · %s 字节  %s\n", tuiMuted.Render("来源"), tuiAccent.Render(tuiLine(d.label)), tuiMuted.Render(position), tuiCount(uint64(len(d.input))), tuiMuted.Render("←→ 换来源 · w 手动输入"))
+	fmt.Fprintf(&b, "%s %s %s %s %s · %s 字节  %s\n", tuiMuted.Render("来源"), tuiHit("key:left", "‹"), tuiAccent.Render(tuiLine(d.label)), tuiHit("key:right", "›"), tuiMuted.Render(position), tuiCount(uint64(len(d.input))), tuiMuted.Render(tuiHints("←→ 换来源 · w 手动输入")))
 	if d.editor != nil {
 		b.WriteString(d.editor.View() + "\n")
 	} else {
@@ -600,12 +600,13 @@ func (m tuiModel) decoderContent() string {
 		if i == len(d.steps)-1 {
 			chain = append(chain, tuiAccent.Render("["+step.label+"]"))
 		} else {
-			chain = append(chain, step.label)
+			// An earlier step is clickable and goes back to it.
+			chain = append(chain, tuiHit(fmt.Sprintf("dstep:%d", i), step.label))
 		}
 	}
-	fmt.Fprintf(&b, "%s %s  %s\n", tuiMuted.Render("步骤"), strings.Join(chain, tuiMuted.Render(" → ")), tuiMuted.Render("Enter 选择解码方式 · Backspace 撤销 · X 十六进制"))
+	fmt.Fprintf(&b, "%s %s  %s\n", tuiMuted.Render("步骤"), strings.Join(chain, tuiMuted.Render(" → ")), tuiMuted.Render(tuiHints("Enter 选择解码方式 · Backspace 撤销 · X 十六进制")))
 	if d.picking {
-		b.WriteString("\n" + tuiAccent.Render("解码为") + tuiMuted.Render("  ↑↓ 选择 · Enter 解码 · Esc 取消 · ✓ 表示当前结果可以这样解码") + "\n")
+		b.WriteString("\n" + tuiAccent.Render("解码为") + tuiMuted.Render("  "+tuiHints("↑↓ 选择 · Enter 解码 · Esc 取消")+" · ✓ 表示当前结果可以这样解码") + "\n")
 		for i, kind := range tuiDecoders {
 			mark := "  "
 			if kind.applies(d.last()) {
@@ -615,7 +616,7 @@ func (m tuiModel) decoderContent() string {
 			if i == d.pick {
 				line = tuiSelected.Render("▸ " + tuiCell(kind.label, 20) + kind.title)
 			}
-			b.WriteString(line + "\n")
+			b.WriteString(tuiHit(fmt.Sprintf("dpick:%d", i), line) + "\n")
 		}
 	}
 	if d.err != "" {

@@ -317,7 +317,7 @@ func (m tuiModel) pairLines(width int) []string {
 	}
 	lines := []string{}
 	if m.msgLayout == layoutSide {
-		lines = append(lines, tuiMuted.Render(fmt.Sprintf("详情宽度不足 %d 列，按上下显示 · > 加宽详情", tuiSideMinWidth)))
+		lines = append(lines, tuiMuted.Render(tuiHints(fmt.Sprintf("详情宽度不足 %d 列，按上下显示 · > 加宽详情", tuiSideMinWidth))))
 	}
 	lines = append(lines, rule("请求"))
 	lines = append(lines, m.requestLines(width)...)
@@ -372,7 +372,7 @@ func (m tuiModel) detailContent() string {
 		if len(t.IntegrityReasons) > 0 {
 			line += tuiWarn.Render(" · 完整性原因 " + tuiLine(strings.Join(t.IntegrityReasons, ", ")))
 		}
-		b.WriteString(line + tuiMuted.Render("  · i 展开记录信息") + "\n")
+		b.WriteString(line + tuiMuted.Render("  · "+tuiHints("i 展开记录信息")) + "\n")
 	} else {
 		service := tuiLine(t.Service)
 		if t.TargetID != "" {
@@ -400,20 +400,20 @@ func (m tuiModel) detailContent() string {
 			stream = fmt.Sprint(t.StreamID)
 		}
 		rows := [][2]string{
-			{"时间", when}, {"来源", tuiLine(t.Client) + tuiMuted.Render("  c 按来源筛选")}, {"直连对端", tuiLine(t.PeerClient)}, {"来源地址依据", tuiLine(t.ClientSource)},
-			{"Host", tuiLine(t.Host) + tuiMuted.Render("  H 按 Host 筛选")}, {"服务", service}, {"后端 / 本地端点", strings.Join(endpoints, " · ")},
+			{"时间", when}, {"来源", tuiLine(t.Client) + tuiMuted.Render("  "+tuiHints("c 按来源筛选"))}, {"直连对端", tuiLine(t.PeerClient)}, {"来源地址依据", tuiLine(t.ClientSource)},
+			{"Host", tuiLine(t.Host) + tuiMuted.Render("  "+tuiHints("H 按 Host 筛选"))}, {"服务", service}, {"后端 / 本地端点", strings.Join(endpoints, " · ")},
 			{"采集来源", strings.Join(source, " · ")}, {"连接", tuiLine(t.Connection)}, {"协议", protocol}, {"HTTP/2 stream ID", stream},
-			{"完整性原因", tuiLine(strings.Join(t.IntegrityReasons, ", "))}, {"记录 ID", tuiLine(t.ID) + tuiMuted.Render("  y 复制")},
+			{"完整性原因", tuiLine(strings.Join(t.IntegrityReasons, ", "))}, {"记录 ID", tuiLine(t.ID) + tuiMuted.Render("  "+tuiHints("y 复制"))},
 		}
 		if t.Service != "" {
-			rows[5][1] += tuiMuted.Render("  S 按服务筛选")
+			rows[5][1] += tuiMuted.Render("  " + tuiHints("S 按服务筛选"))
 		}
 		for _, row := range rows {
 			if termansi.Strip(row[1]) != "" && !strings.HasPrefix(termansi.Strip(row[1]), "  ") {
 				b.WriteString(label(row[0]) + row[1] + "\n")
 			}
 		}
-		b.WriteString(tuiMuted.Render("i 收起记录信息") + "\n")
+		b.WriteString(tuiMuted.Render(tuiHints("i 收起记录信息")) + "\n")
 	}
 	b.WriteString("\n")
 	active := m.activeDetailTab()
@@ -425,10 +425,11 @@ func (m tuiModel) detailContent() string {
 		if tab == detailAlerts {
 			name += fmt.Sprintf(" %d", len(t.Alerts))
 		}
+		id := fmt.Sprintf("dtab:%d", tab)
 		if tab == active {
-			b.WriteString(tuiAccent.Render("[" + name + "]"))
+			b.WriteString(tuiHit(id, tuiAccent.Render("["+name+"]")))
 		} else {
-			b.WriteString(tuiMuted.Render(name))
+			b.WriteString(tuiHit(id, tuiMuted.Render(name)))
 		}
 		b.WriteString("  ")
 	}
@@ -436,7 +437,7 @@ func (m tuiModel) detailContent() string {
 	if m.raw {
 		format = "f 格式化 JSON"
 	}
-	b.WriteString(tuiMuted.Render(" [ ] 切换 · L 排版 " + tuiLayoutNames[m.msgLayout] + " · " + format + " · Y 复制"))
+	b.WriteString(tuiMuted.Render(tuiHints(" [ ] 切换 · L 排版 " + tuiLayoutNames[m.msgLayout] + " · " + format + " · Y 复制")))
 	b.WriteString("\n\n")
 	switch active {
 	case detailRequest:
@@ -472,7 +473,7 @@ func (m tuiModel) detailContent() string {
 				tuiSeverityStyle(a.Severity).Bold(true).Render("["+tuiSeverity(a.Severity)+"]"), tuiBold.Render(tuiLine(a.Rule)),
 				tuiMuted.Render(fmt.Sprintf("规则版本 %d · 命中字段 %s · 视图 %s · URL 解码 %d 轮", a.Version, tuiLine(a.Field), tuiLine(view), a.Decoding)),
 				tuiHighlight(match, tuiPattern([]string{match}), search), tuiMuted.Render(tuiOccurrences(a.Match, request, response)),
-				tuiMuted.Render("m 查看同规则请求 · d 解码片段"))
+				tuiMuted.Render(tuiHints("m 查看同规则请求 · d 解码片段")))
 		}
 	}
 	return b.String()
@@ -516,17 +517,13 @@ func (m tuiModel) listView(width, height int) string {
 	if showHost {
 		header += tuiCell("Host", hostWidth)
 	}
-	lines := []string{}
 	// The web list shows the filtered timeline above the table.
-	if timeline := m.listTimeline(); timeline != nil && !m.split() && (height >= 10 && !m.timelineFocus || height >= 16) {
-		strip := m.listTimelineView(timeline, width)
-		lines = append(lines, strip...)
-		height -= len(strip)
-	}
+	strip, visible := m.listLayout(width, height)
+	lines := append([]string{}, strip...)
+	height -= len(strip)
 	top := len(lines)
 	lines = append(lines, tuiMuted.Render(termansi.Truncate(header+"URL", width, "…")))
-	visible := max(1, height-2)
-	start := max(0, m.selected-visible+1)
+	start := m.listStart(visible)
 	for i := start; i < min(len(m.snapshot.Rows), start+visible); i++ {
 		r := m.snapshot.Rows[i]
 		status := "待响应"
@@ -581,14 +578,14 @@ func (m tuiModel) listView(width, height int) string {
 				line.WriteString(tuiCell(c.text, c.width))
 			}
 			line.WriteString(tuiCell(url, urlWidth))
-			lines = append(lines, tuiSelected.Render(termansi.Truncate(line.String(), width, "")))
+			lines = append(lines, tuiHit(fmt.Sprintf("row:%d", i), tuiSelected.Render(termansi.Truncate(line.String(), width, ""))))
 			continue
 		}
 		for _, c := range cells {
 			line.WriteString(c.style.Render(tuiCell(c.text, c.width)))
 		}
 		line.WriteString(urlStyle.Render(termansi.Truncate(url, urlWidth, "…")))
-		lines = append(lines, termansi.Truncate(line.String(), width, ""))
+		lines = append(lines, tuiHit(fmt.Sprintf("row:%d", i), tuiCell(termansi.Truncate(line.String(), width, ""), width)))
 	}
 	if len(m.snapshot.Rows) == 0 {
 		if m.filter != (tuiFilter{}) {
@@ -602,12 +599,23 @@ func (m tuiModel) listView(width, height int) string {
 	for len(lines)-top < height-1 {
 		lines = append(lines, "")
 	}
-	pager := tuiMuted.Render(fmt.Sprintf("%s 条 · 第 %d / %d 页", tuiCount(uint64(m.snapshot.Count)), m.page+1, max(1, (m.snapshot.Count+99)/100)))
+	pages := max(1, (m.snapshot.Count+99)/100)
+	pager := tuiMuted.Render(fmt.Sprintf("%s 条 · 第 %d / %d 页", tuiCount(uint64(m.snapshot.Count)), m.page+1, pages))
+	if pages > 1 {
+		prev, next := tuiMuted.Render("‹ 上一页"), tuiMuted.Render("下一页 ›")
+		if m.page > 0 {
+			prev = tuiHit("key:p", tuiAccent.UnsetBold().Render("‹ 上一页"))
+		}
+		if m.page+1 < pages {
+			next = tuiHit("key:n", tuiAccent.UnsetBold().Render("下一页 ›"))
+		}
+		pager += "  " + prev + "  " + next
+	}
 	if !m.following() && !m.paused {
 		if m.page == 0 && m.snapshot.Newer > 0 {
-			pager += tuiAccent.Render(fmt.Sprintf(" · ↑ 新增 %s 条，按 g 回到最新", tuiCount(uint64(m.snapshot.Newer))))
+			pager += tuiMuted.Render(" · ") + tuiHit("key:g", tuiAccent.Render(fmt.Sprintf("↑ 新增 %s 条，按 g 回到最新", tuiCount(uint64(m.snapshot.Newer)))))
 		} else if m.page > 0 {
-			pager += tuiMuted.Render(" · 按 g 回到最新")
+			pager += tuiMuted.Render(" · ") + tuiHit("key:g", tuiMuted.Render("按 g 回到最新"))
 		}
 	}
 	lines = append(lines, termansi.Truncate(pager, width, "…"))
@@ -625,34 +633,38 @@ func (m tuiModel) clientText(r tuiRow, width int) string {
 func (m tuiModel) filterChips() []string {
 	f := m.filter
 	chips := []string{}
-	add := func(value, label string) {
+	// Each chip is clickable and removes its condition, like the web chip's ×.
+	chip := func(field, text string) {
+		chips = append(chips, tuiHit("chip:"+field, "["+text+"]"))
+	}
+	add := func(field, value, label string) {
 		if value != "" {
-			chips = append(chips, "["+label+tuiLine(value)+"]")
+			chip(field, label+tuiLine(value))
 		}
 	}
-	add(f.Keyword, "关键词 ")
+	add("keyword", f.Keyword, "关键词 ")
 	if f.Decode > 0 {
-		chips = append(chips, fmt.Sprintf("[URL 解码 %d 次后匹配]", f.Decode))
+		chip("decode", fmt.Sprintf("URL 解码 %d 次后匹配", f.Decode))
 	}
 	if f.Severity != "" {
-		chips = append(chips, "[级别 ≥ "+tuiSeverity(f.Severity)+"]")
+		chip("severity", "级别 ≥ "+tuiSeverity(f.Severity))
 	}
 	switch f.Status {
 	case "":
 	case "pending":
-		chips = append(chips, "[状态 待响应]")
+		chip("status", "状态 待响应")
 	default:
-		add(f.Status, "状态 ")
+		add("status", f.Status, "状态 ")
 	}
-	add(f.Method, "方法 ")
+	add("method", f.Method, "方法 ")
 	if f.HideStatic {
-		chips = append(chips, "[隐藏静态资源]")
+		chip("static", "隐藏静态资源")
 	}
-	add(f.Exclude, "排除 ")
-	add(f.Param, "参数 ")
-	add(f.Client, "来源 ")
-	add(f.Rule, "规则 ")
-	add(f.Service, "服务 ")
+	add("exclude", f.Exclude, "排除 ")
+	add("param", f.Param, "参数 ")
+	add("client", f.Client, "来源 ")
+	add("rule", f.Rule, "规则 ")
+	add("service", f.Service, "服务 ")
 	if f.Since != "" || f.Until != "" {
 		bound := func(stamp, empty string) string {
 			if stamp == "" {
@@ -670,20 +682,21 @@ func (m tuiModel) filterChips() []string {
 		if f.Until == "" {
 			end = ""
 		}
-		chips = append(chips, "[时间 "+bound(f.Since, "最早")+" – "+end+bound(f.Until, "最新")+"]")
+		chip("time", "时间 "+bound(f.Since, "最早")+" – "+end+bound(f.Until, "最新"))
 	}
 	return chips
 }
 func (m tuiModel) filterLabel() string {
 	chips := m.filterChips()
+	label := tuiHit("filter", tuiMuted.Render("筛选"))
 	if len(chips) == 0 {
-		return tuiMuted.Render("筛选  全部")
+		return label + tuiMuted.Render("  全部")
 	}
-	line := tuiMuted.Render("筛选  ") + strings.Join(chips, " ")
+	line := label + "  " + strings.Join(chips, " ")
 	if m.listTab() {
-		line += tuiMuted.Render(fmt.Sprintf("  共 %s 条 · x 清空", tuiCount(uint64(m.snapshot.Count))))
+		line += tuiMuted.Render(fmt.Sprintf("  共 %s 条 · ", tuiCount(uint64(m.snapshot.Count))) + tuiHints("x 清空"))
 	} else if m.aggView() {
-		line += tuiMuted.Render("  · x 清空")
+		line += tuiMuted.Render("  · " + tuiHints("x 清空"))
 	} else {
 		line += tuiMuted.Render("  · 本页不受筛选影响")
 	}
@@ -746,8 +759,9 @@ func (m tuiModel) tabsLine(width int) string {
 		default:
 			parts[i] = tuiMuted.Render(label)
 		}
+		parts[i] = tuiHit(fmt.Sprintf("tab:%d", i), parts[i])
 	}
-	return tuiSpread(strings.Join(parts, "   "), tuiMuted.Render("时间 "+tuiZoneLabel()+" · z 切换"), width)
+	return tuiSpread(strings.Join(parts, "   "), tuiMuted.Render("时间 "+tuiZoneLabel()+" · "+tuiHints("z 切换")), width)
 }
 func (m tuiModel) noticeLine() string {
 	if m.errorText != "" {
@@ -767,13 +781,15 @@ func (m tuiModel) noticeLine() string {
 		return ""
 	}
 	text := "⚠ " + strings.Join(reasons, " · ")
-	if m.tab != tabHealth {
-		text += " · 按 4 查看"
-	}
+	style := tuiWarn
 	if level == 2 {
-		return tuiDanger.Render(text)
+		style = tuiDanger
 	}
-	return tuiWarn.Render(text)
+	if m.tab != tabHealth {
+		// The whole warning opens the health page.
+		return tuiHit("tab:3", style.Render(text+" · 按 4 查看"))
+	}
+	return style.Render(text)
 }
 func (m tuiModel) keysLine() string {
 	switch {
@@ -841,9 +857,24 @@ const tuiHelpText = `快捷键（与网页版一致的键位优先）
 证据    e 导出选中请求的证据压缩包（需要先停止采集）
 刷新    光标在第一页第一行时跟随最新记录，离开后列表定格
         空格 暂停或恢复    r 立即刷新    z 切换本地时间 / UTC
+鼠标    点击页面、标签、行、筛选条件和底部快捷键    滚轮滚动    右键返回上一层
+        拖动时间线选一段时间，单击选中一格，再点一次查看
+        点击筛选条件可去掉该条件    M 关闭或开启鼠标（关闭后可用终端直接选取文字）
 退出    q 或 Ctrl+C`
 
+// View draws the frame without its click zones and asks for mouse input.
 func (m tuiModel) View() tea.View {
+	frame, _ := tuiHitScan(m.render())
+	view := tea.NewView(frame)
+	view.AltScreen = true
+	if !m.noMouse {
+		view.MouseMode = tea.MouseModeCellMotion
+	}
+	return view
+}
+
+// render draws the frame with its click zones.
+func (m tuiModel) render() string {
 	width, height := max(1, m.width), max(1, m.height)
 	contentHeight := m.contentHeight()
 	content := m.viewport.View()
@@ -868,11 +899,9 @@ func (m tuiModel) View() tea.View {
 	}
 	frame := m.identityLine(width) + "\n" + m.tabsLine(width) + "\n" + termansi.Truncate(m.filterLabel(), width, "…") + "\n" +
 		lipgloss.NewStyle().Height(contentHeight).MaxHeight(contentHeight).Render(content) + "\n" +
-		termansi.Truncate(m.noticeLine(), width, "…") + "\n" + tuiMuted.Render(termansi.Truncate(m.keysLine(), width, "…"))
+		termansi.Truncate(m.noticeLine(), width, "…") + "\n" + tuiMuted.Render(termansi.Truncate(tuiHints(m.keysLine()), width, "…"))
 	if width < 40 || height < 12 {
 		frame = "终端过小，请调整到至少 40 列 × 12 行\nCtrl+C 退出"
 	}
-	view := tea.NewView(lipgloss.NewStyle().MaxWidth(width).MaxHeight(height).Render(frame))
-	view.AltScreen = true
-	return view
+	return lipgloss.NewStyle().MaxWidth(width).MaxHeight(height).Render(frame)
 }
