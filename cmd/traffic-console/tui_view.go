@@ -251,41 +251,14 @@ func (m tuiModel) messageLines(text string, width int) []string {
 	return lines
 }
 
-func (m tuiModel) paramsLines(title string, pairs [][2]string, width int) []string {
-	if len(pairs) == 0 {
-		return nil
-	}
-	nameWidth := 8
-	for _, p := range pairs {
-		nameWidth = max(nameWidth, min(24, lipgloss.Width(tuiLine(p[0]))+2))
-	}
-	nameWidth = min(nameWidth, max(4, width/3))
-	lines := []string{"", tuiBold.Render(title) + tuiMuted.Render("  d 后用 ←→ 选择可解码的参数")}
-	for _, p := range pairs[:min(len(pairs), 200)] {
-		for i, line := range wrapPlain(tuiLine(p[1]), max(1, width-nameWidth)) {
-			name := strings.Repeat(" ", nameWidth)
-			if i == 0 {
-				name = tuiAccent.UnsetBold().Render(tuiCell(tuiLine(p[0]), nameWidth))
-			}
-			lines = append(lines, name+m.highlightBody(line))
-		}
-	}
-	return lines
-}
-
-// requestLines is the request side: the message plus its form and cookie parameters.
+// requestLines is the request side: the message as captured. Its parameters
+// have their own tab.
 func (m tuiModel) requestLines(width int) []string {
 	t := m.snapshot.Detail
 	if len(t.Request) == 0 {
 		return []string{tuiMuted.Render("没有保存请求内容。")}
 	}
-	text := m.requestText()
-	lines := m.messageLines(text, width)
-	message := tuiSplitHTTP(text)
-	if strings.Contains(strings.ToLower(message.header("content-type")), "x-www-form-urlencoded") {
-		lines = append(lines, m.paramsLines("表单参数（原文）", tuiPairs(message.body, tuiAmp), width)...)
-	}
-	return append(lines, m.paramsLines("Cookie（原文）", tuiPairs(message.header("cookie"), tuiSemi), width)...)
+	return m.messageLines(m.requestText(), width)
 }
 func (m tuiModel) responseLines(width int) []string {
 	t := m.snapshot.Detail
@@ -475,6 +448,8 @@ func (m tuiModel) detailContent() string {
 		}
 	case detailResponse:
 		b.WriteString(strings.Join(m.responseLines(m.viewport.Width()), "\n"))
+	case detailParams:
+		b.WriteString(strings.Join(m.paramsContent(m.viewport.Width()), "\n"))
 	case detailDecoder:
 		b.WriteString(m.decoderContent())
 	case detailDecoded:
@@ -818,6 +793,8 @@ func (m tuiModel) keysLine() string {
 		return "↑↓ 选择解码方式 · Enter 解码 · Esc 取消"
 	case m.details && m.activeDetailTab() == detailDecoder:
 		return "←→ 换来源 · Enter 解码 · Backspace 撤销 · X 十六进制 · w 手动输入 · Y 复制结果 · [ ] 切标签 · Esc 返回"
+	case m.details && m.activeDetailTab() == detailParams:
+		return "↑↓ 选择参数 · Enter 解码 · j/k 上下一条 · [ ] 切标签 · Y 复制参数 · c/m/H/S 筛选 · e 导出 · Esc 返回"
 	case m.details:
 		return "j/k 上下一条 · ↑↓ 滚动 · [ ] 切标签 · L 排版 · < > 宽度 · d 解码 · f 格式化 · i 记录信息 · / 查找 · c/m/H/S 筛选 · e 导出 · Y 复制 · Esc 返回"
 	case m.aggView():
@@ -847,7 +824,8 @@ const tuiHelpText = `快捷键（与网页版一致的键位优先）
         n p / ← → / PgDn PgUp 翻页
 层级    Enter 打开详情或下钻    Esc 关闭弹层、关闭详情、退出下钻
 详情    j / k 下一条、上一条    ↑↓ PgUp PgDn 滚动    [ ] 或 Tab 切换标签
-        标签：请求/响应、解码、解压正文、检测依据
+        标签：请求/响应、参数、解码、解压正文、检测依据
+        参数：查询参数、表单参数、Cookie 原文，↑↓ 选择，Enter 在解码工具中打开
         L 切换请求与响应排版：左右 / 上下 / 单独（单独时请求、响应分两个标签）
         < > 调整列表与详情宽度：各半 / 详情三分之二 / 详情全屏
         d 打开解码工具    f 切换 JSON 格式化    i 展开记录信息

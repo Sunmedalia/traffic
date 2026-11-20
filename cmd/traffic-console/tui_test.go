@@ -210,6 +210,10 @@ func tuiKey(s string) tea.KeyPressMsg {
 		return tea.KeyPressMsg{Code: tea.KeyLeft, Mod: tea.ModShift}
 	case "end":
 		return tea.KeyPressMsg{Code: tea.KeyEnd}
+	case "down":
+		return tea.KeyPressMsg{Code: tea.KeyDown}
+	case "up":
+		return tea.KeyPressMsg{Code: tea.KeyUp}
 	}
 	panic(s)
 }
@@ -485,6 +489,7 @@ func TestTUILayoutAndDetailTabs(t *testing.T) {
 	m.width = 140
 	m.height = 40
 	m.detailTab = 0
+	m.msgLayout = layoutSide
 	m.resize()
 	// The split pane is narrower than a side-by-side pair, so the messages stack.
 	if m.pairLayout() != layoutStack || !strings.Contains(m.viewport.GetContent(), "response") {
@@ -1002,13 +1007,16 @@ func tuiDetailModel(t *testing.T) *tuiModel {
 func TestTUIDetailParity(t *testing.T) {
 	m := tuiDetailModel(t)
 	content := termansi.Strip(m.viewport.GetContent())
-	for _, want := range []string{"[SQLI-001]", "表单参数（原文）", "pass", "Cookie（原文）", "sid", "i 展开记录信息"} {
+	if strings.Contains(content, "表单参数（原文）") || strings.Contains(content, "Cookie（原文）") {
+		t.Fatalf("parameters still on the request page:\n%s", content)
+	}
+	for _, want := range []string{"[SQLI-001]", "pass=%27+or+1%3D1", "Cookie: sid=YWJj", "i 展开记录信息"} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("request tab misses %q:\n%s", want, content)
 		}
 	}
 	// Request and response share one tab, side by side, when the pane is wide enough.
-	if tabs := m.detailTabs(); len(tabs) != 3 || tabs[2] != detailAlerts {
+	if tabs := m.detailTabs(); len(tabs) != 4 || tabs[1] != detailParams || tabs[3] != detailAlerts {
 		t.Fatalf("pair tabs %v", tabs)
 	}
 	pair := strings.Split(termansi.Strip(m.viewport.GetContent()), "\n")
@@ -1031,7 +1039,7 @@ func TestTUIDetailParity(t *testing.T) {
 	}
 	m.Update(tuiKey("L"))
 	content = termansi.Strip(m.viewport.GetContent())
-	if m.msgLayout != layoutStack || !strings.Contains(content, "── 请求 ") || !strings.Contains(content, "── 响应 ") || strings.Index(content, "── 响应 ") < strings.Index(content, "Cookie（原文）") {
+	if m.msgLayout != layoutStack || !strings.Contains(content, "── 请求 ") || !strings.Contains(content, "── 响应 ") || strings.Index(content, "── 响应 ") < strings.Index(content, "Cookie: sid") {
 		t.Fatalf("stacked layout:\n%s", content)
 	}
 	// A narrow pane falls back from side by side to stacked.
@@ -1047,7 +1055,7 @@ func TestTUIDetailParity(t *testing.T) {
 	if m.msgLayout != layoutSingle {
 		t.Fatal("L did not reach the single layout")
 	}
-	if tabs := m.detailTabs(); len(tabs) != 4 || tabs[3] != detailAlerts {
+	if tabs := m.detailTabs(); len(tabs) != 5 || tabs[2] != detailParams || tabs[4] != detailAlerts {
 		t.Fatalf("tabs %v", tabs)
 	}
 	m.Update(tuiKey("i"))
@@ -1217,5 +1225,49 @@ func TestTUIZoneToggle(t *testing.T) {
 	m.Update(tuiKey("z"))
 	if tuiUseUTC.Load() {
 		t.Fatal("local time not restored")
+	}
+}
+
+func TestTUIParamsTab(t *testing.T) {
+	m := tuiDetailModel(t)
+	m.Update(tuiKey("]"))
+	if m.activeDetailTab() != detailParams {
+		t.Fatalf("second tab %d", m.activeDetailTab())
+	}
+	content := termansi.Strip(m.viewport.GetContent())
+	for _, want := range []string{"查询参数（原文）", "next", "表单参数（原文）", "pass", "Cookie（原文）", "theme"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("params tab misses %q:\n%s", want, content)
+		}
+	}
+	// The cursor starts on the first query parameter and moves through every group.
+	if prefix, pair, total := m.paramAt(m.paramSelected); prefix != "查询参数" || pair[0] != "next" || total != 6 {
+		t.Fatalf("first parameter %s %v %d", prefix, pair, total)
+	}
+	for i := 0; i < 3; i++ {
+		m.Update(tuiKey("down"))
+	}
+	if prefix, pair, _ := m.paramAt(m.paramSelected); prefix != "表单参数" || pair[0] != "pass" {
+		t.Fatalf("selected %s %v", prefix, pair)
+	}
+	if !strings.Contains(termansi.Strip(m.viewport.GetContent()), tuiParamMarker+"pass") {
+		t.Fatal("selection not marked")
+	}
+	m.Update(tuiKey("enter"))
+	if m.activeDetailTab() != detailDecoder || m.decoder.label != "表单参数 pass" || m.decoder.input != "%27+or+1%3D1" {
+		t.Fatalf("decoder source %q %q", m.decoder.label, m.decoder.input)
+	}
+	m.Update(tuiKey("["))
+	if _, cmd := m.Update(tuiKey("Y")); cmd == nil || !strings.Contains(m.flash, "参数") {
+		t.Fatalf("copy params %q", m.flash)
+	}
+	// A request without parameters has no parameter tab.
+	m.snapshot.Detail = &Transaction{ID: m.detailID, URL: "/plain", Request: []byte("GET /plain HTTP/1.1\r\n\r\n")}
+	m.bodies = tuiBodies{}
+	m.updateContent()
+	for _, tab := range m.detailTabs() {
+		if tab == detailParams {
+			t.Fatal("empty parameter tab offered")
+		}
 	}
 }

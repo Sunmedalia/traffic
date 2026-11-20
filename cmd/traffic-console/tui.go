@@ -52,10 +52,11 @@ const (
 	detailDecoder
 	detailDecoded
 	detailAlerts
+	detailParams
 	detailTabCount
 )
 
-var tuiDetailNames = [detailTabCount]string{"请求", "响应", "解码", "解压正文", "检测依据"}
+var tuiDetailNames = [detailTabCount]string{"请求", "响应", "解码", "解压正文", "检测依据", "参数"}
 
 // Summaries scan alert bodies, so they refresh less often than the list.
 const tuiSummaryInterval = 5 * time.Second
@@ -96,6 +97,7 @@ type tuiModel struct {
 	stale, pickDetail                    bool
 	raw, metaOpen                        bool
 	msgLayout, listShare                 int
+	paramSelected                        int
 	detailID, errorText, flash           string
 	alertView                            int
 	aggSelected                          [viewList]int
@@ -310,6 +312,7 @@ func (m *tuiModel) openDetail(row tuiRow) tea.Cmd {
 	m.snapshot.DetailMissing = false
 	m.detailTab = detailRequest
 	m.decoder = nil
+	m.paramSelected = 0
 	m.viewport.GotoTop()
 	m.resize()
 	return m.changed()
@@ -616,6 +619,11 @@ func (m *tuiModel) updateDetailKey(msg tea.KeyPressMsg) (tea.Cmd, bool) {
 			return cmd, true
 		}
 	}
+	if m.activeDetailTab() == detailParams {
+		if cmd, ok := m.updateParamsKey(key); ok {
+			return cmd, true
+		}
+	}
 	switch key {
 	case "tab", "]", "shift+tab", "[":
 		m.stepDetailTab(map[string]int{"tab": 1, "]": 1, "shift+tab": -1, "[": -1}[key])
@@ -681,15 +689,19 @@ func (m *tuiModel) updateDetailKey(msg tea.KeyPressMsg) (tea.Cmd, bool) {
 
 // detailTabs lists the tabs this record offers, like the web detail pane.
 func (m tuiModel) detailTabs() []int {
-	tabs := []int{detailRequest, detailResponse, detailDecoder}
+	tabs := []int{detailRequest, detailResponse}
 	if m.msgLayout != layoutSingle {
 		// The request tab shows both messages, as the web pair view does.
-		tabs = []int{detailRequest, detailDecoder}
+		tabs = []int{detailRequest}
 	}
 	t := m.snapshot.Detail
 	if t == nil || t.ID != m.detailID {
-		return tabs
+		return append(tabs, detailDecoder)
 	}
+	if len(m.paramGroups()) > 0 {
+		tabs = append(tabs, detailParams)
+	}
+	tabs = append(tabs, detailDecoder)
 	if m.bodies.requestView != "" || m.bodies.responseView != "" {
 		tabs = append(tabs, detailDecoded)
 	}

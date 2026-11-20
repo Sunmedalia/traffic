@@ -672,6 +672,14 @@ func (m *tuiModel) copyContent() tea.Cmd {
 			text = strings.ToValidUTF8(string(m.decoder.last()), "�")
 		}
 		label = "解码结果"
+	case detailParams:
+		lines := []string{}
+		for _, g := range m.paramGroups() {
+			for _, p := range g.pairs {
+				lines = append(lines, g.prefix+" "+p[0]+"="+p[1])
+			}
+		}
+		text, label = strings.Join(lines, "\n"), "参数"
 	case detailAlerts:
 		matches := []string{}
 		for _, a := range t.Alerts {
