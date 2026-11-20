@@ -1,11 +1,13 @@
 package main
 
 import (
-	lipgloss "charm.land/lipgloss/v2"
 	"context"
 	"fmt"
 	"time"
 
+	lipgloss "charm.land/lipgloss/v2"
+
+	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
@@ -25,27 +27,36 @@ const tuiChrome = 5
 
 type tuiTick time.Time
 type tuiLoaded struct {
-	Version    uint64
-	Snapshot   tuiSnapshot
-	Err        error
-	Summary    *tuiSummary
-	SummaryKey string
+	Version     uint64
+	Snapshot    tuiSnapshot
+	Err         error
+	Summary     *tuiSummary
+	SummaryKey  string
+	Overview    *tuiOverview
+	Timeline    *sessionTimeline
+	TimelineKey string
 }
 
-// Alert tab views and overview blocks.
+// Alert tab views. The list comes first, as on the web page.
 const (
 	viewRules = iota
 	viewSources
 	viewList
 	alertViewCount
 )
+
+// Detail tabs follow the web detail pane.
 const (
-	blockLevels = iota
-	blockRules
-	blockSources
-	blockRecent
-	blockCount
+	detailRequest = iota
+	detailResponse
+	detailDecoder
+	detailDecoded
+	detailAlerts
+	detailParams
+	detailTabCount
 )
+
+var tuiDetailNames = [detailTabCount]string{"请求", "响应", "解码", "解压正文", "检测依据", "参数"}
 
 // Summaries scan alert bodies, so they refresh less often than the list.
 const tuiSummaryInterval = 5 * time.Second
@@ -63,10 +74,18 @@ type tuiExported struct {
 
 type tuiListState struct{ page, selected int }
 
+// tuiBodies caches the decoded bodies of the open record between renders.
+type tuiBodies struct {
+	key                    string
+	request, requestView   string
+	response, responseView string
+}
+
 type tuiModel struct {
 	ctx                                  context.Context
 	store                                *Store
 	refresh                              time.Duration
+	rulesDir                             string
 	filter                               tuiFilter
 	snapshot                             tuiSnapshot
 	title                                string
@@ -76,14 +95,24 @@ type tuiModel struct {
 	version                              uint64
 	busy, pending, paused, details, help bool
 	stale, pickDetail                    bool
+	raw, metaOpen                        bool
+	msgLayout, listShare                 int
+	paramSelected                        int
 	detailID, errorText, flash           string
 	alertView                            int
 	aggSelected                          [viewList]int
 	block                                int
 	blockSelected                        [blockCount]int
+	timelineAnchor                       int // selection start + 1; 0 when none
+	timelineFocus                        bool
 	summary                              *tuiSummary
 	summaryKey                           string
 	summaryAt                            time.Time
+	overview                             *tuiOverview
+	overviewAt                           time.Time
+	timeline                             *sessionTimeline
+	timelineKey                          string
+	timelineAt                           time.Time
 	drill                                *tuiDrill
 	searchInput                          *textinput.Model
 	searchTerm                           string
@@ -91,6 +120,9 @@ type tuiModel struct {
 	searchIndex                          int
 	form                                 *tuiForm
 	export                               *tuiExport
+	decoder                              *tuiDecoder
+	bodies                               tuiBodies
+	analysis                             *tuiAnalysis
 	viewport                             viewport.Model
 }
 
@@ -101,6 +133,19 @@ var tuiDanger = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF7777"))
 var tuiWarn = lipgloss.NewStyle().Foreground(lipgloss.Color("#E6C35C"))
 var tuiGood = lipgloss.NewStyle().Foreground(lipgloss.Color("#7BD88F"))
 var tuiBold = lipgloss.NewStyle().Bold(true)
+
+// tuiViewportKeys leaves letters free for page actions; j and k only scroll
+// pages without records, because the detail uses them to change record.
+func tuiViewportKeys() viewport.KeyMap {
+	return viewport.KeyMap{
+		PageDown:     key.NewBinding(key.WithKeys("pgdown")),
+		PageUp:       key.NewBinding(key.WithKeys("pgup")),
+		HalfPageUp:   key.NewBinding(key.WithKeys("ctrl+u")),
+		HalfPageDown: key.NewBinding(key.WithKeys("ctrl+d")),
+		Up:           key.NewBinding(key.WithKeys("up", "k")),
+		Down:         key.NewBinding(key.WithKeys("down", "j")),
+	}
+}
 
 func (m tuiModel) tick() tea.Cmd {
 	return tea.Tick(m.refresh, func(t time.Time) tea.Msg { return tuiTick(t) })
@@ -114,13 +159,9 @@ func (m tuiModel) listTab() bool {
 }
 func (m tuiModel) aggView() bool { return m.tab == tabAlerts && m.alertView != viewList && !m.details }
 
-// summaryScope says whether the page shows aggregates and which filter they use.
-// The overview always covers the whole session.
+// summaryScope says whether the page shows alert aggregates and which filter they use.
 func (m tuiModel) summaryScope() (bool, tuiFilter, string) {
-	switch {
-	case m.tab == tabOverview && !m.details:
-		return true, tuiFilter{}, "overview"
-	case m.aggView():
+	if m.aggView() {
 		return true, m.filter, fmt.Sprintf("alerts %#v", m.filter)
 	}
 	return false, tuiFilter{}, ""
@@ -133,7 +174,25 @@ func (m tuiModel) currentSummary() *tuiSummary {
 	}
 	return nil
 }
-func (m tuiModel) modal() bool { return m.form != nil || m.export != nil }
+
+// timelineScope names the list timeline shown above the visible list.
+func (m tuiModel) timelineScope() string {
+	if !m.listTab() || m.details {
+		return ""
+	}
+	return fmt.Sprintf("%d %#v", m.tab, m.filter)
+}
+func (m tuiModel) listTimeline() *sessionTimeline {
+	if key := m.timelineScope(); key != "" && key == m.timelineKey {
+		return m.timeline
+	}
+	return nil
+}
+
+// modal reports a dialog or input that owns the keyboard.
+func (m tuiModel) modal() bool {
+	return m.form != nil || m.export != nil || m.analysis != nil && m.analysis.open || m.searchInput != nil || m.decoder != nil && m.decoder.capturing()
+}
 
 func (m *tuiModel) load() tea.Cmd {
 	if m.busy {
@@ -151,6 +210,10 @@ func (m *tuiModel) load() tea.Cmd {
 	}
 	wantSummary, summaryFilter, summaryKey := m.summaryScope()
 	wantSummary = wantSummary && (summaryKey != m.summaryKey || m.summary == nil || time.Since(m.summaryAt) >= tuiSummaryInterval)
+	wantOverview := m.tab == tabOverview && !m.details && (m.overview == nil || time.Since(m.overviewAt) >= tuiSummaryInterval)
+	timelineKey := m.timelineScope()
+	wantTimeline := timelineKey != "" && (timelineKey != m.timelineKey || m.timeline == nil || time.Since(m.timelineAt) >= tuiSummaryInterval)
+	timelineFilter := m.filter
 	rootCtx, store := m.ctx, m.store
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(rootCtx, 3*time.Second)
@@ -161,17 +224,33 @@ func (m *tuiModel) load() tea.Cmd {
 			result.Summary, result.Err = loadTUISummary(ctx, store, summaryFilter)
 			result.SummaryKey = summaryKey
 		}
+		if result.Err == nil && wantOverview {
+			result.Overview, result.Err = loadTUIOverview(ctx, store)
+		}
+		if result.Err == nil && wantTimeline {
+			result.Timeline, result.Err = loadTUITimeline(ctx, store, timelineFilter, alertsOnly)
+			result.TimelineKey = timelineKey
+		}
 		return result
 	}
 }
 func (m *tuiModel) changed() tea.Cmd  { m.version++; return m.load() }
 func (m tuiModel) contentHeight() int { return max(1, m.height-tuiChrome) }
-func (m tuiModel) split() bool        { return m.details && m.width >= 120 }
+func (m tuiModel) split() bool        { return m.details && m.width >= 120 && m.listShare < 2 }
+
+// listWidth is the list's share of a split detail: half, then a third.
+func (m tuiModel) listWidth() int {
+	if m.listShare == 1 {
+		return m.width / 3
+	}
+	return m.width / 2
+}
 func (m *tuiModel) resize() {
 	width := max(1, m.width)
 	if m.split() {
-		width = max(1, m.width-m.width/2-3)
+		width = max(1, m.width-m.listWidth()-3)
 	}
+	m.viewport.KeyMap = tuiViewportKeys()
 	m.viewport.SetWidth(width)
 	m.viewport.SetHeight(m.contentHeight())
 	m.updateContent()
@@ -180,6 +259,7 @@ func (m *tuiModel) updateContent() {
 	content := ""
 	switch {
 	case m.details:
+		m.cacheBodies()
 		content = m.detailContent()
 	case m.tab == tabHealth:
 		content = m.healthContent()
@@ -196,6 +276,7 @@ func (m *tuiModel) switchTab(tab int) tea.Cmd {
 	}
 	m.lists[m.tab] = tuiListState{m.page, m.selected}
 	m.drill = nil
+	m.timelineFocus, m.timelineAnchor = false, 0
 	m.tab = tab
 	m.page, m.selected = m.lists[tab].page, m.lists[tab].selected
 	m.closeDetail()
@@ -209,11 +290,13 @@ func (m *tuiModel) closeDetail() {
 	m.details = false
 	m.detailID = ""
 	m.pickDetail = false
+	m.decoder = nil
 	m.snapshot.Detail = nil
 	m.snapshot.DetailMissing = false
 }
 func (m *tuiModel) applyFilter(filter tuiFilter) tea.Cmd {
 	m.drill = nil
+	m.timelineFocus, m.timelineAnchor = false, 0
 	m.filter = filter
 	m.page, m.selected = 0, 0
 	m.lists = [tuiTabCount]tuiListState{}
@@ -227,10 +310,9 @@ func (m *tuiModel) openDetail(row tuiRow) tea.Cmd {
 	m.detailID = row.ID
 	m.snapshot.Detail = nil
 	m.snapshot.DetailMissing = false
-	m.detailTab = 0
-	if row.Severity != "" {
-		m.detailTab = 3
-	}
+	m.detailTab = detailRequest
+	m.decoder = nil
+	m.paramSelected = 0
 	m.viewport.GotoTop()
 	m.resize()
 	return m.changed()
@@ -255,6 +337,12 @@ func (m *tuiModel) stepDetail(step int) tea.Cmd {
 	return m.changed()
 }
 
+// refreshNow drops cached aggregates so the next load rebuilds them, like r on the web.
+func (m *tuiModel) refreshNow() tea.Cmd {
+	m.summaryAt, m.overviewAt, m.timelineAt = time.Time{}, time.Time{}, time.Time{}
+	return m.load()
+}
+
 func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -263,7 +351,8 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tuiTick:
 		var load tea.Cmd
-		if !m.paused {
+		// Finished sessions only refresh on demand, as on the web page.
+		if !m.paused && (tuiLive(m.snapshot.Stats.State) || m.overview == nil && m.tab == tabOverview) {
 			load = m.load()
 		}
 		return m, tea.Batch(m.tick(), load)
@@ -275,6 +364,12 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				if msg.Summary != nil {
 					m.summary, m.summaryKey, m.summaryAt = msg.Summary, msg.SummaryKey, time.Now()
+				}
+				if msg.Overview != nil {
+					m.overview, m.overviewAt = msg.Overview, time.Now()
+				}
+				if msg.Timeline != nil {
+					m.timeline, m.timelineKey, m.timelineAt = msg.Timeline, msg.TimelineKey, time.Now()
 				}
 				m.applySnapshot(msg.Snapshot)
 				if m.pickDetail && len(m.snapshot.Rows) > 0 {
@@ -300,6 +395,13 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.flash = fmt.Sprintf("已导出 %s · %s", msg.Path, tuiBytes(msg.Size))
 		}
 		return m, nil
+	case tuiAnalysisTick:
+		if m.analysisRunning() {
+			return m, m.analysisTick()
+		}
+		return m, nil
+	case tuiAnalysisDone:
+		return m, m.finishAnalysis(msg)
 	case tea.KeyPressMsg:
 		return m.updateKey(msg)
 	}
@@ -309,6 +411,11 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.export != nil {
 		var cmd tea.Cmd
 		m.export.input, cmd = m.export.input.Update(msg)
+		return m, cmd
+	}
+	if m.decoder != nil && m.decoder.editor != nil {
+		var cmd tea.Cmd
+		*m.decoder.editor, cmd = m.decoder.editor.Update(msg)
 		return m, cmd
 	}
 	return m, nil
@@ -347,6 +454,9 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if key == "ctrl+c" {
 		return m, tea.Quit
 	}
+	if m.analysis != nil && m.analysis.open {
+		return m, m.updateAnalysis(key)
+	}
 	if m.form != nil {
 		return m, m.updateForm(msg)
 	}
@@ -355,6 +465,9 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.searchInput != nil {
 		return m, m.updateSearch(msg)
+	}
+	if m.details && m.decoder != nil && m.decoder.capturing() {
+		return m, m.updateDecoderModal(msg)
 	}
 	m.flash = ""
 	if key == "q" {
@@ -377,13 +490,23 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.form = newTUIForm(m.filter, m.services(), m.width)
 		return m, m.form.focus()
 	case " ", "space":
+		if !m.paused && !tuiLive(m.snapshot.Stats.State) {
+			m.flash = "会话已结束，不再自动刷新；按 r 立即刷新"
+			return m, nil
+		}
 		m.paused = !m.paused
 		if !m.paused {
 			return m, m.load()
 		}
 		return m, nil
 	case "r":
-		return m, m.load()
+		return m, m.refreshNow()
+	case "z":
+		tuiUseUTC.Store(!tuiUseUTC.Load())
+		m.updateContent()
+		return m, nil
+	case "A":
+		return m, m.openAnalysis()
 	case "1", "2", "3", "4":
 		return m, m.switchTab(int(key[0] - '1'))
 	case "x":
@@ -402,6 +525,14 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.viewport.GotoTop()
 			m.resize()
 			return m, m.changed()
+		}
+		if m.timelineFocus {
+			m.timelineFocus, m.timelineAnchor = false, 0
+			return m, nil
+		}
+		if m.tab == tabOverview && m.timelineAnchor > 0 {
+			m.timelineAnchor = 0
+			return m, nil
 		}
 		if m.drill != nil {
 			return m, m.returnFromDrill()
@@ -424,7 +555,7 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.details || m.listTab() {
 		switch key {
-		case "c", "m", "H":
+		case "c", "m", "H", "S":
 			return m, m.toggleFromRow(key)
 		case "e":
 			return m, m.openExport()
@@ -433,34 +564,16 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	if m.details {
-		switch key {
-		case "tab", "shift+tab":
-			step := 1
-			if key == "shift+tab" {
-				step = 3
-			}
-			m.detailTab = (m.detailTab + step) % 4
-			m.viewport.GotoTop()
-			m.updateContent()
-			return m, nil
-		case "n", "N":
-			if m.searchTerm != "" {
-				step := 1
-				if key == "N" {
-					step = -1
-				}
-				m.jumpSearch(step)
-				return m, nil
-			}
-		case "J":
-			return m, m.stepDetail(1)
-		case "K":
-			return m, m.stepDetail(-1)
+		if cmd, ok := m.updateDetailKey(msg); ok {
+			return m, cmd
 		}
 	}
 	if m.details || !m.listTab() {
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
+		return m, cmd
+	}
+	if cmd, ok := m.updateListTimeline(key); ok {
 		return m, cmd
 	}
 	switch key {
@@ -497,6 +610,133 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateDetailKey handles the detail pane's own keys; ok is false for keys
+// left to the viewport.
+func (m *tuiModel) updateDetailKey(msg tea.KeyPressMsg) (tea.Cmd, bool) {
+	key := msg.String()
+	if m.detailTab == detailDecoder && m.decoder != nil {
+		if cmd, ok := m.updateDecoderKey(key); ok {
+			return cmd, true
+		}
+	}
+	if m.activeDetailTab() == detailParams {
+		if cmd, ok := m.updateParamsKey(key); ok {
+			return cmd, true
+		}
+	}
+	switch key {
+	case "tab", "]", "shift+tab", "[":
+		m.stepDetailTab(map[string]int{"tab": 1, "]": 1, "shift+tab": -1, "[": -1}[key])
+		return nil, true
+	case "n", "N":
+		if m.searchTerm != "" {
+			step := 1
+			if key == "N" {
+				step = -1
+			}
+			m.jumpSearch(step)
+			return nil, true
+		}
+	case "j", "J":
+		return m.stepDetail(1), true
+	case "k", "K":
+		return m.stepDetail(-1), true
+	case "d":
+		m.openDecoderFor("")
+		return nil, true
+	case "f":
+		m.raw = !m.raw
+		if m.raw {
+			m.flash = "正文显示原文"
+		} else {
+			m.flash = "已格式化 JSON 正文"
+		}
+		m.updateContent()
+		return nil, true
+	case "i":
+		m.metaOpen = !m.metaOpen
+		m.updateContent()
+		return nil, true
+	case "Y":
+		return m.copyContent(), true
+	case "L":
+		m.msgLayout = (m.msgLayout + 1) % layoutCount
+		if m.activeDetailTab() != m.detailTab && m.detailTab == detailResponse {
+			m.detailTab = detailRequest
+		}
+		m.flash = "请求与响应：" + tuiLayoutNames[m.msgLayout]
+		if m.pairLayout() != m.msgLayout {
+			m.flash += fmt.Sprintf("（详情宽度不足 %d 列，暂按上下显示，按 > 加宽详情）", tuiSideMinWidth)
+		}
+		m.updateContent()
+		return nil, true
+	case "<", ">":
+		if m.width < 120 {
+			m.flash = "终端不足 120 列，详情已占满全屏"
+			return nil, true
+		}
+		if key == ">" {
+			m.listShare = min(2, m.listShare+1)
+		} else {
+			m.listShare = max(0, m.listShare-1)
+		}
+		m.flash = []string{"列表与详情各占一半", "详情占三分之二", "详情全屏，按 < 显示列表"}[m.listShare]
+		m.resize()
+		return nil, true
+	}
+	return nil, false
+}
+
+// detailTabs lists the tabs this record offers, like the web detail pane.
+func (m tuiModel) detailTabs() []int {
+	tabs := []int{detailRequest, detailResponse}
+	if m.msgLayout != layoutSingle {
+		// The request tab shows both messages, as the web pair view does.
+		tabs = []int{detailRequest}
+	}
+	t := m.snapshot.Detail
+	if t == nil || t.ID != m.detailID {
+		return append(tabs, detailDecoder)
+	}
+	if len(m.paramGroups()) > 0 {
+		tabs = append(tabs, detailParams)
+	}
+	tabs = append(tabs, detailDecoder)
+	if m.bodies.requestView != "" || m.bodies.responseView != "" {
+		tabs = append(tabs, detailDecoded)
+	}
+	if len(t.Alerts) > 0 {
+		tabs = append(tabs, detailAlerts)
+	}
+	return tabs
+}
+func (m tuiModel) activeDetailTab() int {
+	for _, tab := range m.detailTabs() {
+		if tab == m.detailTab {
+			return tab
+		}
+	}
+	return detailRequest
+}
+func (m *tuiModel) stepDetailTab(step int) {
+	tabs := m.detailTabs()
+	at := 0
+	for i, tab := range tabs {
+		if tab == m.activeDetailTab() {
+			at = i
+		}
+	}
+	m.setDetailTab(tabs[(at+step+len(tabs))%len(tabs)])
+}
+func (m *tuiModel) setDetailTab(tab int) {
+	m.detailTab = tab
+	if tab == detailDecoder {
+		m.currentDecoder()
+	}
+	m.viewport.GotoTop()
+	m.updateContent()
+}
+
 // currentRow is the record a row action applies to: the open detail or the cursor.
 func (m tuiModel) currentRow() (tuiRow, bool) {
 	if m.details && m.snapshot.Detail != nil && m.snapshot.Detail.ID == m.detailID {
@@ -516,7 +756,7 @@ func (m tuiModel) currentRow() (tuiRow, bool) {
 	return tuiRow{}, false
 }
 
-// toggleFromRow filters by the client, rule or Host of the current record.
+// toggleFromRow filters by the client, rule, Host or service of the current record.
 func (m *tuiModel) toggleFromRow(key string) tea.Cmd {
 	row, ok := m.currentRow()
 	if !ok {
@@ -544,6 +784,16 @@ func (m *tuiModel) toggleFromRow(key string) tea.Cmd {
 		applied = toggle(&filter.Rule, row.Rule, "该请求没有命中规则")
 	case "H":
 		applied = toggle(&filter.Keyword, row.Host, "该请求没有 Host")
+	case "S":
+		service := ""
+		if m.details && m.snapshot.Detail != nil && m.snapshot.Detail.ID == row.ID {
+			service = m.snapshot.Detail.Service
+		}
+		if !m.details {
+			m.flash = "按 Enter 打开详情后可按服务筛选"
+			return nil
+		}
+		applied = toggle(&filter.Service, service, "该请求没有服务信息")
 	}
 	if !applied {
 		return nil
@@ -552,4 +802,34 @@ func (m *tuiModel) toggleFromRow(key string) tea.Cmd {
 		m.tab = tabRequests
 	}
 	return m.applyFilter(filter)
+}
+
+// updateListTimeline lets t select a time range on the list timeline, like
+// dragging across the web list's timeline.
+func (m *tuiModel) updateListTimeline(key string) (tea.Cmd, bool) {
+	timeline := m.listTimeline()
+	if key == "t" {
+		if timeline == nil || m.split() {
+			m.flash = "时间线还没有数据"
+			return nil, true
+		}
+		m.timelineFocus = !m.timelineFocus
+		m.timelineAnchor = 0
+		m.blockSelected[blockTimeline] = len(m.timelineColumns(timeline, m.timelinePlot())) - 1
+		return nil, true
+	}
+	if !m.timelineFocus || timeline == nil {
+		return nil, false
+	}
+	switch key {
+	case "enter":
+		filter := m.filter
+		filter.Since, filter.Until = m.timelineSelection(timeline)
+		filter.UntilExclusive = true
+		return m.applyFilter(filter), true
+	case "left", "right", "h", "l", "shift+left", "shift+right", "H", "L", "home", "end", "g", "G", "pgup", "pgdown":
+		m.moveTimeline(key, len(m.timelineColumns(timeline, m.timelinePlot())))
+		return nil, true
+	}
+	return nil, false
 }

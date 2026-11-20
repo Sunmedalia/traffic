@@ -3,6 +3,7 @@ package main
 // Rendering of the TUI pages: health, list, detail and chrome lines.
 
 import (
+	"bytes"
 	lipgloss "charm.land/lipgloss/v2"
 	"encoding/json"
 	"fmt"
@@ -81,7 +82,30 @@ func (m tuiModel) startedText() string {
 	if s.Started.IsZero() {
 		return "未知"
 	}
-	return s.Started.Local().Format("2006-01-02 15:04:05 MST -07:00")
+	return tuiIn(s.Started).Format("2006-01-02 15:04:05 MST -07:00")
+}
+func (m tuiModel) stoppedText() string {
+	s := m.snapshot.Stats
+	text := "—"
+	if !s.Stopped.IsZero() {
+		text = tuiFormatTime(s.Stopped, "")
+	}
+	if s.StopReason != "" {
+		text += " · " + tuiLine(s.StopReason)
+	}
+	return text
+}
+func (m tuiModel) dirText() string {
+	if m.store == nil {
+		return "—"
+	}
+	return tuiLine(m.store.dir)
+}
+func (m tuiModel) lastPacketText() string {
+	if t := m.snapshot.Stats.LastPacketAt; !t.IsZero() {
+		return tuiIn(t).Format("2006-01-02 15:04:05.000")
+	}
+	return "—"
 }
 func (m tuiModel) healthContent() string {
 	s := m.snapshot.Stats
@@ -106,6 +130,9 @@ func (m tuiModel) healthContent() string {
 	lines = append(lines,
 		tuiAccent.Render("采集"),
 		label("状态")+tuiStateBadge(s.State)+"    开始于 "+m.startedText(),
+		label("停止")+m.stoppedText(),
+		label("最后收包")+m.lastPacketText(),
+		label("会话目录")+m.dirText(),
 		label("网络包")+tuiCount(s.Packets)+"    网卡丢包 "+level(s.Dropped)+"    用户态队列丢弃 "+level(s.QueueDropped),
 		label("TLS")+fmt.Sprintf("外层记录 %s    明文请求 %s    已知丢弃 %s", tuiCount(s.TLSWireRecords), tuiCount(s.TLSRequests), level(s.TLSDropped)),
 		label("TLS 状态")+tuiLine(s.TLS),
@@ -153,116 +180,302 @@ func (m tuiModel) healthContent() string {
 	return strings.Join(lines, "\n")
 }
 
+// cacheBodies decodes the open record's bodies once per record version.
+func (m *tuiModel) cacheBodies() {
+	t := m.snapshot.Detail
+	if t == nil || t.ID != m.detailID {
+		return
+	}
+	key := fmt.Sprintf("%s|%d|%d|%d", t.ID, len(t.Request), len(t.Response), t.Status)
+	if m.bodies.key == key {
+		return
+	}
+	m.bodies = tuiBodies{key: key}
+	m.bodies.request, m.bodies.requestView = session.DecodedBody(t.Request, 1<<20)
+	m.bodies.response, m.bodies.responseView = session.DecodedBody(t.Response, 1<<20)
+}
+func (m tuiModel) requestText() string  { return session.SafeText(m.snapshot.Detail.Request) }
+func (m tuiModel) responseText() string { return session.SafeText(m.snapshot.Detail.Response) }
+
+// prettyBody indents JSON bodies unless the raw view is selected.
+func (m tuiModel) prettyBody(body string) string {
+	trimmed := strings.TrimSpace(body)
+	if m.raw || trimmed == "" || (trimmed[0] != '{' && trimmed[0] != '[') {
+		return body
+	}
+	var out bytes.Buffer
+	if json.Indent(&out, []byte(trimmed), "", "  ") != nil {
+		return body
+	}
+	return out.String()
+}
+
+// httpView prints a message with styled header names and an optional JSON indent.
+// wrapPlain wraps uncoloured text to width so styles can be applied per line.
+func wrapPlain(text string, width int) []string {
+	return strings.Split(termansi.Hardwrap(text, max(1, width), true), "\n")
+}
+
+// messageLines prints an HTTP message wrapped to width, with styled header
+// names and an optional JSON indent. Lines are styled after wrapping so they
+// can sit beside another column.
+func (m tuiModel) messageLines(text string, width int) []string {
+	message := tuiSplitHTTP(cleanTUIText(text))
+	lines := []string{}
+	for _, line := range wrapPlain(message.start, width) {
+		lines = append(lines, tuiBold.Render(m.highlightBody(line)))
+	}
+	header := tuiAccent.UnsetBold()
+	for _, h := range message.headers {
+		if h[1] == "\x00" {
+			for _, line := range wrapPlain(h[0], width) {
+				lines = append(lines, m.highlightBody(line))
+			}
+			continue
+		}
+		for i, line := range wrapPlain(h[0]+": "+h[1], width) {
+			if i == 0 && len(line) > len(h[0]) {
+				line = header.Render(h[0]) + m.highlightBody(line[len(h[0]):])
+			} else {
+				line = m.highlightBody(line)
+			}
+			lines = append(lines, line)
+		}
+	}
+	if message.body != "" {
+		lines = append(lines, "")
+		for _, line := range wrapPlain(m.prettyBody(message.body), width) {
+			lines = append(lines, m.highlightBody(line))
+		}
+	}
+	return lines
+}
+
+// requestLines is the request side: the message as captured. Its parameters
+// have their own tab.
+func (m tuiModel) requestLines(width int) []string {
+	t := m.snapshot.Detail
+	if len(t.Request) == 0 {
+		return []string{tuiMuted.Render("没有保存请求内容。")}
+	}
+	return m.messageLines(m.requestText(), width)
+}
+func (m tuiModel) responseLines(width int) []string {
+	t := m.snapshot.Detail
+	switch {
+	case len(t.Response) > 0:
+		return m.messageLines(m.responseText(), width)
+	case t.Status != 0:
+		return []string{tuiMuted.Render("没有保存响应内容。")}
+	}
+	return wrapPlain("还没有采集到响应。会话仍在采集时，响应到达后会自动出现。", width)
+}
+
+// Request and response layouts in the detail pane.
+const (
+	layoutSide = iota
+	layoutStack
+	layoutSingle
+	layoutCount
+)
+
+var tuiLayoutNames = [layoutCount]string{"左右", "上下", "单独"}
+
+// tuiSideMinWidth is the narrowest pane that still shows two readable columns.
+const tuiSideMinWidth = 90
+
+// pairLayout is the layout in effect: side by side falls back to stacked
+// when the pane is too narrow.
+func (m tuiModel) pairLayout() int {
+	if m.msgLayout == layoutSide && m.viewport.Width() < tuiSideMinWidth {
+		return layoutStack
+	}
+	return m.msgLayout
+}
+
+// pairLines shows request and response together, like the web message pair.
+func (m tuiModel) pairLines(width int) []string {
+	title := func(name string) string { return tuiAccent.Render(name) }
+	if m.pairLayout() == layoutSide {
+		col := (width - 3) / 2
+		left, right := m.requestLines(col), m.responseLines(col)
+		lines := []string{tuiCell(title("请求"), col) + tuiMuted.Render(" │ ") + title("响应")}
+		for i := 0; i < max(len(left), len(right)); i++ {
+			l, r := "", ""
+			if i < len(left) {
+				l = left[i]
+			}
+			if i < len(right) {
+				r = right[i]
+			}
+			lines = append(lines, tuiCell(l, col)+tuiMuted.Render(" │ ")+r)
+		}
+		return lines
+	}
+	rule := func(name string) string {
+		return title("── "+name+" ") + tuiMuted.Render(strings.Repeat("─", max(0, width-lipgloss.Width(name)-4)))
+	}
+	lines := []string{}
+	if m.msgLayout == layoutSide {
+		lines = append(lines, tuiMuted.Render(fmt.Sprintf("详情宽度不足 %d 列，按上下显示 · > 加宽详情", tuiSideMinWidth)))
+	}
+	lines = append(lines, rule("请求"))
+	lines = append(lines, m.requestLines(width)...)
+	lines = append(lines, "", rule("响应"))
+	return append(lines, m.responseLines(width)...)
+}
+
 func (m tuiModel) detailContent() string {
 	if m.snapshot.DetailMissing {
-		return "该记录已被保留期清理，按 Esc 返回列表，或按 J/K 查看相邻记录"
+		return "这条记录已被保留期清理，无法再查看。按 Esc 返回列表，或按 j/k 查看相邻记录"
 	}
 	t := m.snapshot.Detail
 	if t == nil || t.ID != m.detailID {
 		return "正在加载详情…"
 	}
 	var b strings.Builder
-	label := func(s string) string { return tuiMuted.Render(tuiCell(s, 10)) }
+	label := func(s string) string { return tuiMuted.Render(tuiCell(s, 16)) }
 	status := tuiStatusStyle(t.Status).Render(fmt.Sprint(t.Status))
 	if t.Status == 0 {
 		status = tuiMuted.Render("待响应")
 	}
-	flags := ""
+	pills := []string{tuiBold.Render(tuiLine(t.Method)), status}
 	if t.Incomplete {
-		flags += tuiWarn.Render("  [不完整]")
+		pills = append(pills, tuiWarn.Render("[不完整]"))
 	}
 	if t.Truncated {
-		flags += tuiWarn.Render("  [截断]")
+		pills = append(pills, tuiWarn.Render("[截断]"))
 	}
-	b.WriteString(tuiBold.Render(tuiLine(t.Method)+" "+tuiLine(t.URL)) + "\n")
-	fmt.Fprintf(&b, "%s%s    %s%s%s\n", label("时间"), t.Time.Local().Format("01-02 15:04:05.000"), tuiMuted.Render("响应 "), status, flags)
-	fmt.Fprintf(&b, "%s%s\n", label("客户端"), tuiLine(t.Client))
-	if t.PeerClient != "" {
-		fmt.Fprintf(&b, "%s%s  %s\n", label("直连对端"), tuiLine(t.PeerClient), tuiMuted.Render("来源依据 "+tuiLine(t.ClientSource)))
-	}
-	fmt.Fprintf(&b, "%s%s\n", label("Host"), tuiLine(t.Host))
-	service := []string{}
-	for _, part := range []string{t.Service, pidText(t.PID), backendText(t.Backend), tuiLine(t.Source)} {
-		if part != "" {
-			service = append(service, tuiLine(part))
+	seen := map[string]bool{}
+	for _, a := range t.Alerts {
+		if !seen[a.Rule] && len(seen) < 4 {
+			seen[a.Rule] = true
+			pills = append(pills, tuiSeverityStyle(a.Severity).Bold(true).Render("["+tuiLine(a.Rule)+"]"))
 		}
 	}
-	if len(service) > 0 {
-		fmt.Fprintf(&b, "%s%s\n", label("服务"), strings.Join(service, " · "))
-	}
-	if t.Connection != "" || t.LocalEndpoint != "" {
-		connection := tuiLine(t.Connection)
-		if t.LocalEndpoint != "" {
-			connection += tuiMuted.Render("  本地 " + tuiLine(t.LocalEndpoint))
+	b.WriteString(strings.Join(pills, " ") + "\n")
+	b.WriteString(tuiMuted.Render(tuiLine(t.Host)) + " " + m.highlightBody(tuiLine(t.URL)) + "\n")
+	when := tuiIn(t.Time).Format("2006-01-02 15:04:05.000")
+	if !m.metaOpen {
+		summary := []string{when, tuiLine(t.Client)}
+		if t.Service != "" {
+			summary = append(summary, tuiLine(t.Service))
 		}
-		fmt.Fprintf(&b, "%s%s\n", label("连接"), strings.TrimSpace(connection))
+		if t.Protocol != "" {
+			summary = append(summary, tuiLine(t.Protocol))
+		}
+		if t.StreamID != 0 {
+			summary = append(summary, fmt.Sprintf("stream ID %d", t.StreamID))
+		}
+		line := tuiMuted.Render(strings.Join(summary, " · "))
+		// Integrity reasons stay visible: they qualify everything shown below.
+		if len(t.IntegrityReasons) > 0 {
+			line += tuiWarn.Render(" · 完整性原因 " + tuiLine(strings.Join(t.IntegrityReasons, ", ")))
+		}
+		b.WriteString(line + tuiMuted.Render("  · i 展开记录信息") + "\n")
+	} else {
+		service := tuiLine(t.Service)
+		if t.TargetID != "" {
+			service += " · " + tuiLine(t.TargetID)
+		}
+		endpoints := []string{}
+		for _, part := range []string{t.Backend, t.LocalEndpoint} {
+			if part != "" {
+				endpoints = append(endpoints, tuiLine(part))
+			}
+		}
+		source := []string{}
+		if t.Source != "" {
+			source = append(source, tuiLine(t.Source))
+		}
+		if t.PID != 0 {
+			source = append(source, fmt.Sprintf("PID %d", t.PID))
+		}
+		protocol := tuiLine(t.Protocol)
+		if protocol == "" {
+			protocol = "未知"
+		}
+		stream := ""
+		if t.StreamID != 0 {
+			stream = fmt.Sprint(t.StreamID)
+		}
+		rows := [][2]string{
+			{"时间", when}, {"来源", tuiLine(t.Client) + tuiMuted.Render("  c 按来源筛选")}, {"直连对端", tuiLine(t.PeerClient)}, {"来源地址依据", tuiLine(t.ClientSource)},
+			{"Host", tuiLine(t.Host) + tuiMuted.Render("  H 按 Host 筛选")}, {"服务", service}, {"后端 / 本地端点", strings.Join(endpoints, " · ")},
+			{"采集来源", strings.Join(source, " · ")}, {"连接", tuiLine(t.Connection)}, {"协议", protocol}, {"HTTP/2 stream ID", stream},
+			{"完整性原因", tuiLine(strings.Join(t.IntegrityReasons, ", "))}, {"记录 ID", tuiLine(t.ID) + tuiMuted.Render("  y 复制")},
+		}
+		if t.Service != "" {
+			rows[5][1] += tuiMuted.Render("  S 按服务筛选")
+		}
+		for _, row := range rows {
+			if termansi.Strip(row[1]) != "" && !strings.HasPrefix(termansi.Strip(row[1]), "  ") {
+				b.WriteString(label(row[0]) + row[1] + "\n")
+			}
+		}
+		b.WriteString(tuiMuted.Render("i 收起记录信息") + "\n")
 	}
-	fmt.Fprintf(&b, "%s%s  stream ID %d\n", label("协议"), tuiLine(t.Protocol), t.StreamID)
-	fmt.Fprintf(&b, "%s%s\n", label("完整性原因"), tuiLine(strings.Join(t.IntegrityReasons, ", ")))
-	fmt.Fprintf(&b, "%s%s\n\n", label("ID"), tuiLine(t.ID))
-	labels := []string{"请求", "响应", "解码正文", "检测依据"}
-	if len(t.Alerts) > 0 {
-		labels[3] = fmt.Sprintf("检测依据 %d", len(t.Alerts))
-	}
-	for i, label := range labels {
-		if i == m.detailTab {
-			b.WriteString(tuiAccent.Render("[" + label + "]"))
+	b.WriteString("\n")
+	active := m.activeDetailTab()
+	for _, tab := range m.detailTabs() {
+		name := tuiDetailNames[tab]
+		if tab == detailRequest && m.msgLayout != layoutSingle {
+			name = "请求/响应"
+		}
+		if tab == detailAlerts {
+			name += fmt.Sprintf(" %d", len(t.Alerts))
+		}
+		if tab == active {
+			b.WriteString(tuiAccent.Render("[" + name + "]"))
 		} else {
-			b.WriteString(tuiMuted.Render(label))
+			b.WriteString(tuiMuted.Render(name))
 		}
 		b.WriteString("  ")
 	}
+	format := "f 原文"
+	if m.raw {
+		format = "f 格式化 JSON"
+	}
+	b.WriteString(tuiMuted.Render(" [ ] 切换 · L 排版 " + tuiLayoutNames[m.msgLayout] + " · " + format + " · Y 复制"))
 	b.WriteString("\n\n")
-	switch m.detailTab {
-	case 0:
-		if len(t.Request) == 0 {
-			b.WriteString("暂无请求内容")
+	switch active {
+	case detailRequest:
+		width := m.viewport.Width()
+		if m.msgLayout == layoutSingle {
+			b.WriteString(strings.Join(m.requestLines(width), "\n"))
 		} else {
-			b.WriteString(m.highlightBody(cleanTUIText(session.SafeText(t.Request))))
+			b.WriteString(strings.Join(m.pairLines(width), "\n"))
 		}
-	case 1:
-		if len(t.Response) == 0 {
-			b.WriteString("暂无响应内容")
-		} else {
-			b.WriteString(m.highlightBody(cleanTUIText(session.SafeText(t.Response))))
+	case detailResponse:
+		b.WriteString(strings.Join(m.responseLines(m.viewport.Width()), "\n"))
+	case detailParams:
+		b.WriteString(strings.Join(m.paramsContent(m.viewport.Width()), "\n"))
+	case detailDecoder:
+		b.WriteString(m.decoderContent())
+	case detailDecoded:
+		for _, part := range []struct{ title, view, body string }{{"请求正文", m.bodies.requestView, m.bodies.request}, {"响应正文", m.bodies.responseView, m.bodies.response}} {
+			if part.view == "" {
+				continue
+			}
+			fmt.Fprintf(&b, "%s\n%s\n\n", tuiBold.Render(part.title+" · "+tuiLine(part.view)), m.highlightBody(cleanTUIText(strings.ToValidUTF8(part.body, "\uFFFD"))))
 		}
-	case 2:
-		body, view := session.DecodedBody(t.Request, 1<<20)
-		if view == "" {
-			b.WriteString("暂无可用的 gzip 解码正文，请查看请求标签")
-		} else {
-			fmt.Fprintf(&b, "解码视图 %s\n\n%s", tuiLine(view), m.highlightBody(cleanTUIText(body)))
-		}
-	case 3:
-		if len(t.Alerts) == 0 {
-			b.WriteString("暂无告警")
-		}
-		request, response := cleanTUIText(session.SafeText(t.Request)), cleanTUIText(session.SafeText(t.Response))
+	case detailAlerts:
+		request, response := cleanTUIText(m.requestText()), cleanTUIText(m.responseText())
 		search := m.searchPattern()
 		for _, a := range t.Alerts {
 			match := cleanTUIText(a.Match)
-			fmt.Fprintf(&b, "%s  %s\n%s\n%s\n%s\n%s\n\n", tuiSeverityStyle(a.Severity).Bold(true).Render(tuiLine(a.Rule)), tuiMuted.Render(fmt.Sprintf("版本 %d · 级别 %s · 字段 %s", a.Version, tuiSeverity(a.Severity), tuiLine(a.Field))), tuiMuted.Render(fmt.Sprintf("视图 %s · 解码 %d 轮", alertView(a.View), a.Decoding)), tuiMuted.Render("匹配片段"), tuiHighlight(match, tuiPattern([]string{match}), search), tuiMuted.Render(tuiOccurrences(a.Match, request, response)))
+			view := a.View
+			if view == "" {
+				view = "原始内容"
+			}
+			fmt.Fprintf(&b, "%s %s\n%s\n%s\n%s\n%s\n\n",
+				tuiSeverityStyle(a.Severity).Bold(true).Render("["+tuiSeverity(a.Severity)+"]"), tuiBold.Render(tuiLine(a.Rule)),
+				tuiMuted.Render(fmt.Sprintf("规则版本 %d · 命中字段 %s · 视图 %s · URL 解码 %d 轮", a.Version, tuiLine(a.Field), tuiLine(view), a.Decoding)),
+				tuiHighlight(match, tuiPattern([]string{match}), search), tuiMuted.Render(tuiOccurrences(a.Match, request, response)),
+				tuiMuted.Render("m 查看同规则请求 · d 解码片段"))
 		}
 	}
 	return b.String()
-}
-func alertView(view string) string {
-	if view == "" {
-		return "原文"
-	}
-	return tuiLine(view)
-}
-func pidText(pid int) string {
-	if pid == 0 {
-		return ""
-	}
-	return fmt.Sprintf("PID %d", pid)
-}
-func backendText(backend string) string {
-	if backend == "" {
-		return ""
-	}
-	return "后端 " + backend
 }
 
 // listView adapts columns to width: narrow keeps time, method, status, level and URL.
@@ -296,14 +509,22 @@ func (m tuiModel) listView(width, height int) string {
 			hostWidth = max(hostWidth, min(28, lipgloss.Width(tuiLine(r.Host))+2))
 		}
 	}
-	header := tuiCell("时间", timeWidth) + tuiCell("方法", 7) + tuiCell("状态", 7) + tuiCell("级", 3)
+	header := tuiCell("时间", timeWidth) + tuiCell("级", 3) + tuiCell("方法", 7) + tuiCell("状态", 7)
 	if showClient {
-		header += tuiCell("客户端", clientWidth)
+		header += tuiCell("来源", clientWidth)
 	}
 	if showHost {
 		header += tuiCell("Host", hostWidth)
 	}
-	lines := []string{tuiMuted.Render(termansi.Truncate(header+"URL", width, "…"))}
+	lines := []string{}
+	// The web list shows the filtered timeline above the table.
+	if timeline := m.listTimeline(); timeline != nil && !m.split() && (height >= 10 && !m.timelineFocus || height >= 16) {
+		strip := m.listTimelineView(timeline, width)
+		lines = append(lines, strip...)
+		height -= len(strip)
+	}
+	top := len(lines)
+	lines = append(lines, tuiMuted.Render(termansi.Truncate(header+"URL", width, "…")))
 	visible := max(1, height-2)
 	start := max(0, m.selected-visible+1)
 	for i := start; i < min(len(m.snapshot.Rows), start+visible); i++ {
@@ -326,9 +547,9 @@ func (m tuiModel) listView(width, height int) string {
 			style lipgloss.Style
 		}{
 			{tuiShortTime(r.Time, today), timeWidth, lipgloss.NewStyle()},
+			{tuiSeverity(r.Severity), 3, tuiSeverityStyle(r.Severity)},
 			{tuiLine(r.Method), 7, lipgloss.NewStyle()},
 			{status, 7, tuiStatusStyle(r.Status)},
-			{tuiSeverity(r.Severity), 3, tuiSeverityStyle(r.Severity)},
 		}
 		if showClient {
 			cells = append(cells, struct {
@@ -378,10 +599,10 @@ func (m tuiModel) listView(width, height int) string {
 			lines = append(lines, "暂无请求")
 		}
 	}
-	for len(lines) < height-1 {
+	for len(lines)-top < height-1 {
 		lines = append(lines, "")
 	}
-	pager := tuiMuted.Render(fmt.Sprintf("第 %d/%d 页 · 共 %s 条", m.page+1, max(1, (m.snapshot.Count+99)/100), tuiCount(uint64(m.snapshot.Count))))
+	pager := tuiMuted.Render(fmt.Sprintf("%s 条 · 第 %d / %d 页", tuiCount(uint64(m.snapshot.Count)), m.page+1, max(1, (m.snapshot.Count+99)/100)))
 	if !m.following() && !m.paused {
 		if m.page == 0 && m.snapshot.Newer > 0 {
 			pager += tuiAccent.Render(fmt.Sprintf(" · ↑ 新增 %s 条，按 g 回到最新", tuiCount(uint64(m.snapshot.Newer))))
@@ -409,25 +630,48 @@ func (m tuiModel) filterChips() []string {
 			chips = append(chips, "["+label+tuiLine(value)+"]")
 		}
 	}
+	add(f.Keyword, "关键词 ")
+	if f.Decode > 0 {
+		chips = append(chips, fmt.Sprintf("[URL 解码 %d 次后匹配]", f.Decode))
+	}
 	if f.Severity != "" {
 		chips = append(chips, "[级别 ≥ "+tuiSeverity(f.Severity)+"]")
 	}
-	if f.Since != "" {
-		if t, err := time.Parse(indexTimeFormat, f.Since); err == nil {
-			chips = append(chips, "[时间 ≥ "+t.Local().Format("01-02 15:04:05")+"]")
-		} else {
-			add(f.Since, "时间 ≥ ")
-		}
+	switch f.Status {
+	case "":
+	case "pending":
+		chips = append(chips, "[状态 待响应]")
+	default:
+		add(f.Status, "状态 ")
 	}
-	if f.Until != "" {
-		if t, err := time.Parse(indexTimeFormat, f.Until); err == nil {
-			chips = append(chips, "[时间 ≤ "+t.Local().Format("01-02 15:04:05")+"]")
-		}
+	add(f.Method, "方法 ")
+	if f.HideStatic {
+		chips = append(chips, "[隐藏静态资源]")
 	}
-	add(f.Client, "客户端 = ")
-	add(f.Rule, "规则 = ")
-	add(f.Service, "服务 = ")
-	add(f.Keyword, "关键词 ")
+	add(f.Exclude, "排除 ")
+	add(f.Param, "参数 ")
+	add(f.Client, "来源 ")
+	add(f.Rule, "规则 ")
+	add(f.Service, "服务 ")
+	if f.Since != "" || f.Until != "" {
+		bound := func(stamp, empty string) string {
+			if stamp == "" {
+				return empty
+			}
+			if t, err := time.Parse(indexTimeFormat, stamp); err == nil {
+				return tuiIn(t).Format("01-02 15:04:05")
+			}
+			return tuiLine(stamp)
+		}
+		end := "≤ "
+		if f.UntilExclusive {
+			end = "< "
+		}
+		if f.Until == "" {
+			end = ""
+		}
+		chips = append(chips, "[时间 "+bound(f.Since, "最早")+" – "+end+bound(f.Until, "最新")+"]")
+	}
 	return chips
 }
 func (m tuiModel) filterLabel() string {
@@ -465,11 +709,14 @@ func (m tuiModel) identityLine(width int) string {
 	default:
 		mode = "自动刷新"
 	}
-	right := fmt.Sprintf("请求 %s · 告警 %s", tuiCount(s.Transactions), tuiCount(s.Alerts))
+	right := tuiMuted.Render(fmt.Sprintf("请求 %s · 告警 %s", tuiCount(s.Transactions), tuiCount(s.Alerts)))
 	if mode != "" {
-		right += " · " + mode
+		right += tuiMuted.Render(" · " + mode)
 	}
-	return tuiSpread(left, tuiMuted.Render(right), width)
+	if m.analysisRunning() {
+		right = tuiAccent.Render("● 分析中 "+tuiJobElapsed(m.analysis.job)) + tuiMuted.Render(" · ") + right
+	}
+	return tuiSpread(left, right, width)
 }
 func (m tuiModel) tabsLine(width int) string {
 	level, _ := m.tuiHealth()
@@ -500,7 +747,7 @@ func (m tuiModel) tabsLine(width int) string {
 			parts[i] = tuiMuted.Render(label)
 		}
 	}
-	return tuiSpread(strings.Join(parts, "   "), tuiMuted.Render("本地时间 "+time.Now().Format("MST -07:00")), width)
+	return tuiSpread(strings.Join(parts, "   "), tuiMuted.Render("时间 "+tuiZoneLabel()+" · z 切换"), width)
 }
 func (m tuiModel) noticeLine() string {
 	if m.errorText != "" {
@@ -530,6 +777,8 @@ func (m tuiModel) noticeLine() string {
 }
 func (m tuiModel) keysLine() string {
 	switch {
+	case m.analysis != nil && m.analysis.open:
+		return "↑↓ 选择规则 · Enter 开始分析 · x 停止分析 · Esc 关闭（任务在后台继续）"
 	case m.searchInput != nil:
 		return "输入后按 Enter 查找 · Esc 取消"
 	case m.form != nil:
@@ -538,38 +787,60 @@ func (m tuiModel) keysLine() string {
 		return "Enter 导出 · Esc 取消"
 	case m.help:
 		return "? 或 Esc 关闭帮助 · q 退出"
+	case m.details && m.decoder != nil && m.decoder.editor != nil:
+		return "Enter 用输入内容替换原文 · Esc 取消"
+	case m.details && m.decoder != nil && m.decoder.picking:
+		return "↑↓ 选择解码方式 · Enter 解码 · Esc 取消"
+	case m.details && m.activeDetailTab() == detailDecoder:
+		return "←→ 换来源 · Enter 解码 · Backspace 撤销 · X 十六进制 · w 手动输入 · Y 复制结果 · [ ] 切标签 · Esc 返回"
+	case m.details && m.activeDetailTab() == detailParams:
+		return "↑↓ 选择参数 · Enter 解码 · j/k 上下一条 · [ ] 切标签 · Y 复制参数 · c/m/H/S 筛选 · e 导出 · Esc 返回"
 	case m.details:
-		return "↑↓ 滚动 · J/K 上下一条 · Tab 切标签 · / 查找 · c/m/H 按此筛选 · e 导出 · y 复制 ID · Esc 返回"
+		return "j/k 上下一条 · ↑↓ 滚动 · [ ] 切标签 · L 排版 · < > 宽度 · d 解码 · f 格式化 · i 记录信息 · / 查找 · c/m/H/S 筛选 · e 导出 · Y 复制 · Esc 返回"
 	case m.aggView():
-		return "↑↓ 选择 · Enter 查看逐条 · v 切换视图 · / 筛选 · x 清空 · 空格 暂停 · s 会话 · ? 帮助"
+		return "↑↓ 选择 · Enter 查看逐条 · v 切换视图 · / 筛选 · x 清空 · A 分析 · s 会话 · ? 帮助"
+	case m.tab == tabOverview && m.block == blockTimeline:
+		return "←→ 移动 · Shift+←→ 选范围 · Enter 查看这段请求 · Tab 切换区块 · A 分析 · r 刷新 · s 会话 · ? 帮助"
 	case m.tab == tabOverview:
-		return "Tab 切换区块 · ↑↓ 选择 · Enter 跳到对应告警 · / 筛选 · 空格 暂停 · s 会话 · ? 帮助 · q 退出"
+		return "Tab 切换区块 · ↑↓ 选择 · Enter 查看对应请求 · A 分析 · 空格 暂停 · r 刷新 · s 会话 · ? 帮助 · q 退出"
+	case m.listTab() && m.timelineFocus:
+		return "←→ 移动 · Shift+←→ 选范围 · Enter 只看这段时间 · t 或 Esc 退出时间线"
 	case m.listTab() && m.drill != nil:
 		return "Esc 返回上一层 · ↑↓ 选择 · Enter 详情 · c/m/H 按选中行筛选 · x 清空 · e 导出 · v 切换视图 · ? 帮助"
 	case m.listTab():
-		return "↑↓ 选择 · Enter 详情 · / 筛选 · c/m/H 按选中行筛选 · x 清空 · e 导出 · y 复制 ID · g 最新 · 空格 暂停 · s 会话 · ? 帮助"
+		return "↑↓ 选择 · Enter 详情 · n/p 翻页 · / 筛选 · t 时间线 · c/m/H 按选中行筛选 · x 清空 · e 导出 · g 最新 · 空格 暂停 · A 分析 · s 会话 · ? 帮助"
 	}
-	return "1-4 切换页面 · ↑↓ 滚动 · / 筛选 · 空格 暂停 · r 刷新 · s 会话 · ? 帮助 · q 退出"
+	return "1-4 切换页面 · ↑↓ 滚动 · / 筛选 · 空格 暂停 · r 刷新 · A 分析 · s 会话 · ? 帮助 · q 退出"
 }
 
-const tuiHelpText = `快捷键
+const tuiHelpText = `快捷键（与网页版一致的键位优先）
 
-页面    1 概览   2 请求   3 告警   4 采集健康   s 回到会话选择
-概览    Tab 切换区块，Enter 把规则、来源或级别作为条件跳到告警列表
-告警    v 在按规则、按来源、逐条三种视图间切换，聚合行上 Enter 查看逐条
-移动    ↑↓ / j k 选择或滚动    g 回到最新并恢复跟随    G 本页末尾
+页面    1 概览   2 请求   3 告警   4 采集健康   s 回到会话列表
+概览    Tab 切换区块，Enter 查看对应请求：规则、级别 → 告警；来源、状态 → 请求
+        时间线 ←→ 移动，Shift+←→ 选一段时间，Enter 查看这段时间的请求
+列表    t 进入列表上方的时间线，选一段时间后 Enter 只看这段时间，t / Esc 退出
+告警    v 在逐条、按规则、按来源三种视图间切换，聚合行上 Enter 查看逐条
+移动    ↑↓ / j k 选择    g 回到最新并恢复跟随    G 本页末尾
         n p / ← → / PgDn PgUp 翻页
 层级    Enter 打开详情或下钻    Esc 关闭弹层、关闭详情、退出下钻
-详情    Tab / Shift+Tab 切换请求、响应、解码正文、检测依据
-        J / K 不退出详情查看下一条、上一条
+详情    j / k 下一条、上一条    ↑↓ PgUp PgDn 滚动    [ ] 或 Tab 切换标签
+        标签：请求/响应、参数、解码、解压正文、检测依据
+        参数：查询参数、表单参数、Cookie 原文，↑↓ 选择，Enter 在解码工具中打开
+        L 切换请求与响应排版：左右 / 上下 / 单独（单独时请求、响应分两个标签）
+        < > 调整列表与详情宽度：各半 / 详情三分之二 / 详情全屏
+        d 打开解码工具    f 切换 JSON 格式化    i 展开记录信息
         / 在当前标签中查找，n / N 跳到下一处、上一处，Esc 清除
-        告警匹配片段在请求、响应和解码正文中反色高亮
-筛选    / 打开筛选面板    x 清空全部筛选
-        c 只看选中行的客户端    m 只看它命中的规则    H 只看它的 Host
-        再按一次同一个键取消该条件
-证据    e 导出选中请求的证据压缩包（需要先停止采集）    y 复制请求 ID
+        Y 复制当前标签内容    y 复制请求 ID
+解码    ←→ 选择来源（URL、参数、Cookie、表单、请求头、命中片段）
+        Enter 选择解码方式（URL、Base64、Hex、HTML、Unicode、JWT、Gzip），可连续解码
+        Backspace 撤销一步    X 十六进制    w 手动输入
+筛选    / 打开筛选面板：关键词、URL 解码匹配、级别、状态、方法、静态资源、
+        排除词、参数、状态码、来源、规则、服务、时间范围    x 清空全部筛选
+        c 来源    m 规则    H Host    S 服务（详情中）  再按一次同一个键取消
+分析    A 打开分析面板，用内置规则或规则目录中的文件重新分析当前会话
+证据    e 导出选中请求的证据压缩包（需要先停止采集）
 刷新    光标在第一页第一行时跟随最新记录，离开后列表定格
-        空格 暂停或恢复    r 立即刷新
+        空格 暂停或恢复    r 立即刷新    z 切换本地时间 / UTC
 退出    q 或 Ctrl+C`
 
 func (m tuiModel) View() tea.View {
@@ -579,13 +850,15 @@ func (m tuiModel) View() tea.View {
 	switch {
 	case m.help:
 		content = tuiHelpText
+	case m.analysis != nil && m.analysis.open:
+		content = m.analysisView(contentHeight)
 	case m.form != nil:
 		content = m.form.view(contentHeight)
 	case m.export != nil:
 		content = m.export.view()
 	case m.split():
-		listWidth := width / 2
-		content = lipgloss.JoinHorizontal(lipgloss.Top, lipgloss.NewStyle().Width(listWidth).Render(m.listView(listWidth-1, contentHeight)), tuiMuted.Render(" │ "), m.viewport.View())
+		listWidth := m.listWidth()
+		content = lipgloss.JoinHorizontal(lipgloss.Top, lipgloss.NewStyle().Width(listWidth).Render(m.listView(listWidth-1, contentHeight)), tuiMuted.Render(strings.TrimSuffix(strings.Repeat(" │ \n", contentHeight), "\n")), m.viewport.View())
 	case m.tab == tabOverview && !m.details:
 		content = m.overviewView(width, contentHeight)
 	case m.tab == tabAlerts && !m.details:

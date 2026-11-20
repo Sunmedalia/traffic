@@ -124,7 +124,8 @@ func TestBrowserGroupsAndSearches(t *testing.T) {
 	for _, index := range m.order {
 		got = append(got, m.entries[index].Dir)
 	}
-	if strings.Join(got, ",") != "/live,/new,/old,/admin" {
+	// Sessions stay newest first, grouped by day as on the web list.
+	if strings.Join(got, ",") != "/new,/admin,/live,/old" {
 		t.Fatalf("bad grouping %v", got)
 	}
 	if m.selectedDir() != "/old" {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -60,7 +61,7 @@ func cleanTUIText(s string) string {
 func tuiLine(s string) string { return strings.ReplaceAll(cleanTUIText(s), "\n", " ") }
 func tuiTime(s string) string {
 	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-		return t.Local().Format("01-02 15:04:05")
+		return tuiIn(t).Format("01-02 15:04:05")
 	}
 	return tuiLine(s)
 }
@@ -68,7 +69,7 @@ func tuiTime(s string) string {
 // tuiShortTime drops the date for records from today.
 func tuiShortTime(s string, today bool) string {
 	if t, err := time.Parse(time.RFC3339Nano, s); err == nil && today {
-		return t.Local().Format("15:04:05")
+		return tuiIn(t).Format("15:04:05")
 	}
 	return tuiTime(s)
 }
@@ -77,8 +78,8 @@ func tuiIsToday(s string, now time.Time) bool {
 	if err != nil {
 		return false
 	}
-	y1, m1, d1 := t.Local().Date()
-	y2, m2, d2 := now.Local().Date()
+	y1, m1, d1 := tuiIn(t).Date()
+	y2, m2, d2 := tuiIn(now).Date()
 	return y1 == y2 && m1 == m2 && d1 == d2
 }
 func tuiSeverity(s string) string {
@@ -181,4 +182,22 @@ func tuiSpread(left, right string, width int) string {
 		return termansi.Truncate(left, width, "…")
 	}
 	return left + strings.Repeat(" ", width-lw-rw) + right
+}
+
+// tuiUseUTC switches every displayed and typed time between local time and UTC,
+// like the web page's time zone toggle.
+var tuiUseUTC atomic.Bool
+
+func tuiZone() *time.Location {
+	if tuiUseUTC.Load() {
+		return time.UTC
+	}
+	return time.Local
+}
+func tuiIn(t time.Time) time.Time { return t.In(tuiZone()) }
+func tuiZoneLabel() string {
+	if tuiUseUTC.Load() {
+		return "UTC"
+	}
+	return "本地 " + time.Now().Format("MST -07:00")
 }

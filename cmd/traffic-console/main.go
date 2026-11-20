@@ -139,7 +139,7 @@ func run(args []string) error {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
 	}
-	if cmd != "web" {
+	if cmd != "web" && cmd != "view" {
 		var used bool
 		fs.Visit(func(f *flag.Flag) {
 			if f.Name == "rules-dir" {
@@ -147,7 +147,7 @@ func run(args []string) error {
 			}
 		})
 		if used {
-			return errors.New("--rules-dir requires traffic-console web")
+			return errors.New("--rules-dir requires traffic-console web or view")
 		}
 	}
 	if *limit < 1 {
@@ -170,7 +170,7 @@ func run(args []string) error {
 		return runWeb(*dir, *dataDir, *rulesDir, *listen, *allowRemote, *refresh)
 	}
 	if cmd == "view" {
-		return runSessionBrowser(*dir, *dataDir, *refresh, tuiFilter{Client: *client, Rule: *rule, Severity: *severity, Since: *since, Service: *service})
+		return runSessionBrowser(*dir, *dataDir, *rulesDir, *refresh, tuiFilter{Client: *client, Rule: *rule, Severity: *severity, Since: *since, Service: *service})
 	}
 	if *dir == "" {
 		return errors.New("--session required")
