@@ -20,7 +20,7 @@ import (
 
 type packetRing struct {
 	dir, iface string
-	file       *os.File
+	file       *evidenceFile
 	buffer     *bufio.Writer
 	writer     *pcapgo.Writer
 	size       int64
@@ -42,8 +42,8 @@ func (r *packetRing) write(ci gopacket.CaptureInfo, b []byte) error {
 		if e != nil {
 			return e
 		}
-		r.file = f
-		r.buffer = bufio.NewWriterSize(f, 256<<10)
+		r.file = newEvidenceFile(f)
+		r.buffer = bufio.NewWriterSize(r.file, 256<<10)
 		r.writer = pcapgo.NewWriterNanos(r.buffer)
 		if e = packetio.WriteHeader(r.buffer, r.snaplen, r.link); e != nil {
 			return e

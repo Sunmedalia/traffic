@@ -164,6 +164,14 @@ func analyzeSessionRules(ctx context.Context, dir, webhookURL string, rs []Rule,
 	return analyzeConfigured(ctx, dir, webhookURL, rs, window, paths, replay.Options{RequestLimit: requestLimit, ResponseLimit: responseLimit})
 }
 func analyzeConfigured(ctx context.Context, dir, webhookURL string, rs []Rule, window time.Duration, paths int, limits replay.Options) (analysisReport, error) {
+	report, err := analyzeInSession(ctx, dir, webhookURL, rs, window, paths, limits)
+	if diskFull(err) {
+		err = fmt.Errorf("会话目录所在磁盘空间不足：本地分析在会话目录内构建结果，所需空间与采集证据大小相当（%s）：%w", dir, err)
+	}
+	return report, err
+}
+
+func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, window time.Duration, paths int, limits replay.Options) (analysisReport, error) {
 	report := analysisReport{EngineVersion: analysisEngineVersion, Rules: rs, ScanWindow: window, ScanPaths: paths, Reconstructed: rawSession(dir), RequestLimit: limits.RequestLimit, ResponseLimit: limits.ResponseLimit}
 	if err := validateAnalysisDestination(dir); err != nil {
 		return report, err

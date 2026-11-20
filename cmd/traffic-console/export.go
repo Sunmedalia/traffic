@@ -51,7 +51,7 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 			os.Remove(path)
 		}
 	}()
-	z := zip.NewWriter(f)
+	z := &evidenceZip{Writer: zip.NewWriter(f), modified: time.Now()}
 	hashes := map[string]string{}
 	add := func(name string, data []byte) error {
 		w, e := z.Create(name)
@@ -212,7 +212,7 @@ func lastPacketSegment(files []string, index int) bool {
 	return index+1 == len(files) || session.PacketSegmentGroup(files[index]) != session.PacketSegmentGroup(files[index+1])
 }
 
-func exportPacketSegment(z *zip.Writer, dir, path string, remote, local netip.AddrPort, first, last time.Time, allowTornTail bool) (entry, digest string, truncated bool, err error) {
+func exportPacketSegment(z *evidenceZip, dir, path string, remote, local netip.AddrPort, first, last time.Time, allowTornTail bool) (entry, digest string, truncated bool, err error) {
 	entry, err = filepath.Rel(dir, path)
 	if err != nil {
 		return
@@ -289,4 +289,15 @@ func matchesConnection(data []byte, link uint32, remote, local netip.AddrPort) b
 	remote = netip.AddrPortFrom(remote.Addr().WithZone("").Unmap(), remote.Port())
 	local = netip.AddrPortFrom(local.Addr().WithZone("").Unmap(), local.Port())
 	return (source == remote && destination == local) || (source == local && destination == remote)
+}
+
+// evidenceZip stamps every member with the export time. zip.Writer.Create
+// leaves the modification time zero, which archive tools show as 1980-00-00.
+type evidenceZip struct {
+	*zip.Writer
+	modified time.Time
+}
+
+func (z *evidenceZip) Create(name string) (io.Writer, error) {
+	return z.CreateHeader(&zip.FileHeader{Name: name, Method: zip.Deflate, Modified: z.modified})
 }
