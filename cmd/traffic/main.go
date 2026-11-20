@@ -375,6 +375,9 @@ func run(args []string) (runErr error) {
 			} else {
 				s.stats.ResourceLimits = resourceLimitDescription()
 				defer cleanup()
+				if e := checkMemoryBackedSession(s.dir); e != nil {
+					return e
+				}
 			}
 		}
 		sigCtx, stopSig := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

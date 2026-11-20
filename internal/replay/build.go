@@ -104,6 +104,15 @@ func Build(ctx context.Context, dir string, db *sql.DB, options Options) (sessio
 	}
 	p.finish()
 	if err = stopIndex(); err != nil {
+		// SQLite rolls a batch back on errors such as SQLITE_FULL, so the final
+		// commit then only reports "no transaction is active". Report the
+		// failure recorded first, which names the cause.
+		s.mu.Lock()
+		fatal := s.fatal
+		s.mu.Unlock()
+		if fatal != nil {
+			return s.stats, fatal
+		}
 		return s.stats, err
 	}
 	s.mu.Lock()

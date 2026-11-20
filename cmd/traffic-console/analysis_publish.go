@@ -10,7 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"syscall"
 	"time"
+
+	"github.com/mattn/go-sqlite3"
 )
 
 const analysisPointer = "analysis-current.json"
@@ -231,4 +234,13 @@ func publishAnalysis(ctx context.Context, dir, build string) error {
 		}
 	}
 	return nil
+}
+
+// diskFull reports whether err comes from a filesystem out of space or quota.
+func diskFull(err error) bool {
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) && sqliteErr.Code == sqlite3.ErrFull {
+		return true
+	}
+	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT)
 }

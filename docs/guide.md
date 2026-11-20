@@ -327,7 +327,7 @@ IIS、Windows nginx/apache 和通用 OpenSSL 的探针参数见 [Windows 采集]
 | `--pcap-buffer-mib` | 32 | 每个 libpcap 接口的内核抓包缓冲，范围 2–1024；内核拒绝时回退 libpcap 默认值并记录 `pcap/capture_buffer_fallback` 缺口。WinDivert 不使用 |
 | `--no-detect` | 兼容参数 | 采集始终不执行检测 |
 | `--require-tls` | 关 | 所选目标未通过 HTTPS 预检时拒绝开始 |
-| `--collector-memory-mib` / `--collector-cpu-percent` | 256 / 50 | 限制采集器及子进程，不含目标内探针 |
+| `--collector-memory-mib` / `--collector-cpu-percent` | 256 / 50 | 限制采集器及子进程，不含目标内探针。会话目录若在 tmpfs/ramfs（如多数发行版的 `/tmp`、`/dev/shm`），证据计入该内存预算且无法回收；此时 `--disk-limit-mib` 超过内存预算一半会在开始前拒绝采集，请改用磁盘目录 |
 | `--drain-timeout` | 5s | 部分后端的数据排空预算，最大 15s |
 | `--stop-timeout` | 30s | 停止后的总等待预算，不小于 `--drain-timeout`；超时记录 `stop_budget_exceeded` 缺口、标记失败及排空未确认，以非零状态退出 |
 | `--netns-pid` | 0 | Linux 显式选择抓包网络命名空间 |
@@ -400,7 +400,7 @@ sessions/web-01/2026-11-11/15-04-05-nginx/
 
 TUI、Web、JSON 查询及导出读取同一代分析结果；Web 和 TUI 每次刷新读取最新结果。源文件大小或修改时间变化会使结果失效，需重新分析；这项快速检查不代替证据哈希校验。导出包含 `analysis.json`，原始会话另含 `reconstructed-event.json`，旧会话使用 `captured-event.json` 区分原索引记录。
 
-`traffic-console analyze --request-limit BYTES --response-limit BYTES` 控制本地正文还原和检测上限，默认每侧 1 MiB，最大 16 MiB；Web 使用默认值。上限造成的本地截断可通过调大后重新分析恢复，采集缺口则无法补回。`--retention` 已从采集器删除，旧版循环 PCAP 曾被覆盖的内容无法恢复。
+`traffic-console analyze --request-limit BYTES --response-limit BYTES` 控制本地正文还原和检测上限，默认每侧 1 MiB，最大 16 MiB；Web 使用默认值。上限造成的本地截断可通过调大后重新分析恢复，采集缺口则无法补回。构建结果库所需空间与采集证据大小相当，空间不足时报告会话目录所在磁盘已满。`--retention` 已从采集器删除，旧版循环 PCAP 曾被覆盖的内容无法恢复。
 
 内置规则覆盖疑似 SQL 注入、命令注入、路径穿越、敏感文件探测、扫描、XSS、SSRF、XXE、SSTI、JNDI、反序列化、Webshell 上传，以及响应中的 passwd / 命令输出特征。原始内容和最多两轮 URL 解码视图参与匹配，gzip 正文有界解压。告警是疑似信号，结论要结合响应和现场证据。
 
