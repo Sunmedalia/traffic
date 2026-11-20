@@ -552,28 +552,28 @@ func (m tuiModel) overviewBrief(block, i int) string {
 	switch block {
 	case blockRules:
 		r := o.Summary.Rules[i]
-		return fmt.Sprintf("规则 %s · %s危 · 命中 %s 条请求 · 双击查看这些告警", tuiLine(r.Name), tuiSeverity(r.Severity), tuiCount(uint64(r.Count)))
+		return fmt.Sprintf("规则 %s · %s危 · 命中 %s 条请求 · 再点一次查看这些告警", tuiLine(r.Name), tuiSeverity(r.Severity), tuiCount(uint64(r.Count)))
 	case blockClients:
 		c := o.Summary.Clients[i]
 		text := fmt.Sprintf("来源 %s · %s 请求", tuiLine(c.Name), tuiCount(uint64(c.Count)))
 		if c.Alerts > 0 {
 			text += fmt.Sprintf(" · %s 告警", tuiCount(uint64(c.Alerts)))
 		}
-		return text + " · 双击查看这个来源的请求"
+		return text + " · 再点一次查看这个来源的请求"
 	case blockLevels:
 		items := tuiOrdered(o.Summary.Severities, tuiLevelOrder)
-		return fmt.Sprintf("%s危告警 %s · 双击查看这一级别及以上的告警", tuiSeverity(items[i].Name), percent(items[i].Count, items))
+		return fmt.Sprintf("%s危告警 %s · 再点一次查看这一级别及以上的告警", tuiSeverity(items[i].Name), percent(items[i].Count, items))
 	case blockStatus:
 		items := tuiOrdered(o.Summary.Statuses, tuiStatusOrder)
 		name := map[string]string{"pending": "待响应", "other": "其他状态"}[items[i].Name]
 		if name == "" {
 			name = "响应 " + items[i].Name
 		}
-		return fmt.Sprintf("%s · %s · 双击查看这些请求", name, percent(items[i].Count, items))
+		return fmt.Sprintf("%s · %s · 再点一次查看这些请求", name, percent(items[i].Count, items))
 	case blockRecent:
 		r := o.Recent[i]
 		at, _ := time.Parse(time.RFC3339Nano, r.Time)
-		return fmt.Sprintf("%s危 %s · %s · %s %s · %s · 双击打开详情", tuiSeverity(r.Severity), tuiLine(r.Rule), tuiFormatTime(at, "clock"), tuiLine(tuiClientHost(r.Client)), tuiLine(r.Method), tuiLine(r.URL))
+		return fmt.Sprintf("%s危 %s · %s · %s %s · %s · 再点一次打开详情", tuiSeverity(r.Severity), tuiLine(r.Rule), tuiFormatTime(at, "clock"), tuiLine(tuiClientHost(r.Client)), tuiLine(r.Method), tuiLine(r.URL))
 	}
 	return ""
 }

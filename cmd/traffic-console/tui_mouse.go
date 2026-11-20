@@ -193,7 +193,7 @@ type tuiTimelineDrag struct {
 	again  bool // the press landed on the column that was already the selection
 	inside bool // the press landed inside a selected span, which it keeps unless dragged
 	moved  bool
-	double bool
+	armed  bool // on the overview, the selection was made by an earlier click
 }
 
 // tuiScrollDrag follows a press on the list scrollbar; grab is where the
@@ -255,6 +255,9 @@ func (m *tuiModel) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			return m.updateKey(tuiKeyMsg("esc"))
 		}
 	case tea.MouseMotionMsg:
+		if m.splitDrag {
+			m.dragDivider(mouse.X)
+		}
 		if m.scrollDrag != nil {
 			m.dragScrollbar(mouse.Y)
 		}
@@ -272,6 +275,10 @@ func (m *tuiModel) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 	case tea.MouseReleaseMsg:
 		m.scrollDrag = nil
+		if m.splitDrag {
+			m.splitDrag = false
+			m.flash = fmt.Sprintf("列表 %d 列 · 详情 %d 列 · 双击分隔线恢复各占一半", m.listWidth(), m.viewport.Width())
+		}
 		if m.drag != nil {
 			return m, m.endDrag()
 		}
@@ -298,6 +305,8 @@ func (m *tuiModel) click(id string, double bool) tea.Cmd {
 	}
 	kind, arg, _ := strings.Cut(id, ":")
 	n, _ := strconv.Atoi(arg)
+	armed := m.armed
+	m.armed = ""
 	switch kind {
 	case "key":
 		_, cmd := m.updateKey(tuiKeyMsg(arg))
@@ -343,11 +352,34 @@ func (m *tuiModel) click(id string, double bool) tea.Cmd {
 		}
 		m.selected = n
 		if m.details && m.detailID == m.snapshot.Rows[n].ID {
-			return nil
+			// A later click on the open record hides the detail again; the
+			// second half of a double click keeps it open.
+			if double {
+				return nil
+			}
+			return m.hideDetail()
 		}
 		return m.openDetail(m.snapshot.Rows[n])
+	case "page":
+		switch arg {
+		case "next":
+			return m.gotoPage(m.page + 1)
+		case "prev":
+			return m.gotoPage(m.page - 1)
+		}
+		m.listFree = false
+		return m.gotoPage(0)
+	case "divider":
+		if double {
+			m.listRatio = 0
+			m.listShare = 0
+			m.resize()
+			m.flash = "列表与详情各占一半"
+			return nil
+		}
+		m.splitDrag = true
 	case "tl":
-		m.startDrag(n, double)
+		m.startDrag(n, armed == "timeline")
 		return nil
 	case "sb":
 		m.pressScrollbar(n)
@@ -366,15 +398,16 @@ func (m *tuiModel) click(id string, double bool) tea.Cmd {
 	case "block":
 		m.block, m.timelineAnchor = n, 0
 	case "ov":
-		// On the overview a click shows a summary and a double click opens,
-		// so a stray click does not leave the page.
+		// On the overview a first click shows a summary and a second click
+		// on the same row opens it, so a stray click does not leave the page.
 		block, item, _ := strings.Cut(arg, ":")
 		m.block, _ = strconv.Atoi(block)
 		m.blockSelected[m.block], _ = strconv.Atoi(item)
 		m.timelineAnchor = 0
-		if double {
+		if armed == id {
 			return m.updateOverviewKey("enter")
 		}
+		m.armed = id
 		m.flash = m.overviewBrief(m.block, m.blockSelected[m.block])
 	case "dtab":
 		m.setDetailTab(n)
@@ -397,7 +430,7 @@ func (m *tuiModel) click(id string, double bool) tea.Cmd {
 func (m tuiModel) overviewPage() bool { return m.tab == tabOverview && !m.details }
 
 // startDrag begins a timeline selection on the pressed column.
-func (m *tuiModel) startDrag(col int, double bool) {
+func (m *tuiModel) startDrag(col int, armed bool) {
 	focused := m.timelineFocus
 	if m.overviewPage() {
 		focused = m.block == blockTimeline
@@ -405,7 +438,7 @@ func (m *tuiModel) startDrag(col int, double bool) {
 	} else {
 		m.timelineFocus = true
 	}
-	d := &tuiTimelineDrag{start: col, double: double}
+	d := &tuiTimelineDrag{start: col, armed: armed}
 	m.drag = d
 	cursor := m.blockSelected[blockTimeline]
 	if focused && m.timelineAnchor > 0 {
@@ -420,7 +453,8 @@ func (m *tuiModel) startDrag(col int, double bool) {
 
 // endDrag finishes a press on the timeline. On a list a dragged span, or a
 // second click on the selection, applies it like a drag on the web timeline.
-// The overview only selects: a double click or Enter opens the requests.
+// The overview only selects; clicking the selection again, or Enter, opens
+// the requests.
 func (m *tuiModel) endDrag() tea.Cmd {
 	d := m.drag
 	m.drag = nil
@@ -430,10 +464,11 @@ func (m *tuiModel) endDrag() tea.Cmd {
 	}
 	apply := !clicked || d.inside || d.again
 	if m.overviewPage() {
-		if clicked && d.double {
+		if clicked && d.armed && (d.inside || d.again) {
 			return m.updateOverviewKey("enter")
 		}
-		m.flash = "已选中时间段 · 双击选中处或按 Enter 查看这段时间的请求"
+		m.armed = "timeline"
+		m.flash = "已选中时间段 · 再点一次选中处或按 Enter 查看这段时间的请求"
 		return nil
 	}
 	if !apply {
@@ -441,6 +476,20 @@ func (m *tuiModel) endDrag() tea.Cmd {
 	}
 	cmd, _ := m.updateListTimeline("enter")
 	return cmd
+}
+
+// dragDivider follows the pointer with the divider between list and detail.
+// The divider's line sits one column after the list.
+func (m *tuiModel) dragDivider(x int) {
+	if !m.split() || m.width <= 0 {
+		return
+	}
+	width := max(tuiMinList, min(m.width-tuiMinDetail-3, x-1))
+	if width == m.listWidth() {
+		return // re-wrapping a large detail on every motion event is costly
+	}
+	m.listRatio = max(1, (width*1000+m.width-1)/m.width)
+	m.resize()
 }
 
 // scrollListTo moves the list window. Beside a detail the list scrolls on

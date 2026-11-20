@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	termansi "github.com/charmbracelet/x/ansi"
 )
@@ -197,14 +199,14 @@ func TestTUIMouseTimelineDrag(t *testing.T) {
 func TestTUIMouseOverviewAndParams(t *testing.T) {
 	m := tuiSummaryModel(t)
 	runLoad(m, m.load())
-	// A click on the overview only describes the row; a double click opens it.
+	// A click on the overview only describes the row; clicking it again opens it.
 	runLoad(m, clickZone(t, m, fmt.Sprintf("ov:%d:0", blockRules)))
-	if m.tab != tabOverview || m.block != blockRules || !strings.Contains(m.flash, "双击") {
+	if m.tab != tabOverview || m.block != blockRules || !strings.Contains(m.flash, "再点一次") {
 		t.Fatalf("single click left the overview or showed no summary: %q", m.flash)
 	}
 	runLoad(m, clickZone(t, m, fmt.Sprintf("ov:%d:0", blockRules)))
 	if m.tab != tabAlerts || m.filter.Rule == "" || m.drill == nil {
-		t.Fatalf("double click did not drill %+v", m.filter)
+		t.Fatalf("second click did not drill %+v", m.filter)
 	}
 
 	d := tuiDetailModel(t)
@@ -232,19 +234,28 @@ func TestTUIMouseOverviewAndParams(t *testing.T) {
 func TestTUIOverviewBriefs(t *testing.T) {
 	m := tuiSummaryModel(t)
 	runLoad(m, m.load())
-	for block, want := range map[int]string{blockRules: "规则 ", blockClients: "来源 ", blockLevels: "危告警", blockStatus: "响应 ", blockRecent: "双击打开详情"} {
+	for block, want := range map[int]string{blockRules: "规则 ", blockClients: "来源 ", blockLevels: "危告警", blockStatus: "响应 ", blockRecent: "再点一次打开详情"} {
 		if brief := m.overviewBrief(block, 0); !strings.Contains(brief, want) {
 			t.Errorf("block %d brief %q", block, brief)
 		}
 	}
-	// Clicks far apart are two single clicks.
+	// Another row, or a key in between, needs a fresh first click.
 	runLoad(m, clickZone(t, m, fmt.Sprintf("ov:%d:0", blockRecent)))
-	m.lastClickAt = m.lastClickAt.Add(-time.Second)
+	runLoad(m, clickZone(t, m, fmt.Sprintf("ov:%d:1", blockRecent)))
+	m.Update(tuiKey("up"))
 	runLoad(m, clickZone(t, m, fmt.Sprintf("ov:%d:0", blockRecent)))
 	if m.details || m.tab != tabOverview {
-		t.Fatal("slow clicks counted as a double click")
+		t.Fatal("a first click on a row opened it")
 	}
-	// The overview timeline selects on click and drag, and opens on a double click.
+	// However long the pause, the second click on the same row opens it.
+	m.lastClickAt = m.lastClickAt.Add(-time.Minute)
+	runLoad(m, clickZone(t, m, fmt.Sprintf("ov:%d:0", blockRecent)))
+	if !m.details || m.tab != tabAlerts {
+		t.Fatal("second click did not open the recent alert")
+	}
+	runLoad(m, m.returnFromDrill())
+	runLoad(m, m.load())
+	// The overview timeline selects on click and drag, and opens on another click inside the selection.
 	n := m.blockLen(blockTimeline)
 	last := zoneOf(t, m, fmt.Sprintf("tl:%d", n-1))
 	m.Update(tea.MouseClickMsg{X: last.x0, Y: last.y, Button: tea.MouseLeft})
@@ -254,17 +265,12 @@ func TestTUIOverviewBriefs(t *testing.T) {
 		t.Fatal("overview drag should only select")
 	}
 	inside := zoneOf(t, m, "tl:0")
-	for i := 0; i < 2; i++ {
-		_, cmd := m.Update(tea.MouseClickMsg{X: inside.x0, Y: inside.y, Button: tea.MouseLeft})
-		runLoad(m, cmd)
-		_, cmd = m.Update(tea.MouseReleaseMsg{X: inside.x0, Y: inside.y, Button: tea.MouseLeft})
-		runLoad(m, cmd)
-		if i == 0 && (m.tab != tabOverview || m.timelineAnchor == 0) {
-			t.Fatal("a click inside the span should keep it")
-		}
-	}
+	_, cmd := m.Update(tea.MouseClickMsg{X: inside.x0, Y: inside.y, Button: tea.MouseLeft})
+	runLoad(m, cmd)
+	_, cmd = m.Update(tea.MouseReleaseMsg{X: inside.x0, Y: inside.y, Button: tea.MouseLeft})
+	runLoad(m, cmd)
 	if m.tab != tabRequests || m.filter.Since == "" || m.filter.Until == "" {
-		t.Fatalf("double click did not open the span %+v", m.filter)
+		t.Fatalf("click inside the span did not open it %+v", m.filter)
 	}
 }
 
@@ -313,5 +319,143 @@ func TestTUIListScrollbar(t *testing.T) {
 		if termansi.StringWidth(line) > m.width {
 			t.Fatalf("row overflows: %q", termansi.Strip(line))
 		}
+	}
+}
+
+func tuiPagedModel(t *testing.T) *tuiModel {
+	t.Helper()
+	s := tuiTestStore(t)
+	now := time.Now().UTC()
+	for i := 0; i < 250; i++ {
+		putTUITransaction(t, s, Transaction{ID: fmt.Sprintf("r%03d", i), Time: now.Add(time.Duration(i-250) * time.Second), Client: "192.0.2.1:5000", Method: "GET", URL: fmt.Sprintf("/p%d", i)})
+	}
+	m := &tuiModel{ctx: context.Background(), store: s, refresh: time.Second, width: 160, height: 40, viewport: viewport.New(), tab: tabRequests, alertView: viewList}
+	m.resize()
+	runLoad(m, m.load())
+	return m
+}
+
+// The pager pages the list beside an open detail too, where n is the
+// detail's search key.
+func TestTUIPagerBesideDetail(t *testing.T) {
+	m := tuiPagedModel(t)
+	runLoad(m, clickZone(t, m, "row:3"))
+	if !m.split() {
+		t.Fatal("detail should open beside the list")
+	}
+	if !strings.Contains(m.listView(m.listBox()), "\x1b[7m") {
+		t.Fatal("the open record is not marked in the list")
+	}
+	detail, first := m.detailID, m.snapshot.Rows[0].ID
+	runLoad(m, clickZone(t, m, "page:next"))
+	if m.page != 1 || m.snapshot.Rows[0].ID == first || !m.details || m.detailID != detail {
+		t.Fatalf("page %d details %v", m.page, m.details)
+	}
+	// The open record is not on this page, so no row is marked as selected.
+	if strings.Contains(m.listView(m.listBox()), "\x1b[7m") {
+		t.Fatal("a row on another page is drawn as the open record")
+	}
+	runLoad(m, clickZone(t, m, "page:next"))
+	runLoad(m, clickZone(t, m, "page:prev"))
+	if m.page != 1 {
+		t.Fatalf("prev went to page %d", m.page)
+	}
+	runLoad(m, clickZone(t, m, "page:newest"))
+	if m.page != 0 {
+		t.Fatal("newest did not return to the first page")
+	}
+	// Without a detail the pager and keys still page.
+	runLoad(m, m.hideDetail())
+	runLoad(m, clickZone(t, m, "page:next"))
+	_, cmd := m.Update(tuiKey("n"))
+	runLoad(m, cmd)
+	if m.page != 2 {
+		t.Fatalf("list paging reached page %d", m.page)
+	}
+}
+
+func TestTUIRowClickToggles(t *testing.T) {
+	m := tuiPagedModel(t)
+	runLoad(m, clickZone(t, m, "row:2"))
+	if !m.details || m.detailID != m.snapshot.Rows[2].ID {
+		t.Fatal("first click should open the detail")
+	}
+	runLoad(m, clickZone(t, m, "row:4"))
+	if !m.details || m.detailID != m.snapshot.Rows[4].ID {
+		t.Fatal("another row should switch the detail")
+	}
+	runLoad(m, clickZone(t, m, "row:4"))
+	if !m.details {
+		t.Fatal("a double click should keep the detail open")
+	}
+	m.lastClickAt = time.Time{}
+	runLoad(m, clickZone(t, m, "row:4"))
+	if m.details || m.selected != 4 {
+		t.Fatalf("second click should hide the detail (details %v selected %d)", m.details, m.selected)
+	}
+}
+
+func TestTUIDividerDrag(t *testing.T) {
+	m := tuiPagedModel(t)
+	runLoad(m, clickZone(t, m, "row:0"))
+	d := zoneOf(t, m, "divider")
+	if d.x0 != m.listWidth() {
+		t.Fatalf("divider at %d, list %d", d.x0, m.listWidth())
+	}
+	m.Update(tea.MouseClickMsg{X: d.x0 + 1, Y: d.y, Button: tea.MouseLeft})
+	m.Update(tea.MouseMotionMsg{X: 61, Y: d.y, Button: tea.MouseLeft})
+	if m.listWidth() != 60 || m.viewport.Width() != 160-60-3 {
+		t.Fatalf("list %d detail %d", m.listWidth(), m.viewport.Width())
+	}
+	// Both sides keep a usable width.
+	m.Update(tea.MouseMotionMsg{X: 2, Y: d.y, Button: tea.MouseLeft})
+	if m.listWidth() != tuiMinList {
+		t.Fatalf("list shrank to %d", m.listWidth())
+	}
+	m.Update(tea.MouseMotionMsg{X: 159, Y: d.y, Button: tea.MouseLeft})
+	m.Update(tea.MouseReleaseMsg{X: 159, Y: d.y, Button: tea.MouseLeft})
+	if m.viewport.Width() != tuiMinDetail || m.splitDrag {
+		t.Fatalf("detail shrank to %d", m.viewport.Width())
+	}
+	content := m.View().Content
+	for _, line := range strings.Split(content, "\n") {
+		if termansi.StringWidth(line) > 160 {
+			t.Fatal("dragged split overflows")
+		}
+	}
+	// The proportion survives a resize; < and > go back to the fixed steps.
+	m.Update(tea.WindowSizeMsg{Width: 200, Height: 40})
+	if m.listWidth() <= 100 {
+		t.Fatalf("ratio lost on resize: %d", m.listWidth())
+	}
+	d = zoneOf(t, m, "divider")
+	m.Update(tea.MouseClickMsg{X: d.x0 + 1, Y: d.y, Button: tea.MouseLeft})
+	m.Update(tea.MouseReleaseMsg{X: d.x0 + 1, Y: d.y, Button: tea.MouseLeft})
+	m.Update(tea.MouseClickMsg{X: d.x0 + 1, Y: d.y, Button: tea.MouseLeft})
+	m.Update(tea.MouseReleaseMsg{X: d.x0 + 1, Y: d.y, Button: tea.MouseLeft})
+	if m.listRatio != 0 || m.listWidth() != 100 {
+		t.Fatalf("double click did not reset: %d", m.listWidth())
+	}
+}
+
+// On the overview timeline the first click on a column only selects it,
+// even when the keyboard cursor already sits there.
+func TestTUIOverviewTimelineClicks(t *testing.T) {
+	m := tuiSummaryModel(t)
+	runLoad(m, m.load())
+	col := zoneOf(t, m, "tl:0")
+	click := func() {
+		_, cmd := m.Update(tea.MouseClickMsg{X: col.x0, Y: col.y, Button: tea.MouseLeft})
+		runLoad(m, cmd)
+		_, cmd = m.Update(tea.MouseReleaseMsg{X: col.x0, Y: col.y, Button: tea.MouseLeft})
+		runLoad(m, cmd)
+	}
+	click()
+	if m.tab != tabOverview || !strings.Contains(m.flash, "再点一次") {
+		t.Fatalf("first click opened the timeline: tab %d", m.tab)
+	}
+	click()
+	if m.tab != tabRequests || m.filter.Since == "" {
+		t.Fatal("second click did not open the column")
 	}
 }
