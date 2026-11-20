@@ -131,6 +131,9 @@ type sessionBrowser struct {
 	generation              uint64
 	refresh                 time.Duration
 	filter                  tuiFilter
+	rulesDir                string
+	// autoOpened is set after the first scan, which opens a lone session as the web page does.
+	autoOpened bool
 }
 
 func sessionPath(path string) string {
@@ -308,7 +311,7 @@ func discoverSessions(ctx context.Context, roots []string, caches ...*discoveryC
 	return result
 }
 
-func runSessionBrowser(dir, root string, refresh time.Duration, filter tuiFilter) error {
+func runSessionBrowser(dir, root, rulesDir string, refresh time.Duration, filter tuiFilter) error {
 	if refresh <= 0 {
 		return fmt.Errorf("--refresh 必须大于 0")
 	}
@@ -321,9 +324,10 @@ func runSessionBrowser(dir, root string, refresh time.Duration, filter tuiFilter
 	input.SetVirtualCursor(true)
 	input.CharLimit = 4096
 	input.SetWidth(74)
-	m := &sessionBrowser{ctx: ctx, roots: sessionRoots(root), refresh: refresh, filter: filter, width: 80, height: 24, path: input, query: newSessionQuery()}
+	m := &sessionBrowser{ctx: ctx, roots: sessionRoots(root), refresh: refresh, filter: filter, rulesDir: rulesDir, width: 80, height: 24, path: input, query: newSessionQuery()}
 	defer m.closeSession()
 	if dir != "" {
+		m.autoOpened = true
 		m.roots = append(m.roots, sessionPath(dir))
 		if err := m.openSession(sessionPath(dir)); err != nil {
 			return err
@@ -360,7 +364,7 @@ func (m *sessionBrowser) openSession(dir string) error {
 	m.closeSession()
 	m.childCancel = cancel
 	m.lastDir = dir
-	m.child = &tuiModel{ctx: ctx, store: s, refresh: m.refresh, filter: m.filter, snapshot: snapshot, title: sessionTitle(dir), width: m.width, height: m.height, viewport: viewport.New()}
+	m.child = &tuiModel{ctx: ctx, store: s, refresh: m.refresh, rulesDir: m.rulesDir, filter: m.filter, snapshot: snapshot, title: sessionTitle(dir), width: m.width, height: m.height, viewport: viewport.New(), alertView: viewList}
 	m.child.resize()
 	return nil
 }
@@ -383,7 +387,7 @@ func sessionCommand(cmd tea.Cmd, generation uint64) tea.Cmd {
 		// Only session data needs the tag. Runtime messages such as clipboard
 		// writes must reach Bubble Tea itself; input widgets accept them untagged.
 		switch msg.(type) {
-		case tuiTick, tuiLoaded, tuiExported:
+		case tuiTick, tuiLoaded, tuiExported, tuiAnalysisTick, tuiAnalysisDone:
 			return sessionChildMsg{generation, msg}
 		}
 		return msg
@@ -415,6 +419,14 @@ func (m *sessionBrowser) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.entries, m.notice, m.scanning = msg.Entries, msg.Warning, false
 		m.reorder(selectedDir)
+		if !m.autoOpened && m.child == nil {
+			m.autoOpened = true
+			if len(m.entries) == 1 && m.entries[0].Problem == "" {
+				if err := m.openSession(m.entries[0].Dir); err == nil {
+					return m, sessionCommand(m.child.Init(), m.generation)
+				}
+			}
+		}
 		return m, nil
 	case sessionChildMsg:
 		if m.child == nil || msg.Generation != m.generation {
@@ -429,6 +441,10 @@ func (m *sessionBrowser) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.child != nil {
 			if key == "s" && !m.child.modal() {
+				if m.child.analysisRunning() {
+					m.child.flash = "分析正在进行，离开会话会停止分析；按 A 打开分析面板停止后再切换"
+					return m, nil
+				}
 				m.closeSession()
 				return m, m.scan()
 			}
@@ -476,6 +492,8 @@ func (m *sessionBrowser) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			case "r":
 				return m, m.scan()
+			case "z":
+				tuiUseUTC.Store(!tuiUseUTC.Load())
 			case "o":
 				m.editing = true
 				m.path.SetWidth(max(1, m.width-6))
@@ -553,7 +571,7 @@ func sessionTitle(dir string) string {
 			parts = append(parts, manifest.Host)
 		}
 		if !manifest.Started.IsZero() {
-			parts = append(parts, manifest.Started.Local().Format("2006-01-02"))
+			parts = append(parts, tuiIn(manifest.Started).Format("2006-01-02"))
 		}
 	}
 	name := manifest.Name
@@ -570,28 +588,17 @@ func sessionHost(entry sessionEntry) string {
 	return entry.Host
 }
 
-// reorder applies the search and groups sessions by host. Hosts follow their newest
-// session, and live captures come first within a host.
+// reorder applies the search. Sessions stay newest first and the view groups
+// them by start day, like the web session list.
 func (m *sessionBrowser) reorder(selectedDir string) {
 	query := strings.ToLower(strings.TrimSpace(m.query.Value()))
-	hostRank := map[string]int{}
 	m.order = m.order[:0]
 	for i, entry := range m.entries {
 		if query != "" && !strings.Contains(strings.ToLower(entry.Name+" "+entry.Host+" "+entry.Dir), query) {
 			continue
 		}
-		if _, ok := hostRank[sessionHost(entry)]; !ok {
-			hostRank[sessionHost(entry)] = len(hostRank)
-		}
 		m.order = append(m.order, i)
 	}
-	sort.SliceStable(m.order, func(a, b int) bool {
-		x, y := m.entries[m.order[a]], m.entries[m.order[b]]
-		if hostRank[sessionHost(x)] != hostRank[sessionHost(y)] {
-			return hostRank[sessionHost(x)] < hostRank[sessionHost(y)]
-		}
-		return x.Stats.State == "running" && y.Stats.State != "running"
-	})
 	m.selected = 0
 	for i, index := range m.order {
 		if m.entries[index].Dir == selectedDir {
@@ -654,42 +661,44 @@ func (m *sessionBrowser) View() tea.View {
 
 	// Build every row, then show the window that keeps the cursor visible.
 	numbers := width >= 70
-	columns := tuiCell("", 2) + tuiCell("状态", 14) + tuiCell("开始时间", 16)
+	columns := tuiCell("", 2) + tuiCell("状态", 14) + tuiCell("开始", 10)
 	if numbers {
-		columns += tuiCell("请求", 10) + tuiCell("告警", 8)
+		columns += tuiCell("请求", 10) + tuiCell("告警", 9)
+	}
+	countCell := func(n uint64, known bool, width int) string {
+		switch {
+		case known:
+			return tuiCell(tuiCount(n), width)
+		case n > 0:
+			return tuiMuted.Render(tuiCell("≈ "+tuiCount(n), width))
+		}
+		return tuiMuted.Render(tuiCell("—", width))
 	}
 	rows := []string{}
 	cursor := 0
-	lastHost := ""
+	lastDay := ""
 	for i, index := range m.order {
 		entry := m.entries[index]
-		if host := sessionHost(entry); i == 0 || host != lastHost {
-			rows = append(rows, tuiAccent.Render(clip(tuiLine(host))))
-			lastHost = host
+		if day := tuiIn(entry.Started).Format("2006-01-02"); i == 0 || day != lastDay {
+			rows = append(rows, tuiAccent.Render(day))
+			lastDay = day
 		}
-		requests, alerts := tuiMuted.Render(tuiCell("未知", 10)), tuiMuted.Render(tuiCell("未知", 8))
-		if entry.CountsKnown {
-			requests = tuiCell(tuiCount(entry.Stats.Transactions), 10)
-			alerts = tuiCell(tuiCount(entry.Stats.Alerts), 8)
-			if entry.Stats.Alerts > 0 {
-				alerts = tuiDanger.Render(alerts)
-			}
+		requests, alerts := countCell(entry.Stats.Transactions, entry.CountsKnown, 10), countCell(entry.Stats.Alerts, entry.CountsKnown, 9)
+		if entry.CountsKnown && entry.Stats.Alerts > 0 {
+			alerts = tuiDanger.Render(alerts)
 		}
-		if i == m.selected {
-			cursor = len(rows)
-			plain := tuiCell("", 2) + tuiCell(termansi.Strip(sessionBadge(entry)), 14) + tuiCell(entry.Started.Local().Format("01-02 15:04:05"), 16)
-			if numbers {
-				plain += termansi.Strip(requests) + termansi.Strip(alerts)
-			}
-			plain += tuiLine(entry.Name)
-			rows = append(rows, tuiSelected.Render(tuiCell(plain, width)))
-			continue
-		}
-		line := tuiCell("", 2) + tuiCell(sessionBadge(entry), 14) + tuiCell(entry.Started.Local().Format("01-02 15:04:05"), 16)
+		about := []string{tuiLine(entry.Name), sessionHost(entry), tuiRelative(entry.Started)}
+		line := tuiCell("", 2) + tuiCell(sessionBadge(entry), 14) + tuiCell(tuiIn(entry.Started).Format("15:04:05"), 10)
 		if numbers {
 			line += requests + alerts
 		}
-		rows = append(rows, clip(line+tuiLine(entry.Name)))
+		line += about[0] + tuiMuted.Render(" · "+tuiLine(about[1])+" · "+about[2])
+		if i == m.selected {
+			cursor = len(rows)
+			rows = append(rows, tuiSelected.Render(tuiCell(termansi.Strip(line), width)))
+			continue
+		}
+		rows = append(rows, clip(line))
 	}
 	if len(m.order) == 0 && !m.scanning {
 		if len(m.entries) > 0 {
@@ -706,7 +715,7 @@ func (m *sessionBrowser) View() tea.View {
 	if entry, ok := m.current(); ok {
 		path = entry.Dir
 	}
-	footer := "↑↓ 选择 · Enter 打开 · / 查找 · o 指定目录或文件 · r 重新扫描 · q 退出"
+	footer := "↑↓ 选择 · Enter 打开 · / 查找 · o 指定目录或文件 · r 重新扫描 · z 本地/UTC · q 退出"
 	if m.searching {
 		footer = "输入即筛选 · ↑↓ 选择 · Enter 完成 · Esc 清除"
 	}

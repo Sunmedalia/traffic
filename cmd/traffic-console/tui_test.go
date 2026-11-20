@@ -2,6 +2,7 @@ package main
 
 import (
 	lipgloss "charm.land/lipgloss/v2"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -197,6 +198,14 @@ func tuiKey(s string) tea.KeyPressMsg {
 		return tea.KeyPressMsg{Code: tea.KeyTab}
 	case "right":
 		return tea.KeyPressMsg{Code: tea.KeyRight}
+	case "left":
+		return tea.KeyPressMsg{Code: tea.KeyLeft}
+	case "shift+right":
+		return tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModShift}
+	case "shift+tab":
+		return tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift}
+	case "backspace":
+		return tea.KeyPressMsg{Code: tea.KeyBackspace}
 	}
 	panic(s)
 }
@@ -258,12 +267,19 @@ func TestTUIRefreshAndNavigation(t *testing.T) {
 		t.Fatal("manual refresh while paused failed")
 	}
 	m.Update(tuiKey("/"))
-	if m.form == nil || m.form.index != formSeverity {
-		t.Fatal("form did not open")
+	if m.form == nil || m.form.index != formKeyword || !m.form.fields[formKeyword].input.Focused() {
+		t.Fatal("form did not open on the keyword")
+	}
+	m.Update(tuiKey("tab"))
+	m.Update(tuiKey("tab"))
+	if m.form.index != formSeverity {
+		t.Fatal("tab did not reach the severity choice")
 	}
 	m.Update(tuiKey("right"))
 	m.Update(tuiKey("right"))
-	m.Update(tuiKey("tab"))
+	for m.form.index != formSince {
+		m.Update(tuiKey("tab"))
+	}
 	if !m.form.fields[formSince].input.Focused() {
 		t.Fatal("tab did not focus the time field")
 	}
@@ -337,8 +353,13 @@ func TestTUIHealthLevels(t *testing.T) {
 	if level, _ = m.tuiHealth(); level != 2 {
 		t.Fatal("stale heartbeat not critical")
 	}
-	if !strings.Contains(m.healthContent(), "java-probe-required") || strings.Contains(m.overviewView(100, 20), "网卡丢包") {
-		t.Fatal("diagnostics not moved to the health page")
+	if !strings.Contains(m.healthContent(), "java-probe-required") {
+		t.Fatal("diagnostics missing from the health page")
+	}
+	// The overview carries the web tiles, including the drop counters.
+	m.overview = &tuiOverview{}
+	if !strings.Contains(m.overviewView(100, 20), "TLS 已知丢弃") {
+		t.Fatal("overview tiles missing")
 	}
 }
 func TestTUIParseSince(t *testing.T) {
@@ -408,8 +429,12 @@ func TestTUILayoutAndDetailTabs(t *testing.T) {
 	m.snapshot.Rows = []tuiRow{{ID: "id", URL: "/中文" + strings.Repeat("长", 100)}}
 	for _, size := range []tea.WindowSizeMsg{{Width: 40, Height: 12}, {Width: 80, Height: 24}, {Width: 140, Height: 40}, {Width: 20, Height: 5}} {
 		m.Update(size)
-		for tab := 0; tab < 4; tab++ {
+		for tab := 0; tab < detailTabCount; tab++ {
 			m.detailTab = tab
+			if tab == detailDecoder {
+				m.currentDecoder()
+			}
+			m.metaOpen = tab%2 == 0
 			m.updateContent()
 			content := m.View().Content
 			if lipgloss.Width(content) > size.Width || lipgloss.Height(content) > size.Height {
@@ -419,6 +444,22 @@ func TestTUILayoutAndDetailTabs(t *testing.T) {
 		// Every page, list and popup also fits the terminal.
 		for _, page := range []func(m *tuiModel){
 			func(m *tuiModel) { m.details, m.tab = false, tabOverview },
+			func(m *tuiModel) {
+				m.overview = tuiParityOverview()
+				for block := 0; block < blockCount; block++ {
+					m.block = block
+					content := m.View().Content
+					if lipgloss.Width(content) > m.width || lipgloss.Height(content) > m.height {
+						panic(fmt.Sprintf("overview block %d overflow", block))
+					}
+				}
+			},
+			func(m *tuiModel) {
+				m.details, m.tab = false, tabRequests
+				m.timeline, m.timelineKey = &tuiParityOverview().Timeline, m.timelineScope()
+			},
+			func(m *tuiModel) { m.analysis = &tuiAnalysis{open: true, files: []string{"custom.yaml"}} },
+			func(m *tuiModel) { m.analysis = nil },
 			func(m *tuiModel) { m.details, m.tab = false, tabRequests },
 			func(m *tuiModel) { m.details, m.tab = false, tabHealth },
 			func(m *tuiModel) {
@@ -441,7 +482,7 @@ func TestTUILayoutAndDetailTabs(t *testing.T) {
 	m.detailTab = 0
 	m.resize()
 	m.Update(tuiKey("tab"))
-	if m.detailTab != 1 || !strings.Contains(m.viewport.GetContent(), "response") {
+	if m.detailTab != detailResponse || !strings.Contains(m.viewport.GetContent(), "response") {
 		t.Fatal("response tab not shown")
 	}
 	m.Update(tuiKey("esc"))
@@ -512,8 +553,15 @@ func runLoad(m *tuiModel, cmd tea.Cmd) {
 func TestTUIOverviewDrillAndReturn(t *testing.T) {
 	m := tuiSummaryModel(t)
 	runLoad(m, m.load())
-	if m.currentSummary() == nil || !strings.Contains(m.overviewView(120, 25), "SQLI-001") {
-		t.Fatal("overview summary missing")
+	o := m.overview
+	if o == nil || o.Summary.Total != 2 || o.Summary.Alerted != 2 || len(o.Recent) != 2 || o.Timeline.Total != 2 {
+		t.Fatalf("overview data %+v", o)
+	}
+	view := m.overviewView(120, 40)
+	for _, want := range []string{"SQLI-001", "累计请求", "命中规则", "来源地址", "告警级别", "响应状态", "最近告警", "采集状态"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("overview misses %q:\n%s", want, view)
+		}
 	}
 	m.filter = tuiFilter{Keyword: "kept"}
 	m.Update(tuiKey("tab"))
@@ -521,12 +569,13 @@ func TestTUIOverviewDrillAndReturn(t *testing.T) {
 	if m.block != blockRules || m.blockSelected[blockRules] != 1 {
 		t.Fatal("block navigation failed")
 	}
+	// Rules are ordered by request count, then name, like the web list.
 	_, cmd := m.Update(tuiKey("enter"))
-	if m.tab != tabAlerts || m.alertView != viewList || m.filter != (tuiFilter{Rule: "FILE-001"}) || m.drill == nil {
+	if m.tab != tabAlerts || m.alertView != viewList || m.filter != (tuiFilter{Rule: "SQLI-001"}) || m.drill == nil {
 		t.Fatalf("rule drill: tab=%d view=%d %+v", m.tab, m.alertView, m.filter)
 	}
 	runLoad(m, cmd)
-	if len(m.snapshot.Rows) != 1 || m.snapshot.Rows[0].ID != "2" {
+	if len(m.snapshot.Rows) != 1 || m.snapshot.Rows[0].ID != "1" {
 		t.Fatalf("drilled rows %+v", m.snapshot.Rows)
 	}
 	_, cmd = m.Update(tuiKey("esc"))
@@ -534,12 +583,35 @@ func TestTUIOverviewDrillAndReturn(t *testing.T) {
 	if m.tab != tabOverview || m.filter != (tuiFilter{Keyword: "kept"}) || m.blockSelected[blockRules] != 1 || m.drill != nil {
 		t.Fatalf("return: tab=%d %+v", m.tab, m.filter)
 	}
-	// A recent high alert opens its detail directly.
+	// A source opens the request list, as on the web page.
+	m.block = blockClients
+	_, cmd = m.Update(tuiKey("enter"))
+	if m.tab != tabRequests || m.filter.Client == "" {
+		t.Fatalf("client drill: tab=%d %+v", m.tab, m.filter)
+	}
+	runLoad(m, cmd)
+	_, cmd = m.Update(tuiKey("esc"))
+	runLoad(m, cmd)
+	// The timeline selects a time range of requests.
+	m.block = blockTimeline
+	runLoad(m, m.refreshNow())
+	m.Update(tuiKey("shift+right"))
+	_, cmd = m.Update(tuiKey("enter"))
+	if m.tab != tabRequests || m.filter.Since == "" || m.filter.Until == "" || !m.filter.UntilExclusive {
+		t.Fatalf("timeline drill %+v", m.filter)
+	}
+	runLoad(m, cmd)
+	if m.snapshot.Count == 0 {
+		t.Fatal("timeline range matched nothing")
+	}
+	_, cmd = m.Update(tuiKey("esc"))
+	runLoad(m, cmd)
+	// A recent alert opens its detail directly.
 	m.block = blockRecent
 	_, cmd = m.Update(tuiKey("enter"))
 	runLoad(m, cmd)
-	if !m.details || m.detailID != "1" || m.snapshot.Detail == nil || m.detailTab != 3 {
-		t.Fatal("recent alert detail not opened")
+	if !m.details || m.detailID != "2" || m.snapshot.Detail == nil || m.activeDetailTab() != detailRequest {
+		t.Fatalf("recent alert detail not opened: details=%v id=%q detail=%v tab=%d", m.details, m.detailID, m.snapshot.Detail != nil, m.activeDetailTab())
 	}
 	m.Update(tuiKey("esc"))
 	m.Update(tuiKey("esc"))
@@ -695,7 +767,7 @@ func TestTUITimeRange(t *testing.T) {
 		t.Fatalf("reversed range accepted: %v", err)
 	}
 	form.fields[formUntil].input.SetValue("bad")
-	if _, err := form.filter(); err == nil || !strings.HasPrefix(err.Error(), "时间到") {
+	if _, err := form.filter(); err == nil || !strings.HasPrefix(err.Error(), "结束时间") {
 		t.Fatalf("bad until: %v", err)
 	}
 	form.fields[formSince].input.SetValue("3h")
@@ -705,7 +777,7 @@ func TestTUITimeRange(t *testing.T) {
 		t.Fatalf("range rejected: %v", err)
 	}
 	m := &tuiModel{store: s, filter: got}
-	if !strings.Contains(m.filterLabel(), "时间 ≤") {
+	if !strings.Contains(m.filterLabel(), "– ≤") {
 		t.Fatal("until chip missing")
 	}
 }
@@ -738,5 +810,287 @@ func TestExpiredHeartbeatChecksCaptureLock(t *testing.T) {
 	stopped, warning := readTUIStatus(dir)
 	if stopped.State != "interrupted" || stopped.DrainState != "unverified" || warning == "" {
 		t.Fatalf("unconfirmed shutdown hidden: %+v %s", stopped, warning)
+	}
+}
+
+func tuiParityOverview() *tuiOverview {
+	base := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
+	o := &tuiOverview{Summary: sessionSummary{Total: 30, Alerted: 3,
+		Clients:    []webCount{{Name: "203.0.113.45", Count: 20, Alerts: 3}, {Name: "[2001:db8::1]", Count: 10}},
+		Rules:      []webCount{{Name: "SQLI-001", Severity: "high", Count: 2}, {Name: "FILE-001", Severity: "medium", Count: 1}},
+		Severities: []webCount{{Name: "high", Count: 2}, {Name: "medium", Count: 1}},
+		Statuses:   []webCount{{Name: "2xx", Count: 25}, {Name: "4xx", Count: 3}, {Name: "pending", Count: 2}},
+	}}
+	o.Timeline = sessionTimeline{Total: 30, Granularity: 60}
+	for i := 0; i < 30; i += 3 {
+		o.Timeline.Buckets = append(o.Timeline.Buckets, webBucket{Time: base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339), Requests: 3, Alerts: i % 2})
+	}
+	o.Recent = []tuiRow{{ID: "r1", Time: base.Format(time.RFC3339Nano), Client: "203.0.113.45:1", Method: "GET", URL: "/a", Severity: "high"}}
+	return o
+}
+
+func TestTUITimelineColumns(t *testing.T) {
+	m := tuiModel{}
+	o := tuiParityOverview()
+	columns := m.timelineColumns(&o.Timeline, 100)
+	// 28 minutes of one-minute buckets fit one column each.
+	if len(columns) != 28 || columns[0].requests != 3 || columns[1].requests != 0 || columns[27].to.Sub(columns[0].from) != 28*time.Minute {
+		t.Fatalf("columns %d %+v", len(columns), columns[:2])
+	}
+	columns = m.timelineColumns(&o.Timeline, 7)
+	total := 0
+	for _, c := range columns {
+		total += c.requests
+	}
+	if len(columns) != 7 || total != 30 {
+		t.Fatalf("merged columns %d total %d", len(columns), total)
+	}
+	bars := m.timelineBars(&o.Timeline, 60, 2, false, true)
+	if len(bars) != 4 || !strings.Contains(termansi.Strip(bars[2]), "▲") {
+		t.Fatalf("bars %q", bars)
+	}
+}
+
+func TestTUIDecoders(t *testing.T) {
+	var gz strings.Builder
+	w := gzip.NewWriter(&gz)
+	w.Write([]byte("hello gzip"))
+	w.Close()
+	cases := []struct {
+		name, in, want string
+		run            tuiDecodeFunc
+	}{
+		{"url", "a%20b+c%E4%B8%AD%zz", "a b c中%zz", tuiPercent(true)},
+		{"url raw", "a+b%2B", "a+b+", tuiPercent(false)},
+		{"base64", "aGVsbG8gd29ybGQ", "hello world", tuiBase64},
+		{"base64 url", "PDw_Pz4-", "<<??>>", tuiBase64},
+		{"hex", "0x48 0x69", "Hi", tuiHex},
+		{"html", "&lt;a&#x3e;&#33;&amp;&unknown;", "<a>!&&unknown;", tuiHTML},
+		{"unicode", `\u4e2d\u{1F600}%u0041\x42\n`, "中😀AB\n", tuiUnicode},
+		{"gzip", gz.String(), "hello gzip", tuiInflate},
+	}
+	for _, tt := range cases {
+		got, err := tt.run([]byte(tt.in))
+		if err != nil || string(got) != tt.want {
+			t.Errorf("%s: %q %v", tt.name, got, err)
+		}
+	}
+	jwt := "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig"
+	if got, err := tuiJWT([]byte(jwt)); err != nil || !strings.Contains(string(got), `"sub": "123"`) || !strings.Contains(string(got), "sig") {
+		t.Errorf("jwt %q %v", got, err)
+	}
+	for _, bad := range []struct {
+		in  string
+		run tuiDecodeFunc
+	}{{"!!", tuiBase64}, {"abc", tuiHex}, {"a.b.c.d", tuiJWT}, {"plain", tuiInflate}} {
+		if _, err := bad.run([]byte(bad.in)); err == nil {
+			t.Errorf("accepted %q", bad.in)
+		}
+	}
+	if !tuiDecoders[0].applies([]byte("a%20b")) || tuiDecoders[0].applies([]byte("plain")) || !tuiDecoders[7].applies([]byte(gz.String())) {
+		t.Error("applies marks wrong decoders")
+	}
+	if !tuiLooksBinary([]byte{0, 1, 2, 3, 'a'}) || tuiLooksBinary([]byte("正文 text")) {
+		t.Error("binary detection")
+	}
+	if dump := tuiHexDump([]byte("ABC")); !strings.HasPrefix(dump, "00000000  41 42 43") || !strings.HasSuffix(dump, "ABC") {
+		t.Errorf("dump %q", dump)
+	}
+}
+
+func tuiDetailModel(t *testing.T) *tuiModel {
+	t.Helper()
+	request := "POST /login?next=%2Fadmin&id=MTIz HTTP/1.1\r\nHost: shop\r\nCookie: sid=YWJj; theme=dark\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nuser=admin&pass=%27+or+1%3D1"
+	response := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"items\":[1,2]}"
+	detail := &Transaction{ID: "b", Method: "POST", Host: "shop", URL: "/login?next=%2Fadmin&id=MTIz", Client: "192.0.2.1:5000", Service: "nginx", Status: 200,
+		Request: []byte(request), Response: []byte(response), Alerts: []Alert{{Rule: "SQLI-001", Severity: "high", Match: "' or 1=1", Field: "request.body"}}}
+	m := &tuiModel{ctx: context.Background(), store: tuiTestStore(t), refresh: time.Second, width: 100, height: 40, viewport: viewport.New(), tab: tabRequests, alertView: viewList}
+	m.snapshot.Rows = []tuiRow{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	m.selected = 1
+	m.openDetail(m.snapshot.Rows[1])
+	m.busy = false
+	m.snapshot.Detail = detail
+	m.resize()
+	return m
+}
+
+func TestTUIDetailParity(t *testing.T) {
+	m := tuiDetailModel(t)
+	content := termansi.Strip(m.viewport.GetContent())
+	for _, want := range []string{"[SQLI-001]", "表单参数（原文）", "pass", "Cookie（原文）", "sid", "i 展开记录信息"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("request tab misses %q:\n%s", want, content)
+		}
+	}
+	if tabs := m.detailTabs(); len(tabs) != 4 || tabs[3] != detailAlerts {
+		t.Fatalf("tabs %v", tabs)
+	}
+	m.Update(tuiKey("i"))
+	if !strings.Contains(termansi.Strip(m.viewport.GetContent()), "S 按服务筛选") {
+		t.Fatal("record information not expanded")
+	}
+	m.Update(tuiKey("]"))
+	if m.activeDetailTab() != detailResponse || !strings.Contains(m.viewport.GetContent(), "  \"ok\": true") {
+		t.Fatalf("response not pretty printed:\n%s", m.viewport.GetContent())
+	}
+	m.Update(tuiKey("f"))
+	if !strings.Contains(m.viewport.GetContent(), `{"ok":true,"items":[1,2]}`) {
+		t.Fatal("raw body toggle failed")
+	}
+	if _, cmd := m.Update(tuiKey("Y")); cmd == nil || !strings.Contains(m.flash, "响应") {
+		t.Fatalf("copy content: %q", m.flash)
+	}
+	m.Update(tuiKey("["))
+	m.Update(tuiKey("["))
+	if m.activeDetailTab() != detailAlerts {
+		t.Fatalf("[ did not wrap to the evidence tab: %d", m.activeDetailTab())
+	}
+	// d opens the decoder on the alert match from the evidence tab.
+	m.Update(tuiKey("d"))
+	if m.activeDetailTab() != detailDecoder || m.decoder.label != "命中片段 SQLI-001" {
+		t.Fatalf("decoder source %q", m.decoder.label)
+	}
+	m.Update(tuiKey("left"))
+	if m.decoder.label != "请求正文" {
+		t.Fatalf("previous source %q", m.decoder.label)
+	}
+	// Choose the id query parameter and decode it twice through the picker.
+	for m.decoder.label != "查询参数 id" {
+		m.Update(tuiKey("right"))
+	}
+	m.Update(tuiKey("enter"))
+	if !m.decoder.picking || !m.modal() {
+		t.Fatal("picker not open")
+	}
+	for tuiDecoders[m.decoder.pick].label != "Base64" {
+		m.Update(tuiKey("j"))
+	}
+	m.Update(tuiKey("enter"))
+	if string(m.decoder.last()) != "123" || len(m.decoder.steps) != 2 {
+		t.Fatalf("decode result %q", m.decoder.last())
+	}
+	m.Update(tuiKey("backspace"))
+	if len(m.decoder.steps) != 1 {
+		t.Fatal("undo failed")
+	}
+	m.Update(tuiKey("w"))
+	m.decoder.editor.SetValue("%41")
+	m.Update(tuiKey("enter"))
+	if m.decoder.label != "手动输入" || m.decoder.input != "%41" || m.modal() {
+		t.Fatal("manual input not applied")
+	}
+	// j and k change record, as on the web page.
+	_, cmd := m.Update(tuiKey("j"))
+	if cmd == nil || m.detailID != "c" || m.selected != 2 {
+		t.Fatalf("j did not open the next record: %q", m.detailID)
+	}
+	m.busy = false
+	m.Update(tuiKey("k"))
+	if m.detailID != "b" {
+		t.Fatalf("k did not open the previous record: %q", m.detailID)
+	}
+}
+
+func TestTUIFormParity(t *testing.T) {
+	f := tuiFilter{Keyword: "admin", Decode: 2, Status: "403", Method: "TRACE", HideStatic: true, Exclude: "a b", Param: "cmd", Since: "2026-11-16T10:00:00.123000000Z", Until: "2026-11-16T11:00:00.000000000Z", UntilExclusive: true}
+	form := newTUIForm(f, []string{"nginx"}, 100)
+	got, err := form.filter()
+	if err != nil || got != f {
+		t.Fatalf("round trip changed the filter:\n%+v\n%+v %v", got, f, err)
+	}
+	form.fields[formCode].input.SetValue("")
+	form.fields[formStatus].choice = 5
+	form.fields[formParam].input.SetValue("a=b")
+	if _, err := form.filter(); err == nil {
+		t.Fatal("invalid parameter accepted")
+	}
+	form.fields[formParam].input.SetValue("")
+	if got, err = form.filter(); err != nil || got.Status != "pending" {
+		t.Fatalf("status class %+v %v", got, err)
+	}
+	m := &tuiModel{filter: got}
+	label := m.filterLabel()
+	for _, want := range []string{"URL 解码 2 次", "状态 待响应", "方法 TRACE", "隐藏静态资源", "排除 a b"} {
+		if !strings.Contains(label, want) {
+			t.Fatalf("chips miss %q: %s", want, label)
+		}
+	}
+	if view := form.view(8); lipgloss.Height(view) > 8 {
+		t.Fatalf("form overflow %d", lipgloss.Height(view))
+	}
+}
+
+func TestTUIAnalysisDialog(t *testing.T) {
+	m := tuiSummaryModel(t)
+	m.rulesDir = filepath.Join(t.TempDir(), "rules")
+	if err := os.MkdirAll(m.rulesDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(m.rulesDir, "custom.yaml"), []byte(testManagedRules), 0600); err != nil {
+		t.Fatal(err)
+	}
+	m.snapshot.Stats.State = "running"
+	m.Update(tuiKey("A"))
+	if m.analysis == nil || !m.analysis.open || len(m.analysis.files) != 1 || !m.modal() {
+		t.Fatal("dialog did not list the rule directory")
+	}
+	m.Update(tuiKey("j"))
+	if m.analysis.choice != 1 {
+		t.Fatal("rule choice did not move")
+	}
+	m.Update(tuiKey("enter"))
+	if m.analysis.job != nil || !strings.Contains(m.analysis.err, "采集仍在进行") {
+		t.Fatalf("running capture analysed: %q", m.analysis.err)
+	}
+	m.snapshot.Stats.State = "stopped"
+	_, cmd := m.Update(tuiKey("enter"))
+	if !m.analysisRunning() || cmd == nil || !strings.Contains(m.identityLine(120), "分析中") {
+		t.Fatalf("job did not start: %q", m.analysis.err)
+	}
+	m.Update(tuiKey("esc"))
+	if m.analysis.open || !m.analysisRunning() {
+		t.Fatal("closing the dialog stopped the job")
+	}
+	m.Update(tuiAnalysisDone{ID: m.analysis.job.id, Err: errors.New("boom")})
+	if m.analysis.job.state != "failed" || !strings.Contains(m.flash, "boom") {
+		t.Fatalf("failure not reported: %q", m.flash)
+	}
+	m.Update(tuiKey("A"))
+	if m.analysis.choice != 1 || !strings.Contains(m.analysisView(30), "失败") {
+		t.Fatal("dialog lost its state")
+	}
+	_, cmd = m.Update(tuiKey("enter"))
+	m.Update(tuiKey("x"))
+	if !m.analysis.cancelling {
+		t.Fatal("cancel not requested")
+	}
+	m.Update(tuiAnalysisDone{ID: m.analysis.job.id, Err: context.Canceled})
+	if m.analysis.job.state != "cancelled" || len(m.analysis.history) != 2 || !strings.Contains(m.analysisView(30), "最近任务") {
+		t.Fatal("cancel not reported")
+	}
+	_ = cmd
+	m.Update(tuiAnalysisDone{ID: m.analysis.job.id, Report: analysisReport{Alerts: 3}})
+	if m.analysis.job.state != "cancelled" {
+		t.Fatal("finished job changed state twice")
+	}
+}
+
+func TestTUIZoneToggle(t *testing.T) {
+	defer tuiUseUTC.Store(false)
+	m := &tuiModel{store: tuiTestStore(t), viewport: viewport.New(), width: 100, height: 30}
+	m.Update(tuiKey("z"))
+	if !tuiUseUTC.Load() || !strings.Contains(m.tabsLine(100), "UTC") {
+		t.Fatal("UTC not selected")
+	}
+	stamp := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
+	if got := tuiTime(stamp.Format(time.RFC3339Nano)); got != "11-16 10:00:00" {
+		t.Fatalf("UTC time %q", got)
+	}
+	if got, err := parseTUISince("2026-11-16 10:00", stamp.Add(time.Hour)); err != nil || !got.Equal(stamp) {
+		t.Fatalf("UTC parse %v %v", got, err)
+	}
+	m.Update(tuiKey("z"))
+	if tuiUseUTC.Load() {
+		t.Fatal("local time not restored")
 	}
 }

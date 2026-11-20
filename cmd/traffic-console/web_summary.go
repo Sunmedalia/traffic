@@ -35,6 +35,59 @@ var webGranularities = []struct {
 
 const webTimelineBuckets = 120
 
+// sessionTimeline buckets matching requests by time; Alerts counts alerting requests.
+type sessionTimeline struct {
+	Total       int         `json:"total"`
+	Granularity int         `json:"granularity"`
+	Buckets     []webBucket `json:"buckets"`
+	First       string      `json:"first,omitempty"`
+	Last        string      `json:"last,omitempty"`
+}
+
+func querySessionTimeline(ctx context.Context, db *sql.DB, filter tuiFilter, alertsOnly bool) (sessionTimeline, error) {
+	where, args := filter.where(alertsOnly)
+	var first, last sql.NullString
+	result := sessionTimeline{Granularity: 1, Buckets: []webBucket{}}
+	if err := db.QueryRowContext(ctx, "SELECT min(time),max(time),count(*) FROM entries WHERE "+where, args...).Scan(&first, &last, &result.Total); err != nil {
+		return result, err
+	}
+	if result.Total == 0 {
+		return result, nil
+	}
+	start, startErr := time.Parse(indexTimeFormat, first.String)
+	end, endErr := time.Parse(indexTimeFormat, last.String)
+	if startErr != nil || endErr != nil {
+		return result, errors.New("索引时间格式无法识别")
+	}
+	granularity := webGranularities[len(webGranularities)-1]
+	for _, candidate := range webGranularities {
+		if int(end.Sub(start).Seconds())/candidate.Seconds < webTimelineBuckets {
+			granularity = candidate
+			break
+		}
+	}
+	rows, err := db.QueryContext(ctx, "SELECT substr(time,1,?),count(*),COALESCE(sum(alert>0),0) FROM entries WHERE "+where+" GROUP BY 1 ORDER BY 1", append([]any{granularity.Prefix}, args...)...)
+	if err != nil {
+		return result, err
+	}
+	defer rows.Close()
+	buckets := []webBucket{}
+	for rows.Next() {
+		var bucket webBucket
+		if err = rows.Scan(&bucket.Time, &bucket.Requests, &bucket.Alerts); err != nil {
+			return result, err
+		}
+		bucket.Time += granularity.Suffix
+		buckets = append(buckets, bucket)
+	}
+	if err = rows.Err(); err != nil {
+		return result, err
+	}
+	result.Granularity, result.Buckets = granularity.Seconds, buckets
+	result.First, result.Last = start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano)
+	return result, nil
+}
+
 func (w *webServer) handleTimeline(rw http.ResponseWriter, r *http.Request) {
 	filter, get, err := webFilter(r)
 	if err != nil {
@@ -48,53 +101,11 @@ func (w *webServer) handleTimeline(rw http.ResponseWriter, r *http.Request) {
 	defer s.db.Close()
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	where, args := filter.where(get("alerts") == "1")
-	var first, last sql.NullString
-	var total int
-	if err = s.db.QueryRowContext(ctx, "SELECT min(time),max(time),count(*) FROM entries WHERE "+where, args...).Scan(&first, &last, &total); err != nil {
-		webError(rw, http.StatusInternalServerError, err)
-		return
-	}
-	result := map[string]any{"total": total, "granularity": 1, "buckets": []webBucket{}}
-	if total == 0 {
-		webJSON(rw, http.StatusOK, result)
-		return
-	}
-	start, startErr := time.Parse(indexTimeFormat, first.String)
-	end, endErr := time.Parse(indexTimeFormat, last.String)
-	if startErr != nil || endErr != nil {
-		webError(rw, http.StatusInternalServerError, errors.New("索引时间格式无法识别"))
-		return
-	}
-	granularity := webGranularities[len(webGranularities)-1]
-	for _, candidate := range webGranularities {
-		if int(end.Sub(start).Seconds())/candidate.Seconds < webTimelineBuckets {
-			granularity = candidate
-			break
-		}
-	}
-	rows, err := s.db.QueryContext(ctx, "SELECT substr(time,1,?),count(*),COALESCE(sum(alert>0),0) FROM entries WHERE "+where+" GROUP BY 1 ORDER BY 1", append([]any{granularity.Prefix}, args...)...)
+	result, err := querySessionTimeline(ctx, s.db, filter, get("alerts") == "1")
 	if err != nil {
 		webError(rw, http.StatusInternalServerError, err)
 		return
 	}
-	defer rows.Close()
-	buckets := []webBucket{}
-	for rows.Next() {
-		var bucket webBucket
-		if err = rows.Scan(&bucket.Time, &bucket.Requests, &bucket.Alerts); err != nil {
-			webError(rw, http.StatusInternalServerError, err)
-			return
-		}
-		bucket.Time += granularity.Suffix
-		buckets = append(buckets, bucket)
-	}
-	if err = rows.Err(); err != nil {
-		webError(rw, http.StatusInternalServerError, err)
-		return
-	}
-	result["granularity"], result["buckets"] = granularity.Seconds, buckets
-	result["first"], result["last"] = start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano)
 	webJSON(rw, http.StatusOK, result)
 }
 
@@ -157,33 +168,53 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	where, args := filter.where(false)
-	result := map[string]any{}
-	var total, alerted int
-	if err = s.db.QueryRowContext(ctx, "SELECT count(*),COALESCE(sum(alert>0),0) FROM entries WHERE "+where, args...).Scan(&total, &alerted); err != nil {
+	summary, err := querySessionSummary(ctx, s.db, filter)
+	if err != nil {
 		webError(rw, http.StatusInternalServerError, err)
 		return
 	}
-	result["total"], result["alerted"] = total, alerted
+	result := map[string]any{"total": summary.Total, "alerted": summary.Alerted, "clients": summary.Clients, "rules": summary.Rules, "severities": summary.Severities}
+	if summary.Statuses != nil {
+		result["statuses"] = summary.Statuses
+	}
+	if finished && revision != "" {
+		w.summaryMu.Lock()
+		if len(w.summaries) > 128 {
+			w.summaries = map[string]summaryCacheEntry{}
+		}
+		w.summaries[key] = summaryCacheEntry{revision: revision, data: result}
+		w.summaryMu.Unlock()
+	}
+	webJSON(rw, http.StatusOK, result)
+}
 
+// sessionSummary is the overview breakdown shared by the web page and the TUI.
+// Statuses is nil when the status scan overran its budget.
+type sessionSummary struct {
+	Total, Alerted                       int
+	Clients, Rules, Severities, Statuses []webCount
+}
+
+func querySessionSummary(ctx context.Context, db *sql.DB, filter tuiFilter) (sessionSummary, error) {
+	where, args := filter.where(false)
+	var result sessionSummary
+	if err := db.QueryRowContext(ctx, "SELECT count(*),COALESCE(sum(alert>0),0) FROM entries WHERE "+where, args...).Scan(&result.Total, &result.Alerted); err != nil {
+		return result, err
+	}
+	var err error
 	// The port is stripped so one source address aggregates across connections.
-	clients, err := webCounts(ctx, s.db, `SELECT rtrim(rtrim(client,'0123456789'),':'),count(*),COALESCE(sum(alert>0),0) FROM entries WHERE `+where+` GROUP BY 1 ORDER BY 3 DESC,2 DESC,1 LIMIT 10`, args,
+	result.Clients, err = webCounts(ctx, db, `SELECT rtrim(rtrim(client,'0123456789'),':'),count(*),COALESCE(sum(alert>0),0) FROM entries WHERE `+where+` GROUP BY 1 ORDER BY 3 DESC,2 DESC,1 LIMIT 10`, args,
 		func(rows *sql.Rows, item *webCount) error { return rows.Scan(&item.Name, &item.Count, &item.Alerts) })
 	if err != nil {
-		webError(rw, http.StatusInternalServerError, err)
-		return
+		return result, err
 	}
-	result["clients"] = clients
-
 	// Rule and severity breakdowns only parse the records that carry alerts.
-	rules, err := webCounts(ctx, s.db, `SELECT COALESCE(json_extract(hit.value,'$.rule'),''),COALESCE(json_extract(hit.value,'$.severity'),''),count(DISTINCT entries.id) FROM entries, json_each(entries.alerts) hit WHERE entries.alert>0 AND `+where+` GROUP BY 1,2 ORDER BY 3 DESC,1 LIMIT 10`, args,
+	result.Rules, err = webCounts(ctx, db, `SELECT COALESCE(json_extract(hit.value,'$.rule'),''),COALESCE(json_extract(hit.value,'$.severity'),''),count(DISTINCT entries.id) FROM entries, json_each(entries.alerts) hit WHERE entries.alert>0 AND `+where+` GROUP BY 1,2 ORDER BY 3 DESC,1 LIMIT 10`, args,
 		func(rows *sql.Rows, item *webCount) error { return rows.Scan(&item.Name, &item.Severity, &item.Count) })
 	if err != nil {
-		webError(rw, http.StatusInternalServerError, err)
-		return
+		return result, err
 	}
-	result["rules"] = rules
-	severities, err := webCounts(ctx, s.db, `SELECT severity,count(*) FROM entries WHERE alert>0 AND `+where+` GROUP BY severity`, args,
+	result.Severities, err = webCounts(ctx, db, `SELECT severity,count(*) FROM entries WHERE alert>0 AND `+where+` GROUP BY severity`, args,
 		func(rows *sql.Rows, item *webCount) error {
 			var level int
 			if err := rows.Scan(&level, &item.Count); err != nil {
@@ -193,15 +224,12 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 			return nil
 		})
 	if err != nil {
-		webError(rw, http.StatusInternalServerError, err)
-		return
+		return result, err
 	}
-	result["severities"] = severities
-
 	// Legacy layouts compute status from every record body. That scan can be
 	// expensive, so it keeps a short budget and is omitted when it overruns.
 	statusCtx, stop := context.WithTimeout(ctx, 1500*time.Millisecond)
-	statuses, err := webCounts(statusCtx, s.db, `SELECT status/100,count(*) FROM entries WHERE `+where+` GROUP BY 1 ORDER BY 1`, args,
+	statuses, err := webCounts(statusCtx, db, `SELECT status/100,count(*) FROM entries WHERE `+where+` GROUP BY 1 ORDER BY 1`, args,
 		func(rows *sql.Rows, item *webCount) error {
 			var class int
 			if err := rows.Scan(&class, &item.Count); err != nil {
@@ -217,18 +245,9 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 		})
 	stop()
 	if err == nil {
-		result["statuses"] = statuses
+		result.Statuses = statuses
 	} else if ctx.Err() != nil {
-		webError(rw, http.StatusInternalServerError, err)
-		return
+		return result, err
 	}
-	if finished && revision != "" {
-		w.summaryMu.Lock()
-		if len(w.summaries) > 128 {
-			w.summaries = map[string]summaryCacheEntry{}
-		}
-		w.summaries[key] = summaryCacheEntry{revision: revision, data: result}
-		w.summaryMu.Unlock()
-	}
-	webJSON(rw, http.StatusOK, result)
+	return result, nil
 }

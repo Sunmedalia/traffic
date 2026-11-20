@@ -20,7 +20,7 @@ func consoleHelpOptions(cmd string) map[string]bool {
 	names := "session json"
 	switch cmd {
 	case "view":
-		names = "session data-dir refresh client rule severity since service"
+		names = "session data-dir rules-dir refresh client rule severity since service"
 	case "web":
 		names = "session data-dir rules-dir listen allow-remote refresh"
 	case "analyze":
@@ -104,7 +104,7 @@ Use traffic-console <command> --help for command-specific help.
 	}
 	translations := map[string]string{
 		"session": "已有会话目录（原始采集数据保持只读）", "data-dir": "会话搜索根目录，默认程序旁的 sessions",
-		"rules-dir": "Web 规则存放目录，默认程序旁的 rules；源码 bin 构建使用项目根目录",
+		"rules-dir": "Web 与 TUI 分析面板使用的规则目录，默认程序旁的 rules；源码 bin 构建使用项目根目录",
 		"rules":     "追加 YAML 规则文件；不指定时仅使用内置规则", "scan-window": "扫描行为关联窗口，默认 1m", "scan-paths": "扫描行为不同路径阈值，默认 20",
 		"request-limit":  "本地还原及检测的请求正文上限，默认 1 MiB，最大 16 MiB",
 		"response-limit": "本地还原及检测的响应正文上限，默认 1 MiB，最大 16 MiB",
