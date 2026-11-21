@@ -49,7 +49,7 @@ func TestMergedTUIRetainsCaptureDiagnostics(t *testing.T) {
 	}
 	txn := Transaction{ID: "h2", Protocol: "HTTP/2", StreamID: 7, IntegrityReasons: []string{"frame_gap"}}
 	m.detailID, m.snapshot.Detail = txn.ID, &txn
-	detail := m.detailContent()
+	detail := strings.Join(m.detailLines(200), "\n")
 	for _, want := range []string{"HTTP/2", "stream ID 7", "frame_gap"} {
 		if !strings.Contains(detail, want) {
 			t.Fatalf("missing transaction diagnostic %q: %s", want, detail)

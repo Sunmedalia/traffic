@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	termansi "github.com/charmbracelet/x/ansi"
 )
@@ -329,7 +328,7 @@ func tuiPagedModel(t *testing.T) *tuiModel {
 	for i := 0; i < 250; i++ {
 		putTUITransaction(t, s, Transaction{ID: fmt.Sprintf("r%03d", i), Time: now.Add(time.Duration(i-250) * time.Second), Client: "192.0.2.1:5000", Method: "GET", URL: fmt.Sprintf("/p%d", i)})
 	}
-	m := &tuiModel{ctx: context.Background(), store: s, refresh: time.Second, width: 160, height: 40, viewport: viewport.New(), tab: tabRequests, alertView: viewList}
+	m := &tuiModel{ctx: context.Background(), store: s, refresh: time.Second, width: 160, height: 40, tab: tabRequests, alertView: viewList}
 	m.resize()
 	runLoad(m, m.load())
 	return m

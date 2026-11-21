@@ -40,22 +40,26 @@ func tuiPattern(needles []string) *regexp.Regexp {
 // tuiHighlight marks alert matches and search hits in plain text. Search wins
 // where both overlap. Styles are applied per line so wrapping stays intact.
 func tuiHighlight(text string, alert, search *regexp.Regexp) string {
-	if alert == nil && search == nil {
+	find := func(re *regexp.Regexp) [][]int {
+		if re == nil {
+			return nil
+		}
+		return re.FindAllStringIndex(text, tuiHighlightLimit)
+	}
+	alerts, searches := find(alert), find(search)
+	if len(alerts) == 0 && len(searches) == 0 {
 		return text
 	}
 	marks := make([]byte, len(text))
-	mark := func(re *regexp.Regexp, kind byte) {
-		if re == nil {
-			return
-		}
-		for _, loc := range re.FindAllStringIndex(text, tuiHighlightLimit) {
+	set := func(locs [][]int, kind byte) {
+		for _, loc := range locs {
 			for i := loc[0]; i < loc[1]; i++ {
 				marks[i] = kind
 			}
 		}
 	}
-	mark(alert, 1)
-	mark(search, 2)
+	set(alerts, 1)
+	set(searches, 2)
 	var b strings.Builder
 	for start := 0; start < len(text); {
 		end := start
@@ -102,10 +106,17 @@ func (m tuiModel) searchPattern() *regexp.Regexp {
 	return tuiPattern([]string{m.searchTerm})
 }
 
-// highlightBody applies both highlights to a cleaned record body.
-func (m tuiModel) highlightBody(text string) string {
-	return tuiHighlight(text, m.alertPattern(), m.searchPattern())
+// tuiHighlighter applies both highlights with patterns compiled once, for
+// text highlighted a line at a time.
+type tuiHighlighter struct{ alert, search *regexp.Regexp }
+
+func (m tuiModel) highlighter() tuiHighlighter {
+	return tuiHighlighter{m.alertPattern(), m.searchPattern()}
 }
+func (h tuiHighlighter) highlight(text string) string { return tuiHighlight(text, h.alert, h.search) }
+
+// highlightBody applies both highlights to a cleaned record body.
+func (m tuiModel) highlightBody(text string) string { return m.highlighter().highlight(text) }
 
 // tuiOccurrences explains where a match can be seen in the stored text.
 func tuiOccurrences(match string, request, response string) string {
@@ -122,14 +133,17 @@ func tuiOccurrences(match string, request, response string) string {
 }
 
 // findSearchLines records the wrapped lines that contain the search term.
-func (m *tuiModel) findSearchLines(wrapped string) {
+func (m *tuiModel) findSearchLines(wrapped []string) {
 	m.searchLines = m.searchLines[:0]
 	re := m.searchPattern()
 	if re == nil || !m.details {
 		return
 	}
-	for i, line := range strings.Split(wrapped, "\n") {
-		if re.MatchString(termansi.Strip(line)) {
+	for i, line := range wrapped {
+		if strings.IndexByte(line, '\x1b') >= 0 {
+			line = termansi.Strip(line)
+		}
+		if re.MatchString(line) {
 			m.searchLines = append(m.searchLines, i)
 		}
 	}

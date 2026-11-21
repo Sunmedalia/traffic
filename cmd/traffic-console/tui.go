@@ -3,15 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
 
 	lipgloss "charm.land/lipgloss/v2"
 
-	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textinput"
-	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
-	termansi "github.com/charmbracelet/x/ansi"
 )
 
 const (
@@ -67,6 +65,17 @@ var tuiDetailNames = [detailTabCount]string{"请求", "响应", "解码", "解�
 // Summaries scan alert bodies, so they refresh less often than the list.
 const tuiSummaryInterval = 5 * time.Second
 
+// Content that took longer than tuiSlowContent to build, typically a large
+// body, is wrapped again only once a resize has paused for tuiRewrapDelay.
+const (
+	tuiSlowContent = 40 * time.Millisecond
+	tuiRewrapDelay = 120 * time.Millisecond
+)
+
+// tuiRewrap asks for the content to be wrapped for the current width; it
+// carries the resize it was scheduled for, and a later resize supersedes it.
+type tuiRewrap uint64
+
 // tuiDrill remembers where a drill-down started so Esc can return there.
 type tuiDrill struct {
 	tab, view, selected int
@@ -100,6 +109,7 @@ type tuiModel struct {
 	lists                                [tuiTabCount]tuiListState
 	version                              uint64
 	busy, pending, paused, details, help bool
+	helpTop                              int // first help line shown
 	stale, pickDetail                    bool
 	raw, metaOpen                        bool
 	noMouse, listFree                    bool
@@ -138,7 +148,10 @@ type tuiModel struct {
 	decoder                              *tuiDecoder
 	bodies                               tuiBodies
 	analysis                             *tuiAnalysis
-	viewport                             viewport.Model
+	viewport                             tuiPager
+	contentCost                          time.Duration // time the last content build took
+	wrapSeq                              uint64        // counts resizes that deferred wrapping
+	wrapStale                            bool          // content is still wrapped for an earlier width
 }
 
 var tuiAccent = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#5FD7D7"))
@@ -148,19 +161,6 @@ var tuiDanger = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF7777"))
 var tuiWarn = lipgloss.NewStyle().Foreground(lipgloss.Color("#E6C35C"))
 var tuiGood = lipgloss.NewStyle().Foreground(lipgloss.Color("#7BD88F"))
 var tuiBold = lipgloss.NewStyle().Bold(true)
-
-// tuiViewportKeys leaves letters free for page actions; j and k only scroll
-// pages without records, because the detail uses them to change record.
-func tuiViewportKeys() viewport.KeyMap {
-	return viewport.KeyMap{
-		PageDown:     key.NewBinding(key.WithKeys("pgdown")),
-		PageUp:       key.NewBinding(key.WithKeys("pgup")),
-		HalfPageUp:   key.NewBinding(key.WithKeys("ctrl+u")),
-		HalfPageDown: key.NewBinding(key.WithKeys("ctrl+d")),
-		Up:           key.NewBinding(key.WithKeys("up", "k")),
-		Down:         key.NewBinding(key.WithKeys("down", "j")),
-	}
-}
 
 func (m tuiModel) tick() tea.Cmd {
 	return tea.Tick(m.refresh, func(t time.Time) tea.Msg { return tuiTick(t) })
@@ -265,27 +265,50 @@ func (m tuiModel) listWidth() int {
 	return m.width / 2
 }
 func (m *tuiModel) resize() {
+	m.layoutViewport()
+	m.updateContent()
+}
+
+// layoutViewport sizes the scrolling pane for the current frame.
+func (m *tuiModel) layoutViewport() {
 	width := max(1, m.width)
 	if m.split() {
 		width = max(1, m.width-m.listWidth()-3)
 	}
-	m.viewport.KeyMap = tuiViewportKeys()
 	m.viewport.SetWidth(width)
 	m.viewport.SetHeight(m.contentHeight())
-	m.updateContent()
 }
+
+// resizeSoon follows a size change during a window or divider drag. Content
+// that was slow to build keeps its wrapping, clipped by the pane, until the
+// drag pauses, so each step of the drag stays immediate.
+func (m *tuiModel) resizeSoon() tea.Cmd {
+	if m.contentCost < tuiSlowContent {
+		m.resize()
+		return nil
+	}
+	m.layoutViewport()
+	m.wrapSeq++
+	m.wrapStale = true
+	seq := m.wrapSeq
+	return tea.Tick(tuiRewrapDelay, func(time.Time) tea.Msg { return tuiRewrap(seq) })
+}
+
 func (m *tuiModel) updateContent() {
-	content := ""
+	started := time.Now()
+	width := m.viewport.Width()
+	var lines []string
 	switch {
 	case m.details:
 		m.cacheBodies()
-		content = m.detailContent()
+		lines = m.detailLines(width)
 	case m.tab == tabHealth:
-		content = m.healthContent()
+		lines = tuiWrap(m.healthContent(), width)
 	}
-	wrapped := termansi.Hardwrap(content, max(1, m.viewport.Width()), true)
-	m.viewport.SetContent(wrapped)
-	m.findSearchLines(wrapped)
+	m.viewport.SetContentLines(lines)
+	m.findSearchLines(lines)
+	m.wrapStale = false
+	m.contentCost = time.Since(started)
 }
 
 // switchTab keeps each list tab's own page and cursor.
@@ -404,7 +427,11 @@ func (m *tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateMouse(msg)
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.resize()
+		return m, m.resizeSoon()
+	case tuiRewrap:
+		if uint64(msg) == m.wrapSeq && m.wrapStale {
+			m.updateContent()
+		}
 		return m, nil
 	case tuiTick:
 		var load tea.Cmd
@@ -479,6 +506,7 @@ func (m *tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *tuiModel) applySnapshot(snapshot tuiSnapshot) {
+	before, wasMissing := m.snapshot.Detail, m.snapshot.DetailMissing
 	wasFollowing := m.following()
 	selectedID := ""
 	if !m.stale && len(m.snapshot.Rows) > m.selected {
@@ -503,7 +531,16 @@ func (m *tuiModel) applySnapshot(snapshot tuiSnapshot) {
 		}
 	}
 	m.errorText = ""
+	// Keys that change the detail rebuild it themselves; a refresh returning
+	// the same record leaves it alone, since a large body takes long to lay out.
+	if m.details && m.snapshot.DetailMissing == wasMissing && sameTransaction(before, m.snapshot.Detail) {
+		return
+	}
 	m.updateContent()
+}
+
+func sameTransaction(a, b *Transaction) bool {
+	return a != nil && b != nil && reflect.DeepEqual(*a, *b)
 }
 
 func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -535,12 +572,14 @@ func (m *tuiModel) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.help {
 		if key == "?" || key == "esc" {
 			m.help = false
+		} else {
+			m.scrollHelp(key)
 		}
 		return m, nil
 	}
 	switch key {
 	case "?":
-		m.help = true
+		m.help, m.helpTop = true, 0
 		return m, nil
 	case "/":
 		if m.details {
@@ -712,7 +751,7 @@ func (m *tuiModel) updateDetailKey(msg tea.KeyPressMsg) (tea.Cmd, bool) {
 		}
 		m.flash = "请求与响应：" + tuiLayoutNames[m.msgLayout]
 		if m.pairLayout() != m.msgLayout {
-			m.flash += fmt.Sprintf("（详情宽度不足 %d 列，暂按上下显示，按 > 加宽详情）", tuiSideMinWidth)
+			m.flash += "（" + m.narrowNotice() + "）"
 		}
 		m.updateContent()
 		return nil, true
