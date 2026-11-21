@@ -37,6 +37,8 @@ func UnlockFile(file *os.File) error {
 	return windows.UnlockFileEx(windows.Handle(file.Fd()), 0, 1, 0, &windows.Overlapped{})
 }
 
+func lockContended(err error) bool { return err == windows.ERROR_LOCK_VIOLATION }
+
 func FreeBytes(path string) (uint64, error) {
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
