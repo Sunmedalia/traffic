@@ -181,6 +181,11 @@ func publishAnalysis(ctx context.Context, dir, build string) error {
 		}
 		return err
 	}
+	// The generation being replaced stays as a fallback; older ones are removed.
+	previous := ""
+	if current, pathErr := analysisDatabasePath(dir); pathErr == nil {
+		previous = filepath.Base(current)
+	}
 	if err = root.Rename(build, name); err != nil {
 		return err
 	}
@@ -217,23 +222,38 @@ func publishAnalysis(ctx context.Context, dir, build string) error {
 		return err
 	}
 	published = true
-	// Cleanup only generations and abandoned builds older than a day. A brief
-	// reader-open retry handles a concurrent cleanup; already-open immutable
-	// readers keep their own snapshot.
-	entries, _ := os.ReadDir(dir)
+	removeStaleAnalyses(root, name, previous)
+	return nil
+}
+
+// removeStaleAnalyses keeps the current and previous generations and deletes
+// the rest, so repeated re-analysis holds at most two result databases. Store
+// readers open all their connections up front, so on Unix a reader still on a
+// removed generation keeps its snapshot; on Windows an open generation cannot
+// be removed and is retried by the next publication. A reader that has just
+// read the pointer retries once if the generation disappears before it opens.
+// Builds may belong to another analysis still running, so only those older
+// than a day count as abandoned.
+func removeStaleAnalyses(root *os.Root, current, previous string) {
+	file, err := root.Open(".")
+	if err != nil {
+		return
+	}
+	entries, _ := file.ReadDir(-1)
+	file.Close()
 	for _, entry := range entries {
-		stale := analysisGeneration.MatchString(entry.Name()) && entry.Name() != name
-		if analysisBuild.MatchString(entry.Name()) {
-			stale = true
-		}
-		if stale {
-			info, statErr := entry.Info()
-			if statErr == nil && time.Since(info.ModTime()) > 24*time.Hour {
-				_ = root.Remove(entry.Name())
+		name := entry.Name()
+		switch {
+		case analysisGeneration.MatchString(name):
+			if name != current && name != previous {
+				_ = root.Remove(name)
+			}
+		case analysisBuild.MatchString(name):
+			if info, err := entry.Info(); err == nil && time.Since(info.ModTime()) > 24*time.Hour {
+				_ = root.Remove(name)
 			}
 		}
 	}
-	return nil
 }
 
 // diskFull reports whether err comes from a filesystem out of space or quota.
