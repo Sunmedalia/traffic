@@ -129,7 +129,16 @@ sudo ./bin/traffic capture --service tomcat --pid 1234 \
   --java-agent "$PWD/bin/traffic-java-agent.jar"
 ```
 
-目标 JVM 需要允许动态附加。附加助手默认使用目标 Java；JDK 不匹配时用 `--java-helper` 指定带 `jdk.attach` 的 JDK。
+目标 JVM 需要允许动态附加。附加助手默认使用目标 Java：JDK 9+ 使用 `jdk.attach` 模块，JDK 8 自动把同一 JDK 的 `lib/tools.jar` 加入类路径。目标只装了 JRE（JDK 8 JRE 没有 `tools.jar`）或 JDK 不匹配时，用 `--java-helper` 指定同版本 JDK 的 `java`。
+
+用 `java -jar app.jar` 启动的内嵌 Tomcat（例如 Spring Boot）同样适用，`--pid` 指向该 JVM 即可：
+
+```bash
+sudo ./bin/traffic capture --pid "$(pgrep -f 'java .*-jar .*app.jar')" \
+  --ports 8443 --java-attach --java-agent "$PWD/bin/traffic-java-agent.jar"
+```
+
+`java -jar` 进程在发现阶段归为 tomcat 服务；附加时 Agent 先确认 JVM 内已加载 Tomcat NIO，未加载（例如非 Tomcat 的 JAR 或 Netty 服务）会附加失败并记为不可用，网卡采集继续。
 
 ### 只看 HTTP 或导入 PCAP
 
@@ -504,7 +513,7 @@ targets=nginx,httpd,apache2
 
 ### Tomcat / Java Agent
 
-显式 `--java-attach` 才附加，支持 Tomcat 9/JDK 17、Tomcat 10.1/JDK 21 的 NIO Connector。Agent 用一条发送线程和 128 个分片槽位，单片 64 KiB，队列正文最多 8 MiB；溢出会标记缺口。停止后通道关闭、Agent 停用并恢复字节码，同一 JVM 可再次附加，但 Agent 不支持在同一 JVM 内热升级。禁止附加的 JVM 会报失败，网卡采集继续。
+显式 `--java-attach` 才附加，支持独立 Tomcat 和 `java -jar` 内嵌 Tomcat 的 NIO Connector，Agent 以 Java 8 字节码构建，可附加 JDK 8 及以上的 JVM。已测 Tomcat 9/JDK 8、9/JDK 17、10.1/JDK 21，以及 Spring Boot 2.7 `java -jar` 的 JDK 8/21。Agent 用一条发送线程和 128 个分片槽位，单片 64 KiB，队列正文最多 8 MiB；溢出会标记缺口。停止后通道关闭、Agent 停用并恢复字节码，同一 JVM 可再次附加，但 Agent 不支持在同一 JVM 内热升级。禁止附加的 JVM 会报失败，网卡采集继续。
 
 ### 通用 OpenSSL
 
@@ -577,7 +586,7 @@ go build -o bin/traffic-console ./cmd/traffic-console
 | Linux ARM64 / x86_64 HTTP | 网卡抓包、HTTP/1.1 重组、循环 PCAP | 支持分段、乱序、重传、长连接、中文、分块 |
 | Linux nginx / OpenSSL | 运行中采集 HTTPS 明文、客户端端点、进程身份 | ARM64/x86_64 的 TLS 1.2/1.3 通过 |
 | Linux Apache | 自动发现并采集 OpenSSL 明文 | ARM64 event/worker/prefork 已测，阻塞读取有首次漏采边界 |
-| Linux Tomcat / JSSE | 动态附加 Java Agent | Tomcat 9/JDK 17、10.1/JDK 21 NIO 已测 |
+| Linux Tomcat / JSSE | 动态附加 Java Agent | Tomcat 9/JDK 8、9/JDK 17、10.1/JDK 21 NIO 及 Spring Boot `java -jar` JDK 8/21 已测 |
 | Linux 通用 OpenSSL | 指定 PID 采集 | HAProxy、外部 `_ex` 调用已测 |
 | Linux 预加载 | `LD_PRELOAD` / `ld.so.preload` | CentOS 7 / OpenSSL 1.0.2k；Debian 13 / OpenSSL 3.5 / nginx 非 root worker 已测 |
 | Windows IIS 10 | Npcap HTTP + 动态 HTTPS | 17763、HTTP/1.1、TLS 1.2 已测 |

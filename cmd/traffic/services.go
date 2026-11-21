@@ -51,7 +51,8 @@ func processTarget(root string, pid int) (session.Target, error) {
 	if err != nil {
 		return t, err
 	}
-	cmd := strings.ReplaceAll(string(b), "\x00", " ")
+	args := strings.Split(strings.TrimRight(string(b), "\x00"), "\x00")
+	cmd := strings.Join(args, " ")
 	exe, _ := os.Readlink(filepath.Join(dir, "exe"))
 	name := filepath.Base(exe)
 	switch {
@@ -61,11 +62,31 @@ func processTarget(root string, pid int) (session.Target, error) {
 		t.Service = "apache"
 	case strings.Contains(cmd, "org.apache.catalina.startup.Bootstrap"):
 		t.Service = "tomcat"
+	case name == "java" && javaJarLaunch(args):
+		// Embedded Tomcat (for example Spring Boot) started with `java -jar`.
+		// The agent confirms that Tomcat NIO is loaded before it attaches.
+		t.Service = "tomcat"
 	default:
 		t.Service = "unknown"
 	}
 
 	return t, nil
+}
+
+// javaJarLaunch reports whether a JVM command line runs a JAR (`java [options] -jar app.jar`).
+// Arguments after the main class or JAR belong to the application and are not inspected.
+func javaJarLaunch(args []string) bool {
+	for i := 1; i < len(args); i++ {
+		switch arg := args[i]; {
+		case arg == "-jar":
+			return i+1 < len(args)
+		case arg == "-cp" || arg == "-classpath" || arg == "--class-path" || arg == "-p" || arg == "--module-path" || arg == "--add-modules" || arg == "--add-opens" || arg == "--add-exports":
+			i++
+		case !strings.HasPrefix(arg, "-"):
+			return false
+		}
+	}
+	return false
 }
 
 func populateTarget(root string, t *session.Target) {

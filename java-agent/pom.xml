@@ -5,9 +5,22 @@
   <artifactId>traffic-java-agent</artifactId>
   <version>1.0.0</version>
   <properties>
-    <maven.compiler.release>17</maven.compiler.release>
+    <maven.compiler.source>1.8</maven.compiler.source>
+    <maven.compiler.target>1.8</maven.compiler.target>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
   </properties>
+  <profiles>
+    <!-- Newer JDKs build against the Java 8 API so the agent loads in JDK 8 targets. -->
+    <profile>
+      <id>release-8</id>
+      <activation>
+        <jdk>[9,)</jdk>
+      </activation>
+      <properties>
+        <maven.compiler.release>8</maven.compiler.release>
+      </properties>
+    </profile>
+  </profiles>
   <dependencies>
     <dependency>
       <groupId>net.bytebuddy</groupId>

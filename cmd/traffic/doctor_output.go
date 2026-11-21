@@ -205,14 +205,14 @@ func doctorReason(value string) string {
 		"Frida dependency checked; attach permissions, target ABI and runtime access require verification": "Frida 依赖检查通过；附加权限、目标 ABI 和临时目录访问仍需验证",
 		"Java attachment requires explicit opt-in":                                                         "Java 目标需要显式使用 --java-attach",
 		"Java agent archive is not readable":                                                               "Java Agent JAR 缺失或不可读",
-		"Tomcat NIO only; JVM attach permission and loaded classes require runtime verification":           "仅支持 Tomcat NIO；JVM 附加权限和已加载类仍需验证",
-		"eBPF backend requires Linux":                                                                      "eBPF 后端需要 Linux",
-		"mapped OpenSSL library is unavailable":                                                            "目标映射的 OpenSSL 库不可用",
-		"eCapture executable is unavailable":                                                               "eCapture 可执行文件不可用",
-		"CO-RE BTF is unavailable; startup-loaded preload is a separate opt-in":                            "内核 BTF 不可用；可选择在业务启动时加载随包预加载库",
-		"current backend requires privileged BPF access":                                                   "当前后端需要特权 BPF 访问权限",
-		"library ABI, BPF policy and probe build must be verified at attachment; no coverage guarantee":    "仍需在附加时验证库 ABI、BPF 策略和探针构建，尚不保证覆盖完整",
-		"no supported plaintext backend; HTTP packet capture can continue":                                 "当前目标没有可用的明文后端；HTTP 抓包仍可继续",
+		"Tomcat NIO only (JDK 8+, standalone or java -jar); JVM attach permission and loaded classes require runtime verification": "仅支持 Tomcat NIO（JDK 8+，独立 Tomcat 或 java -jar）；JVM 附加权限和已加载类仍需验证",
+		"eBPF backend requires Linux":                                                                   "eBPF 后端需要 Linux",
+		"mapped OpenSSL library is unavailable":                                                         "目标映射的 OpenSSL 库不可用",
+		"eCapture executable is unavailable":                                                            "eCapture 可执行文件不可用",
+		"CO-RE BTF is unavailable; startup-loaded preload is a separate opt-in":                         "内核 BTF 不可用；可选择在业务启动时加载随包预加载库",
+		"current backend requires privileged BPF access":                                                "当前后端需要特权 BPF 访问权限",
+		"library ABI, BPF policy and probe build must be verified at attachment; no coverage guarantee": "仍需在附加时验证库 ABI、BPF 策略和探针构建，尚不保证覆盖完整",
+		"no supported plaintext backend; HTTP packet capture can continue":                              "当前目标没有可用的明文后端；HTTP 抓包仍可继续",
 	}
 	if text, ok := translated[value]; ok {
 		return text

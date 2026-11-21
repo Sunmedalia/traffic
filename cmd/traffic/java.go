@@ -102,10 +102,11 @@ func captureJava(ctx context.Context, s *Store, p *eventRecorder, t session.Targ
 	}
 	attachCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	if helper == "" {
-		helper = fmt.Sprintf("/proc/%d/exe", t.PID)
+	helper, helperArgs, err := javaAttachCommand("/proc", t.PID, helper, jar)
+	if err != nil {
+		return err
 	}
-	command := exec.CommandContext(attachCtx, helper, "--add-modules", "jdk.attach", "-cp", jar, "traffic.agent.Attach", strconv.Itoa(t.PID), jar, config.Name())
+	command := exec.CommandContext(attachCtx, helper, append(helperArgs, "traffic.agent.Attach", strconv.Itoa(t.PID), jar, config.Name())...)
 	command.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(t.UID), Gid: uint32(t.GID)}}
 	result := make(chan error, 1)
 	go func() {
@@ -241,4 +242,35 @@ func captureJava(ctx context.Context, s *Store, p *eventRecorder, t session.Targ
 		return scanner.Err()
 	}
 	return fmt.Errorf("Java probe disconnected")
+}
+
+// javaAttachCommand returns the attach helper and its JVM options. JDK 9+ exposes the
+// attach API as the jdk.attach module, while JDK 8 ships it in the JDK's lib/tools.jar,
+// which must be put on the class path; a JDK 8 JRE has neither.
+func javaAttachCommand(proc string, pid int, helper, jar string) (string, []string, error) {
+	// Paths read from /proc/PID/exe are inside the target's mount namespace.
+	root := "/"
+	resolved := helper
+	if helper == "" {
+		helper = filepath.Join(proc, strconv.Itoa(pid), "exe")
+		root = filepath.Join(proc, strconv.Itoa(pid), "root")
+		link, err := os.Readlink(helper)
+		if err != nil {
+			return "", nil, fmt.Errorf("Java helper: %w", err)
+		}
+		resolved = strings.TrimSuffix(link, " (deleted)")
+	} else if actual, err := filepath.EvalSymlinks(helper); err == nil {
+		resolved = actual
+	}
+	home := filepath.Dir(filepath.Dir(resolved))
+	if _, err := os.Stat(filepath.Join(root, home, "lib", "modules")); err == nil {
+		return helper, []string{"--add-modules", "jdk.attach", "-cp", jar}, nil
+	}
+	// JDK 8 runs either bin/java or jre/bin/java; tools.jar is in the JDK's lib.
+	for _, candidate := range []string{filepath.Join(home, "lib", "tools.jar"), filepath.Join(filepath.Dir(home), "lib", "tools.jar")} {
+		if readableFile(filepath.Join(root, candidate)) {
+			return helper, []string{"-cp", jar + string(os.PathListSeparator) + filepath.Join(root, candidate)}, nil
+		}
+	}
+	return "", nil, fmt.Errorf("Java helper %s has no attach API (JDK 8 needs lib/tools.jar from a JDK, not a JRE); use --java-helper with a JDK", resolved)
 }

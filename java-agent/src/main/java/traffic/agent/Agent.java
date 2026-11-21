@@ -27,11 +27,28 @@ public final class Agent {
   public static final AtomicLong serial = new AtomicLong();
   public static volatile boolean gap;
   public static final AtomicLong dropped = new AtomicLong();
-  private static volatile Set<Integer> selectedPorts = Set.of();
+  private static volatile Set<Integer> selectedPorts = Collections.emptySet();
   private static volatile boolean protocolV2;
-  private record Access(java.lang.reflect.Field netOut, java.lang.reflect.Method channel) {
+  // The agent is compiled for Java 8 so it can attach to JDK 8 through 21 targets.
+  private static final class Access {
+    private final java.lang.reflect.Field netOut;
+    private final java.lang.reflect.Method channel;
+
+    Access(java.lang.reflect.Field netOut, java.lang.reflect.Method channel) {
+      this.netOut = netOut;
+      this.channel = channel;
+    }
+
+    java.lang.reflect.Field netOut() {
+      return netOut;
+    }
+
+    java.lang.reflect.Method channel() {
+      return channel;
+    }
   }
-  private static final ClassValue<Access> access = new ClassValue<>() {
+  private static final ClassValue<Access> access = new ClassValue<Access>() {
+    @Override
     protected Access computeValue(Class<?> type) {
       try {
         java.lang.reflect.Field field = type.getDeclaredField("netOutBuffer");
@@ -42,19 +59,118 @@ public final class Agent {
       }
     }
   };
-  private record Endpoint(String client, String local, int port) {
+  private static final class Endpoint {
+    private final String client;
+    private final String local;
+    private final int port;
+
+    Endpoint(String client, String local, int port) {
+      this.client = client;
+      this.local = local;
+      this.port = port;
+    }
+
+    String client() {
+      return client;
+    }
+
+    String local() {
+      return local;
+    }
+
+    int port() {
+      return port;
+    }
   }
   private static final Map<SocketChannel, Endpoint> endpoints =
       Collections.synchronizedMap(new WeakHashMap<>());
   private static ResettableClassFileTransformer transformer;
   private static Instrumentation instrumentation;
 
-  public record Event(String connection, String client, String local, int port, byte[] data,
-      boolean read, boolean incomplete) {
+  public static final class Event {
+    private final String connection;
+    private final String client;
+    private final String local;
+    private final int port;
+    private final byte[] data;
+    private final boolean read;
+    private final boolean incomplete;
+
+    public Event(String connection, String client, String local, int port, byte[] data,
+        boolean read, boolean incomplete) {
+      this.connection = connection;
+      this.client = client;
+      this.local = local;
+      this.port = port;
+      this.data = data;
+      this.read = read;
+      this.incomplete = incomplete;
+    }
+
+    public String connection() {
+      return connection;
+    }
+
+    public String client() {
+      return client;
+    }
+
+    public String local() {
+      return local;
+    }
+
+    public int port() {
+      return port;
+    }
+
+    public byte[] data() {
+      return data;
+    }
+
+    public boolean read() {
+      return read;
+    }
+
+    public boolean incomplete() {
+      return incomplete;
+    }
   }
 
-  public record Saved(
-      ByteBuffer[] buffers, int[] positions, Object channel, long epoch, AtomicInteger inFlight) {
+  public static final class Saved {
+    private final ByteBuffer[] buffers;
+    private final int[] positions;
+    private final Object channel;
+    private final long epoch;
+    private final AtomicInteger inFlight;
+
+    public Saved(
+        ByteBuffer[] buffers, int[] positions, Object channel, long epoch, AtomicInteger inFlight) {
+      this.buffers = buffers;
+      this.positions = positions;
+      this.channel = channel;
+      this.epoch = epoch;
+      this.inFlight = inFlight;
+    }
+
+    public ByteBuffer[] buffers() {
+      return buffers;
+    }
+
+    public int[] positions() {
+      return positions;
+    }
+
+    public Object channel() {
+      return channel;
+    }
+
+    public long epoch() {
+      return epoch;
+    }
+
+    public AtomicInteger inFlight() {
+      return inFlight;
+    }
   }
 
   public static synchronized void agentmain(String configPath, Instrumentation inst)
@@ -84,16 +200,20 @@ public final class Agent {
     if (nio2 && !nio) {
       throw new UnsupportedOperationException("Tomcat NIO2 is not supported by this agent");
     }
+    // A `java -jar` target is not known to be Tomcat until its classes are visible here.
+    if (!nio) {
+      throw new UnsupportedOperationException("Tomcat NIO endpoint is not loaded in this JVM");
+    }
     Properties config = new Properties();
-    try (Reader reader = Files.newBufferedReader(Path.of(configPath))) {
+    try (Reader reader = Files.newBufferedReader(Paths.get(configPath), java.nio.charset.StandardCharsets.UTF_8)) {
       config.load(reader);
     }
     protocolV2 = "traffic-java-v2".equals(config.getProperty("protocol"));
     Set<Integer> ports = new HashSet<>();
     for (String value : config.getProperty("ports", "").split(","))
-      if (!value.isBlank())
+      if (!value.trim().isEmpty())
         ports.add(Integer.parseInt(value));
-    selectedPorts = Set.copyOf(ports);
+    selectedPorts = Collections.unmodifiableSet(ports);
     dropped.set(0);
     Socket socket = new Socket("127.0.0.1", Integer.parseInt(config.getProperty("port")));
     socket.setSoTimeout(3000);
@@ -136,7 +256,7 @@ public final class Agent {
   }
 
   public static void send(Socket socket) {
-    try (socket) {
+    try (Socket owned = socket) {
       OutputStream out = socket.getOutputStream();
       InputStream in = socket.getInputStream();
       long sequence = 0;
@@ -204,7 +324,8 @@ public final class Agent {
     if (!active || inside.get())
       return null;
     ByteBuffer[] buffers;
-    if (args[0] instanceof ByteBuffer buffer) {
+    if (args[0] instanceof ByteBuffer) {
+      ByteBuffer buffer = (ByteBuffer) args[0];
       if (buffer == access.get(channel.getClass()).netOut().get(channel))
         return null;
       buffers = new ByteBuffer[] {buffer};
