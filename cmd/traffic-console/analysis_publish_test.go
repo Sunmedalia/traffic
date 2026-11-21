@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Sunmedalia/traffic/internal/index"
+	"github.com/Sunmedalia/traffic/internal/session"
 )
 
 // publishTestGeneration builds and publishes a SQLite generation holding value.
@@ -82,6 +84,67 @@ func TestPublishKeepsCurrentAndPreviousGeneration(t *testing.T) {
 	}
 	if _, err = os.Stat(filepath.Join(dir, abandoned)); !os.IsNotExist(err) {
 		t.Fatal("abandoned build kept", err)
+	}
+}
+
+func TestConcurrentPublishKeepsCurrentGeneration(t *testing.T) {
+	dir := t.TempDir()
+	const publishers = 16
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var builds []string
+	for range publishers {
+		build, err := createAnalysisBuild(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		builds = append(builds, build)
+	}
+	start := make(chan struct{})
+	errs := make(chan error, publishers)
+	for _, build := range builds {
+		go func() {
+			<-start
+			errs <- publishAnalysis(ctx, dir, build)
+		}()
+	}
+	close(start)
+	for range publishers {
+		if err := <-errs; err != nil {
+			t.Error(err)
+		}
+	}
+	if _, err := analysisDatabasePath(dir); err != nil {
+		t.Fatalf("current generation unavailable after concurrent publications: %v", err)
+	}
+	if generations := analysisGenerations(t, dir); len(generations) != 2 {
+		t.Fatalf("expected current and previous generations, got %v", generations)
+	}
+}
+
+func TestPublishCanBeCanceledWhileWaitingForLock(t *testing.T) {
+	dir := t.TempDir()
+	current := publishTestGeneration(t, dir, 1)
+	lock, err := os.OpenFile(filepath.Join(dir, analysisPublishLock), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := session.LockFile(lock, true); err != nil {
+		t.Fatal(err)
+	}
+	defer session.UnlockFile(lock)
+	build, err := createAnalysisBuild(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := publishAnalysis(ctx, dir, build); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("publication with a held lock returned %v", err)
+	}
+	if path, err := analysisDatabasePath(dir); err != nil || filepath.Base(path) != current {
+		t.Fatalf("canceled publication changed current generation: %q, %v", path, err)
 	}
 }
 

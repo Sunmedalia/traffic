@@ -13,10 +13,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Sunmedalia/traffic/internal/session"
 	"github.com/mattn/go-sqlite3"
 )
 
 const analysisPointer = "analysis-current.json"
+const analysisPublishLock = ".analysis-publish.lock"
 
 var analysisGeneration = regexp.MustCompile(`^analysis-[0-9a-f]{32}\.sqlite$`)
 
@@ -29,7 +31,7 @@ func validateAnalysisDestination(dir string) error {
 		return err
 	}
 	defer root.Close()
-	for _, name := range []string{"analysis.sqlite", "analysis.sqlite-journal", "analysis.sqlite-wal", "analysis.sqlite-shm", analysisPointer} {
+	for _, name := range []string{"analysis.sqlite", "analysis.sqlite-journal", "analysis.sqlite-wal", "analysis.sqlite-shm", analysisPointer, analysisPublishLock} {
 		info, err := root.Lstat(name)
 		if os.IsNotExist(err) {
 			continue
@@ -170,6 +172,22 @@ func publishAnalysis(ctx context.Context, dir, build string) error {
 	if err != nil {
 		return err
 	}
+	// Keep this file in place so every publisher locks the same inode.
+	// Builds can proceed concurrently, but the pointer and cleanup form one
+	// publication and must be serialized across processes.
+	lock, err := root.OpenFile(analysisPublishLock, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if errors.Is(err, os.ErrExist) {
+		lock, err = root.OpenFile(analysisPublishLock, os.O_RDWR, 0)
+	}
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := session.LockFileContext(ctx, lock, true); err != nil {
+		return err
+	}
+	defer session.UnlockFile(lock)
+
 	suffix, err := analysisNonce()
 	if err != nil {
 		return err

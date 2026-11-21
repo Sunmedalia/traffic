@@ -21,6 +21,8 @@ func LockFile(file *os.File, exclusive bool) error {
 
 func UnlockFile(file *os.File) error { return syscall.Flock(int(file.Fd()), syscall.LOCK_UN) }
 
+func lockContended(err error) bool { return err == syscall.EWOULDBLOCK }
+
 func FreeBytes(path string) (uint64, error) {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(path, &stat); err != nil {
