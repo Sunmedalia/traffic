@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Sunmedalia/traffic/internal/index"
@@ -171,6 +172,20 @@ func analyzeConfigured(ctx context.Context, dir, webhookURL string, rs []Rule, w
 	return report, err
 }
 
+// analysisPendingBytes bounds the stored records waiting for or under rule
+// matching. One record larger than this is still analysed on its own.
+const analysisPendingBytes = 64 << 20
+
+// analysisJob is one stored record on its way through rule matching.
+type analysisJob struct {
+	id, at, client string
+	raw            []byte
+	size           int
+	record         Transaction
+	err            error
+	done           chan struct{}
+}
+
 func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, window time.Duration, paths int, limits replay.Options) (analysisReport, error) {
 	report := analysisReport{EngineVersion: analysisEngineVersion, Rules: rs, ScanWindow: window, ScanPaths: paths, Reconstructed: rawSession(dir), RequestLimit: limits.RequestLimit, ResponseLimit: limits.ResponseLimit}
 	if err := validateAnalysisDestination(dir); err != nil {
@@ -252,49 +267,101 @@ func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, wi
 		return report, err
 	}
 	defer rows.Close()
-	for rows.Next() {
-		var raw []byte
-		var id string
-		var at, client sql.NullString
-		var record Transaction
-		if err = rows.Scan(&id, &at, &client, &raw); err != nil {
-			return report, err
+	// Decoding and rule matching run on every CPU; scan correlation and writes
+	// stay in source order on this goroutine, so results match a serial run.
+	work := make(chan *analysisJob)
+	var workers sync.WaitGroup
+	for range runtime.GOMAXPROCS(0) {
+		workers.Add(1)
+		go func(work <-chan *analysisJob) {
+			defer workers.Done()
+			for job := range work {
+				if job.err = json.Unmarshal(job.raw, &job.record); job.err == nil {
+					job.record.Alerts = detectWithLimits(job.record, rs, limits.RequestLimit, limits.ResponseLimit)
+				}
+				job.raw = nil
+				close(job.done)
+			}
+		}(work)
+	}
+	defer workers.Wait()
+	var pending []*analysisJob
+	pendingBytes := 0
+	stopped := false
+	stop := func() {
+		if !stopped {
+			stopped = true
+			close(work)
 		}
-		if err = json.Unmarshal(raw, &record); err != nil {
-			return report, err
+	}
+	defer stop()
+	finish := func() error {
+		job := pending[0]
+		pending[0] = nil
+		pending = pending[1:]
+		<-job.done
+		pendingBytes -= job.size
+		if job.err != nil {
+			return job.err
 		}
-		record.Alerts = detectWithLimits(record, rs, limits.RequestLimit, limits.ResponseLimit)
+		record := job.record
 		if alert := scanWithState(record, scanner, window, paths); alert != nil {
 			record.Alerts = append(record.Alerts, *alert)
 		}
 		if record.Alerts == nil {
 			record.Alerts = []Alert{}
 		}
-		alerts, err := json.Marshal(record.Alerts)
-		if err != nil {
-			return report, err
-		}
-		if _, err = stmt.ExecContext(ctx, id, string(alerts)); err != nil {
-			return report, err
-		}
 		// Entries are keyed and timed like the source row so list order and
 		// filters match the stored index exactly.
-		values, err := entryValues(id, at.String, client.String, record)
+		values, err := entryValues(job.id, job.at, job.client, record)
 		if err != nil {
-			return report, err
+			return err
+		}
+		if _, err = stmt.ExecContext(ctx, job.id, values[entryAlertsColumn]); err != nil {
+			return err
 		}
 		if _, err = entries.ExecContext(ctx, values...); err != nil {
-			return report, err
+			return err
 		}
 		report.Transactions++
 		report.Alerts += uint64(len(record.Alerts))
 		if report.Transactions%1000 == 0 {
 			fmt.Fprintf(os.Stderr, "本地分析：已处理 %d 条事务，%d 条告警\n", report.Transactions, report.Alerts)
 		}
+		return nil
+	}
+	maxPending := 4 * runtime.GOMAXPROCS(0)
+	for rows.Next() {
+		var at, client sql.NullString
+		job := &analysisJob{done: make(chan struct{})}
+		if err = rows.Scan(&job.id, &at, &client, &job.raw); err != nil {
+			return report, err
+		}
+		job.at, job.client, job.size = at.String, client.String, len(job.raw)
+		// Bound records in flight by count and by stored size: a few large
+		// bodies must not multiply memory by the number of CPUs.
+		for len(pending) > 0 && (len(pending) >= maxPending || pendingBytes+job.size > analysisPendingBytes) {
+			if err = finish(); err != nil {
+				return report, err
+			}
+		}
+		select {
+		case work <- job:
+		case <-ctx.Done():
+			return report, ctx.Err()
+		}
+		pending = append(pending, job)
+		pendingBytes += job.size
 	}
 	if err = rows.Err(); err != nil {
 		return report, err
 	}
+	for len(pending) > 0 {
+		if err = finish(); err != nil {
+			return report, err
+		}
+	}
+	stop()
 	if err = rows.Close(); err != nil {
 		return report, err
 	}

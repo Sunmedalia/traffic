@@ -82,6 +82,9 @@ func legacyViews(results string) []index.Statement {
 	return []index.Statement{{SQL: legacyEntriesView(results)}, {SQL: records}}
 }
 
+// entryAlertsColumn is the position of the alerts JSON in an entryValues row.
+const entryAlertsColumn = 6
+
 // entryValues returns the entries row of record, whose alerts are final.
 func entryValues(id, at, client string, record Transaction) ([]any, error) {
 	alerts, err := json.Marshal(record.Alerts)

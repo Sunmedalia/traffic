@@ -214,7 +214,7 @@ func detectionMessage(raw []byte, response bool, limit int) detectionHTTP {
 	}
 	if found {
 		_, headers, _ := bytes.Cut(head, []byte("\n"))
-		message.headers, message.body = string(headers), string(payload)
+		message.headers = string(headers)
 	}
 	reader := bufio.NewReaderSize(bytes.NewReader(raw), 4096)
 	var body io.ReadCloser
@@ -236,8 +236,16 @@ func detectionMessage(raw []byte, response bool, limit int) detectionHTTP {
 		data, _ := io.ReadAll(io.LimitReader(body, int64(limit)))
 		body.Close()
 		message.body = string(data)
+	} else if found {
+		message.body = string(payload)
 	}
-	message.decoded, message.decodedView = session.DecodedBody(raw, limit)
+	// DecodedBody parses the message again and only decodes gzip bodies. When
+	// it would pick the same parser, the headers read above already tell
+	// whether it can return anything.
+	sameParser := response == bytes.HasPrefix(raw, []byte("HTTP/"))
+	if !sameParser || strings.EqualFold(message.fields.Get("Content-Encoding"), "gzip") {
+		message.decoded, message.decodedView = session.DecodedBody(raw, limit)
+	}
 	return message
 }
 
