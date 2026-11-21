@@ -1383,6 +1383,13 @@ func TestTUIHelpScrolls(t *testing.T) {
 	if m.help {
 		t.Fatal("a click outside the help keys must close it")
 	}
+	m.width = 160
+	m.resize()
+	m.Update(tuiKey("?"))
+	clickZone(t, m, "key:z")
+	if m.help {
+		t.Fatal("clicking the time-zone hint outside the help footer must close help")
+	}
 	m.width, m.height = 160, 60
 	m.Update(tuiKey("?"))
 	if strings.Contains(m.keysLine(), "滚动") {

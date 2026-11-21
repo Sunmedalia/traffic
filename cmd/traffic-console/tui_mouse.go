@@ -249,7 +249,7 @@ func (m *tuiModel) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 				m.lastClick = "" // a third click starts over
 			}
 			m.flash = ""
-			return m, m.click(id, double)
+			return m, m.click(id, mouse.Y, double)
 		case tea.MouseRight, tea.MouseBackward:
 			// Right click goes back a level, like Esc.
 			return m.updateKey(tuiKeyMsg("esc"))
@@ -304,9 +304,9 @@ func (m *tuiModel) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 }
 
 // click runs the action of a zone.
-func (m *tuiModel) click(id string, double bool) tea.Cmd {
+func (m *tuiModel) click(id string, y int, double bool) tea.Cmd {
 	kind, arg, _ := strings.Cut(id, ":")
-	if m.help && kind != "key" {
+	if m.help && (kind != "key" || y != m.height-1) {
 		// The help's own keys scroll or close it; a click elsewhere closes it.
 		m.help = false
 		return nil
