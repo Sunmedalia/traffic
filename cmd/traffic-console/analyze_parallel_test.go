@@ -89,6 +89,9 @@ func TestParallelAnalysisMatchesSerialOrder(t *testing.T) {
 	if scansSeen == 0 {
 		t.Fatal("fixture never triggers SCAN-001")
 	}
+	if report.ScanSkipped != nil {
+		t.Fatalf("scan limits reported without being reached: %+v", report.ScanSkipped)
+	}
 	if report.Transactions != uint64(len(order)) || report.Alerts != uint64(total) {
 		t.Fatalf("report %d transactions %d alerts, want %d and %d", report.Transactions, report.Alerts, len(order), total)
 	}
@@ -160,5 +163,29 @@ func TestParallelAnalysisCancels(t *testing.T) {
 	}
 	if analysisExists(writer.dir) {
 		t.Fatal("cancelled analysis published a generation")
+	}
+}
+
+func TestAnalysisReportsScanLimit(t *testing.T) {
+	writer := tuiTestStore(t)
+	base := time.Date(2026, 11, 21, 8, 0, 0, 0, time.UTC)
+	for i := range maxScanPaths + 10 {
+		putTUITransaction(t, writer, Transaction{ID: fmt.Sprintf("p-%04d", i), Time: base.Add(time.Duration(i) * time.Millisecond), Client: "192.0.2.9:4000", Method: "GET", URL: fmt.Sprintf("/p/%d", i), Status: 404})
+	}
+	os.WriteFile(filepath.Join(writer.dir, "capture.lock"), nil, 0600)
+	rs, _ := rulesFromYAML(nil)
+	report, err := analyzeSessionRules(context.Background(), writer.dir, "", rs, time.Minute, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.ScanSkipped == nil || report.ScanSkipped.Paths != 10 || report.ScanSkipped.Clients != 0 {
+		t.Fatalf("scan limit not reported: %+v", report.ScanSkipped)
+	}
+	stored, err := readAnalysisReport(writer.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ScanSkipped == nil || *stored.ScanSkipped != *report.ScanSkipped {
+		t.Fatalf("published report lost scan limit: %+v", stored.ScanSkipped)
 	}
 }

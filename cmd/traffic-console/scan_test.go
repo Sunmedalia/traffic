@@ -168,3 +168,21 @@ func BenchmarkScanManyClients(b *testing.B) {
 		}
 	}
 }
+
+func TestScanCountsSkippedTransactions(t *testing.T) {
+	scanner := &scanTracker{clients: map[string]*scanState{}}
+	now := time.Date(2026, 11, 21, 0, 0, 0, 0, time.UTC)
+	for i := range maxScanClients + 3 {
+		scanWithState(Transaction{Time: now, Client: fmt.Sprintf("10.%d.%d.1:80", i/250, i%250), URL: "/", Status: 404}, scanner, time.Hour, 20)
+	}
+	for i := range maxScanPaths + 5 {
+		scanWithState(Transaction{Time: now, Client: "10.0.0.1:80", URL: fmt.Sprintf("/p/%d", i), Status: 404}, scanner, time.Hour, 20)
+	}
+	// Status 0 and unknown clients are never tracked, so they are not skips.
+	scanWithState(Transaction{Time: now, Client: "10.99.0.1:80", URL: "/", Status: 0}, scanner, time.Hour, 20)
+	scanWithState(Transaction{Time: now, Client: "unknown:0", URL: "/", Status: 404}, scanner, time.Hour, 20)
+	// The first client already holds "/", so maxScanPaths-1 new paths fit.
+	if want := (scanSkipped{Clients: 3, Paths: 6}); scanner.skipped != want {
+		t.Fatalf("skipped %+v, want %+v", scanner.skipped, want)
+	}
+}
