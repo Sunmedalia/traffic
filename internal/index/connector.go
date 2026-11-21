@@ -45,13 +45,27 @@ func (c setupConnector) Connect(ctx context.Context) (driver.Conn, error) {
 
 func (c setupConnector) Driver() driver.Driver { return sqliteDriver }
 
-// OpenReader opens dsn with up to conns pooled connections, each prepared by
-// setup, and verifies that the first connection can be established.
+// OpenReader opens dsn with conns pooled connections, each prepared by setup.
+// Every connection is opened up front and kept idle, so a reader never opens
+// its database file again after this returns: on Unix a generation that a
+// later analysis unlinks stays readable through the descriptors already open.
 func OpenReader(dsn string, conns int, setup ...Statement) (*sql.DB, error) {
 	db := sql.OpenDB(setupConnector{dsn: dsn, setup: setup})
 	db.SetMaxOpenConns(conns)
 	db.SetMaxIdleConns(conns)
-	if err := db.Ping(); err != nil {
+	opened := make([]*sql.Conn, 0, conns)
+	var err error
+	for range max(conns, 1) {
+		var conn *sql.Conn
+		if conn, err = db.Conn(context.Background()); err != nil {
+			break
+		}
+		opened = append(opened, conn)
+	}
+	for _, conn := range opened {
+		conn.Close()
+	}
+	if err != nil {
 		db.Close()
 		return nil, err
 	}

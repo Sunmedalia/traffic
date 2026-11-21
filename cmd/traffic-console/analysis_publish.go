@@ -13,10 +13,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Sunmedalia/traffic/internal/session"
 	"github.com/mattn/go-sqlite3"
 )
 
 const analysisPointer = "analysis-current.json"
+const analysisPublishLock = ".analysis-publish.lock"
 
 var analysisGeneration = regexp.MustCompile(`^analysis-[0-9a-f]{32}\.sqlite$`)
 
@@ -29,7 +31,7 @@ func validateAnalysisDestination(dir string) error {
 		return err
 	}
 	defer root.Close()
-	for _, name := range []string{"analysis.sqlite", "analysis.sqlite-journal", "analysis.sqlite-wal", "analysis.sqlite-shm", analysisPointer} {
+	for _, name := range []string{"analysis.sqlite", "analysis.sqlite-journal", "analysis.sqlite-wal", "analysis.sqlite-shm", analysisPointer, analysisPublishLock} {
 		info, err := root.Lstat(name)
 		if os.IsNotExist(err) {
 			continue
@@ -170,6 +172,22 @@ func publishAnalysis(ctx context.Context, dir, build string) error {
 	if err != nil {
 		return err
 	}
+	// Keep this file in place so every publisher locks the same inode.
+	// Builds can proceed concurrently, but the pointer and cleanup form one
+	// publication and must be serialized across processes.
+	lock, err := root.OpenFile(analysisPublishLock, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if errors.Is(err, os.ErrExist) {
+		lock, err = root.OpenFile(analysisPublishLock, os.O_RDWR, 0)
+	}
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := session.LockFileContext(ctx, lock, true); err != nil {
+		return err
+	}
+	defer session.UnlockFile(lock)
+
 	suffix, err := analysisNonce()
 	if err != nil {
 		return err
@@ -180,6 +198,11 @@ func publishAnalysis(ctx context.Context, dir, build string) error {
 			err = os.ErrExist
 		}
 		return err
+	}
+	// The generation being replaced stays as a fallback; older ones are removed.
+	previous := ""
+	if current, pathErr := analysisDatabasePath(dir); pathErr == nil {
+		previous = filepath.Base(current)
 	}
 	if err = root.Rename(build, name); err != nil {
 		return err
@@ -217,23 +240,38 @@ func publishAnalysis(ctx context.Context, dir, build string) error {
 		return err
 	}
 	published = true
-	// Cleanup only generations and abandoned builds older than a day. A brief
-	// reader-open retry handles a concurrent cleanup; already-open immutable
-	// readers keep their own snapshot.
-	entries, _ := os.ReadDir(dir)
+	removeStaleAnalyses(root, name, previous)
+	return nil
+}
+
+// removeStaleAnalyses keeps the current and previous generations and deletes
+// the rest, so repeated re-analysis holds at most two result databases. Store
+// readers open all their connections up front, so on Unix a reader still on a
+// removed generation keeps its snapshot; on Windows an open generation cannot
+// be removed and is retried by the next publication. A reader that has just
+// read the pointer retries once if the generation disappears before it opens.
+// Builds may belong to another analysis still running, so only those older
+// than a day count as abandoned.
+func removeStaleAnalyses(root *os.Root, current, previous string) {
+	file, err := root.Open(".")
+	if err != nil {
+		return
+	}
+	entries, _ := file.ReadDir(-1)
+	file.Close()
 	for _, entry := range entries {
-		stale := analysisGeneration.MatchString(entry.Name()) && entry.Name() != name
-		if analysisBuild.MatchString(entry.Name()) {
-			stale = true
-		}
-		if stale {
-			info, statErr := entry.Info()
-			if statErr == nil && time.Since(info.ModTime()) > 24*time.Hour {
-				_ = root.Remove(entry.Name())
+		name := entry.Name()
+		switch {
+		case analysisGeneration.MatchString(name):
+			if name != current && name != previous {
+				_ = root.Remove(name)
+			}
+		case analysisBuild.MatchString(name):
+			if info, err := entry.Info(); err == nil && time.Since(info.ModTime()) > 24*time.Hour {
+				_ = root.Remove(name)
 			}
 		}
 	}
-	return nil
 }
 
 // diskFull reports whether err comes from a filesystem out of space or quota.

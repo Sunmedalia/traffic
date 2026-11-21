@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"container/heap"
 	"fmt"
 	yaml "gopkg.in/yaml.v3"
 	"io"
@@ -213,7 +214,7 @@ func detectionMessage(raw []byte, response bool, limit int) detectionHTTP {
 	}
 	if found {
 		_, headers, _ := bytes.Cut(head, []byte("\n"))
-		message.headers, message.body = string(headers), string(payload)
+		message.headers = string(headers)
 	}
 	reader := bufio.NewReaderSize(bytes.NewReader(raw), 4096)
 	var body io.ReadCloser
@@ -235,8 +236,16 @@ func detectionMessage(raw []byte, response bool, limit int) detectionHTTP {
 		data, _ := io.ReadAll(io.LimitReader(body, int64(limit)))
 		body.Close()
 		message.body = string(data)
+	} else if found {
+		message.body = string(payload)
 	}
-	message.decoded, message.decodedView = session.DecodedBody(raw, limit)
+	// DecodedBody parses the message again and only decodes gzip bodies. When
+	// it would pick the same parser, the headers read above already tell
+	// whether it can return anything.
+	sameParser := response == bytes.HasPrefix(raw, []byte("HTTP/"))
+	if !sameParser || strings.EqualFold(message.fields.Get("Content-Encoding"), "gzip") {
+		message.decoded, message.decodedView = session.DecodedBody(raw, limit)
+	}
 	return message
 }
 
@@ -307,18 +316,86 @@ type scanPath struct {
 	status int
 }
 type scanState struct {
-	paths     map[string]scanPath
+	paths map[string]scanPath
+	// missing counts paths whose latest status is HTTP 404.
+	missing   int
 	lastAlert time.Time
+}
+
+// scanSeen records one sighting of a path. A path seen again leaves its older
+// sighting in the heap; expiry skips sightings that no longer match the path.
+type scanSeen struct {
+	when         time.Time
+	client, path string
+}
+
+// scanHeap orders sightings oldest first, so expiry only touches the paths
+// that leave the window instead of every tracked path on every transaction.
+type scanHeap []scanSeen
+
+func (h scanHeap) Len() int           { return len(h) }
+func (h scanHeap) Less(i, j int) bool { return h[i].when.Before(h[j].when) }
+func (h scanHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *scanHeap) Push(x any)        { *h = append(*h, x.(scanSeen)) }
+func (h *scanHeap) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	old[len(old)-1] = scanSeen{}
+	*h = old[:len(old)-1]
+	return x
 }
 
 type scanTracker struct {
 	sync.Mutex
 	clients map[string]*scanState
+	seen    scanHeap
+	// tracked is the number of paths across all clients.
+	tracked int
 }
 
 var scans = scanTracker{clients: map[string]*scanState{}}
 
 func scan(t Transaction) *Alert { return scanWithState(t, &scans, scanWindow, scanThreshold) }
+
+// expire drops every path last seen more than scanWindow before now, and
+// clients left without paths, exactly as a full sweep would.
+func (scans *scanTracker) expire(now time.Time, scanWindow time.Duration) {
+	for len(scans.seen) > 0 && now.Sub(scans.seen[0].when) > scanWindow {
+		seen := heap.Pop(&scans.seen).(scanSeen)
+		s := scans.clients[seen.client]
+		if s == nil {
+			continue
+		}
+		x, ok := s.paths[seen.path]
+		if !ok || !x.when.Equal(seen.when) {
+			continue
+		}
+		delete(s.paths, seen.path)
+		scans.tracked--
+		if x.status == 404 {
+			s.missing--
+		}
+		if len(s.paths) == 0 {
+			delete(scans.clients, seen.client)
+		}
+	}
+}
+
+// compact rebuilds the heap from the live paths once superseded sightings
+// dominate it, so a client hitting one path at a high rate stays bounded.
+func (scans *scanTracker) compact() {
+	if len(scans.seen) <= 2*scans.tracked+4096 {
+		return
+	}
+	seen := make(scanHeap, 0, scans.tracked)
+	for client, s := range scans.clients {
+		for path, x := range s.paths {
+			seen = append(seen, scanSeen{x.when, client, path})
+		}
+	}
+	heap.Init(&seen)
+	scans.seen = seen
+}
 
 func scanWithState(t Transaction, scans *scanTracker, scanWindow time.Duration, scanThreshold int) *Alert {
 	if t.Status == 0 {
@@ -331,16 +408,7 @@ func scanWithState(t Transaction, scans *scanTracker, scanWindow time.Duration, 
 	scans.Lock()
 	defer scans.Unlock()
 	now := t.Time
-	for ip, s := range scans.clients {
-		for path, x := range s.paths {
-			if now.Sub(x.when) > scanWindow {
-				delete(s.paths, path)
-			}
-		}
-		if len(s.paths) == 0 {
-			delete(scans.clients, ip)
-		}
-	}
+	scans.expire(now, scanWindow)
 	s := scans.clients[host]
 	if s == nil {
 		if len(scans.clients) >= 2000 {
@@ -349,17 +417,24 @@ func scanWithState(t Transaction, scans *scanTracker, scanWindow time.Duration, 
 		s = &scanState{paths: map[string]scanPath{}}
 		scans.clients[host] = s
 	}
-	path := strings.SplitN(t.URL, "?", 2)[0]
+	path, _, _ := strings.Cut(t.URL, "?")
 	if len(s.paths) >= 1000 {
 		return nil
 	}
-	s.paths[path] = scanPath{now, t.Status}
-	missing := 0
-	for _, x := range s.paths {
-		if x.status == 404 {
-			missing++
+	if old, ok := s.paths[path]; ok {
+		if old.status == 404 {
+			s.missing--
 		}
+	} else {
+		scans.tracked++
 	}
+	s.paths[path] = scanPath{now, t.Status}
+	if t.Status == 404 {
+		s.missing++
+	}
+	heap.Push(&scans.seen, scanSeen{now, host, path})
+	scans.compact()
+	missing := s.missing
 	if len(s.paths) >= scanThreshold && missing*2 >= len(s.paths) && now.Sub(s.lastAlert) >= scanWindow {
 		s.lastAlert = now
 		return &Alert{Rule: "SCAN-001", Version: 1, Severity: "medium", Field: "path-window", Match: fmt.Sprintf("%d distinct paths, %d HTTP 404 within %s", len(s.paths), missing, scanWindow)}

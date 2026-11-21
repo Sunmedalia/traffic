@@ -24,7 +24,7 @@ func TestRules(t *testing.T) {
 }
 func TestScan(t *testing.T) {
 	scans.Lock()
-	scans.clients = map[string]*scanState{}
+	scans.clients, scans.seen, scans.tracked = map[string]*scanState{}, nil, 0
 	scans.Unlock()
 	now := time.Now()
 	for i := 0; i < 20; i++ {
