@@ -205,14 +205,22 @@ func (m *tuiModel) finishAnalysis(msg tuiAnalysisDone) tea.Cmd {
 	default:
 		job.state, job.report = "succeeded", &msg.Report
 		m.flash = fmt.Sprintf("分析完成，%s 条告警", tuiCount(msg.Report.Alerts))
-		if skipped := msg.Report.ScanSkipped; skipped != nil {
-			m.flash += fmt.Sprintf("；扫描检测达到跟踪上限，%s 条事务未参与 SCAN-001 统计", tuiCount(skipped.Clients+skipped.Paths))
+		if warning := tuiScanLimitWarning(job.report); warning != "" {
+			m.flash = warning + " · " + m.flash
 		}
 		m.summary, m.overview, m.timeline = nil, nil, nil
 		m.stale = !m.details
 		return m.refreshNow()
 	}
 	return nil
+}
+
+func tuiScanLimitWarning(report *analysisReport) string {
+	if report == nil || report.ScanSkipped == nil {
+		return ""
+	}
+	skipped := report.ScanSkipped
+	return fmt.Sprintf("SCAN-001 超限，跳过 %s 条事务，可能漏报", tuiCount(skipped.Clients+skipped.Paths))
 }
 
 func tuiJobElapsed(job *tuiAnalysisJob) string {
@@ -251,7 +259,13 @@ func (m tuiModel) analysisView(height int) string {
 	if title == "" && m.store != nil {
 		title = m.store.dir
 	}
-	lines := []string{tuiAccent.Render("分析会话"), tuiLine(title), tuiMuted.Render("分析成功后更新当前会话的告警。停止分析会保留上次完整结果。"), "", tuiBold.Render("规则")}
+	lines := []string{tuiAccent.Render("分析会话"), tuiLine(title)}
+	if job := a.job; job != nil && job.state == "succeeded" {
+		if warning := tuiScanLimitWarning(job.report); warning != "" {
+			lines = append(lines, tuiWarn.Render(warning))
+		}
+	}
+	lines = append(lines, tuiMuted.Render("分析成功后更新当前会话的告警。停止分析会保留上次完整结果。"), "", tuiBold.Render("规则"))
 	options := append([]string{"仅内置规则"}, a.files...)
 	for i, name := range options {
 		if i > 0 {
