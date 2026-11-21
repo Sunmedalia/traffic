@@ -280,7 +280,7 @@ func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, wi
 		go func(work <-chan *analysisJob) {
 			defer workers.Done()
 			for job := range work {
-				if job.err = json.Unmarshal(job.raw, &job.record); job.err == nil {
+				if job.record, job.err = session.DecodeTransaction(job.raw); job.err == nil {
 					job.record.Alerts = detectWithLimits(job.record, rs, limits.RequestLimit, limits.ResponseLimit)
 				}
 				job.raw = nil
