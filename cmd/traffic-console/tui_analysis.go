@@ -205,6 +205,9 @@ func (m *tuiModel) finishAnalysis(msg tuiAnalysisDone) tea.Cmd {
 	default:
 		job.state, job.report = "succeeded", &msg.Report
 		m.flash = fmt.Sprintf("分析完成，%s 条告警", tuiCount(msg.Report.Alerts))
+		if skipped := msg.Report.ScanSkipped; skipped != nil {
+			m.flash += fmt.Sprintf("；扫描检测达到跟踪上限，%s 条事务未参与 SCAN-001 统计", tuiCount(skipped.Clients+skipped.Paths))
+		}
 		m.summary, m.overview, m.timeline = nil, nil, nil
 		m.stale = !m.details
 		return m.refreshNow()

@@ -41,6 +41,10 @@ type analysisReport struct {
 	ScanPaths         int           `json:"scan_paths"`
 	Source            string        `json:"source_signature"`
 	Delivery          *Stats        `json:"delivery,omitempty"`
+	// ScanSkipped counts transactions SCAN-001 could not track because the
+	// client or per-client path limit was reached. Scans among them can go
+	// unreported.
+	ScanSkipped *scanSkipped `json:"scan_skipped,omitempty"`
 }
 
 func sessionIntegrityWarnings(dir string, reconstructed *Stats) []string {
@@ -364,6 +368,10 @@ func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, wi
 	stop()
 	if err = rows.Close(); err != nil {
 		return report, err
+	}
+	if scanner.skipped != (scanSkipped{}) {
+		skipped := scanner.skipped
+		report.ScanSkipped = &skipped
 	}
 	if _, err = tx.ExecContext(ctx, entriesIndexes); err != nil {
 		return report, err

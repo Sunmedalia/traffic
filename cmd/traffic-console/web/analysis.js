@@ -39,8 +39,15 @@ function renderJobCard(job) {
       h('div', {}, h('b', {}, number(report.transactions)), h('span', {}, '事务')),
       h('div', { class: report.alerts ? 'hot' : '' }, h('b', {}, number(report.alerts)), h('span', {}, '告警命中')),
       h('div', {}, h('b', {}, number((report.rules || []).length)), h('span', {}, '规则'))) : null,
+    job.state === 'succeeded' && report && report.scan_skipped ? h('div', { class: 'rules-message' }, scanSkippedText(report.scan_skipped)) : null,
     job.state === 'failed' ? h('div', { class: 'rules-message error' }, job.error) : null,
     job.state === 'cancelled' ? h('div', { class: 'rules-message' }, '已停止，会话保留上次完整的分析结果。') : null);
+}
+
+// SCAN-001 tracks a bounded number of clients and paths; the rest go uncounted.
+function scanSkippedText(skipped) {
+  const total = (skipped.clients || 0) + (skipped.paths || 0);
+  return `扫描检测达到跟踪上限：${number(total)} 条事务未参与 SCAN-001 统计，其中的扫描可能未报出。`;
 }
 
 function renderAnalysisHistory(list) {

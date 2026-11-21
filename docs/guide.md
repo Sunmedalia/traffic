@@ -436,7 +436,7 @@ TUI、Web、JSON 查询及导出读取同一代分析结果；Web 和 TUI 每次
 ./bin/traffic-console analyze --session ./sessions/incident-002 --rules rules.yaml
 ```
 
-`field` 支持 `url`、`request`、`response`、`request.headers`、`response.headers`、`request.body`、`response.body`，单个头部用 `request.header.User-Agent` 这类写法。`severity` 为 `low` / `medium` / `high`。扫描检测默认 60 秒内至少 20 个不同路径且一半以上为 404，在 `traffic-console analyze` 中用 `--scan-window`、`--scan-paths` 调整。
+`field` 支持 `url`、`request`、`response`、`request.headers`、`response.headers`、`request.body`、`response.body`，单个头部用 `request.header.User-Agent` 这类写法。`severity` 为 `low` / `medium` / `high`。扫描检测默认 60 秒内至少 20 个不同路径且一半以上为 404，在 `traffic-console analyze` 中用 `--scan-window`、`--scan-paths` 调整。扫描检测同时最多跟踪 2,000 个客户端、每个客户端 1,000 个路径；超出部分的事务不参与统计，其中的扫描可能未报出。达到上限时，分析结果的 `scan_skipped` 记录这类事务的条数，`analyze` 命令、终端和 Web 的分析面板会给出提示。
 
 ### 可信代理与来源地址
 

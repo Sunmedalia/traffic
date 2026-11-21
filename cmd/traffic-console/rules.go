@@ -351,7 +351,23 @@ type scanTracker struct {
 	seen    scanHeap
 	// tracked is the number of paths across all clients.
 	tracked int
+	skipped scanSkipped
 }
+
+// scanSkipped counts transactions left out of scan correlation by its limits.
+type scanSkipped struct {
+	// Clients counts transactions from a new client while maxScanClients
+	// other clients were tracked.
+	Clients uint64 `json:"clients,omitempty"`
+	// Paths counts transactions from a client already tracking maxScanPaths paths.
+	Paths uint64 `json:"paths,omitempty"`
+}
+
+// Scan correlation tracks at most this many clients and paths per client.
+const (
+	maxScanClients = 2000
+	maxScanPaths   = 1000
+)
 
 var scans = scanTracker{clients: map[string]*scanState{}}
 
@@ -411,14 +427,16 @@ func scanWithState(t Transaction, scans *scanTracker, scanWindow time.Duration, 
 	scans.expire(now, scanWindow)
 	s := scans.clients[host]
 	if s == nil {
-		if len(scans.clients) >= 2000 {
+		if len(scans.clients) >= maxScanClients {
+			scans.skipped.Clients++
 			return nil
 		}
 		s = &scanState{paths: map[string]scanPath{}}
 		scans.clients[host] = s
 	}
 	path, _, _ := strings.Cut(t.URL, "?")
-	if len(s.paths) >= 1000 {
+	if len(s.paths) >= maxScanPaths {
+		scans.skipped.Paths++
 		return nil
 	}
 	if old, ok := s.paths[path]; ok {

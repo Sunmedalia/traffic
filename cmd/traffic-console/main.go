@@ -198,6 +198,9 @@ func run(args []string) error {
 		for _, w := range report.IntegrityWarnings {
 			fmt.Fprintf(os.Stderr, "⚠ 完整性告警：%s\n", w)
 		}
+		if skipped := report.ScanSkipped; skipped != nil {
+			fmt.Fprintf(os.Stderr, "⚠ 扫描检测达到跟踪上限：%d 条事务因客户端超过 %d 个、%d 条因单个客户端路径超过 %d 条未参与 SCAN-001 统计，其中的扫描可能未报出\n", skipped.Clients, maxScanClients, skipped.Paths, maxScanPaths)
+		}
 		emit(report)
 		return nil
 	}
