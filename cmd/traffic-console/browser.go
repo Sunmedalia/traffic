@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"charm.land/bubbles/v2/textinput"
-	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	termansi "github.com/charmbracelet/x/ansi"
@@ -369,7 +368,7 @@ func (m *sessionBrowser) openSession(dir string) error {
 	m.closeSession()
 	m.childCancel = cancel
 	m.lastDir = dir
-	m.child = &tuiModel{ctx: ctx, store: s, refresh: m.refresh, rulesDir: m.rulesDir, filter: m.filter, snapshot: snapshot, title: sessionTitle(dir), width: m.width, height: m.height, viewport: viewport.New(), alertView: viewList, msgLayout: m.msgLayout, listShare: m.listShare, listRatio: m.listRatio, noMouse: m.noMouse}
+	m.child = &tuiModel{ctx: ctx, store: s, refresh: m.refresh, rulesDir: m.rulesDir, filter: m.filter, snapshot: snapshot, title: sessionTitle(dir), width: m.width, height: m.height, alertView: viewList, msgLayout: m.msgLayout, listShare: m.listShare, listRatio: m.listRatio, noMouse: m.noMouse}
 	m.child.resize()
 	return nil
 }
@@ -392,7 +391,7 @@ func sessionCommand(cmd tea.Cmd, generation uint64) tea.Cmd {
 		// Only session data needs the tag. Runtime messages such as clipboard
 		// writes must reach Bubble Tea itself; input widgets accept them untagged.
 		switch msg.(type) {
-		case tuiTick, tuiLoaded, tuiExported, tuiAnalysisTick, tuiAnalysisDone:
+		case tuiTick, tuiLoaded, tuiExported, tuiAnalysisTick, tuiAnalysisDone, tuiRewrap:
 			return sessionChildMsg{generation, msg}
 		}
 		return msg

@@ -253,21 +253,35 @@ func (m tuiModel) overviewTiles(width int) []string {
 	if s.TLSWireRecords > 0 {
 		tiles[2].note = "TLS 外层 " + tuiCount(s.TLSWireRecords)
 	}
-	perRow := 6
-	if width < 96 {
-		perRow = 3
+	// Six tiles share a row only when every label and value fits before a
+	// one-cell gap; otherwise three or two, so a value never runs into the
+	// next tile.
+	need := 0
+	for _, t := range tiles {
+		value := tuiCount(t.value)
+		if t.note != "" {
+			value += " " + t.note
+		}
+		need = max(need, lipgloss.Width(t.label), lipgloss.Width(value))
+	}
+	perRow := 2
+	for _, n := range []int{6, 3} {
+		if n*(need+1) <= width {
+			perRow = n
+			break
+		}
 	}
 	cell := width / perRow
 	lines := []string{}
 	for start := 0; start < len(tiles); start += perRow {
 		labels, values := "", ""
 		for _, t := range tiles[start:min(len(tiles), start+perRow)] {
-			labels += tuiMuted.Render(tuiCell(t.label, cell))
+			labels += tuiMuted.Render(tuiCell(t.label, cell-1)) + " "
 			value := t.style.Render(tuiCount(t.value))
 			if t.note != "" {
 				value += " " + tuiMuted.Render(t.note)
 			}
-			values += tuiCell(value, cell)
+			values += tuiCell(value, cell-1) + " "
 		}
 		lines = append(lines, labels, values)
 	}

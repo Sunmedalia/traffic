@@ -175,6 +175,50 @@ func tuiCell(s string, width int) string {
 	return s + strings.Repeat(" ", max(0, width-lipgloss.Width(s)))
 }
 
+// tuiWidth is the display width of one line. Printable ASCII is one cell per
+// byte, which spares large bodies the grapheme scan.
+func tuiWidth(s string) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] < ' ' || s[i] > '~' {
+			return lipgloss.Width(s)
+		}
+	}
+	return len(s)
+}
+
+// tuiPad pads a line that already fits width, as tuiCell does without
+// measuring it twice.
+func tuiPad(s string, width int) string {
+	w := tuiWidth(s)
+	if w > width {
+		return tuiCell(s, width)
+	}
+	return s + strings.Repeat(" ", width-w)
+}
+
+// tuiWrap hard-wraps text to width and returns its lines. No character takes
+// more cells than bytes, so a line that short already fits and skips the
+// width scan; for a large body that scan is most of the wrapping cost.
+func tuiWrap(text string, width int) []string {
+	width = max(1, width)
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		if len(line) <= width {
+			continue
+		}
+		out := append(make([]string, 0, len(lines)+len(lines)/4), lines[:i]...)
+		for _, line := range lines[i:] {
+			if len(line) <= width {
+				out = append(out, line)
+				continue
+			}
+			out = append(out, strings.Split(termansi.Hardwrap(line, width, true), "\n")...)
+		}
+		return out
+	}
+	return lines
+}
+
 // tuiSpread places right-aligned text at the end of a line, dropping it when there is no room.
 func tuiSpread(left, right string, width int) string {
 	lw, rw := lipgloss.Width(left), lipgloss.Width(right)

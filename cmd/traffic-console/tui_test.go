@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	termansi "github.com/charmbracelet/x/ansi"
 
@@ -218,7 +217,7 @@ func tuiKey(s string) tea.KeyPressMsg {
 	panic(s)
 }
 func TestTUIRefreshAndNavigation(t *testing.T) {
-	m := &tuiModel{ctx: context.Background(), store: tuiTestStore(t), refresh: time.Second, width: 100, height: 30, viewport: viewport.New(), alertView: viewList}
+	m := &tuiModel{ctx: context.Background(), store: tuiTestStore(t), refresh: time.Second, width: 100, height: 30, alertView: viewList}
 	m.snapshot.Rows = []tuiRow{{ID: "old"}, {ID: "selected"}}
 	m.resize()
 	m.Update(tuiKey("2"))
@@ -310,7 +309,7 @@ func TestTUIRefreshAndNavigation(t *testing.T) {
 	}
 }
 func TestTUIRowFiltersAndTabs(t *testing.T) {
-	m := &tuiModel{ctx: context.Background(), store: tuiTestStore(t), refresh: time.Second, width: 100, height: 30, viewport: viewport.New(), tab: tabAlerts, alertView: viewList}
+	m := &tuiModel{ctx: context.Background(), store: tuiTestStore(t), refresh: time.Second, width: 100, height: 30, tab: tabAlerts, alertView: viewList}
 	m.snapshot.Rows = []tuiRow{{ID: "a", Client: "[2001:db8::1]:443", Rule: "SQLI-001", Host: "shop"}, {ID: "b", Client: "192.0.2.1:80"}}
 	m.resize()
 	m.Update(tuiKey("c"))
@@ -348,7 +347,7 @@ func TestTUIRowFiltersAndTabs(t *testing.T) {
 	}
 }
 func TestTUIHealthLevels(t *testing.T) {
-	m := &tuiModel{store: tuiTestStore(t), viewport: viewport.New()}
+	m := &tuiModel{store: tuiTestStore(t)}
 	if level, _ := m.tuiHealth(); level != 0 {
 		t.Fatal("clean capture flagged")
 	}
@@ -399,7 +398,7 @@ func TestTUIParseSince(t *testing.T) {
 func TestTUIExportPopup(t *testing.T) {
 	s := tuiTestStore(t)
 	putTUITransaction(t, s, Transaction{ID: "ev/1", Time: time.Now(), Client: "192.0.2.1:80", Request: []byte("GET / HTTP/1.1\r\n\r\n")})
-	m := &tuiModel{ctx: context.Background(), store: s, refresh: time.Second, width: 100, height: 30, viewport: viewport.New(), tab: tabRequests}
+	m := &tuiModel{ctx: context.Background(), store: s, refresh: time.Second, width: 100, height: 30, tab: tabRequests}
 	m.snapshot.Rows = []tuiRow{{ID: "ev/1", Method: "GET", URL: "/"}}
 	m.Update(tuiKey("e"))
 	if m.export == nil || m.export.input.Value() != "./evidence-ev_1.zip" {
@@ -432,7 +431,7 @@ func TestTUIExportPopup(t *testing.T) {
 	}
 }
 func TestTUILayoutAndDetailTabs(t *testing.T) {
-	m := &tuiModel{store: tuiTestStore(t), viewport: viewport.New(), details: true, detailID: "id", tab: tabRequests}
+	m := &tuiModel{store: tuiTestStore(t), details: true, detailID: "id", tab: tabRequests}
 	m.snapshot.Detail = &Transaction{ID: "id", URL: "/中文" + strings.Repeat("长", 100), Request: []byte(strings.Repeat("正文\n", 200)), Response: []byte("HTTP/1.1 200 OK\r\n\r\nresponse"), Alerts: []Alert{{Rule: "R", Severity: "high", Match: "matched"}}}
 	m.snapshot.Rows = []tuiRow{{ID: "id", URL: "/中文" + strings.Repeat("长", 100)}}
 	for _, size := range []tea.WindowSizeMsg{{Width: 40, Height: 12}, {Width: 80, Height: 24}, {Width: 140, Height: 40}, {Width: 20, Height: 5}} {
@@ -550,7 +549,7 @@ func tuiSummaryModel(t *testing.T) *tuiModel {
 	now := time.Now().UTC()
 	putTUITransaction(t, s, Transaction{ID: "1", Time: now.Add(-time.Minute), Client: "203.0.113.45:5000", Method: "GET", URL: "/a", Alerts: []Alert{{Rule: "SQLI-001", Severity: "high"}}})
 	putTUITransaction(t, s, Transaction{ID: "2", Time: now, Client: "198.51.100.7:5001", Method: "GET", URL: "/.env", Alerts: []Alert{{Rule: "FILE-001", Severity: "medium"}}})
-	m := &tuiModel{ctx: context.Background(), store: s, refresh: time.Second, width: 120, height: 30, viewport: viewport.New()}
+	m := &tuiModel{ctx: context.Background(), store: s, refresh: time.Second, width: 120, height: 30}
 	m.resize()
 	return m
 }
@@ -713,7 +712,7 @@ func TestTUIHighlight(t *testing.T) {
 	}
 }
 func TestTUIDetailSearchAndCopy(t *testing.T) {
-	m := &tuiModel{ctx: context.Background(), store: tuiTestStore(t), refresh: time.Second, width: 100, height: 20, viewport: viewport.New(), tab: tabRequests, details: true, detailID: "id"}
+	m := &tuiModel{ctx: context.Background(), store: tuiTestStore(t), refresh: time.Second, width: 100, height: 20, tab: tabRequests, details: true, detailID: "id"}
 	body := strings.Repeat("filler line\n", 40) + "needle one\n" + strings.Repeat("more\n", 40) + "NEEDLE two\n"
 	m.snapshot.Detail = &Transaction{ID: "id", Request: []byte(body), Alerts: []Alert{{Rule: "R", Severity: "high", Match: "filler"}}}
 	m.snapshot.Rows = []tuiRow{{ID: "id"}}
@@ -994,7 +993,7 @@ func tuiDetailModel(t *testing.T) *tuiModel {
 	response := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"items\":[1,2]}"
 	detail := &Transaction{ID: "b", Method: "POST", Host: "shop", URL: "/login?next=%2Fadmin&id=MTIz", Client: "192.0.2.1:5000", Service: "nginx", Status: 200,
 		Request: []byte(request), Response: []byte(response), Alerts: []Alert{{Rule: "SQLI-001", Severity: "high", Match: "' or 1=1", Field: "request.body"}}}
-	m := &tuiModel{ctx: context.Background(), store: tuiTestStore(t), refresh: time.Second, width: 100, height: 40, viewport: viewport.New(), tab: tabRequests, alertView: viewList}
+	m := &tuiModel{ctx: context.Background(), store: tuiTestStore(t), refresh: time.Second, width: 100, height: 40, tab: tabRequests, alertView: viewList}
 	m.snapshot.Rows = []tuiRow{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	m.selected = 1
 	m.openDetail(m.snapshot.Rows[1])
@@ -1210,7 +1209,7 @@ func TestTUIAnalysisDialog(t *testing.T) {
 
 func TestTUIZoneToggle(t *testing.T) {
 	defer tuiUseUTC.Store(false)
-	m := &tuiModel{store: tuiTestStore(t), viewport: viewport.New(), width: 100, height: 30}
+	m := &tuiModel{store: tuiTestStore(t), width: 100, height: 30}
 	m.Update(tuiKey("z"))
 	if !tuiUseUTC.Load() || !strings.Contains(m.tabsLine(100), "UTC") {
 		t.Fatal("UTC not selected")
@@ -1269,5 +1268,164 @@ func TestTUIParamsTab(t *testing.T) {
 		if tab == detailParams {
 			t.Fatal("empty parameter tab offered")
 		}
+	}
+}
+
+// A refresh that brings back the record already shown must not lay it out
+// again: for a large body that stalled the interface on every tick.
+func TestTUIRefreshKeepsUnchangedDetail(t *testing.T) {
+	m := tuiDetailModel(t)
+	same := *m.snapshot.Detail
+	m.viewport.SetContentLines([]string{"drawn"})
+	m.applySnapshot(tuiSnapshot{Rows: m.snapshot.Rows, Detail: &same})
+	if m.viewport.GetContent() != "drawn" {
+		t.Fatal("refresh rebuilt an unchanged detail")
+	}
+	changed := same
+	changed.Response, changed.Status = []byte("HTTP/1.1 500 Internal Server Error\r\n\r\narrived later"), 500
+	m.applySnapshot(tuiSnapshot{Rows: m.snapshot.Rows, Detail: &changed})
+	if !strings.Contains(m.viewport.GetContent(), "arrived later") {
+		t.Fatal("changed record not redrawn")
+	}
+	m.applySnapshot(tuiSnapshot{Rows: m.snapshot.Rows, DetailMissing: true})
+	if !strings.Contains(m.viewport.GetContent(), "保留期清理") {
+		t.Fatal("removed record not reported")
+	}
+}
+
+func tuiAllLinesFit(t *testing.T, m *tuiModel) bool {
+	t.Helper()
+	for _, line := range strings.Split(m.viewport.GetContent(), "\n") {
+		if lipgloss.Width(line) > m.viewport.Width() {
+			return false
+		}
+	}
+	return true
+}
+
+// Content that was slow to build is wrapped again once a window or divider
+// drag pauses or ends, not at every step of it.
+func TestTUIResizeDefersSlowRewrap(t *testing.T) {
+	m := tuiDetailModel(t)
+	m.msgLayout = layoutStack
+	m.resize()
+	if _, cmd := m.Update(tea.WindowSizeMsg{Width: 90, Height: 40}); cmd != nil || !tuiAllLinesFit(t, m) {
+		t.Fatal("fast content must re-wrap at once")
+	}
+	m.contentCost = time.Second
+	_, first := m.Update(tea.WindowSizeMsg{Width: 70, Height: 40})
+	_, last := m.Update(tea.WindowSizeMsg{Width: 60, Height: 40})
+	if first == nil || last == nil || !m.wrapStale || tuiAllLinesFit(t, m) {
+		t.Fatal("slow content re-wrapped during the resize")
+	}
+	frame := m.View().Content
+	if lipgloss.Width(frame) > 60 {
+		t.Fatal("stale lines must be cut at the pane edge")
+	}
+	m.Update(first())
+	if !m.wrapStale {
+		t.Fatal("a superseded resize re-wrapped")
+	}
+	m.Update(last())
+	if m.wrapStale || !tuiAllLinesFit(t, m) {
+		t.Fatal("content not re-wrapped after the resize settled")
+	}
+
+	m.width = 160
+	m.resize()
+	m.contentCost = time.Second
+	d := zoneOf(t, m, "divider")
+	m.Update(tea.MouseClickMsg{X: d.x0 + 1, Y: d.y, Button: tea.MouseLeft})
+	if _, cmd := m.Update(tea.MouseMotionMsg{X: 100, Y: d.y, Button: tea.MouseLeft}); cmd == nil || !m.wrapStale {
+		t.Fatal("divider drag re-wrapped slow content")
+	}
+	m.Update(tea.MouseReleaseMsg{X: 100, Y: d.y, Button: tea.MouseLeft})
+	if m.wrapStale || !tuiAllLinesFit(t, m) || m.viewport.Width() != 160-99-3 {
+		t.Fatalf("release did not re-wrap for width %d", m.viewport.Width())
+	}
+}
+
+func TestTUIHelpScrolls(t *testing.T) {
+	m := tuiDetailModel(t)
+	m.width, m.height = 80, 24
+	m.resize()
+	m.Update(tuiKey("?"))
+	lines := tuiHelpLines(m.width)
+	for _, line := range lines {
+		if lipgloss.Width(line) > m.width {
+			t.Fatalf("help line wider than the terminal: %q", line)
+		}
+	}
+	view := func() string { return termansi.Strip(m.View().Content) }
+	if !strings.Contains(view(), "第 1–19 行") || strings.Contains(view(), "Ctrl+C") {
+		t.Fatalf("help must start at the top and say it scrolls:\n%s", view())
+	}
+	m.Update(tuiKeyMsg("pgdown"))
+	m.Update(tuiKeyMsg("pgdown"))
+	m.Update(tuiKeyMsg("pgdown"))
+	if !strings.Contains(view(), "退出    q 或 Ctrl+C") || m.helpTop != len(lines)-m.contentHeight() {
+		t.Fatalf("help end not reachable, top %d:\n%s", m.helpTop, view())
+	}
+	m.Update(tea.MouseWheelMsg{X: 5, Y: 10, Button: tea.MouseWheelUp})
+	if m.helpTop != len(lines)-m.contentHeight()-3 {
+		t.Fatalf("wheel did not scroll the help: %d", m.helpTop)
+	}
+	clickZone(t, m, "key:pgup")
+	if !m.help || m.helpTop == len(lines)-m.contentHeight()-3 {
+		t.Fatal("clicking a help key must run it")
+	}
+	m.Update(tuiKeyMsg("esc"))
+	m.Update(tuiKey("?"))
+	if m.helpTop != 0 {
+		t.Fatal("reopened help must start at the top")
+	}
+	clickZone(t, m, "tab:0")
+	if m.help {
+		t.Fatal("a click outside the help keys must close it")
+	}
+	m.width = 160
+	m.resize()
+	m.Update(tuiKey("?"))
+	clickZone(t, m, "key:z")
+	if m.help {
+		t.Fatal("clicking the time-zone hint outside the help footer must close help")
+	}
+	m.width, m.height = 160, 60
+	m.Update(tuiKey("?"))
+	if strings.Contains(m.keysLine(), "滚动") {
+		t.Fatal("help that fits must not offer scrolling")
+	}
+}
+
+func TestTUIOverviewTilesKeepGaps(t *testing.T) {
+	m := tuiSummaryModel(t)
+	m.snapshot.Stats = Stats{Transactions: 1234567, Alerts: 89012, Packets: 3456789, TLSWireRecords: 1234567}
+	m.overview = &tuiOverview{Summary: sessionSummary{Total: 1234567, Alerted: 45678}}
+	for width, rows := range map[int]int{100: 2, 140: 2, 200: 1} {
+		lines := m.overviewTiles(width)
+		if len(lines) != 2*rows {
+			t.Fatalf("width %d: %d tile rows, want %d", width, len(lines)/2, rows)
+		}
+		for _, line := range lines {
+			if strings.Contains(termansi.Strip(line), "…") || lipgloss.Width(line) > width {
+				t.Fatalf("width %d: tile cut or overflowing: %q", width, termansi.Strip(line))
+			}
+		}
+	}
+}
+
+func TestTUINarrowPairNotice(t *testing.T) {
+	m := tuiDetailModel(t)
+	m.msgLayout = layoutSide
+	m.width = 80
+	m.resize()
+	content := termansi.Strip(m.viewport.GetContent())
+	if !strings.Contains(content, "终端宽度不足 90 列") || strings.Contains(content, "加宽详情") {
+		t.Fatalf("full-width detail must not offer >:\n%s", content)
+	}
+	m.width = 160
+	m.resize()
+	if !strings.Contains(termansi.Strip(m.viewport.GetContent()), "> 加宽详情") {
+		t.Fatal("split detail must offer > to widen it")
 	}
 }

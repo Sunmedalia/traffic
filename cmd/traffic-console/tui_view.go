@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -210,42 +211,38 @@ func (m tuiModel) prettyBody(body string) string {
 	return out.String()
 }
 
-// httpView prints a message with styled header names and an optional JSON indent.
-// wrapPlain wraps uncoloured text to width so styles can be applied per line.
-func wrapPlain(text string, width int) []string {
-	return strings.Split(termansi.Hardwrap(text, max(1, width), true), "\n")
-}
-
 // messageLines prints an HTTP message wrapped to width, with styled header
 // names and an optional JSON indent. Lines are styled after wrapping so they
 // can sit beside another column.
 func (m tuiModel) messageLines(text string, width int) []string {
 	message := tuiSplitHTTP(cleanTUIText(text))
+	hl := m.highlighter()
 	lines := []string{}
-	for _, line := range wrapPlain(message.start, width) {
-		lines = append(lines, tuiBold.Render(m.highlightBody(line)))
+	for _, line := range tuiWrap(message.start, width) {
+		lines = append(lines, tuiBold.Render(hl.highlight(line)))
 	}
 	header := tuiAccent.UnsetBold()
 	for _, h := range message.headers {
 		if h[1] == "\x00" {
-			for _, line := range wrapPlain(h[0], width) {
-				lines = append(lines, m.highlightBody(line))
+			for _, line := range tuiWrap(h[0], width) {
+				lines = append(lines, hl.highlight(line))
 			}
 			continue
 		}
-		for i, line := range wrapPlain(h[0]+": "+h[1], width) {
+		for i, line := range tuiWrap(h[0]+": "+h[1], width) {
 			if i == 0 && len(line) > len(h[0]) {
-				line = header.Render(h[0]) + m.highlightBody(line[len(h[0]):])
+				line = header.Render(h[0]) + hl.highlight(line[len(h[0]):])
 			} else {
-				line = m.highlightBody(line)
+				line = hl.highlight(line)
 			}
 			lines = append(lines, line)
 		}
 	}
 	if message.body != "" {
-		lines = append(lines, "")
-		for _, line := range wrapPlain(m.prettyBody(message.body), width) {
-			lines = append(lines, m.highlightBody(line))
+		body := tuiWrap(m.prettyBody(message.body), width)
+		lines = append(slices.Grow(lines, len(body)+1), "")
+		for _, line := range body {
+			lines = append(lines, hl.highlight(line))
 		}
 	}
 	return lines
@@ -268,7 +265,7 @@ func (m tuiModel) responseLines(width int) []string {
 	case t.Status != 0:
 		return []string{tuiMuted.Render("没有保存响应内容。")}
 	}
-	return wrapPlain("还没有采集到响应。会话仍在采集时，响应到达后会自动出现。", width)
+	return tuiWrap("还没有采集到响应。会话仍在采集时，响应到达后会自动出现。", width)
 }
 
 // Request and response layouts in the detail pane.
@@ -293,13 +290,24 @@ func (m tuiModel) pairLayout() int {
 	return m.msgLayout
 }
 
+// narrowNotice explains why side by side shows stacked. Only a detail beside
+// the list can grow with >; otherwise the terminal itself is too narrow.
+func (m tuiModel) narrowNotice() string {
+	if m.split() {
+		return fmt.Sprintf("详情宽度不足 %d 列，按上下显示 · > 加宽详情", tuiSideMinWidth)
+	}
+	return fmt.Sprintf("终端宽度不足 %d 列，按上下显示", tuiSideMinWidth)
+}
+
 // pairLines shows request and response together, like the web message pair.
 func (m tuiModel) pairLines(width int) []string {
 	title := func(name string) string { return tuiAccent.Render(name) }
 	if m.pairLayout() == layoutSide {
 		col := (width - 3) / 2
 		left, right := m.requestLines(col), m.responseLines(col)
-		lines := []string{tuiCell(title("请求"), col) + tuiMuted.Render(" │ ") + title("响应")}
+		divider := tuiMuted.Render(" │ ")
+		lines := make([]string, 0, max(len(left), len(right))+1)
+		lines = append(lines, tuiCell(title("请求"), col)+divider+title("响应"))
 		for i := 0; i < max(len(left), len(right)); i++ {
 			l, r := "", ""
 			if i < len(left) {
@@ -308,7 +316,8 @@ func (m tuiModel) pairLines(width int) []string {
 			if i < len(right) {
 				r = right[i]
 			}
-			lines = append(lines, tuiCell(l, col)+tuiMuted.Render(" │ ")+r)
+			// Both columns are already wrapped to col.
+			lines = append(lines, tuiPad(l, col)+divider+r)
 		}
 		return lines
 	}
@@ -317,7 +326,7 @@ func (m tuiModel) pairLines(width int) []string {
 	}
 	lines := []string{}
 	if m.msgLayout == layoutSide {
-		lines = append(lines, tuiMuted.Render(tuiHints(fmt.Sprintf("详情宽度不足 %d 列，按上下显示 · > 加宽详情", tuiSideMinWidth))))
+		lines = tuiWrap(tuiMuted.Render(tuiHints(m.narrowNotice())), width)
 	}
 	lines = append(lines, rule("请求"))
 	lines = append(lines, m.requestLines(width)...)
@@ -325,13 +334,16 @@ func (m tuiModel) pairLines(width int) []string {
 	return append(lines, m.responseLines(width)...)
 }
 
-func (m tuiModel) detailContent() string {
+// detailLines lays the detail pane out wrapped to width. Messages arrive
+// wrapped from their builders and skip a second pass, which for a large body
+// costs as much as the first.
+func (m tuiModel) detailLines(width int) []string {
 	if m.snapshot.DetailMissing {
-		return "这条记录已被保留期清理，无法再查看。按 Esc 返回列表，或按 j/k 查看相邻记录"
+		return tuiWrap("这条记录已被保留期清理，无法再查看。按 Esc 返回列表，或按 j/k 查看相邻记录", width)
 	}
 	t := m.snapshot.Detail
 	if t == nil || t.ID != m.detailID {
-		return "正在加载详情…"
+		return tuiWrap("正在加载详情…", width)
 	}
 	var b strings.Builder
 	label := func(s string) string { return tuiMuted.Render(tuiCell(s, 16)) }
@@ -438,19 +450,20 @@ func (m tuiModel) detailContent() string {
 		format = "f 格式化 JSON"
 	}
 	b.WriteString(tuiMuted.Render(tuiHints(" [ ] 切换 · L 排版 " + tuiLayoutNames[m.msgLayout] + " · " + format + " · Y 复制")))
-	b.WriteString("\n\n")
+	lines := append(tuiWrap(b.String(), width), "")
 	switch active {
 	case detailRequest:
-		width := m.viewport.Width()
 		if m.msgLayout == layoutSingle {
-			b.WriteString(strings.Join(m.requestLines(width), "\n"))
-		} else {
-			b.WriteString(strings.Join(m.pairLines(width), "\n"))
+			return append(lines, m.requestLines(width)...)
 		}
+		return append(lines, m.pairLines(width)...)
 	case detailResponse:
-		b.WriteString(strings.Join(m.responseLines(m.viewport.Width()), "\n"))
+		return append(lines, m.responseLines(width)...)
+	}
+	b.Reset()
+	switch active {
 	case detailParams:
-		b.WriteString(strings.Join(m.paramsContent(m.viewport.Width()), "\n"))
+		b.WriteString(strings.Join(m.paramsContent(width), "\n"))
 	case detailDecoder:
 		b.WriteString(m.decoderContent())
 	case detailDecoded:
@@ -476,7 +489,7 @@ func (m tuiModel) detailContent() string {
 				tuiMuted.Render(tuiHints("m 查看同规则请求 · d 解码片段")))
 		}
 	}
-	return b.String()
+	return append(lines, tuiWrap(b.String(), width)...)
 }
 
 // listView adapts columns to width: narrow keeps time, method, status, level and URL.
@@ -836,6 +849,10 @@ func (m tuiModel) keysLine() string {
 	case m.export != nil:
 		return "Enter 导出 · Esc 取消"
 	case m.help:
+		if n, height := len(tuiHelpLines(m.width)), m.contentHeight(); n > height {
+			top := m.helpStart(n, height)
+			return fmt.Sprintf("↑↓ 滚动 · PgUp/PgDn 翻页 · 第 %d–%d 行，共 %d 行 · ? 或 Esc 关闭帮助 · q 退出", top+1, min(n, top+height), n)
+		}
 		return "? 或 Esc 关闭帮助 · q 退出"
 	case m.details && m.decoder != nil && m.decoder.editor != nil:
 		return "Enter 用输入内容替换原文 · Esc 取消"
@@ -900,6 +917,65 @@ const tuiHelpText = `快捷键（与网页版一致的键位优先）
         点击筛选条件可去掉该条件    M 关闭或开启鼠标（关闭后可用终端直接选取文字）
 退出    q 或 Ctrl+C`
 
+// tuiHelpIndent is where help text starts after its section name.
+const tuiHelpIndent = 8
+
+// tuiHelpLines wraps the shortcut reference to width, continuing a long
+// item under its section's text rather than cutting it off.
+func tuiHelpLines(width int) []string {
+	lines := []string{}
+	for _, line := range strings.Split(tuiHelpText, "\n") {
+		if lipgloss.Width(line) <= width || width <= 2*tuiHelpIndent {
+			lines = append(lines, line)
+			continue
+		}
+		head, rest := termansi.Cut(line, 0, tuiHelpIndent), termansi.TruncateLeft(line, tuiHelpIndent, "")
+		for i, part := range strings.Split(termansi.Wrap(rest, width-tuiHelpIndent, ""), "\n") {
+			if i > 0 {
+				head = strings.Repeat(" ", tuiHelpIndent)
+			}
+			lines = append(lines, head+part)
+		}
+	}
+	return lines
+}
+
+// helpStart is the first help line shown, kept so the last page stays full.
+func (m tuiModel) helpStart(n, height int) int { return max(0, min(m.helpTop, n-height)) }
+
+func (m tuiModel) helpView(height int) string {
+	lines := tuiHelpLines(m.width)
+	top := m.helpStart(len(lines), height)
+	return strings.Join(lines[top:min(len(lines), top+height)], "\n")
+}
+
+// moveHelp scrolls the help when it is taller than the page.
+func (m *tuiModel) moveHelp(delta int) {
+	n, height := len(tuiHelpLines(m.width)), m.contentHeight()
+	m.helpTop = max(0, min(m.helpStart(n, height)+delta, n-height))
+}
+
+func (m *tuiModel) scrollHelp(key string) {
+	switch key {
+	case "up", "k":
+		m.moveHelp(-1)
+	case "down", "j":
+		m.moveHelp(1)
+	case "pgup":
+		m.moveHelp(-m.contentHeight())
+	case "pgdown", " ", "space":
+		m.moveHelp(m.contentHeight())
+	case "ctrl+u":
+		m.moveHelp(-m.contentHeight() / 2)
+	case "ctrl+d":
+		m.moveHelp(m.contentHeight() / 2)
+	case "home", "g":
+		m.helpTop = 0
+	case "end", "G":
+		m.moveHelp(len(tuiHelpLines(m.width)))
+	}
+}
+
 // View draws the frame without its click zones and asks for mouse input.
 func (m tuiModel) View() tea.View {
 	frame, _ := tuiHitScan(m.render())
@@ -918,7 +994,7 @@ func (m tuiModel) render() string {
 	content := m.viewport.View()
 	switch {
 	case m.help:
-		content = tuiHelpText
+		content = m.helpView(contentHeight)
 	case m.analysis != nil && m.analysis.open:
 		content = m.analysisView(contentHeight)
 	case m.form != nil:

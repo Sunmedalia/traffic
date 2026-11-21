@@ -249,14 +249,15 @@ func (m *tuiModel) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 				m.lastClick = "" // a third click starts over
 			}
 			m.flash = ""
-			return m, m.click(id, double)
+			return m, m.click(id, mouse.Y, double)
 		case tea.MouseRight, tea.MouseBackward:
 			// Right click goes back a level, like Esc.
 			return m.updateKey(tuiKeyMsg("esc"))
 		}
 	case tea.MouseMotionMsg:
+		var cmd tea.Cmd
 		if m.splitDrag {
-			m.dragDivider(mouse.X)
+			cmd = m.dragDivider(mouse.X)
 		}
 		if m.scrollDrag != nil {
 			m.dragScrollbar(mouse.Y)
@@ -264,7 +265,7 @@ func (m *tuiModel) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if d := m.drag; d != nil {
 			col := m.timelineColumnAt(mouse.X)
 			if col < 0 || d.inside && !d.moved && col == d.start {
-				return m, nil
+				return m, cmd
 			}
 			if d.inside && !d.moved {
 				// Dragging from inside a span starts a new one.
@@ -273,10 +274,15 @@ func (m *tuiModel) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			d.moved = true
 			m.blockSelected[blockTimeline] = col
 		}
+		return m, cmd
 	case tea.MouseReleaseMsg:
 		m.scrollDrag = nil
 		if m.splitDrag {
 			m.splitDrag = false
+			if m.wrapStale {
+				// The drag is over, so wrap for the final width without waiting.
+				m.updateContent()
+			}
 			m.flash = fmt.Sprintf("列表 %d 列 · 详情 %d 列 · 双击分隔线恢复各占一半", m.listWidth(), m.viewport.Width())
 		}
 		if m.drag != nil {
@@ -298,12 +304,13 @@ func (m *tuiModel) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 }
 
 // click runs the action of a zone.
-func (m *tuiModel) click(id string, double bool) tea.Cmd {
-	if m.help {
+func (m *tuiModel) click(id string, y int, double bool) tea.Cmd {
+	kind, arg, _ := strings.Cut(id, ":")
+	if m.help && (kind != "key" || y != m.height-1) {
+		// The help's own keys scroll or close it; a click elsewhere closes it.
 		m.help = false
 		return nil
 	}
-	kind, arg, _ := strings.Cut(id, ":")
 	n, _ := strconv.Atoi(arg)
 	armed := m.armed
 	m.armed = ""
@@ -480,16 +487,16 @@ func (m *tuiModel) endDrag() tea.Cmd {
 
 // dragDivider follows the pointer with the divider between list and detail.
 // The divider's line sits one column after the list.
-func (m *tuiModel) dragDivider(x int) {
+func (m *tuiModel) dragDivider(x int) tea.Cmd {
 	if !m.split() || m.width <= 0 {
-		return
+		return nil
 	}
 	width := max(tuiMinList, min(m.width-tuiMinDetail-3, x-1))
 	if width == m.listWidth() {
-		return // re-wrapping a large detail on every motion event is costly
+		return nil // re-wrapping a large detail on every motion event is costly
 	}
 	m.listRatio = max(1, (width*1000+m.width-1)/m.width)
-	m.resize()
+	return m.resizeSoon()
 }
 
 // scrollListTo moves the list window. Beside a detail the list scrolls on
@@ -558,6 +565,7 @@ func (m *tuiModel) wheel(x, y, step int) tea.Cmd {
 	key := map[int]string{-1: "up", 1: "down"}[step]
 	switch {
 	case m.help:
+		m.moveHelp(3 * step)
 		return nil
 	case m.analysis != nil && m.analysis.open, m.form != nil, m.details && m.decoder != nil && m.decoder.picking:
 		_, cmd := m.updateKey(tuiKeyMsg(key))

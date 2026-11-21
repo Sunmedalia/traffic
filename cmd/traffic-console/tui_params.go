@@ -71,6 +71,7 @@ func (m tuiModel) paramsContent(width int) []string {
 	}
 	nameWidth = min(nameWidth, max(4, width/3))
 	lines := []string{tuiMuted.Render(tuiHints("↑↓ 选择参数 · 点击或 Enter 在解码工具中打开 · Y 复制全部参数"))}
+	hl := m.highlighter()
 	index := 0
 	for _, g := range groups {
 		lines = append(lines, "", tuiBold.Render(g.title)+tuiMuted.Render("  "+tuiCount(uint64(len(g.pairs)))+" 个"))
@@ -82,7 +83,7 @@ func (m tuiModel) paramsContent(width int) []string {
 			if value == "" {
 				value = tuiMuted.Render("（空）")
 			}
-			for i, line := range wrapPlain(value, max(1, width-nameWidth-2)) {
+			for i, line := range tuiWrap(value, max(1, width-nameWidth-2)) {
 				name := strings.Repeat(" ", nameWidth)
 				if i == 0 {
 					name = tuiCell(tuiLine(p[0]), nameWidth)
@@ -98,7 +99,7 @@ func (m tuiModel) paramsContent(width int) []string {
 					if i == 0 {
 						name = tuiAccent.UnsetBold().Render(name)
 					}
-					lines = append(lines, tuiHit(id, "  "+name+m.highlightBody(line)))
+					lines = append(lines, tuiHit(id, "  "+name+hl.highlight(line)))
 				}
 			}
 		}
