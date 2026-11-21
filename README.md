@@ -180,7 +180,7 @@ v0.1.3 起使用采集与本地分析分离流程。旧版 v0.1.2 采集时直�
 | Linux nginx / Apache | eCapture / eBPF | 否 | 内核能力、动态 libssl、附加窗口 |
 | 通用 OpenSSL | `--service openssl --pid N` | 否 | 指定进程；自定义 BIO 需逐项验证 |
 | 旧内核 / 无 BTF | OpenSSL 预加载库 | **是** | 显式启动加载；队列丢弃和退出尾部仍有边界 |
-| Tomcat NIO | `--java-attach` | 否 | JDK 17/21；目标需允许动态附加 |
+| Tomcat NIO | `--java-attach` | 否 | JDK 8+，独立 Tomcat 或 `java -jar` 内嵌 Tomcat；目标需允许动态附加 |
 | Windows IIS | WinDivert + IIS 探针 | 否 | 随包自动配置 Frida；已有异步接收可能漏采 |
 | Windows nginx / Apache | WinDivert + OpenSSL 探针 | 否 | 静态 OpenSSL 按二进制哈希匹配 profile |
 | 已有明文 HTTP PCAP | `traffic import` | 不涉及 | 加密 PCAP 本身不能还原 HTTPS 明文 |

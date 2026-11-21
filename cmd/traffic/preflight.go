@@ -117,7 +117,7 @@ func captureChecks(service string, pid int, library, probe string, java bool, ja
 				c.Reason = "Java agent archive is not readable"
 			} else {
 				c.Status = "candidate"
-				c.Reason = "Tomcat NIO only; JVM attach permission and loaded classes require runtime verification"
+				c.Reason = "Tomcat NIO only (JDK 8+, standalone or java -jar); JVM attach permission and loaded classes require runtime verification"
 			}
 		default:
 			c.Backend = "ecapture-openssl"

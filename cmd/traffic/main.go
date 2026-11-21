@@ -81,9 +81,9 @@ func run(args []string) (runErr error) {
 	fs.StringVar(&iisRuntime, "probe-runtime-dir", defaults.runtime, "temporary directory readable by Windows probe targets (alias of --iis-runtime-dir)")
 	fs.StringVar(&opensslProbe, "openssl-probe", defaults.openssl, "Windows OpenSSL plaintext helper; bundled by default")
 	fs.StringVar(&opensslProfile, "openssl-profile", "", "Windows static OpenSSL binary profile JSON; default bundled profiles")
-	javaAttach := fs.Bool("java-attach", false, "explicitly attach Java agent to --pid")
+	javaAttach := fs.Bool("java-attach", false, "explicitly attach Java agent (Tomcat NIO, standalone or java -jar, JDK 8+) to --pid")
 	javaPID := fs.Int("java-pid", 0, "explicit JVM PID for Java attach while auto-discovering other services")
-	javaHelper := fs.String("java-helper", "", "Java executable with jdk.attach; default target executable")
+	javaHelper := fs.String("java-helper", "", "JDK java executable with the attach API (jdk.attach, or lib/tools.jar on JDK 8); default target executable")
 	javaAgent := fs.String("java-agent", session.BundleFile("deps/java/traffic-java-agent.jar", "/opt/traffic/bin/traffic-java-agent.jar"), "Java agent archive")
 	service := fs.String("service", "auto", "service: auto, iis (Windows), nginx, apache, tomcat, openssl")
 	pid := fs.Int("pid", 0, "target process PID; default discover service processes")
@@ -203,7 +203,7 @@ func run(args []string) (runErr error) {
 			return fmt.Errorf("Java target: %w", err)
 		}
 		if target.Service != "tomcat" {
-			return errors.New("Java probe currently supports standalone Tomcat targets")
+			return errors.New("Java probe supports standalone Tomcat or `java -jar` targets")
 		}
 	}
 	if *service == "openssl" && *pid <= 0 {
