@@ -20,6 +20,10 @@ type streamChunk struct {
 type queuedStream struct {
 	ctx        context.Context
 	budget     *semaphore.Weighted
+	factory    *streamFactory
+	launch     func()
+	started    bool
+	lastSeen   time.Time
 	onClose    func()
 	server     string
 	connection string
@@ -57,6 +61,9 @@ func (s *queuedStream) Reassembled(rs []tcpassembly.Reassembly) {
 		if len(r.Bytes) == 0 {
 			continue
 		}
+		if !s.started && !s.start() {
+			return
+		}
 		n := int64(len(r.Bytes))
 		// The input is already on disk. Wait for the parser to consume data
 		// instead of losing a TCP direction when the reader gets ahead.
@@ -72,6 +79,26 @@ func (s *queuedStream) Reassembled(rs []tcpassembly.Reassembly) {
 		}
 	}
 }
+
+// start launches the parser for this direction's first payload. Without a free
+// parser the direction is dropped and reported rather than blocking the reader.
+func (s *queuedStream) start() bool {
+	if s.factory != nil && !s.factory.takeParser() {
+		s.factory.rejected++
+		s.failed.Store(true)
+		s.closeInput()
+		return false
+	}
+	s.started = true
+	if s.chunks == nil {
+		s.chunks = make(chan streamChunk, 256)
+	}
+	if s.launch != nil {
+		s.launch()
+	}
+	return true
+}
+
 func (s *queuedStream) ReassemblyComplete() {
 	s.closeInput()
 	if s.onClose != nil {
@@ -82,7 +109,9 @@ func (s *queuedStream) ReassemblyComplete() {
 func (s *queuedStream) closeInput() {
 	if !s.closed {
 		s.closed = true
-		close(s.chunks)
+		if s.chunks != nil {
+			close(s.chunks)
+		}
 	}
 }
 func (s *queuedStream) Read(b []byte) (int, error) {

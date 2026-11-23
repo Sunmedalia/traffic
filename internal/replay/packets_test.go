@@ -285,10 +285,9 @@ func TestOfflineReassemblyRetiresReplacedOneSidedGeneration(t *testing.T) {
 func TestOfflineReassemblyBoundsAssemblerDirections(t *testing.T) {
 	s := &Store{}
 	p := newHTTP(s)
-	p.slots = make(chan struct{}, 2)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	f := &streamFactory{ctx: ctx, budget: semaphore.NewWeighted(packetQueueBudget), p: p, source: "pcap:test"}
+	f := &streamFactory{ctx: ctx, budget: semaphore.NewWeighted(packetQueueBudget), p: p, source: "pcap:test", maxDirections: 2}
 	assembler := tcpassembly.NewAssembler(tcpassembly.NewStreamPool(f))
 	network := gopacket.NewFlow(layers.EndpointIPv4, []byte{192, 0, 2, 1}, []byte{192, 0, 2, 2})
 	at := time.Unix(1600000000, 0)
@@ -309,6 +308,63 @@ func TestOfflineReassemblyBoundsAssemblerDirections(t *testing.T) {
 	p.wg.Wait()
 	if closed != 2 || len(f.directions) != 0 || f.rejected != 18 {
 		t.Fatalf("retained at EOF=%d remaining=%d rejected=%d", closed, len(f.directions), f.rejected)
+	}
+}
+
+func TestOfflineReassemblySurvivesUnansweredSYNBurst(t *testing.T) {
+	input, write, closePCAP := writeReplayPCAP(t)
+	at := time.Unix(1600000000, 0)
+	// More unanswered SYNs than there are parsers, all within 300 ms.
+	for i := range 3000 {
+		write(at.Add(time.Duration(i)*100*time.Microsecond), layers.TCPPort(20000+i), false, 1, true, nil)
+	}
+	response := []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+	for i := range 20 {
+		port := layers.TCPPort(40000 + i)
+		request := []byte(fmt.Sprintf("GET /after-flood/%d HTTP/1.1\r\nHost: test\r\n\r\n", i))
+		sent := at.Add(time.Second + time.Duration(i)*time.Millisecond)
+		write(sent, port, false, 100, true, nil)
+		write(sent, port, true, 200, true, nil)
+		write(sent, port, false, 101, false, request)
+		write(sent, port, true, 201, false, response)
+	}
+	closePCAP()
+	records, gaps := replayTestPCAP(t, input)
+	if len(records) != 20 || len(gaps) != 0 {
+		t.Fatalf("got %d requests after a SYN burst and gaps %v", len(records), gaps)
+	}
+	for i, record := range records {
+		checkReplayTransaction(t, record, fmt.Sprintf("/after-flood/%d", i), nil)
+	}
+}
+
+func TestOfflineReassemblyEvictsIdleConnectionsForNewOnes(t *testing.T) {
+	input, write, closePCAP := writeReplayPCAP(t)
+	at := time.Unix(1600000000, 0)
+	response := []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+	// Keep-alive connections that never close outnumber the parsers and open
+	// faster than any of them goes idle for a second.
+	defer func(limit int) { packetParserLimit = limit }(packetParserLimit)
+	packetParserLimit = 200
+	const connections = 1300
+	for i := range connections {
+		port := layers.TCPPort(20000 + i)
+		request := []byte(fmt.Sprintf("GET /open/%d HTTP/1.1\r\nHost: test\r\n\r\n", i))
+		sent := at.Add(time.Duration(i) * time.Millisecond)
+		write(sent, port, false, 100, true, nil)
+		write(sent, port, true, 200, true, nil)
+		write(sent, port, false, 101, false, request)
+		write(sent, port, true, 201, false, response)
+	}
+	closePCAP()
+	records, gaps := replayTestPCAP(t, input)
+	if len(records) != connections || gaps["pcap/stream_limit/packets"] != 0 || gaps["pcap/stream_idle_eviction/directions"] == 0 {
+		t.Fatalf("got %d of %d requests and gaps %v", len(records), connections, gaps)
+	}
+	for _, record := range records {
+		if record.Status != 200 || record.Incomplete {
+			t.Fatalf("idle eviction damaged %s: status=%d incomplete=%t", record.URL, record.Status, record.Incomplete)
+		}
 	}
 }
 
