@@ -22,13 +22,13 @@ import (
 )
 
 type Rule struct {
-	ID               string `yaml:"id" json:"id"`
-	Version          int    `yaml:"version" json:"version"`
-	Severity         string `yaml:"severity" json:"severity"`
-	Field            string `yaml:"field" json:"field"`
-	Pattern          string `yaml:"pattern" json:"pattern"`
-	rx               *regexp.Regexp
-	requiredLiterals [][]string
+	ID        string `yaml:"id" json:"id"`
+	Version   int    `yaml:"version" json:"version"`
+	Severity  string `yaml:"severity" json:"severity"`
+	Field     string `yaml:"field" json:"field"`
+	Pattern   string `yaml:"pattern" json:"pattern"`
+	rx        *regexp.Regexp
+	prefilter *prefilter
 }
 
 var builtinRules = []Rule{
@@ -80,7 +80,7 @@ func compileRules(rs []Rule) error {
 		if parseErr != nil {
 			return parseErr
 		}
-		r.requiredLiterals = necessaryRuleLiterals(expression)
+		r.prefilter = rulePrefilter(expression)
 	}
 	return nil
 }

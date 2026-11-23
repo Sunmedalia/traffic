@@ -12,7 +12,12 @@ func TestRulePrefilterPreservesMatchAndUnicodeSemantics(t *testing.T) {
 	for _, rule := range rules {
 		patterns = append(patterns, rule.Pattern)
 	}
-	texts := []string{"", "normal", "alpha", "BETA", "K", "ſ", "世界", "123", "foobarbaz", "ayb", "%2527%2520or%25201%253D1", "UNION SELECT 1", "<img src=x onerror=alert(1)>", "${jndi:ldap://example/a}", "root:x:0:0:", string([]byte{255, 'K'})}
+	texts := []string{"", "normal", "alpha", "BETA", "K", "ſ", "世界", "123", "foobarbaz", "ayb", "%2527%2520or%25201%253D1", "UNION SELECT 1", "<img src=x onerror=alert(1)>", "${jndi:ldap://example/a}", "root:x:0:0:", string([]byte{255, 'K'}),
+		// Adjacency around optional, repeated and zero-width parts.
+		"1 or 1=1", "1 OR '1'='1'", "x or\t2 = 2", "union\tall  select", "unionselect", "sleep (5)", "benchmark(1,2)",
+		"a;id", "a; \tid", "a&cat=3", "a|cat /etc/x", "x=1&id", "$(id)", "`id`", "${ jndi:ldap:", "${jndi :rmi:",
+		"< script>", "<img onload =x>", "javascript :x", "http://127.0.0.1/", "https://localhost", "gopher://x",
+		"uid=0(root) gid=0(root)", "<!ENTITY x SYSTEM \"a\">", "filename=\"a.php\"", "filename= a.phtml", "/shell.php5"}
 	for _, pattern := range patterns {
 		rs := []Rule{{ID: "test", Version: 1, Severity: "high", Field: "request", Pattern: pattern}}
 		if err := compileRules(rs); err != nil {
@@ -20,10 +25,27 @@ func TestRulePrefilterPreservesMatchAndUnicodeSemantics(t *testing.T) {
 		}
 		for _, text := range texts {
 			reference := rs[0]
-			reference.requiredLiterals = nil
+			reference.prefilter = nil
 			if got, want := matchView(rs[0], text, "request"), matchView(reference, text, "request"); !reflect.DeepEqual(got, want) {
 				t.Fatalf("prefilter changed %q on %q: %+v != %+v", pattern, text, got, want)
 			}
+		}
+	}
+}
+
+// Ordinary form posts contain "or", "&", spaces and "cat" (in "application"),
+// but not the contiguous runs SQLI-001 and CMD-001 require.
+func TestRulePrefilterRejectsOrdinaryForms(t *testing.T) {
+	rs := append([]Rule(nil), rules...)
+	if err := compileRules(rs); err != nil {
+		t.Fatal(err)
+	}
+	form := "POST /api/item HTTP/1.1\r\nHost: demo\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\na=1&b=hello world&order=desc&color=red"
+	folded, _ := foldedASCII(form)
+	view := decodedView{text: form, folded: folded, ascii: true}
+	for _, rule := range rs {
+		if (rule.ID == "SQLI-001" || rule.ID == "CMD-001") && rule.mayMatch(view) {
+			t.Errorf("%s prefilter admits an ordinary form post", rule.ID)
 		}
 	}
 }
@@ -43,7 +65,7 @@ func FuzzRulePrefilterNeverRejectsMatch(f *testing.F) {
 		text := string(data)
 		for _, rule := range corpus {
 			reference := rule
-			reference.requiredLiterals = nil
+			reference.prefilter = nil
 			if got, want := matchView(rule, text, "request"), matchView(reference, text, "request"); !reflect.DeepEqual(got, want) {
 				t.Fatalf("changed match %q on %q", rule.Pattern, text)
 			}
@@ -64,5 +86,22 @@ func BenchmarkDetectionViews(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestPrefilterStringSetMatchesContains(t *testing.T) {
+	sets := [][]string{{"union\t", "union "}, {"0(", "1(", "9("}, {"a", "b", ";"}, {"ab", "cd"}, {"x", "xy"}, {"aa", "aaa"}}
+	texts := []string{"", "a", "union", "union x", "xunion\tselect", "((0(", "(9", "9", ";", "zzcd", "xy", "aaaa", "abab", "a(1(", "cdab"}
+	for _, values := range sets {
+		set := newStringSet(values)
+		for _, text := range texts {
+			want := false
+			for _, value := range values {
+				want = want || strings.Contains(text, value)
+			}
+			if got := set.occursIn(text); got != want {
+				t.Errorf("%q in %q = %t, want %t", values, text, got, want)
+			}
+		}
 	}
 }
