@@ -142,7 +142,7 @@ func iisHasSelectedHTTPSPort(selected map[int]bool) bool {
 	return iisPortsMatchHTTPS(iisPorts(), iisHTTPSPorts(), selected)
 }
 
-func discoverTargets(root, service string, selectedPID int, library string) []session.Target {
+func discoverTargets(root, service string, selectedPID, _ int, library string) []session.Target {
 	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
 		return nil
@@ -211,6 +211,6 @@ func discoverTargets(root, service string, selectedPID int, library string) []se
 
 func captureServices(ctx context.Context, s *Store, p *eventRecorder, _, library, service string, pid int, _ bool, _, _ string, _ int) {
 	captureWindowsServices(ctx, s, p, func() []session.Target {
-		return discoverTargets("", service, pid, library)
+		return discoverTargets("", service, pid, 0, library)
 	})
 }

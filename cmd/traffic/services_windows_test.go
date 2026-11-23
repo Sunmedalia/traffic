@@ -75,7 +75,7 @@ func TestWindowsMiddlewareDiscovery(t *testing.T) {
 	if !found {
 		t.Fatalf("listener %d missing from TCP ownership table", port)
 	}
-	targets := discoverTargets("", "openssl", os.Getpid(), "custom-ssl.dll")
+	targets := discoverTargets("", "openssl", os.Getpid(), 0, "custom-ssl.dll")
 	if len(targets) != 1 || targets[0].Service != "openssl" || targets[0].Library != "custom-ssl.dll" {
 		t.Fatalf("generic OpenSSL discovery: %+v", targets)
 	}
