@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -97,6 +98,19 @@ func TestCaptureTLSSubprocessPrivateQueueDrain(t *testing.T) {
 	}
 	if url := runCaptureTLSSubprocessDrain(t, true); !strings.HasPrefix(url, "unix:///") {
 		t.Fatalf("probe was given %q", url)
+	}
+}
+
+func writeQueueFeature(t *testing.T, bin string) {
+	t.Helper()
+	binary, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(binary)
+	metadata := fmt.Sprintf(`{"schema_version":1,"sha256":"%x","openssl_abis":["3.0"],"features":["private_eventq_v1"]}`, sum)
+	if err := os.WriteFile(bin+".traffic.json", []byte(metadata), 0600); err != nil {
+		t.Fatal(err)
 	}
 }
 

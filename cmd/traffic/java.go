@@ -259,8 +259,20 @@ func javaAttachCommand(proc string, pid int, helper, jar string) (string, []stri
 			return "", nil, fmt.Errorf("Java helper: %w", err)
 		}
 		resolved = strings.TrimSuffix(link, " (deleted)")
-	} else if actual, err := filepath.EvalSymlinks(helper); err == nil {
-		resolved = actual
+	} else {
+		var err error
+		helper, err = exec.LookPath(helper)
+		if err != nil {
+			return "", nil, fmt.Errorf("Java helper: %w", err)
+		}
+		resolved, err = filepath.EvalSymlinks(helper)
+		if err != nil {
+			return "", nil, fmt.Errorf("Java helper: %w", err)
+		}
+		resolved, err = filepath.Abs(resolved)
+		if err != nil {
+			return "", nil, fmt.Errorf("Java helper: %w", err)
+		}
 	}
 	home := filepath.Dir(filepath.Dir(resolved))
 	if _, err := os.Stat(filepath.Join(root, home, "lib", "modules")); err == nil {

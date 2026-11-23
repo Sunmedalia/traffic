@@ -37,15 +37,15 @@ func TestServiceDiscoveryAndPIDIdentity(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	all := discoverTargets(root, "auto", 0, "")
+	all := discoverTargets(root, "auto", 0, 0, "")
 	if len(all) != 3 {
 		t.Fatalf("targets %+v", all)
 	}
-	apache := discoverTargets(root, "apache", 0, "")
+	apache := discoverTargets(root, "apache", 0, 0, "")
 	if len(apache) != 1 || apache[0].ID != "12:1234" || apache[0].UID != 33 {
 		t.Fatalf("apache %+v", apache)
 	}
-	generic := discoverTargets(root, "openssl", 14, "/custom/libssl.so")
+	generic := discoverTargets(root, "openssl", 14, 0, "/custom/libssl.so")
 	if len(generic) != 1 || generic[0].Service != "openssl" || generic[0].Library != "/custom/libssl.so" {
 		t.Fatalf("generic %+v", generic)
 	}

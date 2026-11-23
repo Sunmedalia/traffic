@@ -65,10 +65,10 @@ func captureChecks(service string, pid int, library, probe string, java bool, ja
 			return []captureCheck{{Backend: "packet", Status: "unavailable", Reason: err.Error()}}
 		}
 	}
-	targets := discoverTargets(root, service, pid, library)
+	targets := discoverTargets(root, service, pid, javaPID, library)
 	checks := make([]captureCheck, 0, len(targets))
 	for _, target := range targets {
-		if pid == 0 {
+		if pid == 0 && target.PID != javaPID {
 			inScope := false
 			for _, port := range target.Ports {
 				if capturePorts[port] {

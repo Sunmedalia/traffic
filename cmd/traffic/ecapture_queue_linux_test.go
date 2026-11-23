@@ -2,10 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -72,18 +69,5 @@ func TestECaptureQueueEndpointRequiresCapabilityForPrivateSocket(t *testing.T) {
 	private.cleanup()
 	if _, err := os.Stat(filepath.Dir(private.socket)); !os.IsNotExist(err) {
 		t.Fatalf("queue directory not removed: %v", err)
-	}
-}
-
-func writeQueueFeature(t *testing.T, bin string) {
-	t.Helper()
-	binary, err := os.ReadFile(bin)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sum := sha256.Sum256(binary)
-	metadata := fmt.Sprintf(`{"schema_version":1,"sha256":"%s","openssl_abis":["3.0"],"features":["private_eventq_v1"]}`, hex.EncodeToString(sum[:]))
-	if err := os.WriteFile(bin+".traffic.json", []byte(metadata), 0600); err != nil {
-		t.Fatal(err)
 	}
 }

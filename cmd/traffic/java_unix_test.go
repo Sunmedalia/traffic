@@ -19,6 +19,10 @@ func TestJavaJarLaunch(t *testing.T) {
 		"java -cp lib/* com.example.Main -jar x.jar": false,
 		"java -jar":                            false,
 		"java --module-path mods -jar app.jar": true,
+		"java --enable-native-access ALL-UNNAMED -jar app.jar":                                        true,
+		"java --enable-native-access=ALL-UNNAMED -jar app.jar":                                        true,
+		"java --upgrade-module-path mods --add-reads app=other --patch-module app=patch -jar app.jar": true,
+		"java --module=app/Main -jar argument.jar":                                                    false,
 	} {
 		if got := javaJarLaunch(strings.Fields(cmd)); got != want {
 			t.Errorf("%q: got %v", cmd, got)
@@ -28,9 +32,10 @@ func TestJavaJarLaunch(t *testing.T) {
 
 func TestProcessTargetRecognizesJavaJar(t *testing.T) {
 	root := t.TempDir()
-	for pid, p := range map[int]struct{ exe, cmd string }{
-		21: {"/opt/jdk8/jre/bin/java", "java\x00-Xmx512m\x00-jar\x00/srv/app.jar\x00--server.port=8443\x00"},
-		22: {"/opt/jdk8/jre/bin/java", "java\x00-cp\x00app.jar\x00com.example.Worker\x00"},
+	for pid, p := range map[int]struct{ uid, cmd string }{
+		21: {"1000", "java\x00-Xmx512m\x00-jar\x00/srv/app.jar\x00--server.port=8443\x00"},
+		22: {"1000", "java\x00-cp\x00app.jar\x00com.example.Worker\x00"},
+		23: {"0", "java\x00org.apache.catalina.startup.Bootstrap\x00"},
 	} {
 		dir := filepath.Join(root, strconv.Itoa(pid))
 		if err := os.MkdirAll(dir, 0700); err != nil {
@@ -41,12 +46,12 @@ func TestProcessTargetRecognizesJavaJar(t *testing.T) {
 			fields[i] = "0"
 		}
 		fields[19] = "99"
-		for name, body := range map[string]string{"stat": strconv.Itoa(pid) + " (java) " + strings.Join(fields, " "), "status": "Uid:\t1000\t0\t0\t0\nGid:\t1000\t0\t0\t0\n", "cmdline": p.cmd} {
+		for name, body := range map[string]string{"stat": strconv.Itoa(pid) + " (java) " + strings.Join(fields, " "), "status": "Uid:\t" + p.uid + "\nGid:\t" + p.uid + "\n", "cmdline": p.cmd} {
 			if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0600); err != nil {
 				t.Fatal(err)
 			}
 		}
-		if err := os.Symlink(p.exe, filepath.Join(dir, "exe")); err != nil {
+		if err := os.Symlink("/opt/jdk8/jre/bin/java", filepath.Join(dir, "exe")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -55,6 +60,12 @@ func TestProcessTargetRecognizesJavaJar(t *testing.T) {
 	}
 	if target, err := processTarget(root, 22); err != nil || target.Service != "unknown" {
 		t.Fatalf("plain JVM target %+v %v", target, err)
+	}
+	if targets := discoverTargets(root, "auto", 0, 0, ""); len(targets) != 1 || targets[0].PID != 21 {
+		t.Fatalf("auto discovery did not prefer the non-root JVM: %+v", targets)
+	}
+	if targets := discoverTargets(root, "auto", 0, 23, ""); len(targets) != 2 || targets[0].PID != 21 || targets[1].PID != 23 {
+		t.Fatalf("auto discovery lost the explicitly requested JVM: %+v", targets)
 	}
 }
 
@@ -108,9 +119,29 @@ func TestJavaAttachCommandSelectsAttachAPI(t *testing.T) {
 	// An explicit helper is resolved on the collector's own filesystem.
 	jdk := t.TempDir()
 	touch(filepath.Join(jdk, "lib/tools.jar"))
-	touch(filepath.Join(jdk, "bin/java"))
-	helper, args, err = javaAttachCommand(proc, 34, filepath.Join(jdk, "bin/java"), "/a.jar")
-	if err != nil || helper != filepath.Join(jdk, "bin/java") || !reflect.DeepEqual(args, []string{"-cp", "/a.jar:" + filepath.Join(jdk, "lib/tools.jar")}) {
+	java := filepath.Join(jdk, "bin/java")
+	touch(java)
+	if err := os.Chmod(java, 0700); err != nil {
+		t.Fatal(err)
+	}
+	resolvedJDK, err := filepath.EvalSymlinks(jdk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantArgs := []string{"-cp", "/a.jar" + string(os.PathListSeparator) + filepath.Join(resolvedJDK, "lib/tools.jar")}
+	helper, args, err = javaAttachCommand(proc, 34, java, "/a.jar")
+	if err != nil || helper != java || !reflect.DeepEqual(args, wantArgs) {
 		t.Fatalf("explicit %s %v %v", helper, args, err)
+	}
+
+	bin := t.TempDir()
+	pathJava := filepath.Join(bin, "java")
+	if err := os.Symlink(java, pathJava); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	helper, args, err = javaAttachCommand(proc, 34, "java", "/a.jar")
+	if err != nil || helper != pathJava || !reflect.DeepEqual(args, wantArgs) {
+		t.Fatalf("PATH helper %s %v %v", helper, args, err)
 	}
 }

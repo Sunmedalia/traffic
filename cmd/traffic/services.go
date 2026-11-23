@@ -77,13 +77,23 @@ func processTarget(root string, pid int) (session.Target, error) {
 // Arguments after the main class or JAR belong to the application and are not inspected.
 func javaJarLaunch(args []string) bool {
 	for i := 1; i < len(args); i++ {
-		switch arg := args[i]; {
-		case arg == "-jar":
-			return i+1 < len(args)
-		case arg == "-cp" || arg == "-classpath" || arg == "--class-path" || arg == "-p" || arg == "--module-path" || arg == "--add-modules" || arg == "--add-opens" || arg == "--add-exports":
-			i++
-		case !strings.HasPrefix(arg, "-"):
-			return false
+		option, _, inline := strings.Cut(args[i], "=")
+		switch option {
+		case "-jar":
+			return !inline && i+1 < len(args) && args[i+1] != ""
+		case "-m", "--module":
+			return false // subsequent arguments belong to the module
+		case "-cp", "-classpath", "--class-path", "-p", "--module-path",
+			"--upgrade-module-path", "--limit-modules", "--add-modules",
+			"--add-reads", "--add-opens", "--add-exports", "--patch-module",
+			"--enable-native-access", "--source":
+			if !inline {
+				i++
+			}
+		default:
+			if !strings.HasPrefix(option, "-") {
+				return false // main class or source file
+			}
 		}
 	}
 	return false
@@ -110,7 +120,7 @@ func populateTargetWithListeners(root string, t *session.Target, tables map[stri
 	}
 }
 
-func discoverTargets(root, service string, pid int, library string) []session.Target {
+func discoverTargets(root, service string, pid, javaPID int, library string) []session.Target {
 	var dirs []string
 	if pid > 0 {
 		dirs = []string{filepath.Join(root, strconv.Itoa(pid))}
@@ -150,7 +160,8 @@ func discoverTargets(root, service string, pid int, library string) []session.Ta
 		}
 		filtered := targets[:0]
 		for _, t := range targets {
-			if t.UID == 0 && workers[t.Service] {
+			// A JVM selected by --java-pid stays visible during auto discovery.
+			if t.PID != javaPID && t.UID == 0 && workers[t.Service] {
 				continue
 			}
 			filtered = append(filtered, t)
@@ -195,7 +206,7 @@ func captureServices(ctx context.Context, s *Store, p *eventRecorder, bin, libra
 	javaStates := map[string]string{}
 	var wg sync.WaitGroup
 	refresh := func() {
-		current := discoverTargets("/proc", service, pid, library)
+		current := discoverTargets("/proc", service, pid, javaPID, library)
 		selected := current[:0]
 		for _, target := range current {
 			inScope := pid > 0 || target.PID == javaPID

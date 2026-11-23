@@ -9,7 +9,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func doctorReport(devices []pcap.Interface, service string, pid int, library, _ string) map[string]any {
+func doctorReport(devices []pcap.Interface, service string, pid, _ int, library, _ string) map[string]any {
 	path := filepath.Join(os.Getenv("SystemRoot"), "System32", "Npcap", "wpcap.dll")
 	_, npcap := os.Stat(path)
 	_, iis := os.Stat(filepath.Join(os.Getenv("SystemRoot"), "System32", "inetsrv", "config", "applicationHost.config"))
@@ -32,7 +32,7 @@ func doctorReport(devices []pcap.Interface, service string, pid int, library, _ 
 		"os":                    runtime.GOOS, "arch": runtime.GOARCH,
 		"administrator":   windows.GetCurrentProcessToken().IsElevated(),
 		"npcap_installed": npcap == nil, "iis_installed": iis == nil,
-		"interfaces": devices, "targets": discoverTargets("", service, pid, library),
+		"interfaces": devices, "targets": discoverTargets("", service, pid, 0, library),
 		"tls_verified": false, "tls_backend": backend, "tls_backends": []string{"iis-httpapi", "openssl"}, "tls_configured": iisProbe != "" || opensslProbe != "",
 		"tls_state": "bundled probes are configured automatically; capture attaches to selected services, doctor does not attach",
 	}

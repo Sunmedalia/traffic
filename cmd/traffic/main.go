@@ -242,7 +242,7 @@ func run(args []string) (runErr error) {
 		if e != nil {
 			return e
 		}
-		report := doctorReport(devices, *service, *pid, *lib, *ecapture)
+		report := doctorReport(devices, *service, *pid, *javaPID, *lib, *ecapture)
 		report["checks"] = captureChecks(*service, *pid, *lib, *ecapture, *javaAttach, *javaAgent, *preloadSocket, *javaPID)
 		return writeDoctorOutput(os.Stdout, report, *ports, *jsonOutput)
 	}
@@ -359,7 +359,7 @@ func run(args []string) (runErr error) {
 		s.problem(errors.New(session.CoverageWarning))
 		fmt.Fprintf(os.Stderr, "会话目录 %s\n", s.dir)
 		s.report()
-		s.stats.Targets = discoverTargets("/proc", *service, *pid, *lib)
+		s.stats.Targets = discoverTargets("/proc", *service, *pid, *javaPID, *lib)
 		p := newRecorderWithPolicy(s, backpressurePolicy)
 		recorderFinalized := false
 		defer func() {
@@ -413,7 +413,7 @@ func run(args []string) (runErr error) {
 			"interfaces":                       names,
 			"network_namespace_pid":            networkNamespacePID,
 			"service":                          *service,
-			"targets":                          discoverTargets("/proc", *service, *pid, *lib),
+			"targets":                          discoverTargets("/proc", *service, *pid, *javaPID, *lib),
 			"tls_enabled":                      cmd == "capture" && !*noTLS,
 			"detection_mode":                   "offline",
 			"trusted_proxies":                  trustedProxies,
@@ -507,7 +507,7 @@ func run(args []string) (runErr error) {
 				break loop
 			case <-ticker.C:
 				if *noTLS {
-					targets := discoverTargets("/proc", *service, *pid, *lib)
+					targets := discoverTargets("/proc", *service, *pid, *javaPID, *lib)
 					for i := range targets {
 						targets[i].State = "http-only"
 					}
