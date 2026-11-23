@@ -23,7 +23,9 @@ import (
 )
 
 // Engine 5 adds the entries table; earlier generations remain readable.
-const analysisEngineVersion = 5
+// Engine 6 keeps reconstructing new connections while unanswered SYNs or
+// idle keep-alive connections would have filled every parser.
+const analysisEngineVersion = 6
 
 type analysisReport struct {
 	IntegrityWarnings []string      `json:"integrity_warnings,omitempty"`

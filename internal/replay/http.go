@@ -39,13 +39,16 @@ type responseData struct {
 	incomplete bool
 }
 
+// packetParserLimit bounds concurrently parsed TCP directions.
+var packetParserLimit = 2000
+
 const (
 	http1ConnectionLimit = 2000
 	http1PipelineLimit   = 100
 )
 
 func newHTTP(s *Store) *HTTPProcessor {
-	return &HTTPProcessor{s: s, requestMethods: map[string][]string{}, requestReady: make(chan struct{}), pending: map[string][]Transaction{}, responses: map[string][]responseData{}, slots: make(chan struct{}, 2000)}
+	return &HTTPProcessor{s: s, requestMethods: map[string][]string{}, requestReady: make(chan struct{}), pending: map[string][]Transaction{}, responses: map[string][]responseData{}, slots: make(chan struct{}, packetParserLimit)}
 }
 func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int, incomplete bool) {
 	packetStream, _ := r.(*queuedStream)

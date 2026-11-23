@@ -61,7 +61,7 @@ func Build(ctx context.Context, dir string, db *sql.DB, options Options) (sessio
 	if err != nil {
 		return session.Stats{}, err
 	}
-	if _, err = db.Exec(`CREATE TABLE requests(id TEXT PRIMARY KEY,time TEXT,client TEXT,alert INTEGER,data BLOB);CREATE INDEX requests_time ON requests(time DESC);CREATE INDEX requests_alert_time ON requests(time DESC) WHERE alert>0;`); err != nil {
+	if _, err = db.Exec(`CREATE TABLE requests(id TEXT PRIMARY KEY,time TEXT,client TEXT,alert INTEGER,data BLOB)`); err != nil {
 		return session.Stats{}, err
 	}
 	s := &Store{db: db, dir: dir, localAddresses: map[string]bool{}, stats: Stats{Targets: manifest.Targets}}
@@ -119,6 +119,13 @@ func Build(ctx context.Context, dir string, db *sql.DB, options Options) (sessio
 	defer s.mu.Unlock()
 	if s.fatal != nil {
 		return s.stats, s.fatal
+	}
+	// Indexing once after the last write is cheaper than maintaining the index
+	// during reconstruction. (time,id) is the order analysis reads records in;
+	// alerts live in the analysis entries, so requests.alert stays 0 and needs
+	// no partial index.
+	if _, err = db.Exec(`CREATE INDEX requests_time ON requests(time,id)`); err != nil {
+		return s.stats, err
 	}
 	if _, err = db.Exec(`CREATE TABLE reconstruction(id INTEGER PRIMARY KEY, stats BLOB, gaps BLOB)`); err != nil {
 		return s.stats, err
