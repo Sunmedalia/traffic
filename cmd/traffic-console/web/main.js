@@ -173,6 +173,69 @@ function bind() {
     save('detail-width', '');
   });
 
+  // List column widths are a layout preference too. A dragged column keeps
+  // its width in a --col-<name> property on the table; the URL takes the rest.
+  const table = document.querySelector('.rows-table');
+  let columns = {};
+  try {
+    columns = JSON.parse(saved('column-widths', '{}')) || {};
+  } catch (_) { /* a damaged preference falls back to automatic widths */ }
+  const applyColumn = (name) => {
+    if (columns[name]) table.style.setProperty('--col-' + name, columns[name] + 'px');
+    else table.style.removeProperty('--col-' + name);
+  };
+  for (const name of Object.keys(columns)) applyColumn(name);
+  // A column is at least 40px and always leaves the URL 120px.
+  const columnLimit = (grip) => {
+    let others = 0;
+    for (const th of table.querySelectorAll('thead th:not(.wide)')) {
+      if (th !== grip.parentElement && th.offsetWidth) others += th.getBoundingClientRect().width;
+    }
+    return Math.max(40, $('rows-wrap').clientWidth - others - 120);
+  };
+  const setColumn = (grip, width) => {
+    const name = grip.dataset.col;
+    columns[name] = Math.round(Math.max(40, Math.min(columnLimit(grip), width)));
+    applyColumn(name);
+  };
+  const saveColumns = () => save('column-widths', JSON.stringify(columns));
+  for (const grip of table.querySelectorAll('.col-grip')) {
+    let start = 0, startWidth = 0;
+    grip.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      grip.setPointerCapture(event.pointerId);
+      grip.classList.add('dragging');
+      document.body.classList.add('col-resizing');
+      start = event.clientX;
+      startWidth = grip.parentElement.getBoundingClientRect().width;
+    });
+    grip.addEventListener('pointermove', (event) => {
+      if (grip.classList.contains('dragging')) setColumn(grip, startWidth + event.clientX - start);
+    });
+    const release = () => {
+      if (!grip.classList.contains('dragging')) return;
+      grip.classList.remove('dragging');
+      document.body.classList.remove('col-resizing');
+      saveColumns();
+    };
+    grip.addEventListener('pointerup', release);
+    grip.addEventListener('pointercancel', release);
+    grip.addEventListener('dblclick', () => {
+      delete columns[grip.dataset.col];
+      applyColumn(grip.dataset.col);
+      saveColumns();
+    });
+    grip.addEventListener('keydown', (event) => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+      event.preventDefault();
+      event.stopPropagation(); // the list's own arrow keys move the selection
+      const step = event.shiftKey ? 40 : 10;
+      setColumn(grip, grip.parentElement.getBoundingClientRect().width + (event.key === 'ArrowLeft' ? -step : step));
+      saveColumns();
+    });
+  }
+
   // Keep the selected view and copy action in sync when the panes become a pair.
   let showingMessagePair = false;
   new ResizeObserver(() => {

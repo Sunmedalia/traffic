@@ -120,8 +120,11 @@ type tuiModel struct {
 	lastClickAt                          time.Time
 	armed                                string // overview zone whose summary a click showed; clicking it again opens it
 	msgLayout, listShare                 int
-	listRatio                            int  // list width in per mille after a divider drag; 0 follows listShare
-	splitDrag                            bool // the divider between list and detail is held
+	listRatio                            int              // list width in per mille after a divider drag; 0 follows listShare
+	splitDrag                            bool             // the divider between list and detail is held
+	colWidths                            [tuiColCount]int // list column widths fixed by a drag; 0 is automatic
+	colDrag                              *tuiColumnDrag
+	pressX                               int // column of the last left press
 	paramSelected                        int
 	detailID, errorText, flash           string
 	alertView                            int

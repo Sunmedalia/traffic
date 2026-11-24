@@ -497,45 +497,17 @@ func (m tuiModel) listView(width, height int) string {
 	if m.stale {
 		return "正在加载…"
 	}
-	now := time.Now()
-	today := true
-	for _, r := range m.snapshot.Rows {
-		if !tuiIsToday(r.Time, now) {
-			today = false
-			break
-		}
-	}
-	timeWidth := 15
-	if today {
-		timeWidth = 10
-	}
-	showClient, showHost := width >= 80, width >= 100
-	clientWidth, hostWidth := 0, 0
-	if showClient {
-		clientWidth = 17
-		for _, r := range m.snapshot.Rows {
-			clientWidth = max(clientWidth, min(41, lipgloss.Width(tuiLine(m.clientText(r, width)))+2))
-		}
-	}
-	if showHost {
-		hostWidth = 12
-		for _, r := range m.snapshot.Rows {
-			hostWidth = max(hostWidth, min(28, lipgloss.Width(tuiLine(r.Host))+2))
-		}
-	}
-	header := tuiCell("时间", timeWidth) + tuiCell("级", 3) + tuiCell("方法", 7) + tuiCell("状态", 7)
-	if showClient {
-		header += tuiCell("来源", clientWidth)
-	}
-	if showHost {
-		header += tuiCell("Host", hostWidth)
+	cols, today := m.listColumns(width)
+	var header strings.Builder
+	for _, c := range cols {
+		header.WriteString(m.columnHeader(c))
 	}
 	// The web list shows the filtered timeline above the table.
 	strip, visible := m.listLayout(width, height)
 	lines := append([]string{}, strip...)
 	height -= len(strip)
 	top := len(lines)
-	lines = append(lines, tuiMuted.Render(termansi.Truncate(header+"URL", width, "…")))
+	lines = append(lines, termansi.Truncate(header.String()+tuiMuted.Render("URL"), width, "…"))
 	start := m.listStart(visible)
 	// A scrollbar takes the last column when the page has more rows than fit.
 	bar := tuiScrollbar(len(m.snapshot.Rows), visible, start)
@@ -557,29 +529,27 @@ func (m tuiModel) listView(width, height int) string {
 			url += "[截断] "
 		}
 		url += tuiLine(r.URL)
-		cells := []struct {
+		type cell struct {
 			text  string
 			width int
 			style lipgloss.Style
-		}{
-			{tuiShortTime(r.Time, today), timeWidth, lipgloss.NewStyle()},
-			{tuiSeverity(r.Severity), 3, tuiSeverityStyle(r.Severity)},
-			{tuiLine(r.Method), 7, lipgloss.NewStyle()},
-			{status, 7, tuiStatusStyle(r.Status)},
 		}
-		if showClient {
-			cells = append(cells, struct {
-				text  string
-				width int
-				style lipgloss.Style
-			}{tuiLine(m.clientText(r, width)), clientWidth, lipgloss.NewStyle()})
-		}
-		if showHost {
-			cells = append(cells, struct {
-				text  string
-				width int
-				style lipgloss.Style
-			}{tuiLine(r.Host), hostWidth, tuiMuted})
+		cells := make([]cell, 0, len(cols))
+		for _, c := range cols {
+			switch c.id {
+			case tuiColTime:
+				cells = append(cells, cell{tuiShortTime(r.Time, today), c.width, lipgloss.NewStyle()})
+			case tuiColLevel:
+				cells = append(cells, cell{tuiSeverity(r.Severity), c.width, tuiSeverityStyle(r.Severity)})
+			case tuiColMethod:
+				cells = append(cells, cell{tuiLine(r.Method), c.width, lipgloss.NewStyle()})
+			case tuiColStatus:
+				cells = append(cells, cell{status, c.width, tuiStatusStyle(r.Status)})
+			case tuiColClient:
+				cells = append(cells, cell{tuiLine(m.clientText(r, width)), c.width, lipgloss.NewStyle()})
+			case tuiColHost:
+				cells = append(cells, cell{tuiLine(r.Host), c.width, tuiMuted})
+			}
 		}
 		used := 0
 		for _, c := range cells {
@@ -910,6 +880,7 @@ const tuiHelpText = `快捷键（与网页版一致的键位优先）
         空格 暂停或恢复    r 立即刷新    z 切换本地时间 / UTC
 鼠标    点击页面、标签、行、筛选条件和底部快捷键    滚轮滚动    右键返回上一层
         列表右侧滚动条可拖动，点击滚动条空白处翻到该位置
+        拖动列表表头的列边界 ╎ 调整该列宽度，双击列边界恢复自动宽度
         单击列表行在右侧打开详情，再单击同一行收起；拖动列表与详情间的分隔线调整宽度，双击分隔线恢复各占一半
         页脚「‹ 上一页」「下一页 ›」在打开详情时也可翻页，详情保持不变
         概览中单击显示简要信息，再点一次同一行进入；时间线拖动或单击选中，再点一次选中处查看
