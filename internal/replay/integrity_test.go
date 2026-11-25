@@ -15,7 +15,7 @@ import (
 
 func readRecords(t *testing.T, s *Store) map[string]Transaction {
 	t.Helper()
-	rows, err := s.db.Query("SELECT data FROM requests")
+	rows, err := s.db.Query("SELECT " + storedRecord + " FROM requests")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func TestHTTP2MultiplexingHPACKAndTruncation(t *testing.T) {
 	h2Headers(t, encoder, &block, resp, 3, false, hpack.HeaderField{Name: ":status", Value: "201"})
 	resp.WriteData(3, true, []byte("three"))
 	h2Headers(t, encoder, &block, resp, 1, false, hpack.HeaderField{Name: ":status", Value: "200"})
-	resp.WriteData(1, false, bytes.Repeat([]byte("x"), responseLimit))
+	resp.WriteData(1, false, bytes.Repeat([]byte("x"), defaultResponseLimit))
 	resp.WriteData(1, true, []byte("discarded"))
 	p.process(bytes.NewReader(requests.Bytes()), "h2", "127.0.0.1:1234", "test", 0, false)
 	p.process(bytes.NewReader(responses.Bytes()), "h2", "127.0.0.1:443", "test", 0, false)
@@ -272,7 +272,7 @@ func TestTLSLargeBodyDrainsBeforeNextRequest(t *testing.T) {
 	defer s.db.Close()
 	p := newHTTP(s)
 	frames := &Frames{}
-	body := strings.Repeat("x", requestLimit*3)
+	body := strings.Repeat("x", defaultRequestLimit*3)
 	wire := []byte(fmt.Sprintf("POST /large HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n%sGET /next HTTP/1.1\r\nHost: test\r\n\r\n", len(body), body))
 	meta := frameContext{connection: "large", client: "127.0.0.1:1234", local: "127.0.0.1:443"}
 	for len(wire) > 0 {

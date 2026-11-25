@@ -67,9 +67,9 @@ func (a *iisAssembler) save(request *iisRequest, responseComplete bool) error {
 		body := request.responseBody
 		if strings.Contains(strings.ToLower(request.responseHeaders.Get("Transfer-Encoding")), "chunked") {
 			var err error
-			body, err = io.ReadAll(io.LimitReader(httputil.NewChunkedReader(bytes.NewReader(body)), int64(responseLimit)+1))
-			if len(body) > responseLimit {
-				body = body[:responseLimit]
+			body, err = io.ReadAll(io.LimitReader(httputil.NewChunkedReader(bytes.NewReader(body)), int64(a.store.responseLimit())+1))
+			if len(body) > a.store.responseLimit() {
+				body = body[:a.store.responseLimit()]
 				t.Truncated = true
 			}
 			if err != nil && responseComplete && !request.gap {
@@ -143,11 +143,11 @@ func (a *iisAssembler) ingest(event iisEvent) error {
 	}
 	switch event.Type {
 	case "request-body", "response-body":
-		body, limit := &request.requestBody, requestLimit
+		body, limit := &request.requestBody, a.store.requestLimit()
 		if event.Type == "response-body" {
-			body, limit = &request.responseBody, responseLimit
+			body, limit = &request.responseBody, a.store.responseLimit()
 			if strings.Contains(strings.ToLower(request.responseHeaders.Get("Transfer-Encoding")), "chunked") {
-				limit = responseLimit*8 + 32768
+				limit = a.store.responseLimit()*8 + 32768
 			}
 		} else {
 			request.requestObserved += event.Length

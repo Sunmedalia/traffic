@@ -25,6 +25,15 @@ type Frames struct {
 	lengths         map[string]frameLength
 	byteLimit       int
 	connectionLimit int
+	// messageLimit bounds one buffered message; zero uses the default body limits.
+	messageLimit int
+}
+
+func (f *Frames) messageCap() int {
+	if f.messageLimit > 0 {
+		return f.messageLimit
+	}
+	return (*Store)(nil).frameLimit()
 }
 
 func (f *Frames) feed(key string, payload []byte, head ...bool) ([][]byte, bool) {
@@ -126,8 +135,8 @@ func (f *Frames) feed(key string, payload []byte, head ...bool) ([][]byte, bool)
 		f.remove(key)
 		return nil, true
 	}
-	if len(b) > max(requestLimit, responseLimit)+(64<<10) {
-		cap := max(requestLimit, responseLimit) + (64 << 10)
+	if len(b) > f.messageCap() {
+		cap := f.messageCap()
 		headerEnd := bytes.Index(b, []byte("\r\n\r\n"))
 		contentLength := int64(-1)
 		if headerEnd >= 0 {
@@ -179,8 +188,8 @@ func (f *Frames) feed(key string, payload []byte, head ...bool) ([][]byte, bool)
 				end, separator = bytes.Index(b, []byte("\n\n")), 2
 			}
 			isHead := len(head) > responseIndex && head[responseIndex]
-			expected, known = knownHTTPFrameLength(b[:end+separator], isHead)
-			if known && expected.bytes <= max(requestLimit, responseLimit)+(64<<10) {
+			expected, known = knownHTTPFrameLength(b[:end+separator], isHead, f.messageCap())
+			if known && expected.bytes <= f.messageCap() {
 				if f.lengths == nil {
 					f.lengths = map[string]frameLength{}
 				}
@@ -294,7 +303,7 @@ type frameLength struct {
 	advanceResponse bool
 }
 
-func knownHTTPFrameLength(header []byte, head bool) (frameLength, bool) {
+func knownHTTPFrameLength(header []byte, head bool, limit int) (frameLength, bool) {
 	reader, release := borrowHTTPReader(bytes.NewReader(header), min(32768, len(header)))
 	defer release()
 	length := int64(-1)
@@ -320,7 +329,7 @@ func knownHTTPFrameLength(header []byte, head bool) (frameLength, bool) {
 		}
 		length = request.ContentLength
 	}
-	if length < 0 || length > int64(max(requestLimit, responseLimit)+(64<<10)) {
+	if length < 0 || length > int64(limit) {
 		return frameLength{}, false
 	}
 	return frameLength{len(header) + int(length), advance}, true

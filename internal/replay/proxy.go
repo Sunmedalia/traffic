@@ -9,8 +9,6 @@ import (
 	"github.com/Sunmedalia/traffic/internal/session"
 )
 
-var trustedProxies []netip.Prefix
-
 func parseTrustedProxies(value string) ([]netip.Prefix, error) {
 	var prefixes []netip.Prefix
 	if strings.TrimSpace(value) == "" {
@@ -35,8 +33,8 @@ func parseTrustedProxies(value string) ([]netip.Prefix, error) {
 	return prefixes, nil
 }
 
-func trustedProxy(address netip.Addr) bool {
-	for _, prefix := range trustedProxies {
+func trustedProxy(address netip.Addr, proxies []netip.Prefix) bool {
+	for _, prefix := range proxies {
 		if prefix.Contains(address.Unmap()) {
 			return true
 		}
@@ -46,8 +44,8 @@ func trustedProxy(address netip.Addr) bool {
 
 // Walk the chain from the socket peer to the first untrusted hop. An invalid
 // chain leaves the transport identity intact so malformed headers cannot bypass trust.
-func resolveClient(t *Transaction) {
-	if t.PeerClient != "" || len(trustedProxies) == 0 {
+func resolveClient(t *Transaction, proxies []netip.Prefix) {
+	if t.PeerClient != "" || len(proxies) == 0 {
 		return
 	}
 	host, _, err := net.SplitHostPort(t.Client)
@@ -55,7 +53,7 @@ func resolveClient(t *Transaction) {
 		return
 	}
 	peer, err := netip.ParseAddr(host)
-	if err != nil || !trustedProxy(peer) {
+	if err != nil || !trustedProxy(peer, proxies) {
 		return
 	}
 	request, _, err := session.ParseRequest(t.Request)
@@ -85,7 +83,7 @@ func resolveClient(t *Transaction) {
 		addresses[i] = address.Unmap()
 	}
 	client := peer
-	for i := len(addresses) - 1; i >= 0 && trustedProxy(client); i-- {
+	for i := len(addresses) - 1; i >= 0 && trustedProxy(client, proxies); i-- {
 		client = addresses[i]
 	}
 	t.PeerClient = t.Client

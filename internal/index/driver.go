@@ -20,7 +20,10 @@ const Driver = "sqlite3_traffic"
 const MaxURLDecodeRounds = 4
 
 var sqliteDriver = &sqlite3.SQLiteDriver{ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-	return conn.RegisterFunc("traffic_url_decode", URLDecode, true)
+	if err := conn.RegisterFunc("traffic_url_decode", URLDecode, true); err != nil {
+		return err
+	}
+	return conn.RegisterFunc("traffic_record_json", RecordJSON, true)
 }}
 
 func init() {

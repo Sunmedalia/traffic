@@ -361,7 +361,7 @@ func replayPacketFiles(ctx context.Context, s *Store, p *HTTPProcessor, paths []
 					lastPacketAt = ts
 				}
 			}
-			if flow, tcp, ok := decoder.decodeTCP(data, reader.Link); ok && (len(capturePorts) == 0 || capturePorts[int(tcp.SrcPort)] || capturePorts[int(tcp.DstPort)]) {
+			if flow, tcp, ok := decoder.decodeTCP(data, reader.Link); ok && (s.capturesAllPorts() || s.capturePort(int(tcp.SrcPort)) || s.capturePort(int(tcp.DstPort))) {
 				factory.assemble(assembler, flow, tcp, ci.Timestamp)
 			}
 			if last.IsZero() || ci.Timestamp.Sub(last) > time.Second {
