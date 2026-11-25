@@ -485,9 +485,15 @@ public final class Agent {
           transformer.reset(instrumentation, AgentBuilder.RedefinitionStrategy.RETRANSFORMATION);
         }
       } finally {
-        resetQueue();
-        connections.clear();
-        running = false;
+        // Clear running first so an end() racing a disconnect sees !active && !running
+        // and stops queuing before the queue is reset. agentmain is synchronized on
+        // Agent.class, so holding that monitor keeps a new attach, which only checks
+        // active || running, from starting until this session's state is cleared.
+        synchronized (Agent.class) {
+          running = false;
+          resetQueue();
+          connections.clear();
+        }
       }
     }
   }
