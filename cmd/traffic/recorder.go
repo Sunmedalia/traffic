@@ -155,6 +155,10 @@ func (r *eventRecorder) recordOutcome(source, backend string, target session.Tar
 			return false, err
 		}
 		state := r.sources[source]
+		if state == nil && len(r.sources) >= maxRawEventSources {
+			r.mu.Unlock()
+			return false, fmt.Errorf("too many active probe sources")
+		}
 		if state == nil && sourceBytes == nil {
 			r.mu.Unlock()
 			sourceBytes, err = marshalRawEventLine(session.RawEvent{

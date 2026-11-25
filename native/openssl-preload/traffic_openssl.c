@@ -374,7 +374,8 @@ static int event_published(struct queued_event *event, uint64_t position) {
 }
 static void publish_event(struct queued_event *event) {
     __atomic_store_n(&event->published, event->position + 1, __ATOMIC_RELEASE);
-    if (atomic_load(&worker_sleeping))
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&worker_sleeping, __ATOMIC_ACQUIRE))
         pthread_cond_signal(&event_ready);
 }
 static void release_event(struct queued_event *event, uint64_t position) {
@@ -426,13 +427,14 @@ static void *send_worker(void *unused) {
         if ((position == end || !event_published(event, position)) &&
             !__atomic_load_n(&stopping, __ATOMIC_ACQUIRE)) {
             pthread_mutex_lock(&wait_mutex);
-            atomic_store(&worker_sleeping, 1);
+            __atomic_store_n(&worker_sleeping, 1, __ATOMIC_RELEASE);
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
             /* Recheck after advertising sleep. Producers never need this
              * mutex; the timeout bounds a publication racing the wait. */
             if (!event_published(event, position) &&
                 !__atomic_load_n(&stopping, __ATOMIC_ACQUIRE))
                 wait_for_worker(monotonic_milliseconds() + 10);
-            atomic_store(&worker_sleeping, 0);
+            __atomic_store_n(&worker_sleeping, 0, __ATOMIC_RELAXED);
             pthread_mutex_unlock(&wait_mutex);
             continue;
         }

@@ -163,7 +163,7 @@ func (h *winDivertBatchQueue) queueBatch(packets []winDivertBatchPacket) bool {
 	for _, p := range packets {
 		batch.bytes += int64(len(p.data))
 	}
-	for h.batchBytes.Load()+batch.bytes > winDivertBatchBudgetBytes {
+	for h.batchBytes.Load() > 0 && h.batchBytes.Load()+batch.bytes > winDivertBatchBudgetBytes {
 		select {
 		case <-h.batchSpace:
 		case <-h.abortCh:
@@ -225,7 +225,10 @@ func (h *winDivertBatchQueue) readPacket() ([]byte, gopacket.CaptureInfo, error)
 	select {
 	case batch, ok := <-h.batches:
 		if !h.readTimer.Stop() {
-			<-h.readTimer.C
+			select {
+			case <-h.readTimer.C:
+			default:
+			}
 		}
 		return h.acceptBatch(batch, ok)
 	case <-h.readTimer.C:
