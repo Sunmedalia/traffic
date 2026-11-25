@@ -169,7 +169,17 @@ static void test_endpoints(void) {
     }
 }
 
+static void test_monotonic_wait(void) {
+    assert(event_ready_initialized);
+    pthread_mutex_lock(&wait_mutex);
+    uint64_t deadline = monotonic_milliseconds() + 25;
+    wait_for_worker(deadline);
+    assert(monotonic_milliseconds() >= deadline);
+    pthread_mutex_unlock(&wait_mutex);
+}
+
 int main(void) {
+    test_monotonic_wait();
     test_connection_deletion();
     test_endpoints();
     char directory[] = "/tmp/traffic-queue-XXXXXX";
@@ -232,6 +242,7 @@ int main(void) {
         pid_t child = fork();
         assert(child >= 0);
         if (child == 0) {
+            test_monotonic_wait();
             assert(ensure_worker());
             assert(send_event("kid", 3));
             exit(0);

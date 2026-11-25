@@ -76,7 +76,8 @@ static uint64_t queue_write, queue_read;
 static pthread_mutex_t wait_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t transport_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t worker_once = PTHREAD_ONCE_INIT;
-static pthread_cond_t event_ready = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t event_ready;
+static int event_ready_initialized;
 static pthread_t worker;
 static int worker_running, worker_sleeping, stopping;
 static uint64_t stop_deadline;
@@ -99,6 +100,18 @@ static int (*next_get_fd)(const void *);
 static int (*next_set_fd)(void *, int);
 static void *(*next_new)(void *);
 static void (*next_free)(void *);
+
+static int initialize_event_ready(void) {
+    pthread_condattr_t attr;
+    int error = pthread_condattr_init(&attr);
+    if (error)
+        return 0;
+    error = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (!error)
+        error = pthread_cond_init(&event_ready, &attr);
+    pthread_condattr_destroy(&attr);
+    return !error;
+}
 
 static void before_fork(void) {
     for (int i = 0; i < CONNECTION_STRIPES; i++)
@@ -129,13 +142,19 @@ static void child_after_fork(void) {
     atomic_store(&metadata_pending, 0);
     queue_lost = metadata_lost = transport_lost = 0;
     transport_errno = 0;
-    event_ready = (pthread_cond_t)PTHREAD_COND_INITIALIZER;
+    /* The child has no worker to release any inherited waiters. */
+    memset(&event_ready, 0, sizeof(event_ready));
+    event_ready_initialized = initialize_event_ready();
     pthread_mutex_unlock(&transport_mutex);
     for (int i = CONNECTION_STRIPES - 1; i >= 0; i--)
         pthread_mutex_unlock(&connection_mutex[i]);
 }
 
 __attribute__((constructor)) static void register_fork_handlers(void) {
+    pthread_mutex_lock(&wait_mutex);
+    if (!event_ready_initialized)
+        event_ready_initialized = initialize_event_ready();
+    pthread_mutex_unlock(&wait_mutex);
     pthread_atfork(before_fork, after_fork, child_after_fork);
 }
 
@@ -383,18 +402,10 @@ static void release_event(struct queued_event *event, uint64_t position) {
     __atomic_store_n(&queue_read, position + 1, __ATOMIC_RELEASE);
 }
 static void wait_for_worker(uint64_t deadline) {
-    uint64_t now = monotonic_milliseconds();
-    if (deadline <= now)
-        return;
-    uint64_t delay = deadline - now;
-    struct timespec wake;
-    clock_gettime(CLOCK_REALTIME, &wake);
-    wake.tv_sec += (time_t)(delay / 1000);
-    wake.tv_nsec += (long)(delay % 1000) * 1000000;
-    if (wake.tv_nsec >= 1000000000) {
-        wake.tv_sec++;
-        wake.tv_nsec -= 1000000000;
-    }
+    struct timespec wake = {
+        .tv_sec = (time_t)(deadline / 1000),
+        .tv_nsec = (long)(deadline % 1000) * 1000000
+    };
     pthread_cond_timedwait(&event_ready, &wait_mutex, &wake);
 }
 
@@ -519,7 +530,9 @@ static void start_worker(void) {
     for (size_t i = 0; i < EVENT_QUEUE; i++)
         events[i].available = i;
     pthread_mutex_lock(&wait_mutex);
-    if (!__atomic_load_n(&stopping, __ATOMIC_ACQUIRE) &&
+    if (!event_ready_initialized)
+        event_ready_initialized = initialize_event_ready();
+    if (event_ready_initialized && !__atomic_load_n(&stopping, __ATOMIC_ACQUIRE) &&
         !pthread_create(&worker, NULL, send_worker, NULL))
         atomic_store(&worker_running, 1);
     pthread_mutex_unlock(&wait_mutex);
@@ -955,7 +968,8 @@ __attribute__((destructor)) static void shutdown_events(void) {
     pthread_mutex_lock(&wait_mutex);
     atomic_store(&stop_deadline, monotonic_milliseconds() + 500);
     __atomic_store_n(&stopping, 1, __ATOMIC_RELEASE);
-    pthread_cond_signal(&event_ready);
+    if (event_ready_initialized)
+        pthread_cond_signal(&event_ready);
     pthread_mutex_unlock(&wait_mutex);
     if (atomic_load(&worker_running)) {
         pthread_join(worker, NULL);

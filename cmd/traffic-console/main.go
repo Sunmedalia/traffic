@@ -85,7 +85,8 @@ func run(args []string) error {
 	ruleFile := fs.String("rules", "", "additional YAML rules for analyze")
 	scanDuration := fs.Duration("scan-window", time.Minute, "scan correlation window for analyze")
 	scanPaths := fs.Int("scan-paths", 20, "distinct paths for scan detection in analyze")
-	webhookURL := fs.String("alert-webhook", "", "send local analysis alerts to HTTP(S) endpoint")
+	webhookURL := fs.String("alert-webhook", "", "send local analysis alerts; TRAFFIC_WEBHOOK_TOKEN requires HTTPS outside loopback")
+	privateWebhook := fs.Bool("allow-private-webhook", false, "allow RFC1918 and IPv6 ULA webhook destinations; link-local and metadata addresses remain blocked")
 	requestBytes := fs.Int("request-limit", 1<<20, "maximum locally reconstructed request body bytes (up to 16 MiB)")
 	responseBytes := fs.Int("response-limit", 1<<20, "maximum locally reconstructed response body bytes (up to 16 MiB)")
 	dir := fs.String("session", "", "existing session directory")
@@ -116,7 +117,7 @@ func run(args []string) error {
 		var invalid string
 		fs.Visit(func(f *flag.Flag) {
 			switch f.Name {
-			case "rules", "scan-window", "scan-paths", "alert-webhook", "request-limit", "response-limit":
+			case "rules", "scan-window", "scan-paths", "alert-webhook", "allow-private-webhook", "request-limit", "response-limit":
 				invalid = f.Name
 			}
 		})
@@ -127,7 +128,7 @@ func run(args []string) error {
 		var invalid string
 		fs.Visit(func(f *flag.Flag) {
 			switch f.Name {
-			case "session", "rules", "scan-window", "scan-paths", "alert-webhook", "json", "request-limit", "response-limit":
+			case "session", "rules", "scan-window", "scan-paths", "alert-webhook", "allow-private-webhook", "json", "request-limit", "response-limit":
 			default:
 				invalid = f.Name
 			}
@@ -191,6 +192,10 @@ func run(args []string) error {
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
+		if *privateWebhook && *webhookURL != "" {
+			privateWebhookEndpoint.Store(webhookURL)
+			defer privateWebhookEndpoint.CompareAndSwap(webhookURL, nil)
+		}
 		report, err := analyzeConfigured(ctx, *dir, *webhookURL, rules, *scanDuration, *scanPaths, replay.Options{RequestLimit: *requestBytes, ResponseLimit: *responseBytes})
 		if err != nil {
 			return err
