@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,9 +23,10 @@ type Store struct {
 	lastPacketNano     atomic.Int64
 	lastPacketPollNano atomic.Int64
 	lastTLSEventNano   atomic.Int64
+	plaintextObserved  atomic.Bool
 	probeGapTotals     map[string]uint64
 	iisAttached        bool
-	iisPlaintext       bool
+	iisPlaintext       atomic.Bool
 	checkMu            sync.Mutex
 	checks             map[string]captureCheck
 	probeCheck         func(session.Target) captureCheck
@@ -33,6 +36,7 @@ type Store struct {
 	packetDrops        map[string]uint64
 	fatal              error
 	dir                string
+	reportMu           sync.Mutex
 	mu                 sync.Mutex
 	stats              Stats
 
@@ -134,13 +138,26 @@ func openStore(dir string, _ bool) (*Store, error) {
 	return &Store{dir: dir, stats: Stats{DiagnosticsVersion: 1, Started: time.Now().UTC(), State: "running", TLS: "disabled"}}, nil
 }
 func (s *Store) report() {
+	// Serialize status publications so they use the same temporary file and
+	// appear in snapshot order.
+	s.reportMu.Lock()
+	defer s.reportMu.Unlock()
+	stats := s.reportSnapshot()
+	b, err := json.MarshalIndent(stats, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := filepath.Join(s.dir, "status.tmp")
+	if os.WriteFile(tmp, b, 0600) == nil {
+		os.Rename(tmp, filepath.Join(s.dir, "status.json"))
+	}
+}
+
+func (s *Store) reportSnapshot() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.syncAtomicStatsLocked()
-	if s.targetTimes == nil {
-		s.targetTimes = map[string]session.Target{}
-	}
-	live := map[string]session.Target{}
+	live := make(map[string]session.Target, len(s.stats.Targets))
 	now := time.Now().UTC()
 	for i := range s.stats.Targets {
 		target := &s.stats.Targets[i]
@@ -159,11 +176,26 @@ func (s *Store) report() {
 		live[key] = *target
 	}
 	s.targetTimes = live
-	b, _ := json.MarshalIndent(s.stats, "", "  ")
-	tmp := filepath.Join(s.dir, "status.tmp")
-	if os.WriteFile(tmp, b, 0600) == nil {
-		os.Rename(tmp, filepath.Join(s.dir, "status.json"))
+	return s.cloneStatsLocked()
+}
+
+func (s *Store) cloneStatsLocked() Stats {
+	stats := s.stats
+	stats.ProbeTransports = maps.Clone(stats.ProbeTransports)
+	stats.PacketInterfaces = maps.Clone(stats.PacketInterfaces)
+	stats.ProbeExits = maps.Clone(stats.ProbeExits)
+	stats.GapCounts = maps.Clone(stats.GapCounts)
+	stats.Targets = slices.Clone(stats.Targets)
+	for i := range stats.Targets {
+		stats.Targets[i].Ports = slices.Clone(stats.Targets[i].Ports)
 	}
+	stats.IntegrityWarnings = slices.Clone(stats.IntegrityWarnings)
+	stats.Errors = slices.Clone(stats.Errors)
+	if stats.TLSMissingEstimate != nil {
+		estimate := *stats.TLSMissingEstimate
+		stats.TLSMissingEstimate = &estimate
+	}
+	return stats
 }
 func (s *Store) problem(err error) {
 	s.mu.Lock()

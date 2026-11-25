@@ -632,6 +632,9 @@ func TestRecorderObservesOnlySelectedNonemptyNginxPlaintext(t *testing.T) {
 		if s.stats.PlaintextObserved != test.want {
 			t.Fatalf("plaintext_observed=%v for event %+v", s.stats.PlaintextObserved, test.event)
 		}
+		if s.plaintextObserved.Load() != test.want || s.iisPlaintext.Load() {
+			t.Fatalf("incorrect plaintext fast path state for event %+v", test.event)
+		}
 	}
 }
 

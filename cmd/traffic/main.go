@@ -648,10 +648,7 @@ func snapshotStats(s *Store) Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.syncAtomicStatsLocked()
-	b, _ := json.Marshal(s.stats)
-	var snapshot Stats
-	_ = json.Unmarshal(b, &snapshot)
-	return snapshot
+	return s.cloneStatsLocked()
 }
 
 // waitWithin runs fn and reports whether it returned within budget. On

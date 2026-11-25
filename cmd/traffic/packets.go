@@ -32,7 +32,7 @@ type packetRing struct {
 func (r *packetRing) write(ci gopacket.CaptureInfo, b []byte) error {
 	if r.file == nil || r.size+int64(len(b))+16 > 64<<20 {
 		if r.file != nil {
-			if err := r.close(); err != nil {
+			if err := r.closeSegment(); err != nil {
 				return err
 			}
 		}
@@ -43,8 +43,12 @@ func (r *packetRing) write(ci gopacket.CaptureInfo, b []byte) error {
 			return e
 		}
 		r.file = newEvidenceFile(f)
-		r.buffer = bufio.NewWriterSize(r.file, 256<<10)
-		r.writer = pcapgo.NewWriterNanos(r.buffer)
+		if r.buffer == nil {
+			r.buffer = bufio.NewWriterSize(r.file, 256<<10)
+			r.writer = pcapgo.NewWriterNanos(r.buffer)
+		} else {
+			r.buffer.Reset(r.file)
+		}
 		if e = packetio.WriteHeader(r.buffer, r.snaplen, r.link); e != nil {
 			return e
 		}
@@ -56,12 +60,18 @@ func (r *packetRing) write(ci gopacket.CaptureInfo, b []byte) error {
 }
 
 func (r *packetRing) close() error {
+	err := r.closeSegment()
+	r.buffer, r.writer = nil, nil
+	return err
+}
+
+func (r *packetRing) closeSegment() error {
 	if r.file == nil {
 		return nil
 	}
 	err := r.buffer.Flush()
 	err = errors.Join(err, r.file.Sync(), r.file.Close())
-	r.file, r.buffer, r.writer = nil, nil, nil
+	r.file = nil
 	return err
 }
 
@@ -87,6 +97,7 @@ type packetWriter struct {
 	done     chan struct{}
 	pending  atomic.Int64
 	dropped  atomic.Uint64
+	failed   atomic.Bool
 	reported uint64
 	mu       sync.Mutex
 	err      error
@@ -136,6 +147,9 @@ func newPacketWriter(s *Store, iface string, ring *packetRing) *packetWriter {
 }
 
 func (w *packetWriter) failure() error {
+	if !w.failed.Load() {
+		return nil
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.err
@@ -180,6 +194,7 @@ func (w *packetWriter) run() {
 		w.mu.Lock()
 		if w.err == nil {
 			w.err = err
+			w.failed.Store(true)
 		}
 		w.mu.Unlock()
 	}
@@ -205,7 +220,7 @@ func (w *packetWriter) run() {
 			}
 		case <-ticker.C:
 			w.reportDrops()
-			if w.ring.buffer != nil {
+			if w.ring.file != nil {
 				if err := w.ring.buffer.Flush(); err != nil {
 					fail(err)
 				}

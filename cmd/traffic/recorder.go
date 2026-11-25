@@ -124,7 +124,7 @@ func (r *eventRecorder) flushSourceLossLocked(source string, state *sourceRecord
 	if err != nil {
 		return err
 	}
-	if err := r.writer.writeControl(lossBytes); err != nil {
+	if err := r.writer.writeOwnedControl(lossBytes); err != nil {
 		return err
 	}
 	state.pendingLoss = 0
@@ -183,7 +183,7 @@ func (r *eventRecorder) recordOutcomeLocked(source, backend string, target sessi
 		if err != nil {
 			return false, err
 		}
-		if err := r.writer.writeControl(sourceBytes); err != nil {
+		if err := r.writer.writeOwnedControl(sourceBytes); err != nil {
 			return false, err
 		}
 		state = &sourceRecordState{backend: backend, target: target}
@@ -198,7 +198,7 @@ func (r *eventRecorder) recordOutcomeLocked(source, backend string, target sessi
 		if err := r.flushSourceLossLocked(source, state, event.Time); err != nil {
 			return false, err
 		}
-		if err := r.writer.writeControl(eventBytes); err != nil {
+		if err := r.writer.writeOwnedControl(eventBytes); err != nil {
 			return false, err
 		}
 		if event.Type == "end" {
@@ -220,7 +220,7 @@ func (r *eventRecorder) recordOutcomeLocked(source, backend string, target sessi
 		if err != nil {
 			return false, err
 		}
-		accepted, err = r.writer.writeRecoveryAndData(lossBytes, eventBytes)
+		accepted, err = r.writer.writeOwnedRecoveryAndData(lossBytes, eventBytes)
 		if err != nil {
 			return false, err
 		}
@@ -230,7 +230,7 @@ func (r *eventRecorder) recordOutcomeLocked(source, backend string, target sessi
 			state.pendingLoss++
 		}
 	} else {
-		accepted, err = r.writer.writeData(eventBytes)
+		accepted, err = r.writer.writeOwnedData(eventBytes)
 		if err != nil {
 			return false, err
 		}
@@ -327,9 +327,10 @@ func (r *eventRecorder) openssl(source, backend string, target session.Target, e
 	if err != nil {
 		return err
 	}
-	if accepted && target.Service == "nginx" && backend == "openssl" && event.Type == "data" && len(event.Data) > 0 {
+	if accepted && target.Service == "nginx" && backend == "openssl" && event.Type == "data" && len(event.Data) > 0 && !r.store.plaintextObserved.Load() {
 		r.store.mu.Lock()
 		r.store.stats.PlaintextObserved = true
+		r.store.plaintextObserved.Store(true)
 		r.store.mu.Unlock()
 	}
 	if accepted && truncatedBytes > 0 {
@@ -397,11 +398,12 @@ func (r *eventRecorder) iis(source string, target session.Target, event iisEvent
 	if err != nil {
 		return err
 	}
-	if accepted && event.Type == "request" {
+	if accepted && event.Type == "request" && !r.store.iisPlaintext.Load() {
 		r.store.mu.Lock()
-		r.store.iisPlaintext = true
 		r.store.stats.PlaintextObserved = true
 		r.store.stats.AttachWindowSuspect = false
+		r.store.plaintextObserved.Store(true)
+		r.store.iisPlaintext.Store(true)
 		r.store.mu.Unlock()
 	}
 	if event.Type == "probe-gap" {

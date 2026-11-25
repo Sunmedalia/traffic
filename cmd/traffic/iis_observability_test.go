@@ -40,7 +40,7 @@ func TestReceiveHookDoesNotProveRecordedPlaintext(t *testing.T) {
 	}
 	s.fatal = nil
 	s.stats.Errors = nil
-	s.iisPlaintext = true
+	s.iisPlaintext.Store(true)
 	s.stats.PlaintextObserved = true
 	finishIISObservability(s, true)
 	if s.fatal != nil {
@@ -90,7 +90,8 @@ func TestProbeGapKeepsRunningTotal(t *testing.T) {
 }
 
 func TestRawIISRequestSatisfiesPlaintextRequirement(t *testing.T) {
-	s := &Store{dir: t.TempDir(), iisAttached: true}
+	s := &Store{dir: t.TempDir(), iisAttached: true, stats: Stats{PlaintextObserved: true, AttachWindowSuspect: true}}
+	s.plaintextObserved.Store(true) // OpenSSL plaintext has already been observed.
 	recorder := newRecorder(s)
 	if err := recorder.iis("generation", session.Target{ID: "42:start", PID: 42}, iisEvent{Type: "request", ID: "request", Method: "GET", URL: "/"}); err != nil {
 		t.Fatal(err)
@@ -99,7 +100,8 @@ func TestRawIISRequestSatisfiesPlaintextRequirement(t *testing.T) {
 		t.Fatal(err)
 	}
 	finishIISObservability(s, true)
-	if s.fatal != nil || !s.stats.PlaintextObserved || s.stats.Transactions != 0 || s.stats.TLSRequests != 0 {
+	if s.fatal != nil || !s.iisPlaintext.Load() || s.stats.AttachWindowSuspect ||
+		!s.stats.PlaintextObserved || s.stats.Transactions != 0 || s.stats.TLSRequests != 0 {
 		t.Fatal("raw request was decoded or rejected", s.stats, s.fatal)
 	}
 	failed := &Store{dir: t.TempDir(), iisAttached: true}

@@ -47,11 +47,11 @@ func finishIISObservability(s *Store, requirePlaintext bool) {
 	// response went through the hook, the pre-posted receive did not.
 	// Unmatched completions alone are not that window. w3wp completes I/O
 	// that this probe never registered.
-	if s.iisAttached && !s.iisPlaintext && s.stats.ProbeSendMatches > 0 && s.stats.ProbeUnmatchedCompletions > 0 {
+	if s.iisAttached && !s.iisPlaintext.Load() && s.stats.ProbeSendMatches > 0 && s.stats.ProbeUnmatchedCompletions > 0 {
 		s.stats.AttachWindowSuspect = true
 		s.stats.Errors = append(s.stats.Errors, "IIS probe attached but observed no request-side plaintext; responses were hooked and receives were not (attach window). No completed request buffer was recovered; inspect the probe diagnostics. probe_send_matches counts responses only and does not prove request capture.")
 	}
-	if requirePlaintext && (!s.iisAttached || !s.iisPlaintext) && s.fatal == nil {
+	if requirePlaintext && (!s.iisAttached || !s.iisPlaintext.Load()) && s.fatal == nil {
 		s.fatal = errors.New("--require-plaintext: no IIS request-side plaintext was recorded")
 		s.stats.Errors = append(s.stats.Errors, s.fatal.Error())
 	}
@@ -70,7 +70,7 @@ func applyIISProbeSummary(s *Store, values map[string]any) {
 	s.stats.ProbeBodyMatches += body
 	s.stats.ProbeSendMatches += send
 	s.stats.ProbeUnmatchedCompletions += unmatched
-	if s.iisAttached && !s.iisPlaintext && receive == 0 && send > 0 && unmatched > 0 {
+	if s.iisAttached && !s.iisPlaintext.Load() && receive == 0 && send > 0 && unmatched > 0 {
 		s.stats.AttachWindowSuspect = true
 	}
 }

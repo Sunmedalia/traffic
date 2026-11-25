@@ -77,6 +77,55 @@ func TestEvidenceWriterCopiesInputAndFlushesAtStop(t *testing.T) {
 	}
 }
 
+func TestEvidenceWriterQueuesOwnedBuffersInOrder(t *testing.T) {
+	for _, policy := range []evidenceBackpressurePolicy{evidenceBackpressureStrict, evidenceBackpressureDrop} {
+		t.Run(string(policy), func(t *testing.T) {
+			w := &evidenceWriter{
+				store: &Store{}, policy: policy, queue: make(chan evidenceItem, 4),
+				dataBudget: 64, controlBudget: 64, dataSlots: 4, controlSlots: 4,
+				globalDataBudget: 64, globalControlReserve: 64,
+			}
+			source, data := []byte("source"), []byte("data")
+			loss, recovery := []byte("loss"), []byte("recovery")
+			if err := w.writeOwnedControl(source); err != nil {
+				t.Fatal(err)
+			}
+			if accepted, err := w.writeOwnedData(data); err != nil || !accepted {
+				t.Fatalf("data accepted=%v, err=%v", accepted, err)
+			}
+			if accepted, err := w.writeOwnedRecoveryAndData(loss, recovery); err != nil || !accepted {
+				t.Fatalf("recovery accepted=%v, err=%v", accepted, err)
+			}
+			if len(w.queue) != 4 {
+				t.Fatalf("queued %d records, want 4", len(w.queue))
+			}
+			for i, expected := range []evidenceItem{{source, true}, {data, false}, {loss, true}, {recovery, false}} {
+				item := <-w.queue
+				if len(item.data) != len(expected.data) || &item.data[0] != &expected.data[0] || item.control != expected.control {
+					t.Fatalf("record %d was copied or enqueued out of order: %+v", i, item)
+				}
+			}
+		})
+	}
+}
+
+func TestEvidenceWriterClampsGlobalPendingSubtractions(t *testing.T) {
+	s := &Store{rawEvidenceControlPending: 4, stats: Stats{RawEvidencePendingBytes: 2}}
+	w := &evidenceWriter{
+		store: s, policy: evidenceBackpressureDrop, queue: make(chan evidenceItem, 2),
+		dataBudget: 16, controlBudget: 16, dataSlots: 2, controlSlots: 2,
+		globalDataBudget: 16, globalControlReserve: 16,
+		controlPending: 8, controlQueued: 1,
+	}
+	if accepted, err := w.writeOwnedData([]byte("data")); err != nil || !accepted {
+		t.Fatalf("global data pending underflowed: accepted=%v, err=%v", accepted, err)
+	}
+	w.release(4, 8, 1, 1)
+	if s.rawEvidenceControlPending != 0 || s.stats.RawEvidencePendingBytes != 0 {
+		t.Fatalf("global pending bytes underflowed: control=%d total=%d", s.rawEvidenceControlPending, s.stats.RawEvidencePendingBytes)
+	}
+}
+
 func TestEvidenceWriterRejectsOverBudgetWithoutSilentSuccess(t *testing.T) {
 	s := &Store{dir: t.TempDir()}
 	file, err := os.Create(filepath.Join(s.dir, "raw"))
