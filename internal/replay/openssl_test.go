@@ -33,7 +33,7 @@ func TestOpenSSLConnectionBoundaries(t *testing.T) {
 	send("data", "read", "GET /after-loss HTTP/1.1\r\nHost: test\r\n\r\n")
 	send("data", "write", "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n")
 	send("close", "", "")
-	rows, err := store.db.Query("SELECT data FROM requests")
+	rows, err := store.db.Query("SELECT " + storedRecord + " FROM requests")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestConcurrentHEADResponseFraming(t *testing.T) {
 	p.process(strings.NewReader("HEAD /head HTTP/1.1\r\nHost: test\r\n\r\nGET /following HTTP/1.1\r\nHost: test\r\n\r\n"), "head-race", "client", "test", 0, false)
 	<-done
 	var data []byte
-	rows, err := store.db.Query("SELECT data FROM requests")
+	rows, err := store.db.Query("SELECT " + storedRecord + " FROM requests")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,18 +104,16 @@ func TestConcurrentHEADResponseFraming(t *testing.T) {
 }
 
 func TestTruncatedBodyKeepsFollowingResponse(t *testing.T) {
-	previous := responseLimit
-	responseLimit = 4
-	defer func() { responseLimit = previous }()
 	store, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.config.responseLimit = 4
 	defer store.db.Close()
 	p := newHTTP(store)
 	p.process(strings.NewReader("GET /large HTTP/1.1\r\nHost: test\r\n\r\nGET /next HTTP/1.1\r\nHost: test\r\n\r\n"), "truncated", "client", "test", 0, false)
 	p.process(strings.NewReader("HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n12345678HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok"), "truncated", "client", "test", 0, false)
-	rows, err := store.db.Query("SELECT data FROM requests")
+	rows, err := store.db.Query("SELECT " + storedRecord + " FROM requests")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -94,7 +94,7 @@ func (a *opensslAssembler) ingest(event opensslEvent) error {
 		}
 		localPort, _ := strconv.Atoi(localText)
 		remotePort, _ := strconv.Atoi(remoteText)
-		if !capturePorts[localPort] && !capturePorts[remotePort] {
+		if !p.s.capturePort(localPort) && !p.s.capturePort(remotePort) {
 			return nil
 		}
 		p.mu.Lock()
@@ -104,7 +104,7 @@ func (a *opensslAssembler) ingest(event opensslEvent) error {
 		// A response observed while attaching to an in-flight request must not be
 		// retained and assigned to the next request on this keepalive connection.
 		responseDirection := "read"
-		if capturePorts[localPort] {
+		if p.s.capturePort(localPort) {
 			responseDirection = "write"
 		}
 		if len(queue) == 0 && event.Direction == responseDirection {

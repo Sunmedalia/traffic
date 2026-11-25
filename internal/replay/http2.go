@@ -332,10 +332,10 @@ func (p *HTTPProcessor) ingestHTTP2(key string, request bool, data []byte, meta 
 			headerEnd = f.HeadersEnded()
 		case *http2.DataFrame:
 			message := &stream.request
-			limit := requestLimit
+			limit := p.s.requestLimit()
 			if !request {
 				message = &stream.response
-				limit = responseLimit
+				limit = p.s.responseLimit()
 			}
 			if len(message.headers) == 0 || message.ended {
 				fail("http2_data_without_headers")

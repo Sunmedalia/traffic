@@ -55,14 +55,14 @@ func openStoreOnce(dir string) (*Store, error) {
 		if err != nil {
 			return nil, err
 		}
-		report, columns, err := inspectAnalysis(dir, path)
+		report, layout, err := inspectAnalysis(dir, path)
 		if err != nil {
 			s.analysisNote = "本地分析结果不可用：采集索引已变化或分析库无效，请重新运行 traffic-console analyze"
 			setup = legacyViews("")
 		} else {
 			// Results contain alerts and list fields only; bodies always come from collected evidence.
 			setup = []index.Statement{{SQL: "ATTACH DATABASE ? AS analysis", Args: []any{analysisURL(path, "ro")}}}
-			if columns {
+			if layout != layoutResults {
 				setup = append(setup, index.Statement{SQL: "CREATE TEMP VIEW records AS " + recordsSelect("main.requests", "analysis.entries")})
 			} else {
 				setup = append(setup, legacyViews("analysis.results")...)
@@ -78,6 +78,8 @@ func openStoreOnce(dir string) (*Store, error) {
 			s.analysisNote = "尚未执行本地规则分析；运行 traffic-console analyze --session DIR 后查看告警"
 		}
 	}
+	// A v1 index stores each record as one JSON including its bodies.
+	setup = append(setup, storedRecordsView(false))
 	if s.db, err = index.OpenReader(dsn, storeReaders, setup...); err != nil {
 		return nil, err
 	}

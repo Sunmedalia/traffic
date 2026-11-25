@@ -43,6 +43,7 @@ func (f *Frames) ingest(key string, payload []byte, meta frameContext, head bool
 		now = time.Now().UTC()
 	}
 	f.mu.Lock()
+	f.messageLimit = p.s.frameLimit()
 	if f.contexts == nil {
 		f.contexts = make(map[string]frameContext)
 	}
@@ -114,7 +115,7 @@ func (f *Frames) ingest(key string, payload []byte, meta frameContext, head bool
 			_, portText, _ := net.SplitHostPort(meta.local)
 			port, _ := strconv.Atoi(portText)
 			request := strings.HasSuffix(key, "read")
-			if !capturePorts[port] {
+			if !p.s.capturePort(port) {
 				request = !request
 			}
 			h2meta := meta

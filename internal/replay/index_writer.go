@@ -9,6 +9,45 @@ import (
 	"time"
 )
 
+// Version is the reconstruction engine version. Bump it whenever replay
+// output changes for the same evidence and limits: an analysis may reuse the
+// requests of an earlier generation only when it was built by this version.
+const Version = 1
+
+// RequestsTable is the reconstruction layout. data holds the transaction
+// metadata as JSON without the request and response members; the bodies are
+// raw BLOBs, so neither building nor analysis base64-encodes them.
+const RequestsTable = `CREATE TABLE requests(id TEXT PRIMARY KEY,time TEXT,client TEXT,alert INTEGER,data BLOB,request_raw BLOB,response_raw BLOB)`
+
+// RequestsIndex is created once every request is written; (time,id) is the
+// order analysis reads records in.
+const RequestsIndex = `CREATE INDEX requests_time ON requests(time,id)`
+
+// ReconstructionTable stores the build statistics and gaps of the requests.
+const ReconstructionTable = `CREATE TABLE reconstruction(id INTEGER PRIMARY KEY, stats BLOB, gaps BLOB)`
+
+// encodeMetadata returns t's stored metadata JSON, which omits the bodies.
+func encodeMetadata(t Transaction) ([]byte, error) {
+	t.Alerts = nil
+	t.Request, t.Response = nil, nil
+	return json.Marshal(t)
+}
+
+// decodeStored rebuilds a transaction from its metadata and raw bodies.
+func decodeStored(data, request, response []byte) (Transaction, error) {
+	var t Transaction
+	if err := json.Unmarshal(data, &t); err != nil {
+		return t, err
+	}
+	if len(request) > 0 {
+		t.Request = request
+	}
+	if len(response) > 0 {
+		t.Response = response
+	}
+	return t, nil
+}
+
 type indexExecutor interface {
 	Exec(string, ...any) (sql.Result, error)
 	QueryRow(string, ...any) *sql.Row
@@ -25,7 +64,7 @@ func (s *Store) indexExecutorLocked() (indexExecutor, error) {
 		if err != nil {
 			return nil, err
 		}
-		read, err := tx.Prepare("SELECT data FROM requests WHERE id=?")
+		read, err := tx.Prepare(indexRead)
 		if err != nil {
 			_ = tx.Rollback()
 			return nil, err
@@ -52,7 +91,7 @@ func (s *Store) indexReadRowLocked(reader indexExecutor, id string) *sql.Row {
 	if s.indexRead != nil {
 		return s.indexRead.QueryRow(id)
 	}
-	return reader.QueryRow("SELECT data FROM requests WHERE id=?", id)
+	return reader.QueryRow(indexRead, id)
 }
 
 // A record is normally written once: HTTP/1.1 requests wait in memory for
@@ -60,14 +99,14 @@ func (s *Store) indexReadRowLocked(reader indexExecutor, id string) *sql.Row {
 // SELECT EXISTS per write; only a rewrite of a stored ID (a spilled request,
 // an IIS or HTTP/2 stream saved again) runs the update as well.
 const (
-	indexInsert = "INSERT OR IGNORE INTO requests VALUES(?,?,?,?,?)"
-	indexUpdate = "UPDATE requests SET time=?,client=?,alert=?,data=? WHERE id=?"
+	indexRead   = "SELECT data,request_raw,response_raw FROM requests WHERE id=?"
+	indexInsert = "INSERT OR IGNORE INTO requests VALUES(?,?,?,?,?,?,?)"
+	indexUpdate = "UPDATE requests SET time=?,client=?,alert=?,data=?,request_raw=?,response_raw=? WHERE id=?"
 )
 
 func (s *Store) persist(t Transaction) ([]Alert, error) {
-	t.Alerts = nil
 	// Encoding needs no index state; keep it outside the writer lock.
-	data, err := json.Marshal(t)
+	data, err := encodeMetadata(t)
 	if err != nil {
 		return nil, err
 	}
@@ -80,9 +119,9 @@ func (s *Store) persist(t Transaction) ([]Alert, error) {
 	}
 	var result sql.Result
 	if s.indexInsert != nil {
-		result, err = s.indexInsert.Exec(t.ID, stamp, t.Client, 0, data)
+		result, err = s.indexInsert.Exec(t.ID, stamp, t.Client, 0, data, t.Request, t.Response)
 	} else {
-		result, err = writer.Exec(indexInsert, t.ID, stamp, t.Client, 0, data)
+		result, err = writer.Exec(indexInsert, t.ID, stamp, t.Client, 0, data, t.Request, t.Response)
 	}
 	if err != nil {
 		return nil, err
@@ -94,9 +133,9 @@ func (s *Store) persist(t Transaction) ([]Alert, error) {
 	fresh := inserted == 1
 	if !fresh {
 		if s.indexUpdate != nil {
-			_, err = s.indexUpdate.Exec(stamp, t.Client, 0, data, t.ID)
+			_, err = s.indexUpdate.Exec(stamp, t.Client, 0, data, t.Request, t.Response, t.ID)
 		} else {
-			_, err = writer.Exec(indexUpdate, stamp, t.Client, 0, data, t.ID)
+			_, err = writer.Exec(indexUpdate, stamp, t.Client, 0, data, t.Request, t.Response, t.ID)
 		}
 		if err != nil {
 			return nil, err
@@ -104,7 +143,7 @@ func (s *Store) persist(t Transaction) ([]Alert, error) {
 	}
 	if s.indexBatching {
 		s.indexOps++
-		s.indexBytes += len(data)
+		s.indexBytes += len(data) + len(t.Request) + len(t.Response)
 		s.mu.Lock()
 		s.stats.IndexPendingWrites = uint64(s.indexOps)
 		s.mu.Unlock()

@@ -7,10 +7,7 @@ import (
 )
 
 func TestTrustedProxyResolution(t *testing.T) {
-	original := trustedProxies
-	defer func() { trustedProxies = original }()
-	var err error
-	trustedProxies, err = parseTrustedProxies("10.0.0.0/8,2001:db8::/32")
+	trustedProxies, err := parseTrustedProxies("10.0.0.0/8,2001:db8::/32")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,11 +23,11 @@ func TestTrustedProxyResolution(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			record := Transaction{Client: test.peer, Request: []byte("GET / HTTP/1.1\r\nHost: test\r\n" + test.headers + "\r\n")}
-			resolveClient(&record)
+			resolveClient(&record, trustedProxies)
 			if record.Client != test.want || record.ClientSource != test.source {
 				t.Fatalf("got %+v", record)
 			}
-			resolveClient(&record)
+			resolveClient(&record, trustedProxies)
 			if record.Client != test.want {
 				t.Fatalf("repeat resolution changed identity %+v", record)
 			}
@@ -45,13 +42,11 @@ func TestTrustedProxyResolution(t *testing.T) {
 }
 
 func TestProxyIdentityPersistsOnResponse(t *testing.T) {
-	original := trustedProxies
-	defer func() { trustedProxies = original }()
-	trustedProxies, _ = parseTrustedProxies("10.0.0.0/8")
 	s, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.config.trustedProxies, _ = parseTrustedProxies("10.0.0.0/8")
 	defer s.db.Close()
 	record := Transaction{ID: "proxy", Time: time.Now(), Client: "10.1.1.1:1234", Request: []byte("GET / HTTP/1.1\r\nHost: test\r\nX-Forwarded-For: 198.51.100.1\r\n\r\n")}
 	if err := s.save(record); err != nil {

@@ -125,7 +125,7 @@ func exportEvidenceContext(ctx context.Context, s *Store, t Transaction, b []byt
 			return err
 		}
 		var original []byte
-		if err = s.db.QueryRowContext(ctx, "SELECT data FROM main.requests WHERE id=?", t.ID).Scan(&original); err != nil {
+		if err = s.db.QueryRowContext(ctx, "SELECT data FROM stored_records WHERE id=?", t.ID).Scan(&original); err != nil {
 			return err
 		}
 		name := "captured-event.json"

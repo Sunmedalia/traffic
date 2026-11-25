@@ -82,7 +82,7 @@ func replayTestPCAP(t *testing.T, input string) ([]Transaction, map[string]uint6
 	if e != nil {
 		t.Fatal(e)
 	}
-	rows, e := db.Query("SELECT data FROM requests ORDER BY time,id")
+	rows, e := db.Query("SELECT " + storedRecord + " FROM requests ORDER BY time,id")
 	if e != nil {
 		t.Fatal(e)
 	}

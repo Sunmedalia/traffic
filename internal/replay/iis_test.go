@@ -29,7 +29,7 @@ func TestIISRequestResponseAndLoss(t *testing.T) {
 		}
 	}
 	var data []byte
-	if err := store.db.QueryRow("SELECT data FROM requests").Scan(&data); err != nil {
+	if err := store.db.QueryRow("SELECT " + storedRecord + " FROM requests").Scan(&data); err != nil {
 		t.Fatal(err)
 	}
 	var record Transaction
@@ -49,7 +49,7 @@ func TestIISRequestResponseAndLoss(t *testing.T) {
 	if err := assembler.finish(); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := store.db.Query("SELECT data FROM requests WHERE id != ?", record.ID)
+	rows, err := store.db.Query("SELECT "+storedRecord+" FROM requests WHERE id != ?", record.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,13 +69,11 @@ func TestIISRequestResponseAndLoss(t *testing.T) {
 }
 
 func TestIISChunkedBodyLimit(t *testing.T) {
-	originalLimit := responseLimit
-	responseLimit = 4
-	t.Cleanup(func() { responseLimit = originalLimit })
 	store, err := openStore(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.config.responseLimit = 4
 	defer store.db.Close()
 	assembler := &iisAssembler{store: store, target: session.Target{ID: "worker", Service: "iis"}}
 	events := []iisEvent{
@@ -92,7 +90,7 @@ func TestIISChunkedBodyLimit(t *testing.T) {
 		}
 	}
 	var data []byte
-	if err := store.db.QueryRow("SELECT data FROM requests").Scan(&data); err != nil {
+	if err := store.db.QueryRow("SELECT " + storedRecord + " FROM requests").Scan(&data); err != nil {
 		t.Fatal(err)
 	}
 	var record Transaction

@@ -109,7 +109,7 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				request = p.responseRequest(key)
 			}
 			headerLength := bufferedHeaderLength(br)
-			recorder.begin(br, headerLength+responseLimit+rawFramingSlack)
+			recorder.begin(br, headerLength+p.s.responseLimit()+rawFramingSlack)
 			resp, e := http.ReadResponse(br, request)
 			if e != nil {
 				p.s.gap("http1", key, "response_parse_failure", "directions", 1)
@@ -126,7 +126,7 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				delete(p.requestMethods, key)
 			}
 			p.mu.Unlock()
-			body, e := io.ReadAll(io.LimitReader(resp.Body, int64(responseLimit)+1))
+			body, e := io.ReadAll(io.LimitReader(resp.Body, int64(p.s.responseLimit())+1))
 			if closeErr := resp.Body.Close(); e == nil {
 				e = closeErr
 			}
@@ -134,11 +134,11 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			if packetStream != nil {
 				observed = packetStream.latest
 			}
-			if state, ok := r.(interface{ FramingComplete() bool }); ok && state.FramingComplete() && len(body) > responseLimit {
+			if state, ok := r.(interface{ FramingComplete() bool }); ok && state.FramingComplete() && len(body) > p.s.responseLimit() {
 				e = nil
 			}
-			truncated := len(body) > responseLimit
-			raw := savedMessage(recorder, br, headerLength, responseLimit, len(resp.TransferEncoding) > 0, &truncated)
+			truncated := len(body) > p.s.responseLimit()
+			raw := savedMessage(recorder, br, headerLength, p.s.responseLimit(), len(resp.TransferEncoding) > 0, &truncated)
 			p.mu.Lock()
 			if p.http1PairingLossLocked(key) != "" {
 				p.mu.Unlock()
@@ -200,7 +200,7 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				}
 			}
 			headerLength := bufferedHeaderLength(br)
-			recorder.begin(br, headerLength+requestLimit+rawFramingSlack)
+			recorder.begin(br, headerLength+p.s.requestLimit()+rawFramingSlack)
 			req, parseReasons, e := session.ReadRequest(br)
 			if e != nil {
 				p.s.gap("http1", key, "request_parse_failure", "directions", 1)
@@ -227,15 +227,15 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				}
 			}
 			p.mu.Unlock()
-			body, e := io.ReadAll(io.LimitReader(req.Body, int64(requestLimit)+1))
+			body, e := io.ReadAll(io.LimitReader(req.Body, int64(p.s.requestLimit())+1))
 			if closeErr := req.Body.Close(); e == nil {
 				e = closeErr
 			}
-			if state, ok := r.(interface{ FramingComplete() bool }); ok && state.FramingComplete() && len(body) > requestLimit {
+			if state, ok := r.(interface{ FramingComplete() bool }); ok && state.FramingComplete() && len(body) > p.s.requestLimit() {
 				e = nil
 			}
-			truncated := len(body) > requestLimit
-			raw := savedMessage(recorder, br, headerLength, requestLimit, req.ContentLength < 0, &truncated)
+			truncated := len(body) > p.s.requestLimit()
+			raw := savedMessage(recorder, br, headerLength, p.s.requestLimit(), req.ContentLength < 0, &truncated)
 			if state, ok := r.(interface{ Incomplete() bool }); ok {
 				incomplete = incomplete || state.Incomplete()
 			}

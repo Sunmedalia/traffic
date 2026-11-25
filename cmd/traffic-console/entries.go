@@ -48,6 +48,41 @@ func recordsSelect(requests, alerts string) string {
 FROM ` + requests + ` r LEFT JOIN ` + alerts + ` a ON a.id=r.id`
 }
 
+// blobRecordsSelect is recordsSelect for engine 7 reconstructions, whose
+// requests keep metadata JSON in data and the bodies in request_raw and
+// response_raw. traffic_record_json assembles the full transaction JSON only
+// for the rows a query returns, so lists and filters never touch bodies.
+// It is a connection function, so this select is only used in TEMP views
+// and the published file stays readable by any SQLite client.
+func blobRecordsSelect(requests, alerts string) string {
+	return `SELECT r.id,r.time,r.client,
+ CASE WHEN a.id IS NULL THEN r.alert WHEN a.alerts='[]' THEN 0 ELSE json_array_length(a.alerts) END AS alert,
+ traffic_record_json(r.data,r.request_raw,r.response_raw,a.alerts) AS data
+FROM ` + requests + ` r LEFT JOIN ` + alerts + ` a ON a.id=r.id`
+}
+
+// storedRecordsView exposes stored_records(id,data): each collected or
+// reconstructed record as stored, with its bodies but without analysis alerts.
+func storedRecordsView(blob bool) index.Statement {
+	data := "data"
+	if blob {
+		data = "traffic_record_json(data,request_raw,response_raw,NULL)"
+	}
+	return index.Statement{SQL: "CREATE TEMP VIEW stored_records AS SELECT id," + data + " AS data FROM main.requests"}
+}
+
+// analysisLayout is the storage generation of a published analysis.
+type analysisLayout int
+
+const (
+	// layoutResults: a results table only (engine 4 and earlier).
+	layoutResults analysisLayout = iota
+	// layoutEntries: the entries table, bodies inside requests.data JSON (engines 5 and 6).
+	layoutEntries
+	// layoutBlob: entries plus requests with raw BLOB bodies (engine 7).
+	layoutBlob
+)
+
 // legacyEntriesView computes entries from JSON records. results names a legacy
 // analysis results table, or is empty when alerts live inside the records.
 func legacyEntriesView(results string) string {
@@ -101,35 +136,56 @@ func entryValues(id, at, client string, record Transaction) ([]any, error) {
 		record.Method, record.Host, record.URL, record.Status, record.Service, record.Incomplete, record.Truncated}, nil
 }
 
-// inspectAnalysis reads a published generation's metadata and reports whether
-// it stores the entries table. A stale or unreadable generation is an error.
-func inspectAnalysis(dir, path string) (*analysisReport, bool, error) {
+// inspectAnalysis reads a published generation's metadata and storage layout.
+// A stale or unreadable generation is an error.
+func inspectAnalysis(dir, path string) (*analysisReport, analysisLayout, error) {
 	db, err := sql.Open(index.Driver, analysisURL(path, "ro"))
 	if err != nil {
-		return nil, false, err
+		return nil, layoutResults, err
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
-	var raw []byte
-	var report analysisReport
-	if err = db.QueryRow("SELECT data FROM metadata WHERE id=1").Scan(&raw); err != nil {
-		return nil, false, err
-	}
-	if err = json.Unmarshal(raw, &report); err != nil {
-		return nil, false, err
+	report, layout, err := readAnalysisSchema(context.Background(), db, "main")
+	if err != nil {
+		return nil, layoutResults, err
 	}
 	signature, err := sourceSignature(dir)
 	if err != nil {
-		return nil, false, err
+		return nil, layoutResults, err
 	}
 	if signature != report.Source {
-		return nil, false, os.ErrInvalid
+		return nil, layoutResults, os.ErrInvalid
 	}
-	var tables int
-	if err = db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='entries'").Scan(&tables); err != nil {
-		return nil, false, err
+	return report, layout, nil
+}
+
+// readAnalysisSchema reads the metadata and layout of the analysis database
+// attached as schema on q.
+func readAnalysisSchema(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, schema string) (*analysisReport, analysisLayout, error) {
+	var raw []byte
+	var report analysisReport
+	if err := q.QueryRowContext(ctx, "SELECT data FROM "+schema+".metadata WHERE id=1").Scan(&raw); err != nil {
+		return nil, layoutResults, err
 	}
-	return &report, tables > 0, nil
+	if err := json.Unmarshal(raw, &report); err != nil {
+		return nil, layoutResults, err
+	}
+	var entries, blob int
+	if err := q.QueryRowContext(ctx, "SELECT count(*) FROM "+schema+".sqlite_master WHERE type='table' AND name='entries'").Scan(&entries); err != nil {
+		return nil, layoutResults, err
+	}
+	if entries == 0 {
+		return &report, layoutResults, nil
+	}
+	if err := q.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('requests','"+schema+"') WHERE name IN ('request_raw','response_raw')").Scan(&blob); err != nil {
+		return nil, layoutResults, err
+	}
+	if blob == 2 {
+		return &report, layoutBlob, nil
+	}
+	return &report, layoutEntries, nil
 }
 
 // storeReaders is the read connection count of file-backed stores. Every
@@ -141,6 +197,7 @@ const storeReaders = 4
 func checkStoreSchema(ctx context.Context, db *sql.DB) error {
 	for _, query := range []string{
 		"SELECT id,time,client,alert,data FROM records LIMIT 0",
+		"SELECT id,data FROM stored_records LIMIT 0",
 		"SELECT id,time,client,alert,severity,rule,alerts,method,host,url,status,service,incomplete,truncated FROM entries LIMIT 0",
 	} {
 		rows, err := db.QueryContext(ctx, query)

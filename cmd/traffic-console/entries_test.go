@@ -102,9 +102,53 @@ func downgradeAnalysis(t testing.TB, dir string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	db.Close()
+	// Engine 4 stored complete JSON records, never BLOB bodies.
+	inlineAnalysisBodies(t, path, 4)
+	db, err = sql.Open(index.Driver, path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer db.Close()
 	if _, err = db.Exec("DROP VIEW IF EXISTS records; DROP TABLE entries"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// inlineAnalysisBodies rewrites an engine 7 generation at path into the layout
+// engines 5 and 6 published: bodies back inside requests.data as base64 JSON,
+// a persistent records view and engine metadata without reuse fields. It is a
+// no-op on generations without reconstructed requests.
+func inlineAnalysisBodies(t testing.TB, path string, engine int) {
+	t.Helper()
+	db, err := sql.Open(index.Driver, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var blob int
+	if err = db.QueryRow("SELECT count(*) FROM pragma_table_info('requests') WHERE name='request_raw'").Scan(&blob); err != nil {
+		t.Fatal(err)
+	}
+	if blob == 0 {
+		return
+	}
+	for _, statement := range []string{
+		"UPDATE requests SET data=CAST(traffic_record_json(data,request_raw,response_raw,NULL) AS BLOB)",
+		"ALTER TABLE requests DROP COLUMN request_raw",
+		"ALTER TABLE requests DROP COLUMN response_raw",
+		"DROP VIEW IF EXISTS records",
+		"CREATE VIEW records AS " + recordsSelect("requests", "entries"),
+		"UPDATE metadata SET data=json_remove(json_set(data,'$.engine_version',?),'$.reconstruction_version','$.reconstruction_reused','$.reconstructed_at')",
+		"VACUUM",
+	} {
+		var args []any
+		if strings.Contains(statement, "?") {
+			args = []any{engine}
+		}
+		if _, err = db.Exec(statement, args...); err != nil {
+			t.Fatal(statement, err)
+		}
 	}
 }
 
