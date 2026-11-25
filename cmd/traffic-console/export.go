@@ -28,38 +28,185 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 	return exportEvidenceContext(context.Background(), s, t, b, path)
 }
 
-func exportEvidenceContext(ctx context.Context, s *Store, t Transaction, b []byte, path string) error {
-	if err := ctx.Err(); err != nil {
-		return err
+type preparedEvidence struct {
+	store           *Store
+	ownedStore      *Store
+	lock            *os.File
+	t               Transaction
+	raw             []byte
+	analysisMeta    []byte
+	originalEvent   []byte
+	originalName    string
+	statusData      []byte
+	hasStatus       bool
+	gapsData        []byte
+	hasGaps         bool
+	truncatedFiles  []string
+	remote, local   netip.AddrPort
+	hasEndpoints    bool
+	first, last     time.Time
+	packetSource    string
+	hasPacketSource bool
+	packetFiles     []string
+	note            map[string]any
+}
+
+func (p *preparedEvidence) close() {
+	if p.lock != nil {
+		session.UnlockFile(p.lock)
+		p.lock.Close()
+		p.lock = nil
 	}
+	if p.ownedStore != nil {
+		p.ownedStore.db.Close()
+		p.ownedStore = nil
+	}
+}
+
+func prepareEvidence(ctx context.Context, s *Store, t Transaction, b []byte) (*preparedEvidence, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	p := &preparedEvidence{store: s, t: t, raw: b}
+	ok := false
+	defer func() {
+		if !ok {
+			p.close()
+		}
+	}()
+
 	if analysisExists(s.dir) {
 		fresh, err := openStore(s.dir)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		defer fresh.db.Close()
-		s = fresh
-		if err = s.db.QueryRowContext(ctx, "SELECT data FROM records WHERE id=?", t.ID).Scan(&b); err != nil {
-			return err
+		p.ownedStore = fresh
+		p.store = fresh
+		if err = fresh.db.QueryRowContext(ctx, "SELECT data FROM records WHERE id=?", t.ID).Scan(&p.raw); err != nil {
+			return nil, err
 		}
-		t = Transaction{}
-		if err = json.Unmarshal(b, &t); err != nil {
-			return err
+		p.t = Transaction{}
+		if err = json.Unmarshal(p.raw, &p.t); err != nil {
+			return nil, err
 		}
 	}
 
-	f, e := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if e != nil {
-		return e
+	lock, err := os.Open(filepath.Join(p.store.dir, "capture.lock"))
+	if err != nil {
+		return nil, err
 	}
-	ok := false
-	defer func() {
-		f.Close()
-		if !ok {
-			os.Remove(path)
+	if err = session.LockFile(lock, false); err != nil {
+		lock.Close()
+		return nil, fmt.Errorf("%w: %w", errCaptureRunning, err)
+	}
+	p.lock = lock
+
+	if p.store.analysis != nil {
+		p.analysisMeta, err = json.MarshalIndent(p.store.analysis, "", "  ")
+		if err != nil {
+			return nil, err
 		}
-	}()
-	z := &evidenceZip{Writer: zip.NewWriter(f), modified: time.Now()}
+		if err = p.store.db.QueryRowContext(ctx, "SELECT data FROM stored_records WHERE id=?", p.t.ID).Scan(&p.originalEvent); err != nil {
+			return nil, err
+		}
+		p.originalName = "captured-event.json"
+		if p.store.analysis.Reconstructed {
+			p.originalName = "reconstructed-event.json"
+		}
+	}
+
+	if status, err := os.ReadFile(filepath.Join(p.store.dir, "status.json")); err == nil {
+		p.statusData = status
+		p.hasStatus = true
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	// Parse and filter gaps.jsonl before streaming headers so corrupt or
+	// unreadable diagnostics fail with an HTTP error instead of a truncated ZIP.
+	if file, err := os.Open(filepath.Join(p.store.dir, "gaps.jsonl")); err == nil {
+		var selected bytes.Buffer
+		lines := session.NewJSONLines(file, 1<<20)
+		for {
+			if err := ctx.Err(); err != nil {
+				file.Close()
+				return nil, err
+			}
+			var gap session.GapEvent
+			err := lines.Next(&gap)
+			if err == io.EOF {
+				break
+			}
+			if err == session.ErrTruncatedJSONLine {
+				p.truncatedFiles = append(p.truncatedFiles, "gaps.jsonl")
+				break
+			}
+			if err != nil {
+				file.Close()
+				return nil, err
+			}
+			if gap.Connection == "" || gap.Connection == p.t.Connection || gap.Connection == strings.TrimPrefix(p.t.Connection, "tls:") || (p.t.TargetID != "" && gap.Connection == p.t.TargetID) {
+				selected.Write(lines.Bytes())
+				selected.WriteByte('\n')
+			}
+		}
+		file.Close()
+		p.gapsData = selected.Bytes()
+		p.hasGaps = true
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	peer := p.t.PeerClient
+	if peer == "" {
+		peer = p.t.Client
+	}
+	remote, remoteErr := netip.ParseAddrPort(peer)
+	local, localErr := netip.ParseAddrPort(p.t.LocalEndpoint)
+	p.hasEndpoints = remoteErr == nil && localErr == nil && remote.Port() != 0 && local.Port() != 0
+	p.remote, p.local = remote, local
+	p.first, p.last = p.t.Time.Add(-time.Minute), p.t.Time.Add(time.Minute)
+	p.packetSource, p.hasPacketSource = strings.CutPrefix(p.t.Source, "pcap:")
+	packetScope := "TCP connection endpoints within 60 seconds of transaction time; may include other transactions or reused connections with the same endpoints"
+	if p.hasEndpoints && p.hasPacketSource && p.t.ResponseTime.After(p.last) {
+		p.last = p.t.ResponseTime
+		packetScope = "TCP connection endpoints from 60 seconds before transaction time through the observed response; may include other transactions or reused connections with the same endpoints"
+	}
+	if !p.hasEndpoints {
+		packetScope = "packet selection unavailable because the transaction lacks both transport endpoints"
+	}
+	p.note = map[string]any{
+		"schema_version":       1,
+		"source":               p.t.Source,
+		"protocol":             p.t.Protocol,
+		"stream_id":            p.t.StreamID,
+		"integrity_reasons":    p.t.IntegrityReasons,
+		"incomplete":           p.t.Incomplete,
+		"truncated":            p.t.Truncated,
+		"capture_coverage":     session.CoverageWarning,
+		"packet_scope":         packetScope,
+		"tls_plaintext_source": "process hook; network PCAP remains encrypted",
+	}
+	if p.hasEndpoints {
+		p.note["packet_window_start"], p.note["packet_window_end"] = p.first, p.last
+		p.packetFiles, err = session.PacketFiles(p.store.dir)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var reconstructed *Stats
+	if p.store.analysis != nil {
+		reconstructed = p.store.analysis.Reconstruction
+	}
+	if warnings := sessionIntegrityWarnings(p.store.dir, reconstructed); len(warnings) > 0 {
+		p.note["session_integrity_warnings"] = warnings
+	}
+	ok = true
+	return p, nil
+}
+
+func (p *preparedEvidence) writeTo(ctx context.Context, dst io.Writer) error {
+	z := &evidenceZip{Writer: zip.NewWriter(dst), modified: time.Now()}
 	hashes := map[string]string{}
 	add := func(name string, data []byte) error {
 		w, e := z.Create(name)
@@ -73,124 +220,77 @@ func exportEvidenceContext(ctx context.Context, s *Store, t Transaction, b []byt
 		hashes[name] = hex.EncodeToString(h[:])
 		return nil
 	}
-	for name, data := range map[string][]byte{"event.json": b, "request.http": t.Request, "response.http": t.Response} {
-		if e = add(name, data); e != nil {
-			return e
-		}
-	}
-	peer := t.PeerClient
-	if peer == "" {
-		peer = t.Client
-	}
-	remote, remoteErr := netip.ParseAddrPort(peer)
-	local, localErr := netip.ParseAddrPort(t.LocalEndpoint)
-	hasEndpoints := remoteErr == nil && localErr == nil && remote.Port() != 0 && local.Port() != 0
-	first, last := t.Time.Add(-time.Minute), t.Time.Add(time.Minute)
-	packetSource, hasPacketSource := strings.CutPrefix(t.Source, "pcap:")
-	packetScope := "TCP connection endpoints within 60 seconds of transaction time; may include other transactions or reused connections with the same endpoints"
-	if hasEndpoints && hasPacketSource && t.ResponseTime.After(last) {
-		last = t.ResponseTime
-		packetScope = "TCP connection endpoints from 60 seconds before transaction time through the observed response; may include other transactions or reused connections with the same endpoints"
-	}
-	if !hasEndpoints {
-		packetScope = "packet selection unavailable because the transaction lacks both transport endpoints"
-	}
-	note := map[string]any{"schema_version": 1, "source": t.Source, "protocol": t.Protocol, "stream_id": t.StreamID, "integrity_reasons": t.IntegrityReasons, "incomplete": t.Incomplete, "truncated": t.Truncated, "capture_coverage": session.CoverageWarning, "packet_scope": packetScope, "tls_plaintext_source": "process hook; network PCAP remains encrypted"}
-	if hasEndpoints {
-		note["packet_window_start"], note["packet_window_end"] = first, last
-	}
-	var reconstructed *Stats
-	if s.analysis != nil {
-		reconstructed = s.analysis.Reconstruction
-	}
-	if warnings := sessionIntegrityWarnings(s.dir, reconstructed); len(warnings) > 0 {
-		note["session_integrity_warnings"] = warnings
-	}
-	var truncatedFiles []string
-	lock, e := os.Open(filepath.Join(s.dir, "capture.lock"))
-	if e != nil {
-		return e
-	}
-	defer lock.Close()
-	if e = session.LockFile(lock, false); e != nil {
-		return fmt.Errorf("%w: %w", errCaptureRunning, e)
-	}
-	defer session.UnlockFile(lock)
-	if s.analysis != nil {
-		metadata, err := json.MarshalIndent(s.analysis, "", "  ")
-		if err != nil {
-			return err
-		}
-		if err = add("analysis.json", metadata); err != nil {
-			return err
-		}
-		var original []byte
-		if err = s.db.QueryRowContext(ctx, "SELECT data FROM stored_records WHERE id=?", t.ID).Scan(&original); err != nil {
-			return err
-		}
-		name := "captured-event.json"
-		if s.analysis.Reconstructed {
-			name = "reconstructed-event.json"
-		}
-		if err = add(name, original); err != nil {
+	for _, item := range []struct {
+		name string
+		data []byte
+	}{
+		{"event.json", p.raw},
+		{"request.http", p.t.Request},
+		{"response.http", p.t.Response},
+	} {
+		if err := add(item.name, item.data); err != nil {
 			return err
 		}
 	}
-	// Capture diagnostics describe the whole session; gap entries are limited
-	// to this connection / target or an unattributable backend discontinuity.
-	if status, err := os.ReadFile(filepath.Join(s.dir, "status.json")); err == nil {
-		if err := add("capture-status.json", status); err != nil {
+	if p.store.analysis != nil {
+		if err := add("analysis.json", p.analysisMeta); err != nil {
 			return err
 		}
-	} else if !os.IsNotExist(err) {
-		return err
+		if err := add(p.originalName, p.originalEvent); err != nil {
+			return err
+		}
 	}
-	if file, err := os.Open(filepath.Join(s.dir, "gaps.jsonl")); err == nil {
-		var selected bytes.Buffer
-		lines := session.NewJSONLines(file, 1<<20)
-		for {
-			if err := ctx.Err(); err != nil {
-				file.Close()
-				return err
-			}
-			var gap session.GapEvent
-			err := lines.Next(&gap)
-			if err == io.EOF {
-				break
-			}
-			if err == session.ErrTruncatedJSONLine {
-				truncatedFiles = append(truncatedFiles, "gaps.jsonl")
-				break
-			}
-			if err != nil {
-				file.Close()
-				return err
-			}
-			if gap.Connection == "" || gap.Connection == t.Connection || gap.Connection == strings.TrimPrefix(t.Connection, "tls:") || (t.TargetID != "" && gap.Connection == t.TargetID) {
-				selected.Write(lines.Bytes())
-				selected.WriteByte('\n')
-			}
-		}
-		file.Close()
-		if err := add("capture-gaps.jsonl", selected.Bytes()); err != nil {
+	if p.hasStatus {
+		if err := add("capture-status.json", p.statusData); err != nil {
 			return err
 		}
-	} else if !os.IsNotExist(err) {
-		return err
 	}
-	if hasEndpoints {
-		files, err := session.PacketFiles(s.dir)
-		if err != nil {
+	truncatedFiles := append([]string(nil), p.truncatedFiles...)
+	if p.hasGaps {
+		if err := add("capture-gaps.jsonl", p.gapsData); err != nil {
 			return err
 		}
-		for i, name := range files {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if hasPacketSource && filepath.Base(session.PacketSegmentGroup(name)) != packetSource {
+	}
+	if p.hasEndpoints && len(p.packetFiles) > 0 {
+		// Pre-peek the first packet timestamp of candidate segments so segments
+		// completely outside [first, last] (with a small margin for clock skew /
+		// multi-core reordering) are skipped without full packet decoding.
+		// Unreadable or header-corrupt segments (ok == false) are never skipped.
+		const pcapPruneMargin = 5 * time.Second
+		candidates := make([]int, 0, len(p.packetFiles))
+		for i, name := range p.packetFiles {
+			if p.hasPacketSource && filepath.Base(session.PacketSegmentGroup(name)) != p.packetSource {
 				continue
 			}
-			entry, digest, truncated, err := exportPacketSegment(ctx, z, s.dir, name, remote, local, first, last, lastPacketSegment(files, i))
+			candidates = append(candidates, i)
+		}
+		type segStart struct {
+			at time.Time
+			ok bool
+		}
+		starts := make([]segStart, len(candidates))
+		for ci, idx := range candidates {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			at, ok := packetSegmentFirstTime(p.packetFiles[idx])
+			starts[ci] = segStart{at: at, ok: ok}
+		}
+		for ci, idx := range candidates {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			name := p.packetFiles[idx]
+			if starts[ci].ok && starts[ci].at.After(p.last.Add(pcapPruneMargin)) {
+				continue
+			}
+			if starts[ci].ok && ci+1 < len(candidates) {
+				nextIdx := candidates[ci+1]
+				if session.PacketSegmentGroup(p.packetFiles[nextIdx]) == session.PacketSegmentGroup(name) && starts[ci+1].ok && starts[ci+1].at.Before(p.first.Add(-pcapPruneMargin)) {
+					continue
+				}
+			}
+			entry, digest, truncated, err := exportPacketSegment(ctx, z, p.store.dir, name, p.remote, p.local, p.first, p.last, lastPacketSegment(p.packetFiles, idx))
 			if err != nil {
 				return err
 			}
@@ -203,17 +303,55 @@ func exportEvidenceContext(ctx context.Context, s *Store, t Transaction, b []byt
 		}
 	}
 	if len(truncatedFiles) > 0 {
-		note["truncated_source_files"] = truncatedFiles
+		p.note["truncated_source_files"] = truncatedFiles
 	}
-	info, _ := json.MarshalIndent(note, "", "  ")
-	if e = add("evidence.json", info); e != nil {
-		return e
+	info, _ := json.MarshalIndent(p.note, "", "  ")
+	if err := add("evidence.json", info); err != nil {
+		return err
 	}
 	h, _ := json.MarshalIndent(hashes, "", "  ")
-	if e = add("sha256.json", h); e != nil {
+	if err := add("sha256.json", h); err != nil {
+		return err
+	}
+	return z.Close()
+}
+
+func packetSegmentFirstTime(path string) (time.Time, bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return time.Time{}, false
+	}
+	defer file.Close()
+	reader, err := packetio.NewReader(file)
+	if err != nil {
+		return time.Time{}, false
+	}
+	_, ci, err := reader.ReadPacketData()
+	if err != nil {
+		return time.Time{}, false
+	}
+	return ci.Timestamp, true
+}
+
+func exportEvidenceContext(ctx context.Context, s *Store, t Transaction, b []byte, path string) error {
+	prep, err := prepareEvidence(ctx, s, t, b)
+	if err != nil {
+		return err
+	}
+	defer prep.close()
+
+	f, e := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if e != nil {
 		return e
 	}
-	if e = z.Close(); e != nil {
+	ok := false
+	defer func() {
+		f.Close()
+		if !ok {
+			os.Remove(path)
+		}
+	}()
+	if e = prep.writeTo(ctx, f); e != nil {
 		return e
 	}
 	if err := f.Close(); err != nil {
@@ -221,6 +359,21 @@ func exportEvidenceContext(ctx context.Context, s *Store, t Transaction, b []byt
 	}
 	ok = true
 	return nil
+}
+
+// exportEvidenceStream validates the session and capture lock before calling
+// onReady (which writes HTTP headers), then streams the ZIP archive directly
+// into dst without staging a temporary file on disk.
+func exportEvidenceStream(ctx context.Context, s *Store, t Transaction, b []byte, onReady func(), dst io.Writer) error {
+	prep, err := prepareEvidence(ctx, s, t, b)
+	if err != nil {
+		return err
+	}
+	defer prep.close()
+	if onReady != nil {
+		onReady()
+	}
+	return prep.writeTo(ctx, dst)
 }
 
 func lastPacketSegment(files []string, index int) bool {

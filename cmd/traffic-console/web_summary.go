@@ -216,6 +216,10 @@ type sessionSummary struct {
 	Clients, Rules, Severities, Statuses []webCount
 }
 
+// sqlClientHost strips the port from a client endpoint in SQLite without
+// mangling portless IPv4/IPv6 addresses. Shared by web and TUI summaries.
+const sqlClientHost = `CASE WHEN substr(client,1,1)='[' AND instr(client,']:')>0 THEN substr(client,2,instr(client,']:')-2) WHEN instr(client,':')>0 AND instr(substr(client,instr(client,':')+1),':')=0 THEN substr(client,1,instr(client,':')-1) ELSE client END`
+
 func querySessionSummary(ctx context.Context, db *sql.DB, filter tuiFilter) (sessionSummary, error) {
 	where, args := filter.where(false)
 	var result sessionSummary
@@ -244,8 +248,7 @@ func querySessionSummary(ctx context.Context, db *sql.DB, filter tuiFilter) (ses
 	var err error
 	// The port is stripped so one source address aggregates across connections,
 	// without mangling portless IPv4/IPv6 addresses.
-	const clientHostExpr = `CASE WHEN substr(client,1,1)='[' AND instr(client,']:')>0 THEN substr(client,2,instr(client,']:')-2) WHEN instr(client,':')>0 AND instr(substr(client,instr(client,':')+1),':')=0 THEN substr(client,1,instr(client,':')-1) ELSE client END`
-	result.Clients, err = webCounts(ctx, db, `SELECT `+clientHostExpr+`,count(*),COALESCE(sum(alert>0),0) FROM entries WHERE `+where+` GROUP BY 1 ORDER BY 3 DESC,2 DESC,1 LIMIT 10`, args,
+	result.Clients, err = webCounts(ctx, db, `SELECT `+sqlClientHost+`,count(*),COALESCE(sum(alert>0),0) FROM entries WHERE `+where+` GROUP BY 1 ORDER BY 3 DESC,2 DESC,1 LIMIT 10`, args,
 		func(rows *sql.Rows, item *webCount) error { return rows.Scan(&item.Name, &item.Count, &item.Alerts) })
 	if err != nil {
 		return result, err
