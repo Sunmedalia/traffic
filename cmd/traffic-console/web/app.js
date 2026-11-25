@@ -753,13 +753,15 @@ function drawTimeline(host, data, height) {
   if (data.granularity >= 86400) labels.forEach((text, i) => { labels[i] = text.slice(0, 10); });
   set(host, chart, tip, h('div', { class: 'axis' }, labels.map((text) => h('span', {}, text))));
 
-  const indexAt = (event) => {
+  const indexAt = (clientX) => {
     const box = chart.getBoundingClientRect();
-    return Math.max(0, Math.min(count - 1, Math.floor(((event.clientX - box.left) / box.width) * count)));
+    return Math.max(0, Math.min(count - 1, Math.floor(((clientX - box.left) / (box.width || 1)) * count)));
   };
   let anchor = null;
-  const paint = (event) => {
-    const index = indexAt(event);
+  let moveRaf = 0;
+  let pendingX = 0;
+  const paint = (clientX) => {
+    const index = indexAt(clientX);
     const from = anchor == null ? index : Math.min(anchor, index);
     const to = anchor == null ? index : Math.max(anchor, index);
     hover.setAttribute('x', index * slot);
@@ -785,21 +787,30 @@ function drawTimeline(host, data, height) {
     tip.style.left = `${Math.max(90, Math.min(width - 90, ((from + to + 1) / 2) * slot))}px`;
     return [from, to];
   };
-  chart.addEventListener('pointermove', paint);
+  chart.addEventListener('pointermove', (event) => {
+    pendingX = event.clientX;
+    if (moveRaf) return;
+    moveRaf = requestAnimationFrame(() => {
+      moveRaf = 0;
+      paint(pendingX);
+    });
+  });
   chart.addEventListener('pointerleave', () => {
+    if (moveRaf) { cancelAnimationFrame(moveRaf); moveRaf = 0; }
     if (anchor != null) return;
     hover.setAttribute('visibility', 'hidden');
     tip.hidden = true;
   });
   chart.addEventListener('pointerdown', (event) => {
     if (event.button !== 0) return;
-    anchor = indexAt(event);
+    anchor = indexAt(event.clientX);
     chart.setPointerCapture(event.pointerId);
-    paint(event);
+    paint(event.clientX);
   });
   chart.addEventListener('pointerup', (event) => {
+    if (moveRaf) { cancelAnimationFrame(moveRaf); moveRaf = 0; }
     if (anchor == null) return;
-    const [from, to] = paint(event);
+    const [from, to] = paint(event.clientX);
     anchor = null;
     // A plain click on a one-second bucket cannot zoom further.
     if (from === to && count === 1 && data.granularity === 1) return;
@@ -808,6 +819,7 @@ function drawTimeline(host, data, height) {
       filter: { ...filter, since: new Date(start + from * step).toISOString(), until: new Date(start + (to + 1) * step).toISOString() } });
   });
   chart.addEventListener('pointercancel', () => {
+    if (moveRaf) { cancelAnimationFrame(moveRaf); moveRaf = 0; }
     anchor = null;
     brush.setAttribute('visibility', 'hidden');
   });
@@ -867,8 +879,22 @@ function syncFilters() {
 
 // ---- rows ----
 
+function syncRowSelection() {
+  const tbody = $('rows-body');
+  for (const tr of tbody.querySelectorAll('tr.selected')) {
+    if (tr.dataset.id !== state.selected) tr.classList.remove('selected');
+  }
+  if (state.selected) {
+    const active = tbody.querySelector(`tr[data-id="${CSS.escape(state.selected)}"]`);
+    if (active) active.classList.add('selected');
+  }
+  const idx = selectedIndex();
+  $('detail-prev').disabled = idx <= 0;
+  $('detail-next').disabled = idx < 0 || idx >= state.rows.length - 1;
+}
+
 function renderRows(loading) {
-  const key = JSON.stringify(state.rows) + '|' + state.selected + '|' + state.utc;
+  const key = JSON.stringify(state.rows) + '|' + state.utc;
   if (key !== state.rowsKey) {
     state.rowsKey = key;
     const known = state.known;
@@ -885,6 +911,7 @@ function renderRows(loading) {
     }));
     if (state.rows.length || !loading) state.known = new Set(state.rows.map((row) => row.id));
   }
+  syncRowSelection();
   const empty = $('rows-empty');
   empty.hidden = state.rows.length > 0;
   if (!state.rows.length) {
@@ -902,8 +929,6 @@ function renderRows(loading) {
   const pill = $('newpill');
   pill.hidden = added <= 0;
   pill.textContent = `↑ 有 ${number(added)} 条新请求`;
-  $('detail-prev').disabled = selectedIndex() <= 0;
-  $('detail-next').disabled = selectedIndex() < 0 || selectedIndex() >= state.rows.length - 1;
 }
 
 const selectedIndex = () => state.rows.findIndex((row) => row.id === state.selected);
@@ -936,7 +961,7 @@ function closeDetail() {
 
 function hideDetail() {
   closeDetail();
-  renderRows();
+  syncRowSelection();
 }
 
 async function showDetail(id, quiet) {
@@ -950,7 +975,7 @@ async function showDetail(id, quiet) {
     $('split').classList.add('open');
     $('tab-list').classList.add('reading');
     renderDetail();
-    renderRows();
+    syncRowSelection();
   }
   const sid = state.sid;
   try {

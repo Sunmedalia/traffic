@@ -99,12 +99,33 @@ func (w *webServer) handleTimeline(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
+	status, _ := readTUIStatus(s.dir)
+	finished := status.State != "" && status.State != "running" && status.State != "starting" && status.State != "stale"
+	revision := summaryRevision(s)
+	key := s.dir + "|" + r.URL.Query().Encode()
+	if finished && revision != "" {
+		w.timelineMu.Lock()
+		entry, ok := w.timelines[key]
+		w.timelineMu.Unlock()
+		if ok && entry.revision == revision {
+			webJSON(rw, http.StatusOK, entry.data)
+			return
+		}
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	result, err := querySessionTimeline(ctx, s.db, filter, get("alerts") == "1")
 	if err != nil {
 		webError(rw, http.StatusInternalServerError, err)
 		return
+	}
+	if finished && revision != "" {
+		w.timelineMu.Lock()
+		if len(w.timelines) > 128 {
+			w.timelines = map[string]timelineCacheEntry{}
+		}
+		w.timelines[key] = timelineCacheEntry{revision: revision, data: result}
+		w.timelineMu.Unlock()
 	}
 	webJSON(rw, http.StatusOK, result)
 }
@@ -156,7 +177,7 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 	status, _ := readTUIStatus(s.dir)
 	finished := status.State != "" && status.State != "running" && status.State != "starting" && status.State != "stale"
 	revision := summaryRevision(s)
-	key := s.dir + "|" + r.URL.RawQuery
+	key := s.dir + "|" + r.URL.Query().Encode()
 	if finished && revision != "" {
 		w.summaryMu.Lock()
 		entry, ok := w.summaries[key]
@@ -198,8 +219,27 @@ type sessionSummary struct {
 func querySessionSummary(ctx context.Context, db *sql.DB, filter tuiFilter) (sessionSummary, error) {
 	where, args := filter.where(false)
 	var result sessionSummary
-	if err := db.QueryRowContext(ctx, "SELECT count(*),COALESCE(sum(alert>0),0) FROM entries WHERE "+where, args...).Scan(&result.Total, &result.Alerted); err != nil {
+	var low, medium, high, other int
+	if err := db.QueryRowContext(ctx, `SELECT count(*),COALESCE(sum(alert>0),0),
+ COALESCE(sum(CASE WHEN alert>0 AND severity=1 THEN 1 ELSE 0 END),0),
+ COALESCE(sum(CASE WHEN alert>0 AND severity=2 THEN 1 ELSE 0 END),0),
+ COALESCE(sum(CASE WHEN alert>0 AND severity=3 THEN 1 ELSE 0 END),0),
+ COALESCE(sum(CASE WHEN alert>0 AND (severity IS NULL OR severity<1 OR severity>3) THEN 1 ELSE 0 END),0)
+ FROM entries WHERE `+where, args...).Scan(&result.Total, &result.Alerted, &low, &medium, &high, &other); err != nil {
 		return result, err
+	}
+	result.Severities = []webCount{}
+	if other > 0 {
+		result.Severities = append(result.Severities, webCount{Name: "", Count: other})
+	}
+	if low > 0 {
+		result.Severities = append(result.Severities, webCount{Name: "low", Count: low})
+	}
+	if medium > 0 {
+		result.Severities = append(result.Severities, webCount{Name: "medium", Count: medium})
+	}
+	if high > 0 {
+		result.Severities = append(result.Severities, webCount{Name: "high", Count: high})
 	}
 	var err error
 	// The port is stripped so one source address aggregates across connections,
@@ -210,24 +250,9 @@ func querySessionSummary(ctx context.Context, db *sql.DB, filter tuiFilter) (ses
 	if err != nil {
 		return result, err
 	}
-	// Rule and severity breakdowns only parse the records that carry alerts.
+	// Rule breakdowns only parse the records that carry alerts.
 	result.Rules, err = webCounts(ctx, db, `SELECT COALESCE(json_extract(hit.value,'$.rule'),''),COALESCE(json_extract(hit.value,'$.severity'),''),count(DISTINCT entries.id) FROM entries, json_each(entries.alerts) hit WHERE entries.alert>0 AND `+where+` GROUP BY 1,2 ORDER BY 3 DESC,1 LIMIT 10`, args,
 		func(rows *sql.Rows, item *webCount) error { return rows.Scan(&item.Name, &item.Severity, &item.Count) })
-	if err != nil {
-		return result, err
-	}
-	severityNames := [...]string{"", "low", "medium", "high"}
-	result.Severities, err = webCounts(ctx, db, `SELECT severity,count(*) FROM entries WHERE alert>0 AND `+where+` GROUP BY severity`, args,
-		func(rows *sql.Rows, item *webCount) error {
-			var level int
-			if err := rows.Scan(&level, &item.Count); err != nil {
-				return err
-			}
-			if level >= 0 && level < len(severityNames) {
-				item.Name = severityNames[level]
-			}
-			return nil
-		})
 	if err != nil {
 		return result, err
 	}

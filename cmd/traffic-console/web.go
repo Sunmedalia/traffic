@@ -214,9 +214,19 @@ type webServer struct {
 	jobCancel   context.CancelFunc
 	jobs        sync.WaitGroup
 
-	summaryMu sync.Mutex
-	summaries map[string]summaryCacheEntry
-	stores    *storeCache
+	summaryMu  sync.Mutex
+	summaries  map[string]summaryCacheEntry
+	timelineMu sync.Mutex
+	timelines  map[string]timelineCacheEntry
+	stores     *storeCache
+	exportSem  chan struct{}
+}
+
+const maxConcurrentExports = 4
+
+type timelineCacheEntry struct {
+	revision string
+	data     sessionTimeline
 }
 
 const webStoreCacheSize = 16
@@ -433,7 +443,7 @@ var errWebSessionNotFound = errors.New("会话不存在，请重新扫描")
 
 func newWebServer(roots []string, token string, refresh time.Duration) *webServer {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &webServer{token: token, roots: roots, refresh: refresh, sessions: map[string]sessionEntry{}, discovery: newDiscoveryCache(), summaries: map[string]summaryCacheEntry{}, stores: newStoreCache(webStoreCacheSize), ctx: ctx, cancel: cancel}
+	return &webServer{token: token, roots: roots, refresh: refresh, sessions: map[string]sessionEntry{}, discovery: newDiscoveryCache(), summaries: map[string]summaryCacheEntry{}, timelines: map[string]timelineCacheEntry{}, stores: newStoreCache(webStoreCacheSize), exportSem: make(chan struct{}, maxConcurrentExports), ctx: ctx, cancel: cancel}
 }
 
 func webSessionID(dir string) string {
@@ -558,9 +568,10 @@ func (w *webServer) handler() http.Handler {
 		header.Set("Referrer-Policy", "no-referrer")
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			header.Set("Cache-Control", "no-store")
-			got := sha256.Sum256([]byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")))
+			bearer, hasBearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+			got := sha256.Sum256([]byte(bearer))
 			want := sha256.Sum256([]byte(w.token))
-			if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
+			if !hasBearer || subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
 				webError(rw, http.StatusUnauthorized, errors.New("访问令牌无效"))
 				return
 			}
@@ -760,6 +771,18 @@ func (w *webServer) handleDetail(rw http.ResponseWriter, r *http.Request) {
 }
 
 func (w *webServer) handleExport(rw http.ResponseWriter, r *http.Request) {
+	if r.Context().Err() != nil {
+		return
+	}
+	select {
+	case w.exportSem <- struct{}{}:
+		defer func() { <-w.exportSem }()
+	case <-r.Context().Done():
+		return
+	default:
+		webError(rw, http.StatusTooManyRequests, errors.New("当前导出任务过多，请稍后重试"))
+		return
+	}
 	s, release, t, b, ok := w.transaction(rw, r)
 	if !ok {
 		return
@@ -772,7 +795,10 @@ func (w *webServer) handleExport(rw http.ResponseWriter, r *http.Request) {
 	}
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "evidence.zip")
-	if err = exportEvidence(s, t, b, path); err != nil {
+	if err = exportEvidenceContext(r.Context(), s, t, b, path); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "stop capture before exporting evidence") {
 			status, err = http.StatusConflict, errors.New("采集仍在进行，请停止采集后再导出证据")

@@ -109,12 +109,29 @@ const DECODERS = [
   } },
 ];
 
+const MAX_DECODE_PROBE = 4096;
+
 // Cheap synchronous check used to dim decoders that would fail or change nothing.
 function decoderApplies(decoder, bytes, text) {
   if (decoder.async) return (bytes[0] === 0x1f && bytes[1] === 0x8b) || (bytes[0] === 0x78 && [0x01, 0x5e, 0x9c, 0xda].includes(bytes[1]));
+  let probeBytes = bytes;
+  let probeText = text;
+  if (bytes.length > MAX_DECODE_PROBE || text.length > MAX_DECODE_PROBE) {
+    probeText = text.slice(0, MAX_DECODE_PROBE);
+    if (decoder.key === 'base64') {
+      const clean = probeText.replace(/\s+/g, '');
+      const aligned = clean.length - (clean.length % 4);
+      probeText = aligned > 0 ? clean.slice(0, aligned) : '';
+    } else if (decoder.key === 'hex') {
+      const clean = probeText.replace(/0x|\\x|%|[\s:,-]/gi, '');
+      const aligned = clean.length - (clean.length % 2);
+      probeText = aligned > 0 ? clean.slice(0, aligned) : '';
+    }
+    probeBytes = utf8In.encode(probeText);
+  }
   try {
-    const out = decoder.run(bytes, text);
-    return out.length !== bytes.length || out.some((b, i) => b !== bytes[i]);
+    const out = decoder.run(probeBytes, probeText);
+    return out.length !== probeBytes.length || out.some((b, i) => b !== probeBytes[i]);
   } catch (_) {
     return false;
   }

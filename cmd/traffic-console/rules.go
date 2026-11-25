@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"container/heap"
 	"fmt"
 	yaml "gopkg.in/yaml.v3"
@@ -13,7 +14,6 @@ import (
 	"os"
 	"regexp"
 	"regexp/syntax"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -57,7 +57,15 @@ var responseLimit = 1 << 20
 var scanWindow = time.Minute
 var scanThreshold = 20
 
+const (
+	maxCompiledRules     = 512
+	maxRulePatternLength = 4096
+)
+
 func compileRules(rs []Rule) error {
+	if len(rs) > maxCompiledRules {
+		return fmt.Errorf("too many rules: %d exceeds limit %d", len(rs), maxCompiledRules)
+	}
 	seen := map[string]bool{}
 	for i := range rs {
 		r := &rs[i]
@@ -70,6 +78,9 @@ func compileRules(rs []Rule) error {
 		}
 		if r.Severity != "low" && r.Severity != "medium" && r.Severity != "high" {
 			return fmt.Errorf("invalid severity")
+		}
+		if len(r.Pattern) > maxRulePatternLength {
+			return fmt.Errorf("rule %q pattern too long (%d bytes, max %d)", r.ID, len(r.Pattern), maxRulePatternLength)
 		}
 		rx, e := regexp.Compile(r.Pattern)
 		if e != nil {
@@ -126,6 +137,49 @@ func loadRules(path string) error {
 	return err
 }
 
+type messageNeeds struct {
+	raw     bool
+	headers bool
+	fields  bool
+	body    bool
+	decoded bool
+}
+
+var allMessageNeeds = messageNeeds{raw: true, headers: true, fields: true, body: true, decoded: true}
+
+type ruleFieldPlan struct {
+	request  messageNeeds
+	response messageNeeds
+}
+
+func planRuleFields(rs []Rule) ruleFieldPlan {
+	var plan ruleFieldPlan
+	for _, r := range rs {
+		var dst *messageNeeds
+		switch {
+		case r.Field == "url":
+			continue
+		case strings.HasPrefix(r.Field, "response"):
+			dst = &plan.response
+		default:
+			dst = &plan.request
+		}
+		switch {
+		case r.Field == "request" || r.Field == "response":
+			dst.raw = true
+			dst.decoded = true
+		case strings.Contains(r.Field, ".header."):
+			dst.fields = true
+		case r.Field == "request.headers" || r.Field == "response.headers":
+			dst.headers = true
+		case r.Field == "request.body" || r.Field == "response.body":
+			dst.body = true
+			dst.decoded = true
+		}
+	}
+	return plan
+}
+
 func detect(t Transaction) []Alert { return detectWithRules(t, rules) }
 
 func detectWithRules(t Transaction, rs []Rule) []Alert {
@@ -133,6 +187,10 @@ func detectWithRules(t Transaction, rs []Rule) []Alert {
 }
 
 func detectWithLimits(t Transaction, rs []Rule, requestLimit, responseLimit int) []Alert {
+	return detectWithPlan(t, rs, planRuleFields(rs), requestLimit, responseLimit, nil)
+}
+
+func detectWithPlan(t Transaction, rs []Rule, plan ruleFieldPlan, requestLimit, responseLimit int, br *bufio.Reader) []Alert {
 	var out []Alert
 	var request, response *detectionHTTP
 	type fieldView struct{ field, view string }
@@ -152,13 +210,13 @@ func detectWithLimits(t Transaction, rs []Rule, requestLimit, responseLimit int)
 		if rule.Field != "url" {
 			if responseRule {
 				if response == nil {
-					m := detectionMessage(t.Response, true, responseLimit)
+					m := detectionMessageWith(t.Response, true, responseLimit, plan.response, br)
 					response = &m
 				}
 				message = response
 			} else {
 				if request == nil {
-					m := detectionMessage(t.Request, false, requestLimit)
+					m := detectionMessageWith(t.Request, false, requestLimit, plan.request, br)
 					request = &m
 				}
 				message = request
@@ -205,45 +263,114 @@ type detectionHTTP struct {
 	fields                                   http.Header
 }
 
+var gzipReaderPool sync.Pool
+
+func gunzipBody(src io.Reader, limit int) (string, string) {
+	var reader *gzip.Reader
+	var err error
+	if pooled := gzipReaderPool.Get(); pooled != nil {
+		reader = pooled.(*gzip.Reader)
+		err = reader.Reset(src)
+		if err != nil {
+			gzipReaderPool.Put(reader)
+			return "", ""
+		}
+	} else {
+		reader, err = gzip.NewReader(src)
+		if err != nil {
+			return "", ""
+		}
+	}
+	defer func() {
+		_ = reader.Close()
+		gzipReaderPool.Put(reader)
+	}()
+	decoded, err := io.ReadAll(io.LimitReader(reader, int64(limit)+1))
+	view := "gzip-body"
+	if len(decoded) > limit {
+		decoded = decoded[:limit]
+		view = "gzip-body-truncated"
+	} else if err != nil {
+		view = "gzip-body-incomplete"
+	}
+	return string(decoded), view
+}
+
 func detectionMessage(raw []byte, response bool, limit int) detectionHTTP {
-	message := detectionHTTP{raw: string(raw)}
-	// Keep bounded partial bodies searchable even when the saved message is truncated.
-	head, payload, found := bytes.Cut(raw, []byte("\r\n\r\n"))
-	if !found {
-		head, payload, found = bytes.Cut(raw, []byte("\n\n"))
+	return detectionMessageWith(raw, response, limit, allMessageNeeds, nil)
+}
+
+func detectionMessageWith(raw []byte, response bool, limit int, needs messageNeeds, br *bufio.Reader) detectionHTTP {
+	if len(raw) == 0 {
+		return detectionHTTP{}
 	}
-	if found {
-		_, headers, _ := bytes.Cut(head, []byte("\n"))
-		message.headers = string(headers)
+	var message detectionHTTP
+	if needs.raw {
+		message.raw = string(raw)
 	}
-	reader := bufio.NewReaderSize(bytes.NewReader(raw), 4096)
+	var head, payload []byte
+	var found bool
+	if needs.headers || needs.body {
+		// Keep bounded partial bodies searchable even when the saved message is truncated.
+		head, payload, found = bytes.Cut(raw, []byte("\r\n\r\n"))
+		if !found {
+			head, payload, found = bytes.Cut(raw, []byte("\n\n"))
+		}
+		if found && needs.headers {
+			_, headers, _ := bytes.Cut(head, []byte("\n"))
+			message.headers = string(headers)
+		}
+	}
+	if !needs.fields && !needs.body && !needs.decoded {
+		return message
+	}
+	var reader *bufio.Reader
+	if br != nil {
+		br.Reset(bytes.NewReader(raw))
+		reader = br
+	} else {
+		reader = bufio.NewReaderSize(bytes.NewReader(raw), 4096)
+	}
+	var parsedHeader http.Header
 	var body io.ReadCloser
 	if response {
 		parsed, err := http.ReadResponse(reader, nil)
 		if err == nil {
-			message.fields, body = parsed.Header, parsed.Body
+			parsedHeader, body = parsed.Header, parsed.Body
 		}
 	} else {
 		parsed, _, err := session.ReadRequest(reader)
 		if err == nil {
-			message.fields, body = parsed.Header, parsed.Body
+			parsedHeader, body = parsed.Header, parsed.Body
 			if parsed.Host != "" {
-				message.fields.Set("Host", parsed.Host)
+				parsedHeader.Set("Host", parsed.Host)
 			}
 		}
 	}
+	if needs.fields {
+		message.fields = parsedHeader
+	}
+	sameParser := response == bytes.HasPrefix(raw, []byte("HTTP/"))
+	isGzip := body != nil && strings.EqualFold(parsedHeader.Get("Content-Encoding"), "gzip")
 	if body != nil {
-		data, _ := io.ReadAll(io.LimitReader(body, int64(limit)))
+		if needs.body {
+			data, _ := io.ReadAll(io.LimitReader(body, int64(limit)))
+			message.body = string(data)
+			if needs.decoded && sameParser && isGzip {
+				var src io.Reader = bytes.NewReader(data)
+				if len(data) == limit {
+					src = io.MultiReader(src, body)
+				}
+				message.decoded, message.decodedView = gunzipBody(src, limit)
+			}
+		} else if needs.decoded && sameParser && isGzip {
+			message.decoded, message.decodedView = gunzipBody(body, limit)
+		}
 		body.Close()
-		message.body = string(data)
-	} else if found {
+	} else if needs.body && found {
 		message.body = string(payload)
 	}
-	// DecodedBody parses the message again and only decodes gzip bodies. When
-	// it would pick the same parser, the headers read above already tell
-	// whether it can return anything.
-	sameParser := response == bytes.HasPrefix(raw, []byte("HTTP/"))
-	if !sameParser || strings.EqualFold(message.fields.Get("Content-Encoding"), "gzip") {
+	if needs.decoded && !sameParser {
 		message.decoded, message.decodedView = session.DecodedBody(raw, limit)
 	}
 	return message
@@ -298,17 +425,47 @@ func matchView(rule Rule, text, view string) *Alert {
 	return matchDecodedViews(rule, decodeViews(text), view)
 }
 
-var validPercentEscape = regexp.MustCompile(`%[0-9a-fA-F]{2}`)
+func fromHex(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
 
 func decodePercent(text string) string {
-	decoded, err := url.QueryUnescape(text)
-	if err == nil {
+	if strings.IndexAny(text, "%+") < 0 {
+		return text
+	}
+	if decoded, err := url.QueryUnescape(text); err == nil {
 		return decoded
 	}
-	return validPercentEscape.ReplaceAllStringFunc(strings.ReplaceAll(text, "+", " "), func(escape string) string {
-		value, _ := strconv.ParseUint(escape[1:], 16, 8)
-		return string([]byte{byte(value)})
-	})
+	var out strings.Builder
+	out.Grow(len(text))
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case '+':
+			out.WriteByte(' ')
+		case '%':
+			if i+2 < len(text) {
+				hi, ok1 := fromHex(text[i+1])
+				lo, ok2 := fromHex(text[i+2])
+				if ok1 && ok2 {
+					out.WriteByte(hi<<4 | lo)
+					i += 2
+					continue
+				}
+			}
+			out.WriteByte('%')
+		default:
+			out.WriteByte(text[i])
+		}
+	}
+	return out.String()
 }
 
 type scanPath struct {
