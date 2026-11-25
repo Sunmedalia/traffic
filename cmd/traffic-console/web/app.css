@@ -307,6 +307,22 @@ table.data tbody tr.fresh { animation: fresh 1.6s ease-out; }
 @keyframes fresh { from { background: var(--accent-soft); } }
 table.data td.time { color: var(--muted); }
 table.data td.wide { max-width: none; width: 100%; }
+/* A dragged list column keeps the width in --col-<name>; unset columns size themselves. */
+.rows-table th:not(.wide) { overflow: hidden; text-overflow: ellipsis; }
+.rows-table th:nth-child(1), .rows-table td:nth-child(1) { --w: var(--col-time); }
+.rows-table th:nth-child(2), .rows-table td:nth-child(2) { --w: var(--col-level); }
+.rows-table th:nth-child(3), .rows-table td:nth-child(3) { --w: var(--col-method); }
+.rows-table th:nth-child(4), .rows-table td:nth-child(4) { --w: var(--col-status); }
+.rows-table th:nth-child(5), .rows-table td:nth-child(5) { --w: var(--col-client); }
+.rows-table th:nth-child(6), .rows-table td:nth-child(6) { --w: var(--col-host); }
+.rows-table th:not(.wide), .rows-table td:not(.wide) { box-sizing: border-box; width: var(--w, auto); min-width: var(--w, 0); }
+.rows-table th:not(.wide) { max-width: var(--w, none); }
+.rows-table td:not(.wide) { max-width: var(--w, 260px); }
+.col-grip { position: absolute; top: 0; right: 0; bottom: 0; width: 8px; cursor: col-resize; touch-action: none; }
+.col-grip::after { content: ""; position: absolute; top: 6px; bottom: 6px; right: 3px; width: 2px; border-radius: 1px; background: var(--line); transition: background .12s; }
+.col-grip:hover::after, .col-grip:focus-visible::after, .col-grip.dragging::after { background: var(--accent); }
+.col-grip:focus-visible { outline: none; }
+body.col-resizing { cursor: col-resize; user-select: none; }
 table.data td.url { max-width: 0; }
 .sev { display: inline-block; min-width: 20px; padding: 0 5px; border-radius: 4px; font: 600 11px/17px var(--sans); text-align: center; }
 .sev.high { background: color-mix(in srgb, var(--high) 20%, transparent); color: var(--high); }

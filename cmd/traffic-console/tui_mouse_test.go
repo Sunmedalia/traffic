@@ -458,3 +458,60 @@ func TestTUIOverviewTimelineClicks(t *testing.T) {
 		t.Fatal("second click did not open the column")
 	}
 }
+
+func TestTUIColumnDrag(t *testing.T) {
+	m := tuiPagedModel(t)
+	width, _ := m.listBox()
+	before, _ := m.listColumns(width)
+	method := before[2]
+	if method.id != tuiColMethod {
+		t.Fatalf("third column is %d", method.id)
+	}
+	b := zoneOf(t, m, fmt.Sprintf("col:%d", tuiColMethod))
+	m.Update(tea.MouseClickMsg{X: b.x0, Y: b.y, Button: tea.MouseLeft})
+	m.Update(tea.MouseMotionMsg{X: b.x0 + 5, Y: b.y, Button: tea.MouseLeft})
+	m.Update(tea.MouseReleaseMsg{X: b.x0 + 5, Y: b.y, Button: tea.MouseLeft})
+	if m.colDrag != nil || m.colWidths[tuiColMethod] != method.width+5 {
+		t.Fatalf("method width %d, want %d", m.colWidths[tuiColMethod], method.width+5)
+	}
+	// The boundary moved with the column, and later columns follow it.
+	if moved := zoneOf(t, m, fmt.Sprintf("col:%d", tuiColMethod)); moved.x0 != b.x0+5 {
+		t.Fatalf("boundary at %d, want %d", moved.x0, b.x0+5)
+	}
+	// A column cannot crowd out the URL or vanish.
+	m.lastClickAt = time.Time{}
+	m.Update(tea.MouseClickMsg{X: b.x0 + 5, Y: b.y, Button: tea.MouseLeft})
+	m.Update(tea.MouseMotionMsg{X: 10000, Y: b.y, Button: tea.MouseLeft})
+	m.Update(tea.MouseReleaseMsg{X: 10000, Y: b.y, Button: tea.MouseLeft})
+	cols, _ := m.listColumns(width)
+	used := 0
+	for _, c := range cols {
+		used += c.width
+	}
+	if width-used != tuiColURLMin {
+		t.Fatalf("URL left %d columns", width-used)
+	}
+	for _, line := range strings.Split(m.View().Content, "\n") {
+		if termansi.StringWidth(line) > m.width {
+			t.Fatal("widened column overflows")
+		}
+	}
+	m.lastClickAt = time.Time{}
+	b = zoneOf(t, m, fmt.Sprintf("col:%d", tuiColMethod))
+	m.Update(tea.MouseClickMsg{X: b.x0, Y: b.y, Button: tea.MouseLeft})
+	m.Update(tea.MouseMotionMsg{X: -100, Y: b.y, Button: tea.MouseLeft})
+	m.Update(tea.MouseReleaseMsg{X: -100, Y: b.y, Button: tea.MouseLeft})
+	if m.colWidths[tuiColMethod] != tuiColMin {
+		t.Fatalf("method shrank to %d", m.colWidths[tuiColMethod])
+	}
+	// A double click on the boundary restores the automatic width.
+	b = zoneOf(t, m, fmt.Sprintf("col:%d", tuiColMethod))
+	m.lastClickAt = time.Time{}
+	for range 2 {
+		m.Update(tea.MouseClickMsg{X: b.x0, Y: b.y, Button: tea.MouseLeft})
+		m.Update(tea.MouseReleaseMsg{X: b.x0, Y: b.y, Button: tea.MouseLeft})
+	}
+	if m.colWidths[tuiColMethod] != 0 {
+		t.Fatalf("double click kept width %d", m.colWidths[tuiColMethod])
+	}
+}

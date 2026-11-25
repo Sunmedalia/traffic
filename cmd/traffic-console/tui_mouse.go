@@ -249,6 +249,7 @@ func (m *tuiModel) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 				m.lastClick = "" // a third click starts over
 			}
 			m.flash = ""
+			m.pressX = mouse.X
 			return m, m.click(id, mouse.Y, double)
 		case tea.MouseRight, tea.MouseBackward:
 			// Right click goes back a level, like Esc.
@@ -261,6 +262,9 @@ func (m *tuiModel) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.scrollDrag != nil {
 			m.dragScrollbar(mouse.Y)
+		}
+		if m.colDrag != nil {
+			m.dragColumn(mouse.X)
 		}
 		if d := m.drag; d != nil {
 			col := m.timelineColumnAt(mouse.X)
@@ -277,6 +281,7 @@ func (m *tuiModel) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case tea.MouseReleaseMsg:
 		m.scrollDrag = nil
+		m.endColumnDrag()
 		if m.splitDrag {
 			m.splitDrag = false
 			if m.wrapStale {
@@ -385,6 +390,9 @@ func (m *tuiModel) click(id string, y int, double bool) tea.Cmd {
 			return nil
 		}
 		m.splitDrag = true
+	case "col":
+		m.startColumnDrag(n, m.pressX, double)
+		return nil
 	case "tl":
 		m.startDrag(n, armed == "timeline")
 		return nil
