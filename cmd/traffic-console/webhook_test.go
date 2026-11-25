@@ -210,3 +210,26 @@ func TestWebhookDialRechecksChangingDNSAnswer(t *testing.T) {
 		}
 	}
 }
+
+func TestWebhookBlocksCGNATNAT64AndExternalLoopbackRebind(t *testing.T) {
+	if err := checkWebhookIP(netip.MustParseAddr("100.64.0.1"), false, false); err == nil {
+		t.Fatalf("CGNAT 100.64.0.1 should require --allow-private-webhook")
+	}
+	if err := checkWebhookIP(netip.MustParseAddr("100.64.0.1"), true, false); err != nil {
+		t.Fatalf("CGNAT 100.64.0.1 should be allowed with --allow-private-webhook: %v", err)
+	}
+	for _, blocked := range []string{"100.100.100.200", "64:ff9b::169.254.169.254", "64:ff9b:1::10.0.0.1"} {
+		if err := checkWebhookIP(netip.MustParseAddr(blocked), true, false); err == nil {
+			t.Fatalf("%s must remain blocked even with --allow-private-webhook", blocked)
+		}
+	}
+	if err := checkWebhookIPForHost(netip.MustParseAddr("127.0.0.1"), false, false, false); err == nil {
+		t.Fatalf("external hostname resolving to loopback should require --allow-private-webhook")
+	}
+	if err := checkWebhookIPForHost(netip.MustParseAddr("127.0.0.1"), false, true, true); err == nil || !strings.Contains(err.Error(), "requires HTTPS") {
+		t.Fatalf("external hostname resolving to loopback over HTTP with token must require HTTPS: %v", err)
+	}
+	if err := checkWebhookIPForHost(netip.MustParseAddr("127.0.0.1"), true, false, true); err != nil {
+		t.Fatalf("explicit loopback host over HTTP with token should remain allowed: %v", err)
+	}
+}

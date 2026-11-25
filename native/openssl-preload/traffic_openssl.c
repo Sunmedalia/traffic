@@ -151,7 +151,10 @@ static void child_after_fork(void) {
 }
 
 __attribute__((constructor)) static void register_fork_handlers(void) {
-    event_ready_initialized = initialize_event_ready();
+    pthread_mutex_lock(&wait_mutex);
+    if (!event_ready_initialized)
+        event_ready_initialized = initialize_event_ready();
+    pthread_mutex_unlock(&wait_mutex);
     pthread_atfork(before_fork, after_fork, child_after_fork);
 }
 
@@ -527,6 +530,8 @@ static void start_worker(void) {
     for (size_t i = 0; i < EVENT_QUEUE; i++)
         events[i].available = i;
     pthread_mutex_lock(&wait_mutex);
+    if (!event_ready_initialized)
+        event_ready_initialized = initialize_event_ready();
     if (event_ready_initialized && !__atomic_load_n(&stopping, __ATOMIC_ACQUIRE) &&
         !pthread_create(&worker, NULL, send_worker, NULL))
         atomic_store(&worker_running, 1);

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,9 +20,23 @@ import (
 var privateWebhookEndpoint atomic.Pointer[string]
 
 var (
-	ec2MetadataIPv6 = netip.MustParseAddr("fd00:ec2::254")
-	ecsMetadataIPv4 = netip.MustParseAddr("100.100.100.200")
+	ec2MetadataIPv6      = netip.MustParseAddr("fd00:ec2::254")
+	ecsMetadataIPv4      = netip.MustParseAddr("100.100.100.200")
+	cgnatPrefix          = netip.MustParsePrefix("100.64.0.0/10")
+	nat64WellKnownPrefix = netip.MustParsePrefix("64:ff9b::/96")
+	nat64LocalPrefix     = netip.MustParsePrefix("64:ff9b:1::/48")
 )
+
+func isLoopbackHost(host string) bool {
+	trimmed := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if trimmed == "localhost" {
+		return true
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return ip.Unmap().IsLoopback()
+	}
+	return false
+}
 
 func validateWebhook(endpoint string) error {
 	if endpoint == "" {
@@ -35,20 +50,34 @@ func validateWebhook(endpoint string) error {
 }
 
 func checkWebhookIP(ip netip.Addr, allowPrivate, requireLoopback bool) error {
+	return checkWebhookIPForHost(ip, true, allowPrivate, requireLoopback)
+}
+
+func checkWebhookIPForHost(ip netip.Addr, loopbackHost, allowPrivate, requireLoopback bool) error {
 	ip = ip.Unmap().WithZone("")
 	if ip.IsLoopback() {
+		if loopbackHost {
+			return nil
+		}
+		if requireLoopback {
+			return fmt.Errorf("TRAFFIC_WEBHOOK_TOKEN requires HTTPS for non-loopback webhook destinations")
+		}
+		if !allowPrivate {
+			return fmt.Errorf("private webhook destination %s requires --allow-private-webhook", ip)
+		}
 		return nil
 	}
 	// Global unicast excludes link-local, unspecified and multicast.
-	// The rest of IPv4's zero network needs an explicit check.
+	// The rest of IPv4's zero network, cloud metadata, and NAT64 prefixes need explicit checks.
 	if !ip.IsGlobalUnicast() || (ip.Is4() && ip.As4()[0] == 0) ||
-		ip == ec2MetadataIPv6 || ip == ecsMetadataIPv4 {
+		ip == ec2MetadataIPv6 || ip == ecsMetadataIPv4 ||
+		nat64WellKnownPrefix.Contains(ip) || nat64LocalPrefix.Contains(ip) {
 		return fmt.Errorf("webhook destination %s is not permitted", ip)
 	}
 	if requireLoopback {
 		return fmt.Errorf("TRAFFIC_WEBHOOK_TOKEN requires HTTPS for non-loopback webhook destinations")
 	}
-	if ip.IsPrivate() && !allowPrivate {
+	if (ip.IsPrivate() || cgnatPrefix.Contains(ip)) && !allowPrivate {
 		return fmt.Errorf("private webhook destination %s requires --allow-private-webhook", ip)
 	}
 	return nil
@@ -82,10 +111,11 @@ func webhookDialContext(resolver *net.Resolver, allowPrivate, requireLoopback bo
 				return nil, err
 			}
 		}
+		loopbackHost := isLoopbackHost(host)
 		var lastErr error
 		allowed := ips[:0]
 		for _, ip := range ips {
-			if err := checkWebhookIP(ip, allowPrivate, requireLoopback); err != nil {
+			if err := checkWebhookIPForHost(ip, loopbackHost, allowPrivate, requireLoopback); err != nil {
 				lastErr = err
 			} else {
 				allowed = append(allowed, ip)
