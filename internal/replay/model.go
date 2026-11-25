@@ -29,19 +29,19 @@ var responseLimit = 64 << 10
 var capturePorts = map[int]bool{80: true, 443: true}
 
 type Store struct {
-	requests                           requestCache
-	indexMu                            sync.Mutex
-	indexTx                            *sql.Tx
-	indexRead, indexWrite, indexExists *sql.Stmt
-	indexBatching                      bool
-	indexOps, indexBytes               int
-	db                                 *sql.DB
-	dir                                string
-	mu                                 sync.Mutex
-	stats                              Stats
-	fatal                              error
-	localAddresses                     map[string]bool
-	gaps                               []session.GapEvent
+	requests                            requestCache
+	indexMu                             sync.Mutex
+	indexTx                             *sql.Tx
+	indexRead, indexInsert, indexUpdate *sql.Stmt
+	indexBatching                       bool
+	indexOps, indexBytes                int
+	db                                  *sql.DB
+	dir                                 string
+	mu                                  sync.Mutex
+	stats                               Stats
+	fatal                               error
+	localAddresses                      map[string]bool
+	gaps                                []session.GapEvent
 }
 
 func openStore(dir string, write bool) (*Store, error) {
@@ -52,6 +52,16 @@ func openStore(dir string, write bool) (*Store, error) {
 	return &Store{db: db, dir: dir, localAddresses: map[string]bool{}}, nil
 }
 func (s *Store) save(t Transaction) error {
+	s.prepare(&t)
+	if _, err := s.persist(t); err != nil {
+		return err
+	}
+	return nil
+}
+
+// prepare normalizes a record before it is stored or parked. It is idempotent:
+// a parked request is prepared when it is read and again when it is paired.
+func (s *Store) prepare(t *Transaction) {
 	if t.PID > 0 {
 		// Once a request has a start identity, keep it when its response is
 		// restored. Looking up the PID again could reassign old evidence to a
@@ -111,7 +121,7 @@ func (s *Store) save(t Transaction) error {
 	if strings.HasPrefix(t.Connection, "tls:preload/") {
 		t.Backend = "openssl-preload"
 	}
-	resolveClient(&t)
+	resolveClient(t)
 	t.SchemaVersion = 1
 	if t.Protocol == "" && t.Method != "" {
 		t.Protocol = "HTTP/1.1"
@@ -127,11 +137,6 @@ func (s *Store) save(t Transaction) error {
 		t.ID = hex.EncodeToString(h[:12])
 	}
 	t.Alerts = nil
-	if _, err := s.persist(t); err != nil {
-		return err
-	}
-	s.requests.put(t)
-	return nil
 }
 func (s *Store) problem(err error) {
 	s.mu.Lock()

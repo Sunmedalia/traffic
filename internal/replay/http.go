@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -152,15 +153,22 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				incomplete = incomplete || state.Incomplete()
 			}
 			if len(queue) > 0 {
+				// Popping the FIFO entry makes this goroutine the only owner of
+				// the request, so restoring and saving it need not hold p.mu.
 				t := queue[0]
-				if err := p.s.restorePending(&t); err != nil {
-					t.Incomplete = true
-					p.s.problem(err)
-				}
 				if len(queue) == 1 {
 					delete(p.pending, key)
 				} else {
 					p.pending[key] = queue[1:]
+				}
+				parked, inMemory := p.s.requests.take(t.ID)
+				p.mu.Unlock()
+				if inMemory {
+					t = parked
+				} else if err := p.s.restore(&t); err != nil {
+					// The cache spilled this request; SQLite must hold it.
+					t.Incomplete = true
+					p.s.problem(err)
 				}
 				t.Response = raw
 				t.ResponseTime = observed
@@ -170,19 +178,18 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				if err := p.s.save(t); err != nil {
 					p.s.fail(err)
 				}
+				continue
 			}
-			if len(queue) == 0 {
-				rs := p.responses[key]
-				if len(rs) < http1PipelineLimit && p.responseCount < http1ConnectionLimit && p.responseBytes+int64(len(raw)) <= 8<<20 {
-					p.responseBytes += int64(len(raw))
-					p.responseCount++
-					p.responses[key] = append(rs, responseData{raw: raw, observed: observed, status: resp.StatusCode, truncated: truncated, incomplete: e != nil || incomplete})
-				} else {
-					p.loseHTTP1PairingLocked(key, "response_queue_limit")
-					p.s.mu.Lock()
-					p.s.stats.QueueDropped++
-					p.s.mu.Unlock()
-				}
+			rs := p.responses[key]
+			if len(rs) < http1PipelineLimit && p.responseCount < http1ConnectionLimit && p.responseBytes+int64(len(raw)) <= 8<<20 {
+				p.responseBytes += int64(len(raw))
+				p.responseCount++
+				p.responses[key] = append(rs, responseData{raw: raw, observed: observed, status: resp.StatusCode, truncated: truncated, incomplete: e != nil || incomplete})
+			} else {
+				p.loseHTTP1PairingLocked(key, "response_queue_limit")
+				p.s.mu.Lock()
+				p.s.stats.QueueDropped++
+				p.s.mu.Unlock()
 			}
 			p.mu.Unlock()
 		} else {
@@ -245,14 +252,20 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 			if endpoint, ok := r.(interface{ LocalEndpoint() string }); ok {
 				t.LocalEndpoint = endpoint.LocalEndpoint()
 			}
+			// Normalize the copy a parked request keeps before taking p.mu, as
+			// a write at this point would have. Exactly one of t and parked is
+			// used; clipping keeps prepare's appends out of t's reasons.
+			parked := t
+			parked.IntegrityReasons = slices.Clip(parked.IntegrityReasons)
+			p.s.prepare(&parked)
 			p.mu.Lock()
 			if state, ok := r.(interface{ Aborted() bool }); ok && state.Aborted() {
+				p.mu.Unlock()
 				t.Incomplete = true
 				t.IntegrityReasons = append(t.IntegrityReasons, "tcp_stream_gap")
 				if err := p.s.save(t); err != nil {
 					p.s.fail(err)
 				}
-				p.mu.Unlock()
 				return
 			}
 			q, rs := p.pending[key], p.responses[key]
@@ -282,12 +295,19 @@ func (p *HTTPProcessor) process(r io.Reader, key, client, source string, pid int
 				t.Truncated = t.Truncated || rd.truncated
 				t.Incomplete = t.Incomplete || rd.incomplete
 			} else {
+				// Park the request before p.mu is released: a response that
+				// pops this FIFO entry must find it parked or already spilled.
 				p.pending[key] = append(q, Transaction{ID: t.ID, Time: t.Time, Method: t.Method, Source: t.Source, Client: t.Client, Connection: t.Connection, PID: t.PID, Host: t.Host})
+				if err := p.s.parkPending(parked); err != nil {
+					p.s.fail(err)
+				}
+				p.mu.Unlock()
+				continue
 			}
+			p.mu.Unlock()
 			if err := p.s.save(t); err != nil {
 				p.s.fail(err)
 			}
-			p.mu.Unlock()
 		}
 	}
 }

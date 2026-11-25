@@ -280,7 +280,7 @@ func TestTLSLargeBodyDrainsBeforeNextRequest(t *testing.T) {
 		frames.ingest("largeread", wire[:n], meta, false, p)
 		wire = wire[n:]
 	}
-	rows := readRecords(t, s)
+	rows := storedRecords(t, s)
 	if len(rows) != 2 || !rows["/large"].Truncated || rows["/large"].Incomplete || rows["/next"].Incomplete {
 		t.Fatalf("lost boundary after truncated body: %+v", rows)
 	}
