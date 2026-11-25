@@ -39,6 +39,9 @@ type preparedEvidence struct {
 	originalName    string
 	statusData      []byte
 	hasStatus       bool
+	gapsData        []byte
+	hasGaps         bool
+	truncatedFiles  []string
 	remote, local   netip.AddrPort
 	hasEndpoints    bool
 	first, last     time.Time
@@ -103,7 +106,7 @@ func prepareEvidence(ctx context.Context, s *Store, t Transaction, b []byte) (*p
 		if err != nil {
 			return nil, err
 		}
-		if err = p.store.db.QueryRowContext(ctx, "SELECT data FROM main.requests WHERE id=?", p.t.ID).Scan(&p.originalEvent); err != nil {
+		if err = p.store.db.QueryRowContext(ctx, "SELECT data FROM stored_records WHERE id=?", p.t.ID).Scan(&p.originalEvent); err != nil {
 			return nil, err
 		}
 		p.originalName = "captured-event.json"
@@ -115,6 +118,41 @@ func prepareEvidence(ctx context.Context, s *Store, t Transaction, b []byte) (*p
 	if status, err := os.ReadFile(filepath.Join(p.store.dir, "status.json")); err == nil {
 		p.statusData = status
 		p.hasStatus = true
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	// Parse and filter gaps.jsonl before streaming headers so corrupt or
+	// unreadable diagnostics fail with an HTTP error instead of a truncated ZIP.
+	if file, err := os.Open(filepath.Join(p.store.dir, "gaps.jsonl")); err == nil {
+		var selected bytes.Buffer
+		lines := session.NewJSONLines(file, 1<<20)
+		for {
+			if err := ctx.Err(); err != nil {
+				file.Close()
+				return nil, err
+			}
+			var gap session.GapEvent
+			err := lines.Next(&gap)
+			if err == io.EOF {
+				break
+			}
+			if err == session.ErrTruncatedJSONLine {
+				p.truncatedFiles = append(p.truncatedFiles, "gaps.jsonl")
+				break
+			}
+			if err != nil {
+				file.Close()
+				return nil, err
+			}
+			if gap.Connection == "" || gap.Connection == p.t.Connection || gap.Connection == strings.TrimPrefix(p.t.Connection, "tls:") || (p.t.TargetID != "" && gap.Connection == p.t.TargetID) {
+				selected.Write(lines.Bytes())
+				selected.WriteByte('\n')
+			}
+		}
+		file.Close()
+		p.gapsData = selected.Bytes()
+		p.hasGaps = true
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -207,45 +245,18 @@ func (p *preparedEvidence) writeTo(ctx context.Context, dst io.Writer) error {
 			return err
 		}
 	}
-	var truncatedFiles []string
-	// Capture diagnostics describe the whole session; gap entries are limited
-	// to this connection / target or an unattributable backend discontinuity.
-	if file, err := os.Open(filepath.Join(p.store.dir, "gaps.jsonl")); err == nil {
-		var selected bytes.Buffer
-		lines := session.NewJSONLines(file, 1<<20)
-		for {
-			if err := ctx.Err(); err != nil {
-				file.Close()
-				return err
-			}
-			var gap session.GapEvent
-			err := lines.Next(&gap)
-			if err == io.EOF {
-				break
-			}
-			if err == session.ErrTruncatedJSONLine {
-				truncatedFiles = append(truncatedFiles, "gaps.jsonl")
-				break
-			}
-			if err != nil {
-				file.Close()
-				return err
-			}
-			if gap.Connection == "" || gap.Connection == p.t.Connection || gap.Connection == strings.TrimPrefix(p.t.Connection, "tls:") || (p.t.TargetID != "" && gap.Connection == p.t.TargetID) {
-				selected.Write(lines.Bytes())
-				selected.WriteByte('\n')
-			}
-		}
-		file.Close()
-		if err := add("capture-gaps.jsonl", selected.Bytes()); err != nil {
+	truncatedFiles := append([]string(nil), p.truncatedFiles...)
+	if p.hasGaps {
+		if err := add("capture-gaps.jsonl", p.gapsData); err != nil {
 			return err
 		}
-	} else if !os.IsNotExist(err) {
-		return err
 	}
 	if p.hasEndpoints && len(p.packetFiles) > 0 {
 		// Pre-peek the first packet timestamp of candidate segments so segments
-		// completely outside [first, last] are skipped without full packet decoding.
+		// completely outside [first, last] (with a small margin for clock skew /
+		// multi-core reordering) are skipped without full packet decoding.
+		// Unreadable or header-corrupt segments (ok == false) are never skipped.
+		const pcapPruneMargin = 5 * time.Second
 		candidates := make([]int, 0, len(p.packetFiles))
 		for i, name := range p.packetFiles {
 			if p.hasPacketSource && filepath.Base(session.PacketSegmentGroup(name)) != p.packetSource {
@@ -270,12 +281,12 @@ func (p *preparedEvidence) writeTo(ctx context.Context, dst io.Writer) error {
 				return err
 			}
 			name := p.packetFiles[idx]
-			if starts[ci].ok && starts[ci].at.After(p.last) {
+			if starts[ci].ok && starts[ci].at.After(p.last.Add(pcapPruneMargin)) {
 				continue
 			}
-			if ci+1 < len(candidates) {
+			if starts[ci].ok && ci+1 < len(candidates) {
 				nextIdx := candidates[ci+1]
-				if session.PacketSegmentGroup(p.packetFiles[nextIdx]) == session.PacketSegmentGroup(name) && starts[ci+1].ok && starts[ci+1].at.Before(p.first) {
+				if session.PacketSegmentGroup(p.packetFiles[nextIdx]) == session.PacketSegmentGroup(name) && starts[ci+1].ok && starts[ci+1].at.Before(p.first.Add(-pcapPruneMargin)) {
 					continue
 				}
 			}

@@ -802,8 +802,12 @@ func (w *webServer) handleExport(rw http.ResponseWriter, r *http.Request) {
 		rw.WriteHeader(http.StatusOK)
 	}, rw)
 	if err != nil {
-		if headersSent || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return
+		}
+		if headersSent {
+			// Abort the response stream so clients do not see a clean EOF on a truncated ZIP.
+			panic(http.ErrAbortHandler)
 		}
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "stop capture before exporting evidence") {

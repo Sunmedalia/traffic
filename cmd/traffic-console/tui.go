@@ -125,6 +125,7 @@ type tuiModel struct {
 	paramSelected                        int
 	detailID, errorText, flash           string
 	detailMeta                           *tuiDetailMeta
+	forceDetail                          bool
 	alertView                            int
 	aggSelected                          [viewList]int
 	block                                int
@@ -219,7 +220,9 @@ func (m *tuiModel) load() tea.Cmd {
 	m.pending = false
 	version, filter, page, alertsOnly, detailID := m.version, m.filter, m.page, m.tab == tabAlerts, m.detailID
 	var prevDetailMeta *tuiDetailMeta
-	if m.details && detailID != "" && m.snapshot.Detail != nil && m.snapshot.Detail.ID == detailID && m.detailMeta != nil && m.detailMeta.ID == detailID {
+	if m.forceDetail {
+		m.forceDetail = false
+	} else if m.details && detailID != "" && m.snapshot.Detail != nil && m.snapshot.Detail.ID == detailID && m.detailMeta != nil && m.detailMeta.ID == detailID {
 		meta := *m.detailMeta
 		prevDetailMeta = &meta
 	}
@@ -430,6 +433,7 @@ func (m *tuiModel) gotoPage(page int) tea.Cmd {
 func (m *tuiModel) refreshNow() tea.Cmd {
 	m.summaryAt, m.overviewAt, m.timelineAt = time.Time{}, time.Time{}, time.Time{}
 	m.detailMeta = nil
+	m.forceDetail = true
 	return m.load()
 }
 
@@ -535,7 +539,9 @@ func (m *tuiModel) applySnapshot(snapshot tuiSnapshot) {
 		selectedID = m.snapshot.Rows[m.selected].ID
 	}
 	m.snapshot, m.page, m.stale = snapshot, snapshot.Page, false
-	m.detailMeta = snapshot.DetailMeta
+	if !m.forceDetail {
+		m.detailMeta = snapshot.DetailMeta
+	}
 	m.selected = min(m.selected, max(0, len(m.snapshot.Rows)-1))
 	if !wasFollowing && !m.pickDetail {
 		for i, row := range m.snapshot.Rows {

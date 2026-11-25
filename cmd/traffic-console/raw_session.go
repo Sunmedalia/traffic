@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/Sunmedalia/traffic/internal/index"
+	"github.com/Sunmedalia/traffic/internal/replay"
 )
 
 func rawSession(dir string) bool {
@@ -26,11 +27,17 @@ func openRawStore(dir string) (*Store, error) {
 		if err != nil {
 			return nil, err
 		}
-		if report, columns, inspectErr := inspectAnalysis(dir, path); inspectErr == nil {
+		if report, layout, inspectErr := inspectAnalysis(dir, path); inspectErr == nil {
 			var setup []index.Statement
-			if !columns {
+			switch layout {
+			case layoutResults:
 				setup = legacyViews("main.results")
+			case layoutBlob:
+				// Engine 7 publishes no records view: assembling bodies needs
+				// a connection function, so the view is per connection.
+				setup = []index.Statement{{SQL: "CREATE TEMP VIEW records AS " + blobRecordsSelect("main.requests", "main.entries")}}
 			}
+			setup = append(setup, storedRecordsView(layout == layoutBlob))
 			db, err := index.OpenReader(analysisURL(path, "ro"), storeReaders, setup...)
 			if err != nil {
 				return nil, err
@@ -44,7 +51,7 @@ func openRawStore(dir string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	if _, err = db.Exec(`CREATE TABLE requests(id TEXT PRIMARY KEY,time TEXT,client TEXT,alert INTEGER,data BLOB);` + entriesTable + `;CREATE VIEW records AS ` + recordsSelect("requests", "entries")); err != nil {
+	if _, err = db.Exec(replay.RequestsTable + `;` + entriesTable + `;CREATE VIEW records AS ` + blobRecordsSelect("requests", "entries") + `;` + storedRecordsView(true).SQL); err != nil {
 		db.Close()
 		return nil, err
 	}

@@ -21,25 +21,16 @@ type Options struct {
 	ResponseLimit int
 }
 
-// Decoder configuration remains process-local while legacy parsers are migrated;
-// serialize builds, with cancellation while waiting, rather than racing globals.
-var buildSlot = make(chan struct{}, 1)
-
+// Build reconstructs dir into db. Every decoder setting lives on the build's
+// own Store, so independent builds run concurrently.
 func Build(ctx context.Context, dir string, db *sql.DB, options Options) (session.Stats, error) {
-	select {
-	case buildSlot <- struct{}{}:
-		defer func() { <-buildSlot }()
-	case <-ctx.Done():
-		return session.Stats{}, ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return session.Stats{}, err
 	}
 	if options.RequestLimit < 1 || options.ResponseLimit < 1 {
 		return session.Stats{}, errors.New("invalid reconstruction body limits")
 	}
-	oldRequest, oldResponse, oldPorts, oldProxies := requestLimit, responseLimit, capturePorts, trustedProxies
-	defer func() {
-		requestLimit, responseLimit, capturePorts, trustedProxies = oldRequest, oldResponse, oldPorts, oldProxies
-	}()
-	requestLimit, responseLimit = options.RequestLimit, options.ResponseLimit
+	config := buildConfig{requestLimit: options.RequestLimit, responseLimit: options.ResponseLimit}
 	var manifest struct {
 		Ports     []int            `json:"capture_ports"`
 		Addresses []string         `json:"local_addresses"`
@@ -53,18 +44,18 @@ func Build(ctx context.Context, dir string, db *sql.DB, options Options) (sessio
 	if err = json.Unmarshal(data, &manifest); err != nil {
 		return session.Stats{}, err
 	}
-	capturePorts = map[int]bool{}
+	config.capturePorts = map[int]bool{}
 	for _, port := range manifest.Ports {
-		capturePorts[port] = true
+		config.capturePorts[port] = true
 	}
-	trustedProxies, err = parseTrustedProxies(strings.Join(manifest.Proxies, ","))
+	config.trustedProxies, err = parseTrustedProxies(strings.Join(manifest.Proxies, ","))
 	if err != nil {
 		return session.Stats{}, err
 	}
-	if _, err = db.Exec(`CREATE TABLE requests(id TEXT PRIMARY KEY,time TEXT,client TEXT,alert INTEGER,data BLOB)`); err != nil {
+	if _, err = db.Exec(RequestsTable); err != nil {
 		return session.Stats{}, err
 	}
-	s := &Store{db: db, dir: dir, localAddresses: map[string]bool{}, stats: Stats{Targets: manifest.Targets}}
+	s := &Store{db: db, dir: dir, localAddresses: map[string]bool{}, stats: Stats{Targets: manifest.Targets}, config: config}
 	for _, address := range manifest.Addresses {
 		s.localAddresses[address] = true
 	}
@@ -124,10 +115,10 @@ func Build(ctx context.Context, dir string, db *sql.DB, options Options) (sessio
 	// during reconstruction. (time,id) is the order analysis reads records in;
 	// alerts live in the analysis entries, so requests.alert stays 0 and needs
 	// no partial index.
-	if _, err = db.Exec(`CREATE INDEX requests_time ON requests(time,id)`); err != nil {
+	if _, err = db.Exec(RequestsIndex); err != nil {
 		return s.stats, err
 	}
-	if _, err = db.Exec(`CREATE TABLE reconstruction(id INTEGER PRIMARY KEY, stats BLOB, gaps BLOB)`); err != nil {
+	if _, err = db.Exec(ReconstructionTable); err != nil {
 		return s.stats, err
 	}
 	stats, _ := json.Marshal(s.stats)

@@ -4,11 +4,11 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"github.com/Sunmedalia/traffic/internal/index"
 	"github.com/Sunmedalia/traffic/internal/session"
 	"net"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -24,9 +24,22 @@ type Stats = session.Stats
 const indexTimeFormat = session.IndexTimeFormat
 
 var serial atomic.Uint64
-var requestLimit = 256 << 10
-var responseLimit = 64 << 10
-var capturePorts = map[int]bool{80: true, 443: true}
+
+// Default body limits of a store that was not configured by Build.
+const (
+	defaultRequestLimit  = 256 << 10
+	defaultResponseLimit = 64 << 10
+)
+
+// buildConfig is the decoder configuration of one reconstruction. It belongs
+// to the Store, so concurrent builds with different inputs never share it.
+type buildConfig struct {
+	requestLimit, responseLimit int
+	// capturePorts nil means the default HTTP ports 80 and 443; an empty map
+	// (a manifest naming no ports) means every port.
+	capturePorts   map[int]bool
+	trustedProxies []netip.Prefix
+}
 
 type Store struct {
 	requests                            requestCache
@@ -42,12 +55,59 @@ type Store struct {
 	fatal                               error
 	localAddresses                      map[string]bool
 	gaps                                []session.GapEvent
+	config                              buildConfig
 }
 
+func (s *Store) requestLimit() int {
+	if s == nil || s.config.requestLimit < 1 {
+		return defaultRequestLimit
+	}
+	return s.config.requestLimit
+}
+
+func (s *Store) responseLimit() int {
+	if s == nil || s.config.responseLimit < 1 {
+		return defaultResponseLimit
+	}
+	return s.config.responseLimit
+}
+
+// frameLimit bounds one buffered TLS plaintext message.
+func (s *Store) frameLimit() int {
+	return max(s.requestLimit(), s.responseLimit()) + (64 << 10)
+}
+
+// capturePort reports whether port is a configured service port.
+func (s *Store) capturePort(port int) bool {
+	if s == nil || s.config.capturePorts == nil {
+		return port == 80 || port == 443
+	}
+	return s.config.capturePorts[port]
+}
+
+// capturesAllPorts reports whether packet replay keeps every TCP port.
+func (s *Store) capturesAllPorts() bool {
+	return s != nil && s.config.capturePorts != nil && len(s.config.capturePorts) == 0
+}
+
+func (s *Store) trustedProxies() []netip.Prefix {
+	if s == nil {
+		return nil
+	}
+	return s.config.trustedProxies
+}
+
+// openStore opens a test store on a v1 index extended to the build layout.
 func openStore(dir string, write bool) (*Store, error) {
 	db, err := index.OpenDB(dir, write)
 	if err != nil {
 		return nil, err
+	}
+	if write {
+		if _, err = db.Exec("ALTER TABLE requests ADD COLUMN request_raw BLOB; ALTER TABLE requests ADD COLUMN response_raw BLOB"); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 	return &Store{db: db, dir: dir, localAddresses: map[string]bool{}}, nil
 }
@@ -121,7 +181,7 @@ func (s *Store) prepare(t *Transaction) {
 	if strings.HasPrefix(t.Connection, "tls:preload/") {
 		t.Backend = "openssl-preload"
 	}
-	resolveClient(t)
+	resolveClient(t, s.trustedProxies())
 	t.SchemaVersion = 1
 	if t.Protocol == "" && t.Method != "" {
 		t.Protocol = "HTTP/1.1"
@@ -163,10 +223,14 @@ func (s *Store) restore(record *Transaction) error {
 	if s.indexTx != nil {
 		reader = s.indexTx
 	}
-	var data []byte
-	if err := s.indexReadRowLocked(reader, record.ID).Scan(&data); err != nil {
+	var data, request, response []byte
+	if err := s.indexReadRowLocked(reader, record.ID).Scan(&data, &request, &response); err != nil {
 		return err
 	}
-	*record = Transaction{}
-	return json.Unmarshal(data, record)
+	restored, err := decodeStored(data, request, response)
+	if err != nil {
+		return err
+	}
+	*record = restored
+	return nil
 }

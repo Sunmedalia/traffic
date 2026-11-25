@@ -313,3 +313,68 @@ func TestExportPrunesOutOfWindowPCAPSegments(t *testing.T) {
 		t.Fatalf("unexpected out-of-window segment in archive: %v", found)
 	}
 }
+
+func TestExportEvidenceStreamFailsBeforeHeadersOnBadGaps(t *testing.T) {
+	s := tuiTestStore(t)
+	if err := os.WriteFile(filepath.Join(s.dir, "capture.lock"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.dir, "gaps.jsonl"), []byte("{not-json}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tx := Transaction{ID: "bad-gaps", Time: time.Now().UTC()}
+	raw, _ := json.Marshal(tx)
+	called := false
+	var buf bytes.Buffer
+	err := exportEvidenceStream(context.Background(), s, tx, raw, func() { called = true }, &buf)
+	if err == nil {
+		t.Fatalf("expected error on corrupt gaps.jsonl")
+	}
+	if called {
+		t.Fatalf("onReady must not be called before gaps.jsonl validation fails")
+	}
+}
+
+func TestExportEvidenceDoesNotSkipCorruptHeaderSegment(t *testing.T) {
+	s := tuiTestStore(t)
+	if err := os.WriteFile(filepath.Join(s.dir, "capture.lock"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	packetsDir := filepath.Join(s.dir, "packets")
+	if err := os.MkdirAll(packetsDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	pkt := evidencePacket(t, false, 12345)
+	// Segment 1 has a corrupt header so packetSegmentFirstTime returns ok=false.
+	if err := os.WriteFile(filepath.Join(packetsDir, "any-0001.pcap"), []byte("bad-pcap-header"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Segment 2 starts before [T-1m, T+1m], which must NOT cause corrupt segment 1 to be skipped.
+	f, err := os.Create(filepath.Join(packetsDir, "any-0002.pcap"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := packetio.WriteHeader(f, 65535, uint32(layers.LinkTypeEthernet)); err != nil {
+		t.Fatal(err)
+	}
+	w := pcapgo.NewWriterNanos(f)
+	if err := w.WritePacket(gopacket.CaptureInfo{Timestamp: now.Add(-2 * time.Minute), CaptureLength: len(pkt), Length: len(pkt)}, pkt); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tx := Transaction{
+		ID:            "corrupt-seg",
+		Time:          now,
+		Client:        "192.0.2.1:12345",
+		LocalEndpoint: "192.0.2.2:80",
+		Source:        "pcap:any",
+	}
+	raw, _ := json.Marshal(tx)
+	err = exportEvidence(s, tx, raw, filepath.Join(t.TempDir(), "out.zip"))
+	if err == nil {
+		t.Fatalf("expected error on corrupt-header segment, got nil (segment was silently skipped)")
+	}
+}

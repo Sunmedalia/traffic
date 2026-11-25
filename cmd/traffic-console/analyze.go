@@ -26,7 +26,9 @@ import (
 // Engine 5 adds the entries table; earlier generations remain readable.
 // Engine 6 keeps reconstructing new connections while unanswered SYNs or
 // idle keep-alive connections would have filled every parser.
-const analysisEngineVersion = 6
+// Engine 7 stores reconstructed bodies as raw BLOBs beside metadata JSON and
+// lets a re-analysis reuse an earlier generation's reconstruction.
+const analysisEngineVersion = 7
 
 type analysisReport struct {
 	IntegrityWarnings []string      `json:"integrity_warnings,omitempty"`
@@ -44,6 +46,13 @@ type analysisReport struct {
 	ScanPaths         int           `json:"scan_paths"`
 	Source            string        `json:"source_signature"`
 	Delivery          *Stats        `json:"delivery,omitempty"`
+	// ReconstructionVersion is the replay.Version that produced the requests.
+	ReconstructionVersion int `json:"reconstruction_version,omitempty"`
+	// ReconstructionReused reports that this run copied the requests of the
+	// previous generation instead of replaying the evidence again.
+	ReconstructionReused bool `json:"reconstruction_reused,omitempty"`
+	// ReconstructedAt is when the evidence was last actually replayed.
+	ReconstructedAt time.Time `json:"reconstructed_at,omitzero"`
 	// ScanSkipped counts transactions SCAN-001 could not track because the
 	// client or per-client path limit was reached. Scans among them can go
 	// unreported.
@@ -185,12 +194,13 @@ const analysisPendingBytes = 64 << 20
 
 // analysisJob is one stored record on its way through rule matching.
 type analysisJob struct {
-	id, at, client string
-	raw            []byte
-	size           int
-	record         Transaction
-	err            error
-	done           chan struct{}
+	id, at, client    string
+	raw               []byte
+	request, response []byte
+	size              int
+	record            Transaction
+	err               error
+	done              chan struct{}
 }
 
 func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, window time.Duration, paths int, limits replay.Options) (analysisReport, error) {
@@ -239,11 +249,19 @@ func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, wi
 	}
 	defer db.Close()
 	if report.Reconstructed {
-		stats, err := replay.Build(ctx, dir, db, limits)
+		report.ReconstructionVersion = replay.Version
+		reused, err := reuseReconstruction(ctx, dir, db, &report)
 		if err != nil {
 			return report, err
 		}
-		report.Reconstruction = &stats
+		if !reused {
+			stats, err := replay.Build(ctx, dir, db, limits)
+			if err != nil {
+				return report, err
+			}
+			report.Reconstruction = &stats
+			report.ReconstructedAt = time.Now().UTC()
+		}
 	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -266,9 +284,9 @@ func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, wi
 	scanner := &scanTracker{clients: map[string]*scanState{}}
 	var rows *sql.Rows
 	if report.Reconstructed {
-		rows, err = tx.QueryContext(ctx, "SELECT id,time,client,data FROM requests ORDER BY time,id")
+		rows, err = tx.QueryContext(ctx, "SELECT id,time,client,data,request_raw,response_raw FROM requests ORDER BY time,id")
 	} else {
-		rows, err = source.QueryContext(ctx, "SELECT id,time,client,data FROM requests ORDER BY time,id")
+		rows, err = source.QueryContext(ctx, "SELECT id,time,client,data,NULL,NULL FROM requests ORDER BY time,id")
 	}
 	if err != nil {
 		return report, err
@@ -285,10 +303,18 @@ func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, wi
 			defer workers.Done()
 			br := bufio.NewReaderSize(nil, 4096)
 			for job := range work {
+				// Engine 7 metadata carries no bodies, so decoding no longer
+				// base64-decodes them; v1 index records still embed theirs.
 				if job.record, job.err = session.DecodeTransaction(job.raw); job.err == nil {
+					if len(job.request) > 0 {
+						job.record.Request = job.request
+					}
+					if len(job.response) > 0 {
+						job.record.Response = job.response
+					}
 					job.record.Alerts = detectWithPlan(job.record, rs, fieldPlan, limits.RequestLimit, limits.ResponseLimit, br)
 				}
-				job.raw = nil
+				job.raw, job.request, job.response = nil, nil, nil
 				close(job.done)
 			}
 		}(work)
@@ -343,10 +369,10 @@ func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, wi
 	for rows.Next() {
 		var at, client sql.NullString
 		job := &analysisJob{done: make(chan struct{})}
-		if err = rows.Scan(&job.id, &at, &client, &job.raw); err != nil {
+		if err = rows.Scan(&job.id, &at, &client, &job.raw, &job.request, &job.response); err != nil {
 			return report, err
 		}
-		job.at, job.client, job.size = at.String, client.String, len(job.raw)
+		job.at, job.client, job.size = at.String, client.String, len(job.raw)+len(job.request)+len(job.response)
 		// Bound records in flight by count and by stored size: a few large
 		// bodies must not multiply memory by the number of CPUs.
 		for len(pending) > 0 && (len(pending) >= maxPending || pendingBytes+job.size > analysisPendingBytes) {
@@ -380,11 +406,6 @@ func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, wi
 	}
 	if _, err = tx.ExecContext(ctx, entriesIndexes); err != nil {
 		return report, err
-	}
-	if report.Reconstructed {
-		if _, err = tx.ExecContext(ctx, "CREATE VIEW records AS "+recordsSelect("requests", "entries")); err != nil {
-			return report, err
-		}
 	}
 	signature, err := sourceSignature(dir)
 	if err != nil {
@@ -476,6 +497,91 @@ func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, wi
 		report.Delivery = &delivery.stats
 	}
 	return report, nil
+}
+
+// requestsColumns is the engine 7 requests layout, in table order.
+const requestsColumns = "id,time,client,alert,data,request_raw,response_raw"
+
+// reuseReconstruction fills db with the requests and reconstruction of the
+// current generation when that generation replayed the same evidence (source
+// signature) with the same replay version and body limits, so a run that only
+// changes rules or scan settings skips replay.Build. It returns false, with db
+// left empty, when no generation qualifies or the copy fails; the caller then
+// replays the evidence. The earlier generation is only ever attached read-only.
+func reuseReconstruction(ctx context.Context, dir string, db *sql.DB, report *analysisReport) (bool, error) {
+	if !analysisExists(dir) {
+		return false, nil
+	}
+	path, err := analysisDatabasePath(dir)
+	if err != nil {
+		return false, nil
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+	// A generation removed by a concurrent publication fails to attach and
+	// simply means a full replay.
+	if _, err = conn.ExecContext(ctx, "ATTACH DATABASE ? AS previous", analysisURL(path, "ro")); err != nil {
+		return false, nil
+	}
+	defer conn.ExecContext(context.Background(), "DETACH DATABASE previous")
+	// Decide from the attached file itself, not from an earlier inspection,
+	// so the pointer moving in between cannot pair stale requests with a match.
+	previous, layout, err := readAnalysisSchema(ctx, conn, "previous")
+	if err != nil || layout != layoutBlob || !previous.Reconstructed ||
+		previous.ReconstructionVersion != replay.Version ||
+		previous.RequestLimit != report.RequestLimit || previous.ResponseLimit != report.ResponseLimit ||
+		previous.Source == "" || previous.Source != report.Source {
+		return false, nil
+	}
+	var columns string
+	if err = conn.QueryRowContext(ctx, "SELECT group_concat(name,',') FROM (SELECT name FROM pragma_table_info('requests','previous') ORDER BY cid)").Scan(&columns); err != nil || columns != requestsColumns {
+		return false, nil
+	}
+	var stats, gaps []byte
+	if err = conn.QueryRowContext(ctx, "SELECT stats,gaps FROM previous.reconstruction WHERE id=1").Scan(&stats, &gaps); err != nil {
+		return false, nil
+	}
+	var reconstruction Stats
+	if err = json.Unmarshal(stats, &reconstruction); err != nil {
+		return false, nil
+	}
+	// INSERT ... SELECT * into an empty table of the same layout lets SQLite
+	// copy records page by page without decoding them.
+	copyErr := func() error {
+		for _, statement := range []string{
+			replay.RequestsTable,
+			"INSERT INTO main.requests SELECT * FROM previous.requests",
+			replay.RequestsIndex,
+			replay.ReconstructionTable,
+		} {
+			if _, err := conn.ExecContext(ctx, statement); err != nil {
+				return err
+			}
+		}
+		_, err := conn.ExecContext(ctx, "INSERT INTO main.reconstruction VALUES(1,?,?)", stats, gaps)
+		return err
+	}()
+	if copyErr != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		if _, err = conn.ExecContext(ctx, "DROP TABLE IF EXISTS main.requests; DROP TABLE IF EXISTS main.reconstruction"); err != nil {
+			return false, err
+		}
+		fmt.Fprintf(os.Stderr, "本地分析：复用上次还原结果失败，改为重新还原：%v\n", copyErr)
+		return false, nil
+	}
+	report.Reconstruction = &reconstruction
+	report.ReconstructionReused = true
+	report.ReconstructedAt = previous.ReconstructedAt
+	if report.ReconstructedAt.IsZero() {
+		report.ReconstructedAt = previous.Completed
+	}
+	fmt.Fprintln(os.Stderr, "本地分析：证据与还原参数未变，复用上次还原结果，跳过 PCAP/TLS 重放")
+	return true, nil
 }
 
 func readAnalysisReport(dir string) (*analysisReport, error) {

@@ -50,7 +50,7 @@ func TestResponsePairing(t *testing.T) {
 			p.process(strings.NewReader(resp), key, "client", "test", 1, false)
 		}
 	}
-	rows, e := s.db.Query("SELECT data FROM requests")
+	rows, e := s.db.Query("SELECT " + storedRecord + " FROM requests")
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -113,11 +113,11 @@ func TestTruncatedEvidencePreserved(t *testing.T) {
 	}
 	defer s.db.Close()
 	p := newHTTP(s)
-	body := strings.Repeat("a", requestLimit+100)
+	body := strings.Repeat("a", defaultRequestLimit+100)
 	req := fmt.Sprintf("POST / HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
 	p.process(strings.NewReader(req), "truncate", "client", "test", 1, false)
 	row := storedRecords(t, s)["/"]
-	if !row.Truncated || !bytes.Contains(row.Request, []byte("POST / HTTP/1.1")) || !bytes.HasSuffix(row.Request, []byte(strings.Repeat("a", requestLimit))) {
+	if !row.Truncated || !bytes.Contains(row.Request, []byte("POST / HTTP/1.1")) || !bytes.HasSuffix(row.Request, []byte(strings.Repeat("a", defaultRequestLimit))) {
 		t.Fatal("truncated evidence missing")
 	}
 }
@@ -131,7 +131,7 @@ func TestInterimResponse(t *testing.T) {
 	p.process(strings.NewReader("GET / HTTP/1.1\r\nHost: test\r\n\r\n"), "interim", "client", "test", 1, false)
 	p.process(strings.NewReader("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"), "interim", "client", "test", 1, false)
 	var b []byte
-	s.db.QueryRow("SELECT data FROM requests").Scan(&b)
+	s.db.QueryRow("SELECT " + storedRecord + " FROM requests").Scan(&b)
 	var row Transaction
 	json.Unmarshal(b, &row)
 	if row.Status != 200 {
@@ -155,7 +155,7 @@ func TestPartialTLSExpiry(t *testing.T) {
 	}
 	frames.expire(time.Now().Add(61*time.Second), false, p, "")
 	var raw []byte
-	if e = s.db.QueryRow("SELECT data FROM requests").Scan(&raw); e != nil {
+	if e = s.db.QueryRow("SELECT " + storedRecord + " FROM requests").Scan(&raw); e != nil {
 		t.Fatal(e)
 	}
 	var record Transaction
@@ -199,3 +199,6 @@ func TestStorePathAndTimeOrdering(t *testing.T) {
 		}
 	}
 }
+
+// storedRecord selects a requests row as its full transaction JSON.
+const storedRecord = "traffic_record_json(data,request_raw,response_raw,NULL)"
