@@ -1,7 +1,6 @@
 package replay
 
 import (
-	"encoding/json"
 	"github.com/Sunmedalia/traffic/internal/session"
 	"testing"
 	"time"
@@ -37,15 +36,8 @@ func TestJavaEventGapIsPreserved(t *testing.T) {
 	p := newHTTP(s)
 	frames := &Frames{}
 	frames.ingest("read", []byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n"), frameContext{connection: "java:target:1", client: "127.0.0.1:1000", incomplete: true, local: "127.0.0.1:8443"}, false, p)
-	var data []byte
-	if err = s.db.QueryRow("SELECT data FROM requests").Scan(&data); err != nil {
-		t.Fatal(err)
-	}
-	var record Transaction
-	if err = json.Unmarshal(data, &record); err != nil {
-		t.Fatal(err)
-	}
-	if !record.Incomplete || record.LocalEndpoint != "127.0.0.1:8443" || s.stats.TLSDropped != 0 {
+	record, ok := storedRecords(t, s)["/"]
+	if !ok || !record.Incomplete || record.LocalEndpoint != "127.0.0.1:8443" || s.stats.TLSDropped != 0 {
 		t.Fatalf("lost gap metadata: %+v %+v", record, s.stats)
 	}
 }

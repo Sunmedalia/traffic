@@ -116,10 +116,7 @@ func TestTruncatedEvidencePreserved(t *testing.T) {
 	body := strings.Repeat("a", requestLimit+100)
 	req := fmt.Sprintf("POST / HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
 	p.process(strings.NewReader(req), "truncate", "client", "test", 1, false)
-	var b []byte
-	s.db.QueryRow("SELECT data FROM requests").Scan(&b)
-	var row Transaction
-	json.Unmarshal(b, &row)
+	row := storedRecords(t, s)["/"]
 	if !row.Truncated || !bytes.Contains(row.Request, []byte("POST / HTTP/1.1")) || !bytes.HasSuffix(row.Request, []byte(strings.Repeat("a", requestLimit))) {
 		t.Fatal("truncated evidence missing")
 	}

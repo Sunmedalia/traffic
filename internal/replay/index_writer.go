@@ -30,19 +30,18 @@ func (s *Store) indexExecutorLocked() (indexExecutor, error) {
 			_ = tx.Rollback()
 			return nil, err
 		}
-		write, err := tx.Prepare("INSERT OR REPLACE INTO requests VALUES(?,?,?,?,?)")
+		insert, err := tx.Prepare(indexInsert)
 		if err != nil {
 			_ = tx.Rollback()
 			return nil, err
 		}
-		exists, err := tx.Prepare("SELECT EXISTS(SELECT 1 FROM requests WHERE id=?)")
+		update, err := tx.Prepare(indexUpdate)
 		if err != nil {
 			_ = tx.Rollback()
 			return nil, err
 		}
-		s.indexExists = exists
 		s.indexTx = tx
-		s.indexRead, s.indexWrite = read, write
+		s.indexRead, s.indexInsert, s.indexUpdate = read, insert, update
 	}
 	return s.indexTx, nil
 }
@@ -56,36 +55,52 @@ func (s *Store) indexReadRowLocked(reader indexExecutor, id string) *sql.Row {
 	return reader.QueryRow("SELECT data FROM requests WHERE id=?", id)
 }
 
+// A record is normally written once: HTTP/1.1 requests wait in memory for
+// their response. The insert reports whether the ID is new, which replaces a
+// SELECT EXISTS per write; only a rewrite of a stored ID (a spilled request,
+// an IIS or HTTP/2 stream saved again) runs the update as well.
+const (
+	indexInsert = "INSERT OR IGNORE INTO requests VALUES(?,?,?,?,?)"
+	indexUpdate = "UPDATE requests SET time=?,client=?,alert=?,data=? WHERE id=?"
+)
+
 func (s *Store) persist(t Transaction) ([]Alert, error) {
+	t.Alerts = nil
+	// Encoding needs no index state; keep it outside the writer lock.
+	data, err := json.Marshal(t)
+	if err != nil {
+		return nil, err
+	}
+	stamp := t.Time.UTC().Format(indexTimeFormat)
 	s.indexMu.Lock()
 	defer s.indexMu.Unlock()
 	writer, err := s.indexExecutorLocked()
 	if err != nil {
 		return nil, err
 	}
-	var exists bool
-	if s.indexExists != nil {
-		err = s.indexExists.QueryRow(t.ID).Scan(&exists)
+	var result sql.Result
+	if s.indexInsert != nil {
+		result, err = s.indexInsert.Exec(t.ID, stamp, t.Client, 0, data)
 	} else {
-		err = writer.QueryRow("SELECT EXISTS(SELECT 1 FROM requests WHERE id=?)", t.ID).Scan(&exists)
+		result, err = writer.Exec(indexInsert, t.ID, stamp, t.Client, 0, data)
 	}
 	if err != nil {
 		return nil, err
 	}
-	fresh := !exists
-	t.Alerts = nil
-	data, err := json.Marshal(t)
+	inserted, err := result.RowsAffected()
 	if err != nil {
 		return nil, err
 	}
-	args := []any{t.ID, t.Time.UTC().Format(indexTimeFormat), t.Client, len(t.Alerts), data}
-	if s.indexWrite != nil {
-		_, err = s.indexWrite.Exec(args...)
-	} else {
-		_, err = writer.Exec("INSERT OR REPLACE INTO requests VALUES(?,?,?,?,?)", args...)
-	}
-	if err != nil {
-		return nil, err
+	fresh := inserted == 1
+	if !fresh {
+		if s.indexUpdate != nil {
+			_, err = s.indexUpdate.Exec(stamp, t.Client, 0, data, t.ID)
+		} else {
+			_, err = writer.Exec(indexUpdate, stamp, t.Client, 0, data, t.ID)
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 	if s.indexBatching {
 		s.indexOps++
@@ -116,7 +131,7 @@ func (s *Store) flushIndexLocked() error {
 	}
 	tx, ops := s.indexTx, s.indexOps
 	s.indexTx = nil
-	s.indexRead, s.indexWrite, s.indexExists = nil, nil, nil
+	s.indexRead, s.indexInsert, s.indexUpdate = nil, nil, nil
 	s.indexOps = 0
 	s.indexBytes = 0
 	err := tx.Commit()

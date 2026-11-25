@@ -295,6 +295,7 @@ func replayPacketFiles(ctx context.Context, s *Store, p *HTTPProcessor, paths []
 			err = ctx.Err()
 		}
 	}()
+	decoder := newPacketDecoder()
 	var last time.Time
 	var packets uint64
 	var firstPacketAt, lastPacketAt time.Time
@@ -360,9 +361,8 @@ func replayPacketFiles(ctx context.Context, s *Store, p *HTTPProcessor, paths []
 					lastPacketAt = ts
 				}
 			}
-			packet := packetio.Decode(data, reader.Link)
-			if tcp, ok := packet.Layer(layers.LayerTypeTCP).(*layers.TCP); ok && packet.NetworkLayer() != nil && (len(capturePorts) == 0 || capturePorts[int(tcp.SrcPort)] || capturePorts[int(tcp.DstPort)]) {
-				factory.assemble(assembler, packet.NetworkLayer().NetworkFlow(), tcp, ci.Timestamp)
+			if flow, tcp, ok := decoder.decodeTCP(data, reader.Link); ok && (len(capturePorts) == 0 || capturePorts[int(tcp.SrcPort)] || capturePorts[int(tcp.DstPort)]) {
+				factory.assemble(assembler, flow, tcp, ci.Timestamp)
 			}
 			if last.IsZero() || ci.Timestamp.Sub(last) > time.Second {
 				cutoff := ci.Timestamp.Add(-time.Minute)
