@@ -9,7 +9,7 @@ import (
 
 func TestConsoleCommandHelpScopesAndExamples(t *testing.T) {
 	fs := flag.NewFlagSet("help-test", flag.ContinueOnError)
-	for _, name := range []string{"session", "rules", "rules-dir", "scan-window", "scan-paths", "alert-webhook", "listen", "out", "limit"} {
+	for _, name := range []string{"session", "rules", "rules-dir", "scan-window", "scan-paths", "alert-webhook", "allow-private-webhook", "listen", "out", "limit"} {
 		fs.String(name, "", "test option")
 	}
 	for _, cn := range []bool{false, true} {
@@ -22,10 +22,10 @@ func TestConsoleCommandHelpScopesAndExamples(t *testing.T) {
 				t.Fatalf("web help missing %q: %s", expected, web.String())
 			}
 		}
-		if strings.Contains(web.String(), "--scan-paths") || strings.Contains(web.String(), "--alert-webhook") {
+		if strings.Contains(web.String(), "--scan-paths") || strings.Contains(web.String(), "--alert-webhook") || strings.Contains(web.String(), "--allow-private-webhook") {
 			t.Fatal("web help contains CLI analysis options")
 		}
-		for _, expected := range []string{"--rules ", "--scan-window", "--scan-paths", "--alert-webhook", "analysis-current.json"} {
+		for _, expected := range []string{"--rules ", "--scan-window", "--scan-paths", "--alert-webhook", "--allow-private-webhook", "analysis-current.json"} {
 			if !strings.Contains(analyze.String(), expected) {
 				t.Fatalf("analyze help missing %q: %s", expected, analyze.String())
 			}
@@ -39,6 +39,15 @@ func TestConsoleCommandHelpScopesAndExamples(t *testing.T) {
 		if cn && !strings.Contains(web.String(), "规则与分析") {
 			t.Fatal("missing Chinese rule management guidance")
 		}
+	}
+}
+
+func TestAllowPrivateWebhookFlagOnlyAppliesToAnalyze(t *testing.T) {
+	if err := run([]string{"web", "--allow-private-webhook"}); err == nil || !strings.Contains(err.Error(), "requires traffic-console analyze") {
+		t.Fatalf("web accepted the private webhook flag: %v", err)
+	}
+	if err := run([]string{"analyze", "--allow-private-webhook"}); err == nil || err.Error() != "--session required" {
+		t.Fatalf("analyze rejected the private webhook flag: %v", err)
 	}
 }
 

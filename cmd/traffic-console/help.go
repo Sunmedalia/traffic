@@ -24,7 +24,7 @@ func consoleHelpOptions(cmd string) map[string]bool {
 	case "web":
 		names = "session data-dir rules-dir listen allow-remote refresh"
 	case "analyze":
-		names = "session rules scan-window scan-paths alert-webhook request-limit response-limit json"
+		names = "session rules scan-window scan-paths alert-webhook allow-private-webhook request-limit response-limit json"
 	case "requests", "events":
 		names = "session limit service client rule severity since json"
 	case "export":
@@ -106,10 +106,11 @@ Use traffic-console <command> --help for command-specific help.
 		"session": "已有会话目录（原始采集数据保持只读）", "data-dir": "会话搜索根目录，默认程序旁的 sessions",
 		"rules-dir": "Web 与 TUI 分析面板使用的规则目录，默认程序旁的 rules；源码 bin 构建使用项目根目录",
 		"rules":     "追加 YAML 规则文件；不指定时仅使用内置规则", "scan-window": "扫描行为关联窗口，默认 1m", "scan-paths": "扫描行为不同路径阈值，默认 20",
-		"request-limit":  "本地还原及检测的请求正文上限，默认 1 MiB，最大 16 MiB",
-		"response-limit": "本地还原及检测的响应正文上限，默认 1 MiB，最大 16 MiB",
-		"alert-webhook":  "本地分析成功后投递告警；令牌从 TRAFFIC_WEBHOOK_TOKEN 读取",
-		"listen":         "Web 监听地址，默认 127.0.0.1:8080", "allow-remote": "允许非回环地址上的明文 HTTP 访问", "refresh": "界面刷新间隔，默认 1s；Web 最小 500ms",
+		"request-limit":         "本地还原及检测的请求正文上限，默认 1 MiB，最大 16 MiB",
+		"response-limit":        "本地还原及检测的响应正文上限，默认 1 MiB，最大 16 MiB",
+		"alert-webhook":         "本地分析成功后投递告警；设置 TRAFFIC_WEBHOOK_TOKEN 时，非回环目标必须使用 HTTPS",
+		"allow-private-webhook": "允许向 RFC1918 或 IPv6 ULA 私网投递；链路本地和元数据地址仍被拦截",
+		"listen":                "Web 监听地址，默认 127.0.0.1:8080", "allow-remote": "允许非回环地址上的明文 HTTP 访问", "refresh": "界面刷新间隔，默认 1s；Web 最小 500ms",
 		"out": "证据 ZIP 路径，不覆盖已有文件", "limit": "最多返回的查询结果数，默认 100", "service": "按服务筛选", "client": "按来源 IP 或 IP:端口筛选",
 		"rule": "按规则 ID 筛选", "severity": "最低告警级别：low / medium / high", "since": "RFC3339 起始时间", "json": "查询默认输出 JSON",
 	}

@@ -19,14 +19,15 @@ import (
 )
 
 type packetRing struct {
-	dir, iface string
-	file       *evidenceFile
-	buffer     *bufio.Writer
-	writer     *pcapgo.Writer
-	size       int64
-	index      int
-	link       uint32
-	snaplen    uint32
+	dir, iface    string
+	file          evidenceSink
+	buffer        *bufio.Writer
+	writer        *pcapgo.Writer
+	segmentCloses chan<- evidenceSink
+	size          int64
+	index         int
+	link          uint32
+	snaplen       uint32
 }
 
 func (r *packetRing) write(ci gopacket.CaptureInfo, b []byte) error {
@@ -70,25 +71,30 @@ func (r *packetRing) closeSegment() error {
 		return nil
 	}
 	err := r.buffer.Flush()
-	err = errors.Join(err, r.file.Sync(), r.file.Close())
+	file := r.file
 	r.file = nil
-	return err
+	if r.segmentCloses != nil {
+		r.segmentCloses <- file
+		return err
+	}
+	return errors.Join(err, syncAndCloseSegment(file))
+}
+
+func syncAndCloseSegment(file evidenceSink) error {
+	return errors.Join(file.Sync(), file.Close())
 }
 
 const packetWriteQueueBytes = 16 << 20
-const packetWriteQueueItems = 8192
+const packetWriteQueueItems = 32768
 
 type packetWriteItem struct {
 	ci   gopacket.CaptureInfo
 	data []byte
 }
 
-// packetWriter moves PCAP encoding, buffered writes, periodic flushes and the
-// rotation fsync off the capture loop. Previously a slow disk or the Sync at
-// each 64 MiB rotation stalled ReadPacketData, so the kernel ring dropped
-// packets without attribution. Live capture now sheds into an explicit
-// pcap/write_queue_overflow gap once the bounded queue is full. Offline import
-// uses syncPacketSink instead because it can wait without losing input.
+// packetWriter moves PCAP encoding, buffered writes and periodic flushes off
+// the capture loop. A separate worker makes retired segments durable. Live
+// capture reports pcap/write_queue_overflow when the packet queue fills.
 type packetWriter struct {
 	store    *Store
 	iface    string
@@ -186,45 +192,61 @@ func (w *packetWriter) reportDrops() {
 	}
 }
 
+func (w *packetWriter) recordFailure(err error) {
+	if err == nil {
+		return
+	}
+	w.mu.Lock()
+	w.err = errors.Join(w.err, err)
+	w.failed.Store(true)
+	w.mu.Unlock()
+}
+
 func (w *packetWriter) run() {
 	defer close(w.done)
+	// Keep one retired file queued while another is being synced. A sustained
+	// disk stall applies backpressure instead of accumulating open segments.
+	segments := make(chan evidenceSink, 1)
+	segmentsDone := make(chan struct{})
+	w.ring.segmentCloses = segments
+	go func() {
+		defer close(segmentsDone)
+		for file := range segments {
+			w.recordFailure(syncAndCloseSegment(file))
+		}
+	}()
+	defer func() {
+		w.reportDrops()
+		w.recordFailure(w.ring.close())
+		w.ring.segmentCloses = nil
+		close(segments)
+		<-segmentsDone
+	}()
+
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	fail := func(err error) {
-		w.mu.Lock()
-		if w.err == nil {
-			w.err = err
-			w.failed.Store(true)
-		}
-		w.mu.Unlock()
-	}
 	for {
+		var err error
 		select {
 		case item, ok := <-w.queue:
 			if !ok {
-				w.reportDrops()
-				if err := w.ring.close(); err != nil {
-					fail(err)
-				}
 				return
 			}
 			w.pending.Add(-int64(len(item.data)))
-			if err := w.ring.write(item.ci, item.data); err != nil {
-				fail(err)
-				// Keep draining so the capture loop never blocks on a dead writer.
-				for item := range w.queue {
-					w.pending.Add(-int64(len(item.data)))
-				}
-				_ = w.ring.close()
-				return
-			}
+			err = w.ring.write(item.ci, item.data)
 		case <-ticker.C:
 			w.reportDrops()
 			if w.ring.file != nil {
-				if err := w.ring.buffer.Flush(); err != nil {
-					fail(err)
-				}
+				err = w.ring.buffer.Flush()
 			}
+		}
+		if err != nil {
+			w.recordFailure(err)
+			// Keep draining so the capture loop never blocks on a dead writer.
+			for item := range w.queue {
+				w.pending.Add(-int64(len(item.data)))
+			}
+			return
 		}
 	}
 }

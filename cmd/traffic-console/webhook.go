@@ -6,10 +6,21 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
+)
+
+// The CLI grants the exception to its configured endpoint for one analysis.
+var privateWebhookEndpoint atomic.Pointer[string]
+
+var (
+	ec2MetadataIPv6 = netip.MustParseAddr("fd00:ec2::254")
+	ecsMetadataIPv4 = netip.MustParseAddr("100.100.100.200")
 )
 
 func validateWebhook(endpoint string) error {
@@ -21,6 +32,83 @@ func validateWebhook(endpoint string) error {
 		return fmt.Errorf("--alert-webhook requires an HTTP(S) URL without userinfo or fragment")
 	}
 	return nil
+}
+
+func checkWebhookIP(ip netip.Addr, allowPrivate, requireLoopback bool) error {
+	ip = ip.Unmap().WithZone("")
+	if ip.IsLoopback() {
+		return nil
+	}
+	// Global unicast excludes link-local, unspecified and multicast.
+	// The rest of IPv4's zero network needs an explicit check.
+	if !ip.IsGlobalUnicast() || (ip.Is4() && ip.As4()[0] == 0) ||
+		ip == ec2MetadataIPv6 || ip == ecsMetadataIPv4 {
+		return fmt.Errorf("webhook destination %s is not permitted", ip)
+	}
+	if requireLoopback {
+		return fmt.Errorf("TRAFFIC_WEBHOOK_TOKEN requires HTTPS for non-loopback webhook destinations")
+	}
+	if ip.IsPrivate() && !allowPrivate {
+		return fmt.Errorf("private webhook destination %s requires --allow-private-webhook", ip)
+	}
+	return nil
+}
+
+func webhookDialContext(resolver *net.Resolver, allowPrivate, requireLoopback bool) func(context.Context, string, string) (net.Conn, error) {
+	dialer := net.Dialer{KeepAlive: 30 * time.Second}
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+
+		// Validate before passing a numeric address to DialContext. Go can
+		// rewrite an unspecified dial address to loopback before net.Dialer.Control.
+		var ips []netip.Addr
+		if ip, err := netip.ParseAddr(host); err == nil {
+			ips = []netip.Addr{ip}
+		} else {
+			family := "ip"
+			switch network {
+			case "tcp4":
+				family = "ip4"
+			case "tcp6":
+				family = "ip6"
+			}
+			ips, err = resolver.LookupNetIP(ctx, family, host)
+			if err != nil {
+				return nil, err
+			}
+		}
+		var lastErr error
+		allowed := ips[:0]
+		for _, ip := range ips {
+			if err := checkWebhookIP(ip, allowPrivate, requireLoopback); err != nil {
+				lastErr = err
+			} else {
+				allowed = append(allowed, ip)
+			}
+		}
+
+		deadline, _ := ctx.Deadline()
+		for i, ip := range allowed {
+			// Share the connection budget so an unreachable address leaves
+			// time for later candidates. A numeric dial never resolves again.
+			attempt, cancel := context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(allowed)-i))
+			conn, err := dialer.DialContext(attempt, network, net.JoinHostPort(ip.String(), port))
+			cancel()
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		if lastErr == nil {
+			lastErr = fmt.Errorf("webhook destination has no IP addresses")
+		}
+		return nil, lastErr
+	}
 }
 
 type alertWebhook struct {
@@ -37,9 +125,21 @@ type alertWebhook struct {
 
 func newAlertWebhook(s *deliveryReport, endpoint, token string) *alertWebhook {
 	ctx, cancel := context.WithCancel(context.Background())
+	parsed, _ := url.Parse(endpoint)
+	requireLoopback := token != "" && (parsed == nil || parsed.Scheme != "https")
+	privateEndpoint := privateWebhookEndpoint.Load()
+	allowPrivate := privateEndpoint != nil && *privateEndpoint == endpoint
+	transport := &http.Transport{
+		// Direct connections make the dial policy apply to the webhook
+		// destination itself, even when HTTP(S)_PROXY is set.
+		DialContext:         webhookDialContext(net.DefaultResolver, allowPrivate, requireLoopback),
+		ForceAttemptHTTP2:   true,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 3 * time.Second,
+	}
 	w := &alertWebhook{
 		queue: make(chan []byte, 128), done: make(chan struct{}), cancel: cancel,
-		client:   &http.Client{Timeout: 3 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
+		client:   &http.Client{Transport: transport, Timeout: 3 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
 		endpoint: endpoint, token: token, store: s,
 	}
 	go func() {

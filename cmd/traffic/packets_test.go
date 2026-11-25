@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -139,6 +142,9 @@ func TestPacketWriterPersistsInOrderOffCaptureLoop(t *testing.T) {
 	s := &Store{}
 	ring := &packetRing{dir: dir, iface: "lo", link: uint32(layers.LinkTypeEthernet), snaplen: uint32(captureSnapshotLength())}
 	w := newPacketWriter(s, "lo", ring)
+	if cap(w.queue) != 32768 {
+		t.Fatalf("packet queue capacity = %d, want 32768", cap(w.queue))
+	}
 	for i := 0; i < 100; i++ {
 		data := []byte{byte(i), 1, 2, 3}
 		if accepted, err := w.write(gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: len(data), Length: len(data)}, data); err != nil || !accepted {
@@ -172,6 +178,93 @@ func TestPacketWriterPersistsInOrderOffCaptureLoop(t *testing.T) {
 	}
 	if w.pending.Load() != 0 || s.stats.GapCounts != nil {
 		t.Fatal("unexpected pending bytes or gaps", w.pending.Load(), s.stats.GapCounts)
+	}
+}
+
+type blockedPacketSegment struct {
+	bytes.Buffer
+	started, unblock  chan struct{}
+	syncErr, closeErr error
+}
+
+func (f *blockedPacketSegment) Sync() error {
+	close(f.started)
+	<-f.unblock
+	return f.syncErr
+}
+
+func (f *blockedPacketSegment) Close() error { return f.closeErr }
+
+func TestPacketWriterRotatesWhileOldSegmentSyncsAndJoinsCloseErrors(t *testing.T) {
+	dir := t.TempDir()
+	old := &blockedPacketSegment{
+		started: make(chan struct{}), unblock: make(chan struct{}),
+		syncErr: errors.New("segment sync failed"), closeErr: errors.New("segment close failed"),
+	}
+	buffer := bufio.NewWriter(old)
+	ring := &packetRing{
+		dir: dir, iface: "lo", link: uint32(layers.LinkTypeEthernet), snaplen: 65535,
+		file: old, buffer: buffer, writer: pcapgo.NewWriterNanos(buffer), size: 64 << 20, index: 1,
+	}
+	w := newPacketWriter(&Store{}, "lo", ring)
+	var release sync.Once
+	unblock := func() { close(old.unblock) }
+	t.Cleanup(func() {
+		release.Do(unblock)
+		_ = w.close()
+	})
+
+	packet := []byte{1, 2, 3, 4}
+	ci := gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: len(packet), Length: len(packet)}
+	if accepted, err := w.write(ci, packet); !accepted || err != nil {
+		t.Fatalf("write accepted=%t err=%v", accepted, err)
+	}
+	select {
+	case <-old.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retired segment did not start syncing")
+	}
+
+	path := filepath.Join(dir, "lo-000000000002.pcap")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("rotation stalled on the previous file's Sync")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- w.close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("close returned before the retired segment finished: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	release.Do(unblock)
+	select {
+	case err := <-closed:
+		if !errors.Is(err, old.syncErr) || !errors.Is(err, old.closeErr) {
+			t.Fatalf("close did not report both segment errors: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("close did not finish")
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	reader, err := pcapgo.NewReader(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _, err := reader.ReadPacketData(); err != nil || !bytes.Equal(got, packet) {
+		t.Fatalf("rotated segment packet = %v, err=%v", got, err)
 	}
 }
 
