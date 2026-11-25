@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +29,7 @@ const (
 	evidenceDefaultControlSlots         = 2048
 	evidenceDefaultGlobalDataBudget     = 32 << 20
 	evidenceDefaultGlobalControlReserve = 4 << 20
+	evidenceBufferSize                  = 256 << 10
 )
 
 var evidenceBackpressure = string(evidenceBackpressureStrict)
@@ -299,7 +301,21 @@ func (w *evidenceWriter) flushShedGap() {
 	}
 }
 
-func (w *evidenceWriter) enqueueStrictLocked(data []byte, control bool) (string, error) {
+func (w *evidenceWriter) enqueueLocked(data []byte, control, owned bool) {
+	if !owned {
+		data = bytes.Clone(data)
+	}
+	if control {
+		w.controlPending += len(data)
+		w.controlQueued++
+	} else {
+		w.dataPending += len(data)
+		w.dataQueued++
+	}
+	w.queue <- evidenceItem{data: data, control: control}
+}
+
+func (w *evidenceWriter) enqueueStrictLocked(data []byte, control, owned bool) (string, error) {
 	totalPending := w.dataPending + w.controlPending
 	totalQueued := w.dataQueued + w.controlQueued
 	if len(data) > evidenceMaxRecordBytes || len(data) > w.dataBudget || totalPending+len(data) > w.dataBudget || totalQueued >= w.dataSlots {
@@ -320,19 +336,20 @@ func (w *evidenceWriter) enqueueStrictLocked(data []byte, control bool) (string,
 		w.store.stats.RawEvidenceHighWaterBytes = w.store.stats.RawEvidencePendingBytes
 	}
 	w.store.mu.Unlock()
-	copied := append([]byte(nil), data...)
-	if control {
-		w.controlPending += len(copied)
-		w.controlQueued++
-	} else {
-		w.dataPending += len(copied)
-		w.dataQueued++
-	}
-	w.queue <- evidenceItem{data: copied, control: control}
+	w.enqueueLocked(data, control, owned)
 	return "", nil
 }
 
+// Callers of the owned write methods relinquish their buffers on entry.
+func (w *evidenceWriter) writeOwnedControl(data []byte) error {
+	return w.writeControlWithOwnership(data, true)
+}
+
 func (w *evidenceWriter) writeControl(data []byte) error {
+	return w.writeControlWithOwnership(data, false)
+}
+
+func (w *evidenceWriter) writeControlWithOwnership(data []byte, owned bool) error {
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
@@ -344,7 +361,7 @@ func (w *evidenceWriter) writeControl(data []byte) error {
 		return err
 	}
 	if w.policy != evidenceBackpressureDrop {
-		reason, err := w.enqueueStrictLocked(data, true)
+		reason, err := w.enqueueStrictLocked(data, true, owned)
 		w.mu.Unlock()
 		if err != nil {
 			w.store.gap(w.backend, "", reason, "writes", 1)
@@ -375,15 +392,12 @@ func (w *evidenceWriter) writeControl(data []byte) error {
 		w.store.stats.RawEvidenceHighWaterBytes = w.store.stats.RawEvidencePendingBytes
 	}
 	w.store.mu.Unlock()
-	copied := append([]byte(nil), data...)
-	w.controlPending += len(copied)
-	w.controlQueued++
-	w.queue <- evidenceItem{data: copied, control: true}
+	w.enqueueLocked(data, true, owned)
 	w.mu.Unlock()
 	return nil
 }
 
-func (w *evidenceWriter) checkAndReserveDataDropLocked(lossData, eventData []byte) (accepted bool, gapDelta uint64, controlErr error) {
+func (w *evidenceWriter) checkAndReserveDataDropLocked(lossData, eventData []byte, owned bool) (accepted bool, gapDelta uint64, controlErr error) {
 	if len(eventData) > evidenceMaxRecordBytes || len(eventData) > w.dataBudget {
 		// An oversized event cannot fit even in an empty data queue; drop it as a
 		// complete event without wedging subsequent normal-sized events unless the
@@ -398,7 +412,7 @@ func (w *evidenceWriter) checkAndReserveDataDropLocked(lossData, eventData []byt
 	w.store.mu.Lock()
 	globalPending := w.store.stats.RawEvidencePendingBytes
 	globalControlPending := w.store.rawEvidenceControlPending
-	globalDataPending := globalPending - globalControlPending
+	globalDataPending := globalPending - min(globalPending, globalControlPending)
 	if w.shedding && !w.dataDrainedLocked(globalDataPending) {
 		w.store.mu.Unlock()
 		return false, w.noteShedLocked(len(eventData), false), nil
@@ -429,19 +443,21 @@ func (w *evidenceWriter) checkAndReserveDataDropLocked(lossData, eventData []byt
 	}
 	w.store.mu.Unlock()
 	if len(lossData) > 0 {
-		lossCopy := append([]byte(nil), lossData...)
-		w.controlPending += len(lossCopy)
-		w.controlQueued++
-		w.queue <- evidenceItem{data: lossCopy, control: true}
+		w.enqueueLocked(lossData, true, owned)
 	}
-	eventCopy := append([]byte(nil), eventData...)
-	w.dataPending += len(eventCopy)
-	w.dataQueued++
-	w.queue <- evidenceItem{data: eventCopy, control: false}
+	w.enqueueLocked(eventData, false, owned)
 	return true, w.takeUnreportedShedLocked(), nil
 }
 
 func (w *evidenceWriter) writeData(data []byte) (bool, error) {
+	return w.writeDataWithOwnership(data, false)
+}
+
+func (w *evidenceWriter) writeOwnedData(data []byte) (bool, error) {
+	return w.writeDataWithOwnership(data, true)
+}
+
+func (w *evidenceWriter) writeDataWithOwnership(data []byte, owned bool) (bool, error) {
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
@@ -453,7 +469,7 @@ func (w *evidenceWriter) writeData(data []byte) (bool, error) {
 		return false, err
 	}
 	if w.policy != evidenceBackpressureDrop {
-		reason, err := w.enqueueStrictLocked(data, false)
+		reason, err := w.enqueueStrictLocked(data, false, owned)
 		w.mu.Unlock()
 		if err != nil {
 			w.store.gap(w.backend, "", reason, "writes", 1)
@@ -462,7 +478,7 @@ func (w *evidenceWriter) writeData(data []byte) (bool, error) {
 		}
 		return true, nil
 	}
-	accepted, gapDelta, controlErr := w.checkAndReserveDataDropLocked(nil, data)
+	accepted, gapDelta, controlErr := w.checkAndReserveDataDropLocked(nil, data, owned)
 	w.mu.Unlock()
 	if controlErr != nil {
 		w.store.gap(w.backend, "", "evidence_control_overflow", "writes", 1)
@@ -475,10 +491,10 @@ func (w *evidenceWriter) writeData(data []byte) (bool, error) {
 	return accepted, nil
 }
 
-// writeRecoveryAndData atomically enqueues a preceding loss control record and
+// writeOwnedRecoveryAndData atomically enqueues a preceding loss control record and
 // the recovered data event into the same FIFO queue once the data budget can
 // accept the event, preventing any post-gap data from overtaking its loss marker.
-func (w *evidenceWriter) writeRecoveryAndData(lossData, eventData []byte) (bool, error) {
+func (w *evidenceWriter) writeOwnedRecoveryAndData(lossData, eventData []byte) (bool, error) {
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
@@ -490,9 +506,9 @@ func (w *evidenceWriter) writeRecoveryAndData(lossData, eventData []byte) (bool,
 		return false, err
 	}
 	if w.policy != evidenceBackpressureDrop {
-		reason, err := w.enqueueStrictLocked(lossData, true)
+		reason, err := w.enqueueStrictLocked(lossData, true, true)
 		if err == nil {
-			reason, err = w.enqueueStrictLocked(eventData, false)
+			reason, err = w.enqueueStrictLocked(eventData, false, true)
 		}
 		w.mu.Unlock()
 		if err != nil {
@@ -502,7 +518,7 @@ func (w *evidenceWriter) writeRecoveryAndData(lossData, eventData []byte) (bool,
 		}
 		return true, nil
 	}
-	accepted, gapDelta, controlErr := w.checkAndReserveDataDropLocked(lossData, eventData)
+	accepted, gapDelta, controlErr := w.checkAndReserveDataDropLocked(lossData, eventData, true)
 	w.mu.Unlock()
 	if controlErr != nil {
 		w.store.gap(w.backend, "", "evidence_control_overflow", "writes", 1)
@@ -527,12 +543,8 @@ func (w *evidenceWriter) release(dataBytes, controlBytes, dataItems, controlItem
 	w.controlQueued -= controlItems
 	released := uint64(dataBytes + controlBytes)
 	w.store.mu.Lock()
-	w.store.rawEvidenceControlPending -= uint64(controlBytes)
-	if released >= w.store.stats.RawEvidencePendingBytes {
-		w.store.stats.RawEvidencePendingBytes = 0
-	} else {
-		w.store.stats.RawEvidencePendingBytes -= released
-	}
+	w.store.rawEvidenceControlPending -= min(w.store.rawEvidenceControlPending, uint64(controlBytes))
+	w.store.stats.RawEvidencePendingBytes -= min(w.store.stats.RawEvidencePendingBytes, released)
 	w.store.mu.Unlock()
 	w.mu.Unlock()
 }
@@ -588,7 +600,7 @@ func (w *evidenceWriter) run() {
 		}
 		close(w.done)
 	}()
-	writer := bufio.NewWriterSize(w.sink, 64<<10)
+	writer := bufio.NewWriterSize(w.sink, evidenceBufferSize)
 	bufferedData, bufferedControl := 0, 0
 	bufferedDataItems, bufferedControlItems := 0, 0
 	flush := func() error {
@@ -628,7 +640,7 @@ func (w *evidenceWriter) run() {
 				bufferedData += len(item.data)
 				bufferedDataItems++
 			}
-			if bufferedData+bufferedControl >= 256<<10 || (len(w.queue) == 0 && w.congested.Load()) {
+			if bufferedData+bufferedControl >= evidenceBufferSize || (len(w.queue) == 0 && w.congested.Load()) {
 				if runErr = flush(); runErr != nil {
 					return
 				}

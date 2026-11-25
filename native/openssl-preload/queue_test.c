@@ -54,7 +54,88 @@ static void *producer(void *argument) {
     return NULL;
 }
 
+static void test_connection_deletion(void) {
+    const size_t stripe = 3, home = CONNECTION_WIDTH - 2;
+    void *keys[CONNECTION_WIDTH];
+    void *anchor = NULL;
+    size_t count = 0;
+    for (uintptr_t address = 16; count < CONNECTION_WIDTH || !anchor; address += 16) {
+        void *ssl = (void *)address;
+        uint64_t hash = connection_hash(ssl);
+        if (hash % CONNECTION_STRIPES != stripe)
+            continue;
+        if (connection_home(hash) == home && count < CONNECTION_WIDTH)
+            keys[count++] = ssl;
+        if (connection_home(hash) == home + 1)
+            anchor = ssl;
+    }
+
+    pthread_mutex_lock(&connection_mutex[stripe]);
+    struct connection *first = find_connection(keys[0], 1);
+    struct connection *fixed = find_connection(anchor, 1);
+    assert(first == &connections[stripe][home]);
+    assert(fixed == first + 1);
+    uint64_t generations[CONNECTION_WIDTH];
+    for (size_t i = 1; i < CONNECTION_WIDTH - 1; i++) {
+        struct connection *entry = find_connection(keys[i], 1);
+        assert(entry == &connections[stripe][(home + i + 1) % CONNECTION_WIDTH]);
+        entry->fd = (int)i;
+        generations[i] = entry->generation;
+    }
+    assert(find_connection(keys[CONNECTION_WIDTH - 1], 1) == NULL);
+
+    remove_connection(first);
+    assert(find_connection(keys[0], 0) == NULL);
+    assert(find_connection(anchor, 0) == fixed);
+    for (size_t i = 1; i < CONNECTION_WIDTH - 1; i++) {
+        struct connection *entry = find_connection(keys[i], 0);
+        assert(entry && entry->fd == (int)i && entry->generation == generations[i]);
+    }
+    struct connection *replacement = find_connection(keys[CONNECTION_WIDTH - 1], 1);
+    assert(replacement && replacement->fd == -1);
+    assert(find_connection(keys[0], 1) == NULL);
+    for (size_t i = 1; i < CONNECTION_WIDTH; i++) {
+        struct connection *entry = find_connection(keys[i], 0);
+        assert(entry);
+        remove_connection(entry);
+    }
+    remove_connection(find_connection(anchor, 0));
+    for (size_t i = 0; i < CONNECTION_WIDTH; i++)
+        assert(connections[stripe][i].ssl == NULL);
+    pthread_mutex_unlock(&connection_mutex[stripe]);
+}
+
+static void test_raw_event_boundary(int fd) {
+    struct queued_event *event = reserve_event(CHUNK_SIZE, 1, 1);
+    assert(event);
+    memset(&event->payload.body, 0, sizeof(event->payload.body));
+    strcpy(event->payload.body.direction, "read");
+    publish_event(event);
+    char message[EVENT_SIZE];
+    ssize_t n = recv(fd, message, sizeof(message) - 1, 0);
+    assert(n > 0);
+    message[n] = 0;
+    const char *payload = strstr(message, "\"data_b64\":\"");
+    assert(payload);
+    payload += strlen("\"data_b64\":\"");
+    assert(strspn(payload, "A") == CHUNK_SIZE * 4 / 3);
+    assert(!strcmp(payload + CHUNK_SIZE * 4 / 3, "\"}"));
+
+    /* Reject an invalid raw record and keep the next queue item deliverable. */
+    event = reserve_event(CHUNK_SIZE + 1, 1, 1);
+    assert(event);
+    memset(&event->payload.body, 0, sizeof(event->payload.body));
+    publish_event(event);
+    assert(send_event("next", 4));
+    n = recv(fd, message, sizeof(message) - 1, 0);
+    assert(n > 0);
+    message[n] = 0;
+    assert(strstr(message, "\"type\":\"loss\"") && strstr(message, "\"count\":1"));
+    expect_message(fd, "next");
+}
+
 int main(void) {
+    test_connection_deletion();
     char directory[] = "/tmp/traffic-queue-XXXXXX";
     assert(mkdtemp(directory));
     assert(snprintf(destination, sizeof(destination), "%s/events", directory) > 0);
@@ -81,6 +162,8 @@ int main(void) {
     for (int i = 2; i < EVENT_QUEUE; i++)
         expect_message(fd, "buf");
     pthread_mutex_unlock(&connection_mutex[0]);
+
+    test_raw_event_boundary(fd);
 
     /* Repeated wraparound with out-of-lock publication and four producers. */
     pthread_t producers[4];

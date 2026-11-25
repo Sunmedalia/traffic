@@ -55,9 +55,13 @@ func TestPacketRingFlushesBufferedTailAtRotationAndClose(t *testing.T) {
 	if err := ring.write(info, payload); err != nil {
 		t.Fatal(err)
 	}
+	buffer := ring.buffer
 	ring.size = 64 << 20
 	if err := ring.write(info, payload); err != nil {
 		t.Fatal(err)
+	}
+	if ring.buffer != buffer {
+		t.Fatal("rotation replaced the packet buffer")
 	}
 	if err := ring.close(); err != nil {
 		t.Fatal(err)

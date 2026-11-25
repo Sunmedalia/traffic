@@ -172,3 +172,27 @@ func TestProbeTransportPreservesTerminalControlAndCountsOnlySequencedDrops(t *te
 		t.Fatal("receive queue leaked byte reservations")
 	}
 }
+
+func TestProbeTransportFinalControlKeepsSheddingUntilDrained(t *testing.T) {
+	r := newFakeProbeReader()
+	first := make([]byte, 5<<20)
+	drain := encodeFakeProcessLog("traffic-control-v1:drained:seq=9,dropped=0,perf_lost=0")
+	r.messages <- first
+	r.messages <- make([]byte, 4<<20)
+	r.messages <- drain
+	r.messages <- encodeFakeTLSEvent(9, 1, "conn", "read", []byte("still congested"))
+	close(r.messages)
+
+	tr := startProbeTransport(r)
+	defer tr.close()
+	awaitProbeDone(t, tr)
+	if data, shed, err := tr.next(); len(data) != len(first) || shed != (probeShed{}) || err != nil {
+		t.Fatalf("first message: bytes=%d, shed=%+v, err=%v", len(data), shed, err)
+	}
+	if data, shed, err := tr.next(); len(data) != len(drain) || shed != (probeShed{messages: 1}) || err != nil {
+		t.Fatalf("final control: bytes=%d, shed=%+v, err=%v", len(data), shed, err)
+	}
+	if _, shed, err := tr.next(); shed != (probeShed{messages: 1, sequenced: 1}) || !errors.Is(err, io.EOF) {
+		t.Fatalf("data resumed before the recovery threshold: shed=%+v, err=%v", shed, err)
+	}
+}

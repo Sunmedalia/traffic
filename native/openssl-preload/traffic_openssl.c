@@ -28,6 +28,7 @@
 #define CHUNK_SIZE 12288
 static pthread_once_t initialize_once = PTHREAD_ONCE_INIT;
 #define CONNECTION_STRIPES 64
+#define CONNECTION_WIDTH (CONNECTIONS / CONNECTION_STRIPES)
 static pthread_mutex_t connection_mutex[CONNECTION_STRIPES] = {
     [0 ... CONNECTION_STRIPES - 1] = PTHREAD_MUTEX_INITIALIZER
 };
@@ -83,9 +84,9 @@ static char identity[96];
 static struct connection {
     void *ssl;
     uint64_t generation, epoch;
-    int used, fd;
+    int fd;
     char local[128], peer[128];
-} connections[CONNECTIONS];
+} connections[CONNECTION_STRIPES][CONNECTION_WIDTH];
 static int (*next_read)(void *, void *, int);
 static int (*next_write)(void *, const void *, int);
 static int (*next_read_ex)(void *, void *, size_t, size_t *);
@@ -161,6 +162,8 @@ static void debug_note(const char *state) {
     length = snprintf(message, sizeof(message),
                       "pid=%ld comm=%s %s destination=%s\n", (long)getpid(),
                       comm, state, destination);
+    if (length < 0 || (size_t)length >= sizeof(message))
+        return;
     fd = open(debug_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
     if (fd < 0)
         return;
@@ -437,6 +440,13 @@ static void *send_worker(void *unused) {
                 "\"client\":\"%s\",\"data_b64\":\"",
                 (long)copy->pid, copy->ssl, (unsigned long long)copy->generation,
                 copy->identity, copy->direction, copy->local, copy->peer);
+            if (header < 0 || (size_t)header >= sizeof(message) ||
+                length > sizeof(copy->bytes) ||
+                4 * ((length + 2) / 3) + 2 > sizeof(message) - (size_t)header) {
+                atomic_fetch_add(&lost, loss_count);
+                release_event(event, position);
+                continue;
+            }
             size_t used = (size_t)header;
             used += encode_base64(message + used, copy->bytes, length);
             memcpy(message + used, "\"}", 2);
@@ -542,9 +552,12 @@ static int report_loss(void) {
         (unsigned long long)atomic_load(&metadata_lost),
         (unsigned long long)atomic_load(&transport_lost),
         (unsigned long long)queue_length(), atomic_load(&transport_errno));
-    pthread_mutex_lock(&transport_mutex);
-    int sent = transmit_event(message, (size_t)length);
-    pthread_mutex_unlock(&transport_mutex);
+    int sent = 0;
+    if (length >= 0 && (size_t)length < sizeof(message)) {
+        pthread_mutex_lock(&transport_mutex);
+        sent = transmit_event(message, (size_t)length);
+        pthread_mutex_unlock(&transport_mutex);
+    }
     if (sent) {
         atomic_fetch_add(&metadata_epoch, 1);
         atomic_store(&retry_after, 0);
@@ -555,28 +568,46 @@ static int report_loss(void) {
     return 0;
 }
 
+static size_t connection_home(uint64_t hash) {
+    return (hash / CONNECTION_STRIPES) % CONNECTION_WIDTH;
+}
+
+/* Callers hold the mutex for this connection's stripe. */
 static struct connection *find_connection(void *ssl, int create) {
-    size_t i, empty = CONNECTIONS;
     uint64_t hash = connection_hash(ssl);
-    size_t stripe = hash % CONNECTION_STRIPES;
-    size_t width = CONNECTIONS / CONNECTION_STRIPES;
-    size_t initial = (hash / CONNECTION_STRIPES) % width;
-    for (size_t step = 0; step < width; step++) {
-        i = stripe + ((initial + step) % width) * CONNECTION_STRIPES;
-        if (connections[i].ssl == ssl)
-            return &connections[i];
-        if (!connections[i].ssl && empty == CONNECTIONS)
-            empty = i;
-        if (!connections[i].used)
-            break;
+    struct connection *stripe = connections[hash % CONNECTION_STRIPES];
+    size_t initial = connection_home(hash);
+    for (size_t step = 0; step < CONNECTION_WIDTH; step++) {
+        struct connection *entry = &stripe[(initial + step) % CONNECTION_WIDTH];
+        if (entry->ssl == ssl)
+            return entry;
+        if (!entry->ssl) {
+            if (!create)
+                return NULL;
+            entry->ssl = ssl;
+            entry->fd = -1;
+            entry->generation = atomic_fetch_add(&sequence, 1) + 1;
+            return entry;
+        }
     }
-    if (!create || empty == CONNECTIONS)
-        return NULL;
-    connections[empty].ssl = ssl;
-    connections[empty].used = 1;
-    connections[empty].fd = -1;
-    connections[empty].generation = atomic_fetch_add(&sequence, 1) + 1;
-    return &connections[empty];
+    return NULL;
+}
+
+static void remove_connection(struct connection *entry) {
+    struct connection *stripe = connections[connection_hash(entry->ssl) % CONNECTION_STRIPES];
+    size_t hole = (size_t)(entry - stripe);
+    size_t i = (hole + 1) % CONNECTION_WIDTH;
+    for (size_t scanned = 0; scanned < CONNECTION_WIDTH - 1 && stripe[i].ssl;
+         scanned++, i = (i + 1) % CONNECTION_WIDTH) {
+        size_t home = connection_home(connection_hash(stripe[i].ssl));
+        /* Move only entries whose probe path crosses the hole. */
+        if ((hole + CONNECTION_WIDTH - home) % CONNECTION_WIDTH <
+            (i + CONNECTION_WIDTH - home) % CONNECTION_WIDTH) {
+            stripe[hole] = stripe[i];
+            hole = i;
+        }
+    }
+    stripe[hole].ssl = NULL;
 }
 
 static int endpoint(int fd, int peer, char *output, size_t capacity) {
@@ -735,28 +766,31 @@ void *SSL_new(void *context) {
 }
 
 void SSL_free(void *ssl) {
-    char message[384];
-    struct connection *connection;
-    int length, saved_errno = errno;
+    int saved_errno = errno;
     pthread_once(&initialize_once, initialize);
     if (ssl && destination[0]) {
         (void)ensure_worker();
         pthread_mutex_t *mutex = connection_lock(ssl);
+        uint64_t generation = 0;
         pthread_mutex_lock(mutex);
-        connection = find_connection(ssl, 0);
+        struct connection *connection = find_connection(ssl, 0);
         if (connection) {
-            length = snprintf(
+            generation = connection->generation;
+            remove_connection(connection);
+        }
+        pthread_mutex_unlock(mutex);
+        if (connection) {
+            char message[384];
+            int length = snprintf(
                 message, sizeof(message),
                 "{\"protocol\":\"traffic-openssl-v1\",\"type\":\"close\","
                 "\"process_id\":\"%s\",\"connection\":\"%ld-%p-%llu\"}",
                 identity, (long)getpid(), ssl,
-                (unsigned long long)connection->generation);
-            if (!send_event(message, (size_t)length))
+                (unsigned long long)generation);
+            if (length < 0 || (size_t)length >= sizeof(message) ||
+                !send_event(message, (size_t)length))
                 atomic_fetch_add(&lost, 1);
-            connection->ssl = NULL;
-            connection->used = 2;
         }
-        pthread_mutex_unlock(mutex);
     }
     errno = saved_errno;
     if (next_free)

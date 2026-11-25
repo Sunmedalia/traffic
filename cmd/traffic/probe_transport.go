@@ -107,7 +107,9 @@ func startProbeTransport(reader probeMessageReader, onError ...func(error)) *pro
 				}
 			}
 			finalReserved = finalReserved || reserved
-			shedding = false
+			// Admission through the reserve does not satisfy the normal
+			// recovery threshold.
+			shedding = reason != ""
 			t.queue <- probeMessage{data: data, shed: shed, finalReserve: reserved}
 			shed = probeShed{}
 			for value := t.pending.Load(); value > t.highWater.Load(); {
