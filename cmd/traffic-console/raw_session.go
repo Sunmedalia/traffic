@@ -35,7 +35,7 @@ func openRawStore(dir string) (*Store, error) {
 			if err != nil {
 				return nil, err
 			}
-			return &Store{db: db, dir: dir, analysis: report}, nil
+			return &Store{db: db, dir: dir, reader: true, analysis: report}, nil
 		}
 	}
 	// Each :memory: connection is a separate database, so keep exactly one.
@@ -48,5 +48,5 @@ func openRawStore(dir string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, dir: dir, analysisNote: "原始采集会话尚未还原或输入已变化；请运行 traffic-console analyze，或在 Web「分析」页中开始分析"}, nil
+	return &Store{db: db, dir: dir, reader: true, analysisNote: "原始采集会话尚未还原或输入已变化；请运行 traffic-console analyze，或在 Web「分析」页中开始分析"}, nil
 }

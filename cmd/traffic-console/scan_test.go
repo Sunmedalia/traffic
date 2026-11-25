@@ -44,7 +44,7 @@ func (scans *sweepScanner) scan(t Transaction, scanWindow time.Duration, scanThr
 		scans.clients[host] = s
 	}
 	path := strings.SplitN(t.URL, "?", 2)[0]
-	if len(s.paths) >= 1000 {
+	if _, ok := s.paths[path]; !ok && len(s.paths) >= 1000 {
 		return nil
 	}
 	s.paths[path] = scanPath{now, t.Status}

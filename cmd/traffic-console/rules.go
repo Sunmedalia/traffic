@@ -435,15 +435,15 @@ func scanWithState(t Transaction, scans *scanTracker, scanWindow time.Duration, 
 		scans.clients[host] = s
 	}
 	path, _, _ := strings.Cut(t.URL, "?")
-	if len(s.paths) >= maxScanPaths {
-		scans.skipped.Paths++
-		return nil
-	}
 	if old, ok := s.paths[path]; ok {
 		if old.status == 404 {
 			s.missing--
 		}
 	} else {
+		if len(s.paths) >= maxScanPaths {
+			scans.skipped.Paths++
+			return nil
+		}
 		scans.tracked++
 	}
 	s.paths[path] = scanPath{now, t.Status}

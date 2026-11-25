@@ -134,29 +134,20 @@ func TestWebServesSessionsOverTokenProtectedAPI(t *testing.T) {
 	if err := json.Unmarshal(body, &sessions); err != nil || status != http.StatusOK || len(sessions.Sessions) != 1 {
 		t.Fatalf("sessions %d %s", status, body)
 	}
-	apiCompressed, err := http.NewRequest(http.MethodGet, server.URL+"/api/sessions", nil)
+	apiSmall, err := http.NewRequest(http.MethodGet, server.URL+"/api/sessions", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	apiCompressed.Header.Set("Authorization", "Bearer "+token)
-	apiCompressed.Header.Set("Accept-Encoding", "gzip")
-	apiResponse, err := server.Client().Do(apiCompressed)
+	apiSmall.Header.Set("Authorization", "Bearer "+token)
+	apiSmall.Header.Set("Accept-Encoding", "gzip")
+	apiResponse, err := server.Client().Do(apiSmall)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if apiResponse.Header.Get("Content-Encoding") != "gzip" {
-		apiResponse.Body.Close()
-		t.Fatalf("api was not compressed: %q", apiResponse.Header.Get("Content-Encoding"))
-	}
-	apiGzip, err := gzip.NewReader(apiResponse.Body)
-	if err != nil {
-		apiResponse.Body.Close()
-		t.Fatal(err)
-	}
-	apiBody, err := io.ReadAll(apiGzip)
+	apiBody, err := io.ReadAll(apiResponse.Body)
 	apiResponse.Body.Close()
-	if err != nil || !bytes.Contains(apiBody, []byte(`"sessions"`)) {
-		t.Fatalf("compressed api %v", err)
+	if err != nil || apiResponse.Header.Get("Content-Encoding") != "" || !bytes.Contains(apiBody, []byte(`"sessions"`)) {
+		t.Fatalf("small api response should skip gzip: encoding=%q err=%v body=%s", apiResponse.Header.Get("Content-Encoding"), err, apiBody)
 	}
 	found := sessions.Sessions[0]
 	if found.State != "stopped" || found.Transactions != 2 || found.Alerts != 1 || found.Problem != "" {

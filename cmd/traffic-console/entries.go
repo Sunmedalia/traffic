@@ -43,8 +43,8 @@ CREATE INDEX entries_alert_time ON entries(time,id) WHERE alert>0;`
 // the stored transaction JSON. Both relations carry an alerts array column.
 func recordsSelect(requests, alerts string) string {
 	return `SELECT r.id,r.time,r.client,
- CASE WHEN a.id IS NULL THEN r.alert ELSE json_array_length(a.alerts) END AS alert,
- CASE WHEN a.id IS NULL THEN r.data ELSE json_set(CAST(r.data AS TEXT),'$.alerts',json(a.alerts)) END AS data
+ CASE WHEN a.id IS NULL THEN r.alert WHEN a.alerts='[]' THEN 0 ELSE json_array_length(a.alerts) END AS alert,
+ CASE WHEN a.id IS NULL OR (r.alert=0 AND a.alerts='[]') THEN r.data ELSE json_set(CAST(r.data AS TEXT),'$.alerts',json(a.alerts)) END AS data
 FROM ` + requests + ` r LEFT JOIN ` + alerts + ` a ON a.id=r.id`
 }
 

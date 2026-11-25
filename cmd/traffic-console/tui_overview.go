@@ -40,19 +40,26 @@ type tuiOverview struct {
 }
 
 func loadTUIOverview(ctx context.Context, s *Store) (*tuiOverview, error) {
-	fresh, err := openStore(s.dir)
-	if err != nil {
-		return nil, err
+	if s == nil {
+		return nil, fmt.Errorf("会话未打开")
 	}
-	defer fresh.db.Close()
+	if !s.reader || s.db == nil {
+		fresh, err := openStore(s.dir)
+		if err != nil {
+			return nil, err
+		}
+		defer fresh.db.Close()
+		s = fresh
+	}
+	var err error
 	result := &tuiOverview{}
-	if result.Summary, err = querySessionSummary(ctx, fresh.db, tuiFilter{}); err != nil {
+	if result.Summary, err = querySessionSummary(ctx, s.db, tuiFilter{}); err != nil {
 		return nil, err
 	}
-	if result.Timeline, err = querySessionTimeline(ctx, fresh.db, tuiFilter{}, false); err != nil {
+	if result.Timeline, err = querySessionTimeline(ctx, s.db, tuiFilter{}, false); err != nil {
 		return nil, err
 	}
-	recent, err := loadTUISnapshot(ctx, fresh, tuiFilter{}, true, 0, "", nil, 8)
+	recent, err := loadTUISnapshot(ctx, s, tuiFilter{}, true, 0, "", nil, 8)
 	if err != nil {
 		return nil, err
 	}
@@ -61,12 +68,18 @@ func loadTUIOverview(ctx context.Context, s *Store) (*tuiOverview, error) {
 }
 
 func loadTUITimeline(ctx context.Context, s *Store, filter tuiFilter, alertsOnly bool) (*sessionTimeline, error) {
-	fresh, err := openStore(s.dir)
-	if err != nil {
-		return nil, err
+	if s == nil {
+		return nil, fmt.Errorf("会话未打开")
 	}
-	defer fresh.db.Close()
-	timeline, err := querySessionTimeline(ctx, fresh.db, filter, alertsOnly)
+	if !s.reader || s.db == nil {
+		fresh, err := openStore(s.dir)
+		if err != nil {
+			return nil, err
+		}
+		defer fresh.db.Close()
+		s = fresh
+	}
+	timeline, err := querySessionTimeline(ctx, s.db, filter, alertsOnly)
 	return &timeline, err
 }
 

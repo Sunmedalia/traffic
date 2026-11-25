@@ -58,12 +58,12 @@ func (w *webServer) handleAnalyze(rw http.ResponseWriter, r *http.Request) {
 		webError(rw, 422, err)
 		return
 	}
-	s := w.sessionStore(rw, r)
+	s, release := w.sessionStore(rw, r)
 	if s == nil {
 		return
 	}
 	dir := s.dir
-	s.db.Close()
+	release()
 	w.jobMu.Lock()
 	defer w.jobMu.Unlock()
 	if w.ctx.Err() != nil {

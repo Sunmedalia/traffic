@@ -2,6 +2,7 @@ package main
 
 import (
 	"compress/gzip"
+	"container/list"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -50,10 +51,21 @@ var webAssetTags = func() map[string]string {
 	return tags
 }()
 
+const gzipMinBytes = 1024
+
+var gzipWriterPool = sync.Pool{
+	New: func() any {
+		return gzip.NewWriter(io.Discard)
+	},
+}
+
 type gzipResponseWriter struct {
 	http.ResponseWriter
 	gz          *gzip.Writer
+	buf         []byte
+	status      int
 	wroteHeader bool
+	decided     bool
 }
 
 func (w *gzipResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
@@ -63,30 +75,102 @@ func (w *gzipResponseWriter) WriteHeader(status int) {
 		return
 	}
 	w.wroteHeader = true
-	if status == http.StatusNoContent || status == http.StatusNotModified || status == http.StatusResetContent {
+	w.status = status
+	if status < 200 || status == http.StatusNoContent || status == http.StatusNotModified || status == http.StatusResetContent {
+		w.decided = true
 		w.ResponseWriter.WriteHeader(status)
 		return
 	}
+	if w.Header().Get("Content-Encoding") != "" {
+		w.decided = true
+		w.ResponseWriter.WriteHeader(status)
+		return
+	}
+	if raw := w.Header().Get("Content-Length"); raw != "" {
+		if length, err := strconv.ParseInt(raw, 10, 64); err == nil && length < gzipMinBytes {
+			w.decided = true
+			w.ResponseWriter.WriteHeader(status)
+			return
+		}
+	}
+}
+
+func (w *gzipResponseWriter) startGzip() {
+	w.decided = true
 	w.Header().Set("Content-Encoding", "gzip")
 	w.Header().Del("Content-Length")
-	w.ResponseWriter.WriteHeader(status)
-	w.gz = gzip.NewWriter(w.ResponseWriter)
+	w.ResponseWriter.WriteHeader(w.status)
+	gz := gzipWriterPool.Get().(*gzip.Writer)
+	gz.Reset(w.ResponseWriter)
+	w.gz = gz
 }
 
 func (w *gzipResponseWriter) Write(p []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	if w.gz == nil {
+	if w.decided {
+		if w.gz != nil {
+			return w.gz.Write(p)
+		}
 		return w.ResponseWriter.Write(p)
+	}
+	if len(w.buf)+len(p) < gzipMinBytes {
+		w.buf = append(w.buf, p...)
+		return len(p), nil
+	}
+	w.startGzip()
+	if len(w.buf) > 0 {
+		if _, err := w.gz.Write(w.buf); err != nil {
+			w.buf = nil
+			return 0, err
+		}
+		w.buf = nil
 	}
 	return w.gz.Write(p)
 }
 
+func (w *gzipResponseWriter) Flush() {
+	if !w.decided {
+		w.decided = true
+		if !w.wroteHeader {
+			w.wroteHeader = true
+			w.status = http.StatusOK
+		}
+		w.ResponseWriter.WriteHeader(w.status)
+		if len(w.buf) > 0 {
+			_, _ = w.ResponseWriter.Write(w.buf)
+			w.buf = nil
+		}
+	}
+	if w.gz != nil {
+		_ = w.gz.Flush()
+	}
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 func (w *gzipResponseWriter) Close() error {
 	if w.gz != nil {
-		return w.gz.Close()
+		err := w.gz.Close()
+		w.gz.Reset(io.Discard)
+		gzipWriterPool.Put(w.gz)
+		w.gz = nil
+		return err
 	}
+	if !w.decided {
+		w.decided = true
+		if w.wroteHeader {
+			w.ResponseWriter.WriteHeader(w.status)
+			if len(w.buf) > 0 {
+				_, err := w.ResponseWriter.Write(w.buf)
+				w.buf = nil
+				return err
+			}
+		}
+	}
+	w.buf = nil
 	return nil
 }
 
@@ -132,6 +216,186 @@ type webServer struct {
 
 	summaryMu sync.Mutex
 	summaries map[string]summaryCacheEntry
+	stores    *storeCache
+}
+
+const webStoreCacheSize = 16
+
+type storeCacheKey struct {
+	dir      string
+	revision string
+}
+
+type cachedStore struct {
+	key     storeCacheKey
+	store   *Store
+	refs    int
+	evicted bool
+	elem    *list.Element
+}
+
+// storeCache maintains a bounded LRU cache of read-only *Store instances keyed
+// by (dir, revision). Reference counts keep evicted stores open until in-flight
+// requests finish using them.
+type storeCache struct {
+	mu      sync.Mutex
+	max     int
+	closed  bool
+	lru     *list.List
+	entries map[storeCacheKey]*cachedStore
+}
+
+func newStoreCache(max int) *storeCache {
+	if max < 1 {
+		max = 1
+	}
+	return &storeCache{max: max, lru: list.New(), entries: map[storeCacheKey]*cachedStore{}}
+}
+
+func storeRevision(dir string) string {
+	signature, err := sourceSignature(dir)
+	if err != nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(signature)
+	if info, err := os.Stat(filepath.Join(dir, "manifest.json")); err == nil {
+		fmt.Fprintf(&b, "|m:%d:%d", info.Size(), info.ModTime().UnixNano())
+	}
+	if info, err := os.Stat(filepath.Join(dir, analysisPointer)); err == nil {
+		fmt.Fprintf(&b, "|p:%d:%d", info.Size(), info.ModTime().UnixNano())
+	}
+	if path, err := analysisDatabasePath(dir); err == nil {
+		b.WriteByte('|')
+		b.WriteString(filepath.Base(path))
+		if info, statErr := os.Stat(path); statErr == nil {
+			fmt.Fprintf(&b, ":%d:%d", info.Size(), info.ModTime().UnixNano())
+		}
+	} else {
+		b.WriteString("|err:")
+		b.WriteString(err.Error())
+	}
+	return b.String()
+}
+
+func (c *storeCache) acquire(dir string) (*Store, func(), error) {
+	revision := storeRevision(dir)
+	if revision == "" {
+		c.mu.Lock()
+		closed := c.closed
+		c.mu.Unlock()
+		if closed {
+			return nil, nil, errors.New("服务正在停止")
+		}
+		s, err := openStore(dir)
+		if err != nil {
+			return nil, nil, err
+		}
+		var once sync.Once
+		return s, func() { once.Do(func() { s.db.Close() }) }, nil
+	}
+	key := storeCacheKey{dir: dir, revision: revision}
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, nil, errors.New("服务正在停止")
+	}
+	if entry, ok := c.entries[key]; ok {
+		c.lru.MoveToFront(entry.elem)
+		entry.refs++
+		c.mu.Unlock()
+		return entry.store, c.releaseOnce(entry), nil
+	}
+	c.mu.Unlock()
+
+	s, err := openStore(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var toClose []*sql.DB
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		s.db.Close()
+		return nil, nil, errors.New("服务正在停止")
+	}
+	if existing, ok := c.entries[key]; ok {
+		c.lru.MoveToFront(existing.elem)
+		existing.refs++
+		c.mu.Unlock()
+		s.db.Close()
+		return existing.store, c.releaseOnce(existing), nil
+	}
+	for existingKey, existing := range c.entries {
+		if existingKey.dir == dir {
+			c.lru.Remove(existing.elem)
+			delete(c.entries, existingKey)
+			existing.evicted = true
+			if existing.refs == 0 {
+				toClose = append(toClose, existing.store.db)
+			}
+		}
+	}
+	entry := &cachedStore{key: key, store: s, refs: 1}
+	entry.elem = c.lru.PushFront(entry)
+	c.entries[key] = entry
+	for c.lru.Len() > c.max {
+		back := c.lru.Back()
+		victim := back.Value.(*cachedStore)
+		c.lru.Remove(back)
+		delete(c.entries, victim.key)
+		victim.evicted = true
+		if victim.refs == 0 {
+			toClose = append(toClose, victim.store.db)
+		}
+	}
+	c.mu.Unlock()
+	for _, db := range toClose {
+		db.Close()
+	}
+	return entry.store, c.releaseOnce(entry), nil
+}
+
+func (c *storeCache) releaseOnce(entry *cachedStore) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.release(entry)
+		})
+	}
+}
+
+func (c *storeCache) release(entry *cachedStore) {
+	var toClose *sql.DB
+	c.mu.Lock()
+	entry.refs--
+	if entry.evicted && entry.refs == 0 {
+		toClose = entry.store.db
+	}
+	c.mu.Unlock()
+	if toClose != nil {
+		toClose.Close()
+	}
+}
+
+func (c *storeCache) close() {
+	var toClose []*sql.DB
+	c.mu.Lock()
+	c.closed = true
+	for key, entry := range c.entries {
+		delete(c.entries, key)
+		entry.evicted = true
+		if entry.refs == 0 {
+			toClose = append(toClose, entry.store.db)
+		}
+	}
+	c.lru.Init()
+	c.mu.Unlock()
+	for _, db := range toClose {
+		db.Close()
+	}
 }
 
 type summaryCacheEntry struct {
@@ -169,7 +433,7 @@ var errWebSessionNotFound = errors.New("会话不存在，请重新扫描")
 
 func newWebServer(roots []string, token string, refresh time.Duration) *webServer {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &webServer{token: token, roots: roots, refresh: refresh, sessions: map[string]sessionEntry{}, discovery: newDiscoveryCache(), summaries: map[string]summaryCacheEntry{}, ctx: ctx, cancel: cancel}
+	return &webServer{token: token, roots: roots, refresh: refresh, sessions: map[string]sessionEntry{}, discovery: newDiscoveryCache(), summaries: map[string]summaryCacheEntry{}, stores: newStoreCache(webStoreCacheSize), ctx: ctx, cancel: cancel}
 }
 
 func webSessionID(dir string) string {
@@ -180,6 +444,9 @@ func webSessionID(dir string) string {
 func (w *webServer) close() {
 	w.cancel()
 	w.jobs.Wait()
+	if w.stores != nil {
+		w.stores.close()
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.ruleLibrary != nil {
@@ -206,7 +473,7 @@ func (w *webServer) discover(ctx context.Context, force bool) sessionsFound {
 }
 
 // Session IDs only resolve to directories found under the configured roots.
-func (w *webServer) store(ctx context.Context, id string) (*Store, error) {
+func (w *webServer) store(ctx context.Context, id string) (*Store, func(), error) {
 	w.mu.Lock()
 	entry, ok := w.sessions[id]
 	w.mu.Unlock()
@@ -216,14 +483,14 @@ func (w *webServer) store(ctx context.Context, id string) (*Store, error) {
 		entry, ok = w.sessions[id]
 		w.mu.Unlock()
 		if !ok {
-			return nil, errWebSessionNotFound
+			return nil, nil, errWebSessionNotFound
 		}
 	}
-	s, err := openStore(entry.Dir)
+	s, release, err := w.stores.acquire(entry.Dir)
 	if err != nil {
-		return nil, fmt.Errorf("无法打开会话: %w", err)
+		return nil, nil, fmt.Errorf("无法打开会话: %w", err)
 	}
-	return s, nil
+	return s, release, nil
 }
 
 func webJSON(rw http.ResponseWriter, status int, v any) {
@@ -324,17 +591,17 @@ func (w *webServer) handleSessions(rw http.ResponseWriter, r *http.Request) {
 	webJSON(rw, http.StatusOK, map[string]any{"sessions": list, "roots": w.roots, "warning": found.Warning, "refresh_ms": w.refresh.Milliseconds()})
 }
 
-func (w *webServer) sessionStore(rw http.ResponseWriter, r *http.Request) *Store {
-	s, err := w.store(r.Context(), r.PathValue("sid"))
+func (w *webServer) sessionStore(rw http.ResponseWriter, r *http.Request) (*Store, func()) {
+	s, release, err := w.store(r.Context(), r.PathValue("sid"))
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, errWebSessionNotFound) {
 			status = http.StatusNotFound
 		}
 		webError(rw, status, err)
-		return nil
+		return nil, nil
 	}
-	return s
+	return s, release
 }
 
 // webFilter validates the query parameters shared by the list, timeline and summary endpoints.
@@ -400,11 +667,11 @@ func (w *webServer) handleRequests(rw http.ResponseWriter, r *http.Request) {
 	if page > 0 && get("anchor_id") != "" {
 		anchor = &tuiRow{ID: get("anchor_id"), Time: get("anchor_time")}
 	}
-	s := w.sessionStore(rw, r)
+	s, release := w.sessionStore(rw, r)
 	if s == nil {
 		return
 	}
-	defer s.db.Close()
+	defer release()
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	snapshot, err := loadTUISnapshot(ctx, s, filter, get("alerts") == "1", page, "", anchor, limit)
@@ -422,40 +689,40 @@ func (w *webServer) handleRequests(rw http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (w *webServer) transaction(rw http.ResponseWriter, r *http.Request) (*Store, Transaction, []byte, bool) {
+func (w *webServer) transaction(rw http.ResponseWriter, r *http.Request) (*Store, func(), Transaction, []byte, bool) {
 	var t Transaction
-	s := w.sessionStore(rw, r)
+	s, release := w.sessionStore(rw, r)
 	if s == nil {
-		return nil, t, nil, false
+		return nil, nil, t, nil, false
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	var b []byte
 	err := s.db.QueryRowContext(ctx, "SELECT data FROM records WHERE id=?", r.PathValue("rid")).Scan(&b)
 	if err == sql.ErrNoRows {
-		s.db.Close()
+		release()
 		webError(rw, http.StatusNotFound, errors.New("该记录不存在或已被保留期清理"))
-		return nil, t, nil, false
+		return nil, nil, t, nil, false
 	}
 	if err == nil {
 		err = json.Unmarshal(b, &t)
 	}
 	if err != nil {
-		s.db.Close()
+		release()
 		webError(rw, http.StatusInternalServerError, fmt.Errorf("读取请求详情: %w", err))
-		return nil, t, nil, false
+		return nil, nil, t, nil, false
 	}
-	return s, t, b, true
+	return s, release, t, b, true
 }
 
 // handleRequestMeta returns only the fields that change when a response arrives.
 // Pending detail views poll this instead of downloading request and response bodies.
 func (w *webServer) handleRequestMeta(rw http.ResponseWriter, r *http.Request) {
-	s := w.sessionStore(rw, r)
+	s, release := w.sessionStore(rw, r)
 	if s == nil {
 		return
 	}
-	defer s.db.Close()
+	defer release()
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	var status, alertCount int
@@ -474,11 +741,11 @@ func (w *webServer) handleRequestMeta(rw http.ResponseWriter, r *http.Request) {
 }
 
 func (w *webServer) handleDetail(rw http.ResponseWriter, r *http.Request) {
-	s, t, _, ok := w.transaction(rw, r)
+	_, release, t, _, ok := w.transaction(rw, r)
 	if !ok {
 		return
 	}
-	defer s.db.Close()
+	defer release()
 	decoded, view := session.DecodedBody(t.Request, 1<<20)
 	responseDecoded, responseView := session.DecodedBody(t.Response, 1<<20)
 	result := map[string]any{
@@ -493,11 +760,11 @@ func (w *webServer) handleDetail(rw http.ResponseWriter, r *http.Request) {
 }
 
 func (w *webServer) handleExport(rw http.ResponseWriter, r *http.Request) {
-	s, t, b, ok := w.transaction(rw, r)
+	s, release, t, b, ok := w.transaction(rw, r)
 	if !ok {
 		return
 	}
-	defer s.db.Close()
+	defer release()
 	dir, err := os.MkdirTemp("", "traffic-export-*")
 	if err != nil {
 		webError(rw, http.StatusInternalServerError, err)
