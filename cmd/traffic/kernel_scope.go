@@ -36,6 +36,10 @@ func processStartIdentity(stream string, pid int) string {
 	if !ok {
 		return ""
 	}
+	return parseProcessStartIdentity(prefix, pid)
+}
+
+func parseProcessStartIdentity(prefix string, pid int) string {
 	process, ticks, ok := strings.Cut(prefix, ":")
 	if !ok {
 		return ""
@@ -47,6 +51,9 @@ func processStartIdentity(stream string, pid int) string {
 	value, err := strconv.ParseUint(ticks, 10, 64)
 	if err != nil || value == 0 {
 		return ""
+	}
+	if process[0] != '0' && process[0] != '+' && ticks[0] != '0' && ticks[0] != '+' {
+		return prefix
 	}
 	return fmt.Sprintf("%d:%d", pid, value)
 }

@@ -27,7 +27,6 @@ import (
 
 const (
 	winDivertPacketBufferBytes = 512 << 10
-	winDivertBatchChannelCap   = 256
 	winDivertParamQueueLength  = 0
 	winDivertParamQueueTime    = 1
 	winDivertParamQueueSize    = 2
@@ -127,17 +126,16 @@ type winDivertPacketHandle struct {
 	anchorUTC               time.Time
 	anchorTicks             int64
 	qpcFreq                 int64
-	batches                 chan []winDivertBatchPacket
-	current                 []winDivertBatchPacket
-	errCh                   chan error
-	abortCh                 chan struct{}
-	pumpDone                chan struct{}
-	closing                 atomic.Bool
-	lastPollNano            atomic.Int64
-	timestampFallbacks      atomic.Uint64
-	debugBatches            int
-	stopOnce                sync.Once
-	closeOnce               sync.Once
+	*winDivertBatchQueue
+	errCh              chan error
+	abortCh            chan struct{}
+	pumpDone           chan struct{}
+	closing            atomic.Bool
+	lastPollNano       atomic.Int64
+	timestampFallbacks atomic.Uint64
+	debugBatches       int
+	stopOnce           sync.Once
+	closeOnce          sync.Once
 }
 
 func openLivePacket(ctx context.Context, iface string) (packetHandle, error) {
@@ -228,22 +226,23 @@ func openLivePacket(ctx context.Context, iface string) (packetHandle, error) {
 		dll.Release()
 		return nil, fmt.Errorf("创建 WinDivert 事件句柄失败: %w", err)
 	}
+	abortCh := make(chan struct{})
 	result := &winDivertPacketHandle{
-		handle:      handle,
-		event:       event,
-		recvEx:      recvEx,
-		shutdown:    shutdown,
-		close:       closeProc,
-		buf:         make([]byte, winDivertPacketBufferBytes),
-		addrBuf:     make([]byte, winDivertBatchMax*winDivertAddrSize),
-		snaplen:     int(captureSnapshotLength()),
-		anchorUTC:   anchorUTC,
-		anchorTicks: anchorTicks,
-		qpcFreq:     qpcFreq,
-		batches:     make(chan []winDivertBatchPacket, winDivertBatchChannelCap),
-		errCh:       make(chan error, 1),
-		abortCh:     make(chan struct{}),
-		pumpDone:    make(chan struct{}),
+		handle:              handle,
+		event:               event,
+		recvEx:              recvEx,
+		shutdown:            shutdown,
+		close:               closeProc,
+		buf:                 make([]byte, winDivertPacketBufferBytes),
+		addrBuf:             make([]byte, winDivertBatchMax*winDivertAddrSize),
+		snaplen:             int(captureSnapshotLength()),
+		anchorUTC:           anchorUTC,
+		anchorTicks:         anchorTicks,
+		qpcFreq:             qpcFreq,
+		winDivertBatchQueue: newWinDivertBatchQueue(abortCh),
+		errCh:               make(chan error, 1),
+		abortCh:             abortCh,
+		pumpDone:            make(chan struct{}),
 	}
 	if os.Getenv("TRAFFIC_WINDIVERT_DEBUG") == "1" {
 		result.debugBatches = 32
@@ -325,7 +324,7 @@ func (h *winDivertPacketHandle) pump() {
 	}()
 
 	for {
-		h.lastPollNano.Store(time.Now().UTC().UnixNano())
+		h.lastPollNano.Store(time.Now().UnixNano())
 		if err := windows.ResetEvent(h.event); err != nil {
 			h.recordErr(fmt.Errorf("reset WinDivert receive event: %w", err))
 			return
@@ -344,7 +343,8 @@ func (h *winDivertPacketHandle) pump() {
 			uintptr(unsafe.Pointer(&h.addrLen)),
 			uintptr(unsafe.Pointer(&h.overlapped)),
 		)
-		h.lastPollNano.Store(time.Now().UTC().UnixNano())
+		receivedAt := time.Now().UTC()
+		h.lastPollNano.Store(receivedAt.UnixNano())
 
 		var recvErr error
 		if ok != 0 {
@@ -355,7 +355,8 @@ func (h *winDivertPacketHandle) pump() {
 			var shutdownDeadline time.Time
 			for {
 				ev, waitErr := windows.WaitForSingleObject(h.event, 100)
-				h.lastPollNano.Store(time.Now().UTC().UnixNano())
+				receivedAt = time.Now().UTC()
+				h.lastPollNano.Store(receivedAt.UnixNano())
 				if ev == windows.WAIT_OBJECT_0 {
 					recvErr = windows.GetOverlappedResult(h.handle, &h.overlapped, &h.recvLen, false)
 					break
@@ -391,11 +392,9 @@ func (h *winDivertPacketHandle) pump() {
 			}
 			if errors.Is(recvErr, windows.ERROR_INSUFFICIENT_BUFFER) {
 				marker := []winDivertBatchPacket{{
-					ci: gopacket.CaptureInfo{Timestamp: time.Now().UTC(), CaptureLength: 0, Length: len(h.buf) + 1},
+					ci: gopacket.CaptureInfo{Timestamp: receivedAt, CaptureLength: 0, Length: len(h.buf) + 1},
 				}}
-				select {
-				case h.batches <- marker:
-				case <-h.abortCh:
+				if !h.queueBatch(marker) {
 					return
 				}
 				continue
@@ -404,8 +403,7 @@ func (h *winDivertPacketHandle) pump() {
 			return
 		}
 
-		receivedAt := time.Now().UTC()
-		pkts, splitErr := splitWinDivertBatch(h.buf, h.recvLen, h.addrBuf, h.addrLen, h.snaplen, func(ticks int64) time.Time {
+		pkts, splitErr := splitWinDivertBatch(h.buf, h.recvLen, h.addrBuf, h.addrLen, h.snaplen, receivedAt, func(ticks int64) time.Time {
 			stamp, converted := winDivertPacketTime(ticks, h.anchorTicks, h.qpcFreq, h.anchorUTC, receivedAt)
 			if !converted {
 				h.timestampFallbacks.Add(1)
@@ -413,12 +411,8 @@ func (h *winDivertPacketHandle) pump() {
 			return stamp
 		})
 		h.debugBatch(receivedAt, pkts, splitErr)
-		if len(pkts) > 0 {
-			select {
-			case h.batches <- pkts:
-			case <-h.abortCh:
-				return
-			}
+		if len(pkts) > 0 && !h.queueBatch(pkts) {
+			return
 		}
 		if splitErr != nil {
 			h.recordErr(splitErr)
@@ -428,44 +422,18 @@ func (h *winDivertPacketHandle) pump() {
 }
 
 func (h *winDivertPacketHandle) ReadPacketData() ([]byte, gopacket.CaptureInfo, error) {
-	if len(h.current) > 0 {
-		pkt := h.current[0]
-		h.current = h.current[1:]
-		return pkt.data, pkt.ci, nil
+	data, ci, err := h.readPacket()
+	if err != io.EOF {
+		return data, ci, err
 	}
 	select {
-	case batch, ok := <-h.batches:
-		if ok && len(batch) > 0 {
-			pkt := batch[0]
-			h.current = batch[1:]
-			return pkt.data, pkt.ci, nil
-		}
+	case err := <-h.errCh:
+		return nil, ci, err
 	default:
-	}
-	timer := time.NewTimer(100 * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case batch, ok := <-h.batches:
-		if !ok {
-			select {
-			case err := <-h.errCh:
-				return nil, gopacket.CaptureInfo{}, err
-			default:
-				if h.closing.Load() {
-					return nil, gopacket.CaptureInfo{}, io.EOF
-				}
-				return nil, gopacket.CaptureInfo{}, errors.New("WinDivert packet stream ended unexpectedly")
-			}
+		if h.closing.Load() {
+			return nil, ci, io.EOF
 		}
-		if len(batch) == 0 {
-			return nil, gopacket.CaptureInfo{}, pcap.NextErrorTimeoutExpired
-		}
-		pkt := batch[0]
-		h.current = batch[1:]
-		return pkt.data, pkt.ci, nil
-	case <-timer.C:
-		// Report terminal errors only after all completed batches are consumed.
-		return nil, gopacket.CaptureInfo{}, pcap.NextErrorTimeoutExpired
+		return nil, ci, errors.New("WinDivert packet stream ended unexpectedly")
 	}
 }
 

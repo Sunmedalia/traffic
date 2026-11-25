@@ -91,14 +91,16 @@ func startProbeTransport(reader probeMessageReader, onError ...func(error)) *pro
 			}
 			reserved := false
 			if reason != "" {
-				reserved = !finalReserved && t.reserveFinalControl(data)
+				var frame protoFields
+				valid := frame.parse(data) == nil
+				reserved = valid && !finalReserved && t.reserveFinalControl(len(data), &frame)
 				if !reserved {
 					if reason != "shedding" {
 						t.overflow(reason)
 					}
 					shedding = true
 					shed.messages++
-					if probeFrameHasSequence(data) {
+					if valid && probeFrameHasSequence(&frame) {
 						shed.sequenced++
 					}
 					t.shedMessages.Add(1)
@@ -144,18 +146,14 @@ func (t *probeTransport) reserve(data []byte) string {
 
 // Keep the one terminal control in FIFO order even when data exhausted the
 // normal receive budget. Only the first reserved control can use this slot.
-func (t *probeTransport) reserveFinalControl(data []byte) bool {
-	if len(data) > probeFinalControlMaxBytes || len(t.queue) == cap(t.queue) {
-		return false
-	}
-	var frame protoFields
-	if frame.parse(data) != nil || frame.ints[1] != 1 {
+func (t *probeTransport) reserveFinalControl(size int, frame *protoFields) bool {
+	if size > probeFinalControlMaxBytes || len(t.queue) == cap(t.queue) || frame.ints[1] != 1 {
 		return false
 	}
 	if _, ok := parseProbeDrainControl(string(frame.bytes[4])); !ok {
 		return false
 	}
-	n := int64(len(data))
+	n := int64(size)
 	if probeFinalControlBytes.Add(n) > probeFinalControlBudget {
 		probeFinalControlBytes.Add(-n)
 		return false
@@ -164,9 +162,9 @@ func (t *probeTransport) reserveFinalControl(data []byte) bool {
 	return true
 }
 
-func probeFrameHasSequence(data []byte) bool {
-	var frame, event protoFields
-	return frame.parse(data) == nil && frame.bytes[2] != nil &&
+func probeFrameHasSequence(frame *protoFields) bool {
+	var event protoFields
+	return frame.bytes[2] != nil &&
 		event.parse(frame.bytes[2]) == nil && event.ints[17] != 0
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -72,7 +73,7 @@ func TestEvidenceWriterCopiesInputAndFlushesAtStop(t *testing.T) {
 	if err != nil || !bytes.Equal(saved, expected) {
 		t.Fatal("queued evidence alias or missing tail", string(saved), err)
 	}
-	if s.stats.RawEvidencePendingBytes != 0 || s.stats.RawEvidenceWriters != 0 {
+	if s.rawEvidencePendingBytes() != 0 || s.stats.RawEvidenceWriters != 0 {
 		t.Fatal(s.stats)
 	}
 }
@@ -110,7 +111,8 @@ func TestEvidenceWriterQueuesOwnedBuffersInOrder(t *testing.T) {
 }
 
 func TestEvidenceWriterClampsGlobalPendingSubtractions(t *testing.T) {
-	s := &Store{rawEvidenceControlPending: 4, stats: Stats{RawEvidencePendingBytes: 2}}
+	s := &Store{}
+	s.rawEvidencePending.Store(uint64(packEvidencePending(0, 4)))
 	w := &evidenceWriter{
 		store: s, policy: evidenceBackpressureDrop, queue: make(chan evidenceItem, 2),
 		dataBudget: 16, controlBudget: 16, dataSlots: 2, controlSlots: 2,
@@ -118,11 +120,50 @@ func TestEvidenceWriterClampsGlobalPendingSubtractions(t *testing.T) {
 		controlPending: 8, controlQueued: 1,
 	}
 	if accepted, err := w.writeOwnedData([]byte("data")); err != nil || !accepted {
-		t.Fatalf("global data pending underflowed: accepted=%v, err=%v", accepted, err)
+		t.Fatalf("control bytes consumed the data budget: accepted=%v, err=%v", accepted, err)
 	}
 	w.release(4, 8, 1, 1)
-	if s.rawEvidenceControlPending != 0 || s.stats.RawEvidencePendingBytes != 0 {
-		t.Fatalf("global pending bytes underflowed: control=%d total=%d", s.rawEvidenceControlPending, s.stats.RawEvidencePendingBytes)
+	if evidencePending(s.rawEvidencePending.Load()).control() != 0 || s.rawEvidencePendingBytes() != 0 {
+		t.Fatalf("global pending bytes underflowed: control=%d total=%d", evidencePending(s.rawEvidencePending.Load()).control(), s.rawEvidencePendingBytes())
+	}
+}
+
+func TestEvidenceWriterReservesConcurrentRecoveryPairsWithinGlobalBudgets(t *testing.T) {
+	const writers, budget = 32, 16
+	s := &Store{dir: t.TempDir()}
+	start := make(chan struct{})
+	results := make(chan *evidenceWriter, writers)
+	var wg sync.WaitGroup
+	for range writers {
+		w := &evidenceWriter{
+			store: s, policy: evidenceBackpressureDrop, queue: make(chan evidenceItem, 2),
+			dataBudget: budget, controlBudget: budget, dataSlots: 1, controlSlots: 1,
+			globalDataBudget: budget, globalControlReserve: budget,
+		}
+		wg.Go(func() {
+			<-start
+			if accepted, err := w.writeOwnedRecoveryAndData([]byte{1}, []byte{2}); err != nil {
+				t.Errorf("recovery failed: %v", err)
+			} else if accepted {
+				results <- w
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	stats := snapshotStats(s)
+	if len(results) != budget || stats.RawEvidencePendingBytes != 2*budget ||
+		stats.RawEvidenceHighWaterBytes != 2*budget || stats.QueueDropped != writers-budget {
+		t.Fatalf("accepted=%d, pending=%d, high water=%d, shed=%d", len(results),
+			stats.RawEvidencePendingBytes, stats.RawEvidenceHighWaterBytes, stats.QueueDropped)
+	}
+	for w := range results {
+		w.release(1, 1, 1, 1)
+	}
+	stats = snapshotStats(s)
+	if stats.RawEvidencePendingBytes != 0 || stats.RawEvidenceHighWaterBytes != 2*budget {
+		t.Fatalf("after release: pending=%d, high water=%d", stats.RawEvidencePendingBytes, stats.RawEvidenceHighWaterBytes)
 	}
 }
 
@@ -158,7 +199,7 @@ func TestEvidenceWriterAcceptsQuotaBurstWithinByteBudget(t *testing.T) {
 		}
 	}
 	s.mu.Lock()
-	pending := s.stats.RawEvidencePendingBytes
+	pending := s.rawEvidencePendingBytes()
 	fatal := s.fatal
 	s.mu.Unlock()
 	if pending > 4<<20 || fatal != nil {
@@ -188,7 +229,7 @@ func TestEvidenceWriterFailureAndBoundedStop(t *testing.T) {
 	}
 	close(slow.gate)
 	<-writer.done
-	if !s.stats.RawEvidenceDrainUnconfirmed || s.stats.RawEvidenceWriters != 0 || s.stats.RawEvidencePendingBytes != 0 {
+	if !s.stats.RawEvidenceDrainUnconfirmed || s.stats.RawEvidenceWriters != 0 || s.rawEvidencePendingBytes() != 0 {
 		t.Fatal(s.stats)
 	}
 }
@@ -331,7 +372,7 @@ func TestEvidenceWriterDropPolicyReservesControlBudgetDuringGlobalSaturation(t *
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if s.fatal != nil || s.stats.QueueDropped != 6 || s.stats.GapCounts["raw-tls/evidence_queue_shed/events"] != 6 {
+	if s.fatal != nil || s.rawEvidenceQueueDropped.Load() != 6 || s.stats.GapCounts["raw-tls/evidence_queue_shed/events"] != 6 {
 		t.Fatalf("unexpected stats: fatal=%v stats=%+v", s.fatal, s.stats)
 	}
 	lines := bytes.Split(bytes.TrimSpace(saved.Bytes()), []byte("\n"))

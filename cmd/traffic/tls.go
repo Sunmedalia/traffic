@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -361,6 +362,14 @@ func consumeTLSProbe(
 		attached()
 	}
 	source := fmt.Sprintf("ecapture-%d", epoch)
+	connectionPrefix := fmt.Sprintf("probe-%d/", epoch)
+	type probeSource struct {
+		key    string
+		target session.Target
+	}
+	sources := make(map[string]probeSource)
+	var lastPID int
+	var lastIdentityPrefix, lastReportedIdentity string
 	endReason := "probe_stopped"
 	defer func() {
 		if err := p.boundary(source, session.RawEvent{Type: "end", Reason: endReason}); err != nil {
@@ -518,11 +527,18 @@ func consumeTLSProbe(
 		if nums[6] != 0 && !capturePorts[int(nums[6])] {
 			continue
 		}
+		pid := int(nums[7])
 		reportedIdentity := ""
 		if scoped {
-			reportedIdentity = processStartIdentity(string(fields[16]), int(nums[7]))
+			if prefix, _, ok := bytes.Cut(fields[16], []byte("/")); ok {
+				if pid != lastPID || string(prefix) != lastIdentityPrefix {
+					lastPID, lastIdentityPrefix = pid, string(prefix)
+					lastReportedIdentity = parseProcessStartIdentity(lastIdentityPrefix, pid)
+				}
+				reportedIdentity = lastReportedIdentity
+			}
 		}
-		identity := accepts(int(nums[7]), reportedIdentity)
+		identity := accepts(pid, reportedIdentity)
 		if identity == "" {
 			continue
 		}
@@ -541,14 +557,12 @@ func consumeTLSProbe(
 		}
 		payload := fields[11]
 
-		key := string(fields[2])
-		if len(fields[3]) > 0 && len(fields[5]) > 0 {
-			key = fmt.Sprintf("%d/%s:%d|%s:%d", nums[7], fields[3], nums[4], fields[5], nums[6])
+		id := fields[16]
+		fallback := len(id) == 0 && len(fields[3]) > 0 && len(fields[5]) > 0
+		if len(id) == 0 && !fallback {
+			id = fields[2]
 		}
-		if len(fields[16]) > 0 {
-			key = string(fields[16])
-		}
-		if strings.HasPrefix(key, "unknown_") {
+		if bytes.HasPrefix(id, []byte("unknown_")) {
 			s.mu.Lock()
 			s.stats.TLSDropped++
 			s.mu.Unlock()
@@ -558,17 +572,37 @@ func consumeTLSProbe(
 			}
 			continue
 		}
-		key = fmt.Sprintf("probe-%d/%s", epoch, key)
+		var key string
+		if fallback {
+			key = fmt.Sprintf("%s%d/%s:%d|%s:%d", connectionPrefix, pid, fields[3], nums[4], fields[5], nums[6])
+		} else {
+			key = connectionPrefix + string(id)
+		}
 		client := "unknown"
 		if len(fields[3]) > 0 {
 			client = net.JoinHostPort(string(fields[3]), strconv.Itoa(int(nums[4])))
 		}
-		target := p.target(int(nums[7]), identity)
+		probe, ok := sources[identity]
+		if !ok {
+			probe = probeSource{key: source + "/" + identity, target: p.target(pid, identity)}
+			if len(sources) < maxRawEventSources {
+				sources[identity] = probe
+			}
+		}
+		var direction string
+		switch {
+		case bytes.Equal(fields[14], []byte("read")):
+			direction = "read"
+		case bytes.Equal(fields[14], []byte("write")):
+			direction = "write"
+		default:
+			direction = string(fields[14])
+		}
 		kind := "data"
 		if len(payload) == 0 {
 			kind = "close"
 		}
-		if err := p.record(source+"/"+identity, "ecapture", target, session.RawEvent{Type: kind, Connection: key, Direction: string(fields[14]), Data: payload, Local: net.JoinHostPort(string(fields[5]), strconv.Itoa(int(nums[6]))), Client: client}); err != nil {
+		if err := p.record(probe.key, "ecapture", probe.target, session.RawEvent{Type: kind, Connection: key, Direction: direction, Data: payload, Local: net.JoinHostPort(string(fields[5]), strconv.Itoa(int(nums[6]))), Client: client}); err != nil {
 			return err
 		}
 	}
@@ -585,6 +619,9 @@ var ansi = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 var lost = regexp.MustCompile(`lost_samples=([0-9]+)`)
 
 func (l *probeLog) Write(b []byte) (int, error) {
+	if !bytes.Contains(b, []byte("lost_samples=")) && bytes.IndexByte(b, '\x1b') < 0 {
+		return l.file.Write(b)
+	}
 	plain := ansi.ReplaceAll(b, nil)
 	var batch uint64
 	for _, m := range lost.FindAllSubmatch(plain, -1) {

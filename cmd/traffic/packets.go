@@ -241,6 +241,42 @@ func (w *packetWriter) close() error {
 	return w.failure()
 }
 
+const packetStatsBatchSize = 128
+
+type packetCaptureProgress struct {
+	count, truncated, driverOverflow uint64
+	first, last                      int64
+}
+
+func (p *packetCaptureProgress) addCaptured(stamp time.Time) {
+	if stamp.IsZero() {
+		stamp = time.Now()
+	}
+	ns := stamp.UnixNano()
+	if p.count == 0 {
+		p.first, p.last = ns, ns
+	} else {
+		p.first, p.last = min(p.first, ns), max(p.last, ns)
+	}
+	p.count++
+}
+
+func (p *packetCaptureProgress) publish(s *Store) {
+	s.notePacketBatch(p.count, p.first, p.last)
+	p.count = 0
+}
+
+func (p *packetCaptureProgress) reportGaps(s *Store, iface string) {
+	if p.truncated != 0 {
+		s.gap("pcap", iface, "snapshot_truncated", "packets", p.truncated)
+		p.truncated = 0
+	}
+	if p.driverOverflow != 0 {
+		s.gap("pcap", iface, "driver_buffer_overflow", "packets", p.driverOverflow)
+		p.driverOverflow = 0
+	}
+}
+
 func capturePackets(ctx context.Context, s *Store, p *eventRecorder, iface, filter, input string) error {
 	var h packetHandle
 	var e error
@@ -302,18 +338,53 @@ func capturePackets(ctx context.Context, s *Store, p *eventRecorder, iface, filt
 			s.fail(fmt.Errorf("close packet evidence: %w", err))
 		}
 	}()
-	last := time.Now()
-	if input != "" {
-		if err := checkDisk(s); err != nil {
-			return err
-		}
-	} else {
-		s.notePacketPoll(time.Now().UTC())
+	live := input == ""
+	poll, _ := h.(pollTimestamper)
+	if live {
+		s.notePacketPoll(time.Now())
+	} else if err := checkDisk(s); err != nil {
+		return err
 	}
+	var progress packetCaptureProgress
+	batch := 0
+	publish := func() {
+		progress.publish(s)
+		if live {
+			if poll != nil {
+				s.notePacketPoll(poll.LastPollTime())
+			} else if batch > 0 {
+				s.notePacketPoll(time.Now())
+			}
+		}
+		batch = 0
+	}
+	defer func() {
+		publish()
+		progress.reportGaps(s, iface)
+	}()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 	var importedBytes int64
 	_, drainsOnCancel := h.(interface{ drainsOnCancel() })
 	var drainDeadline time.Time
 	for {
+		select {
+		case <-ticker.C:
+			publish()
+			progress.reportGaps(s, iface)
+			if live {
+				reportTimestampFallbacks()
+				if st, err := h.Stats(); err == nil {
+					s.recordPacketDrops(iface, uint64(st.PacketsDropped+st.PacketsIfDropped))
+				}
+			} else if importedBytes > 0 {
+				if err := checkDisk(s); err != nil {
+					return err
+				}
+				importedBytes = 0
+			}
+		default:
+		}
 		if ctx.Err() != nil {
 			if !drainsOnCancel {
 				return nil
@@ -326,14 +397,9 @@ func capturePackets(ctx context.Context, s *Store, p *eventRecorder, iface, filt
 			}
 		}
 		data, ci, e := h.ReadPacketData()
-		if input == "" {
-			if pt, ok := h.(pollTimestamper); ok {
-				s.notePacketPoll(pt.LastPollTime())
-			} else {
-				s.notePacketPoll(time.Now().UTC())
-			}
-		}
+		batch++
 		if e == pcap.NextErrorTimeoutExpired {
+			publish()
 			if err := writer.failure(); err != nil {
 				return err
 			}
@@ -346,37 +412,32 @@ func capturePackets(ctx context.Context, s *Store, p *eventRecorder, iface, filt
 			return e
 		}
 		if len(data) == 0 && ci.CaptureLength == 0 && ci.Length > 0 {
-			s.gap("pcap", iface, "driver_buffer_overflow", "packets", 1)
-			continue
-		}
-		accepted, writeErr := writer.write(ci, data)
-		if writeErr != nil {
-			return writeErr
-		}
-		if input != "" {
-			// checkDisk walks the session directory; checking every 1 MiB
-			// made large imports quadratic in the number of segments.
-			importedBytes += int64(len(data)) + 16
-			if importedBytes >= 16<<20 || time.Since(last) > time.Second {
-				if e = checkDisk(s); e != nil {
-					return e
+			progress.driverOverflow++
+		} else {
+			accepted, writeErr := writer.write(ci, data)
+			if writeErr != nil {
+				return writeErr
+			}
+			if accepted {
+				progress.addCaptured(ci.Timestamp)
+			}
+			if ci.CaptureLength < ci.Length {
+				progress.truncated++
+			}
+			if !live {
+				// checkDisk walks the session directory; large imports
+				// check at most once per 16 MiB or periodic tick.
+				importedBytes += int64(len(data)) + 16
+				if importedBytes >= 16<<20 {
+					if err := checkDisk(s); err != nil {
+						return err
+					}
+					importedBytes = 0
 				}
-				importedBytes = 0
-				last = time.Now()
 			}
 		}
-		if accepted {
-			s.notePacketCaptured(ci.Timestamp)
-		}
-		if ci.CaptureLength < ci.Length {
-			s.gap("pcap", iface, "snapshot_truncated", "packets", 1)
-		}
-		if input == "" && time.Since(last) > time.Second {
-			reportTimestampFallbacks()
-			if st, e := h.Stats(); e == nil {
-				s.recordPacketDrops(iface, uint64(st.PacketsDropped+st.PacketsIfDropped))
-			}
-			last = time.Now()
+		if batch >= packetStatsBatchSize {
+			publish()
 		}
 	}
 }

@@ -12,6 +12,29 @@ import (
 	"github.com/google/gopacket/pcapgo"
 )
 
+func TestPacketCaptureProgressPublishesBoundsAndAggregatesGaps(t *testing.T) {
+	s := &Store{dir: t.TempDir()}
+	start := time.Now().UTC()
+	p := packetCaptureProgress{}
+	for _, stamp := range []time.Time{start.Add(time.Second), start, start.Add(2 * time.Second)} {
+		p.addCaptured(stamp)
+	}
+	p.publish(s)
+	p.addCaptured(start.Add(time.Second))
+	p.publish(s)
+	p.publish(s)
+
+	p.truncated, p.driverOverflow = 8, 3
+	p.reportGaps(s, "lo")
+	p.reportGaps(s, "lo")
+	stats := snapshotStats(s)
+	if stats.Packets != 4 || stats.FirstPacketAt != start || stats.LastPacketAt != start.Add(2*time.Second) ||
+		stats.GapCounts["pcap/snapshot_truncated/packets"] != 8 ||
+		stats.GapCounts["pcap/driver_buffer_overflow/packets"] != 3 || s.gapEvents != 2 {
+		t.Fatalf("packet progress: %+v", stats)
+	}
+}
+
 func TestPacketRingWindowsDeviceAndLargeFrame(t *testing.T) {
 	dir := t.TempDir()
 	device := `\Device\NPF_{010DBF10-606E-4FF7-9B78-CEEB459A8EB8}`

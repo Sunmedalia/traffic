@@ -40,7 +40,11 @@ type Store struct {
 	mu                 sync.Mutex
 	stats              Stats
 
-	rawEvidenceControlPending uint64 // guarded by mu
+	// Data and control counts share one CAS so a recovery pair reserves both
+	// budgets together across writers. Each budget fits in 32 bits.
+	rawEvidencePending      atomic.Uint64
+	rawEvidenceHighWater    atomic.Uint64
+	rawEvidenceQueueDropped atomic.Uint64
 }
 
 func (s *Store) notePacketPoll(t time.Time) {
@@ -55,29 +59,26 @@ func (s *Store) notePacketPoll(t time.Time) {
 	}
 }
 
-func (s *Store) notePacketCaptured(t time.Time) {
-	s.packetCount.Add(1)
-	if t.IsZero() {
-		t = time.Now().UTC()
-	} else {
-		t = t.UTC()
+func (s *Store) notePacketBatch(count uint64, first, last int64) {
+	if count == 0 {
+		return
 	}
-	ns := t.UnixNano()
+	s.packetCount.Add(count)
 	for {
 		cur := s.firstPacketNano.Load()
-		if cur != 0 && cur <= ns {
+		if cur != 0 && cur <= first {
 			break
 		}
-		if s.firstPacketNano.CompareAndSwap(cur, ns) {
+		if s.firstPacketNano.CompareAndSwap(cur, first) {
 			break
 		}
 	}
 	for {
 		cur := s.lastPacketNano.Load()
-		if cur >= ns {
+		if cur >= last {
 			break
 		}
-		if s.lastPacketNano.CompareAndSwap(cur, ns) {
+		if s.lastPacketNano.CompareAndSwap(cur, last) {
 			break
 		}
 	}
@@ -101,7 +102,14 @@ func (s *Store) noteTLSEvent(t time.Time) {
 	}
 }
 
+func (s *Store) rawEvidencePendingBytes() uint64 {
+	return evidencePending(s.rawEvidencePending.Load()).total()
+}
+
 func (s *Store) syncAtomicStatsLocked() {
+	s.stats.RawEvidencePendingBytes = s.rawEvidencePendingBytes()
+	s.stats.RawEvidenceHighWaterBytes = max(s.stats.RawEvidenceHighWaterBytes, s.stats.RawEvidencePendingBytes, s.rawEvidenceHighWater.Load())
+	s.stats.QueueDropped = s.rawEvidenceQueueDropped.Load()
 	if n := s.packetCount.Load(); n > s.stats.Packets {
 		s.stats.Packets = n
 	}

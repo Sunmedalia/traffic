@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -191,6 +192,67 @@ func TestParseProbeDrainControl(t *testing.T) {
 		if _, ok := parseProbeDrainControl(invalid); ok {
 			t.Fatalf("accepted invalid drain control %q", invalid)
 		}
+	}
+}
+
+func TestConsumeTLSProbePrefersStreamIDAndKeepsEndpointFallback(t *testing.T) {
+	const pid, identity = 7890, "7890:100"
+	oldPorts := capturePorts
+	capturePorts = map[int]bool{443: true}
+	defer func() { capturePorts = oldPorts }()
+	target := session.Target{ID: identity, PID: pid, Service: "nginx"}
+	s := &Store{dir: t.TempDir(), stats: Stats{Targets: []session.Target{target}}}
+	recorder := newRecorder(s)
+	t.Cleanup(func() { _ = recorder.close() })
+	probe := newScriptedProbe(nil)
+	stream := identity + "/connection"
+	probe.messages <- encodeFakeTLSEvent(1, pid, stream, "read", []byte("first"))
+	probe.messages <- encodeFakeTLSEvent(2, pid, stream, "write", []byte("second"))
+	probe.messages <- encodeFakeTLSEvent(3, pid, "", "read", []byte("fallback"))
+	close(probe.messages)
+	if err := runScriptedTLSProbe(t, context.Background(), s, recorder, probe, nil, time.Second, time.Second, pid, identity, func() {}); !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	}
+	if err := recorder.close(); err != nil {
+		t.Fatal(err)
+	}
+	events := readRawEventsFromStream(t, filepath.Join(s.dir, "tls", "stream.jsonl"))
+	if len(events) != 5 || events[0].Type != "source" || events[0].Target == nil ||
+		events[0].Target.ID != identity || events[0].Target.Service != target.Service ||
+		events[4].Type != "end" {
+		t.Fatalf("source and boundary records: %+v", events)
+	}
+	if !strings.HasSuffix(events[1].Connection, "/"+stream) || events[2].Connection != events[1].Connection ||
+		events[1].Direction != "read" || events[2].Direction != "write" ||
+		!strings.HasSuffix(events[3].Connection, "/7890/127.0.0.1:54321|127.0.0.1:443") {
+		t.Fatalf("connection and direction records: %+v", events[1:4])
+	}
+	for _, event := range events[1:] {
+		if event.Source != events[0].Source {
+			t.Fatalf("source changed: %+v", event)
+		}
+	}
+}
+
+func TestProbeLogPreservesBytesAndCountsColoredLoss(t *testing.T) {
+	file, err := os.Create(filepath.Join(t.TempDir(), "probe.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	s := &Store{}
+	log := &probeLog{store: s, file: file}
+	var want []byte
+	for _, line := range []string{"ordinary log\n", "\x1b[31mlost_samples=2\x1b[0m\n", "lost_\x1b[31msamples=3\x1b[0m\n"} {
+		want = append(want, line...)
+		if n, err := log.Write([]byte(line)); n != len(line) || err != nil {
+			t.Fatalf("write %q: bytes=%d err=%v", line, n, err)
+		}
+	}
+	log.reconcilePerfLost(5)
+	got, err := os.ReadFile(file.Name())
+	if err != nil || !bytes.Equal(got, want) || s.stats.TLSDropped != 5 {
+		t.Fatalf("log bytes=%q, dropped=%d, err=%v", got, s.stats.TLSDropped, err)
 	}
 }
 

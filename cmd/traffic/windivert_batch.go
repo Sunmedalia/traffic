@@ -3,9 +3,12 @@ package main
 import (
 	"encoding/binary"
 	"errors"
+	"io"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/gopacket"
+	"github.com/google/gopacket/pcap"
 )
 
 const winDivertAddrSize = 80
@@ -73,7 +76,7 @@ func winDivertIPLength(packet []byte) (int, error) {
 // splitWinDivertBatch validates the complete byte and address layout before
 // exposing packets. Each address must match exactly one IP packet, including
 // the final packet and single-packet receives.
-func splitWinDivertBatch(buf []byte, recvLen uint32, addrBuf []byte, addrLen uint32, snaplen int, toUTC func(int64) time.Time) ([]winDivertBatchPacket, error) {
+func splitWinDivertBatch(buf []byte, recvLen uint32, addrBuf []byte, addrLen uint32, snaplen int, receivedAt time.Time, toUTC func(int64) time.Time) ([]winDivertBatchPacket, error) {
 	if uint64(recvLen) > uint64(len(buf)) {
 		return nil, errors.New("invalid WinDivert packet length")
 	}
@@ -83,9 +86,13 @@ func splitWinDivertBatch(buf []byte, recvLen uint32, addrBuf []byte, addrLen uin
 	if uint64(addrLen) > uint64(len(addrBuf)) || addrLen == 0 || addrLen%winDivertAddrSize != 0 || addrLen/winDivertAddrSize > winDivertBatchMax {
 		return nil, errors.New("invalid WinDivert address array length")
 	}
+	if snaplen <= 0 {
+		snaplen = len(buf)
+	}
 	count := int(addrLen) / winDivertAddrSize
 	raw := buf[:recvLen]
 	var lengths [winDivertBatchMax]int
+	var capturedBytes int
 	for i := range count {
 		if len(raw) == 0 {
 			return nil, errors.New("WinDivert address has no matching packet")
@@ -95,15 +102,13 @@ func splitWinDivertBatch(buf []byte, recvLen uint32, addrBuf []byte, addrLen uin
 			return nil, err
 		}
 		lengths[i] = length
+		capturedBytes += min(length, snaplen)
 		raw = raw[length:]
 	}
 	if len(raw) != 0 {
 		return nil, errors.New("WinDivert packet bytes remain after last address")
 	}
-	if snaplen <= 0 {
-		snaplen = len(buf)
-	}
-	receivedAt := time.Now().UTC()
+	slab := make([]byte, capturedBytes)
 	raw = buf[:recvLen]
 	out := make([]winDivertBatchPacket, 0, count)
 	for i, length := range lengths[:count] {
@@ -115,10 +120,116 @@ func splitWinDivertBatch(buf []byte, recvLen uint32, addrBuf []byte, addrLen uin
 				stamp = converted
 			}
 		}
-		data := append([]byte(nil), raw[:min(length, snaplen)]...)
+		captured := min(length, snaplen)
+		data := slab[:captured:captured]
+		copy(data, raw[:captured])
+		slab = slab[captured:]
 		out = append(out, winDivertBatchPacket{data: data,
 			ci: gopacket.CaptureInfo{Timestamp: stamp, CaptureLength: len(data), Length: length}})
 		raw = raw[length:]
 	}
 	return out, nil
+}
+
+const winDivertBatchChannelCap = 256
+const winDivertBatchBudgetBytes = 32 << 20
+
+type winDivertQueuedBatch struct {
+	packets []winDivertBatchPacket
+	bytes   int64
+}
+
+type winDivertBatchQueue struct {
+	batches    chan winDivertQueuedBatch
+	batchBytes atomic.Int64
+	batchSpace chan struct{}
+	abortCh    <-chan struct{}
+	current    winDivertQueuedBatch
+	readTimer  *time.Timer
+}
+
+func newWinDivertBatchQueue(abortCh <-chan struct{}) *winDivertBatchQueue {
+	return &winDivertBatchQueue{
+		batches:    make(chan winDivertQueuedBatch, winDivertBatchChannelCap),
+		batchSpace: make(chan struct{}, 1),
+		abortCh:    abortCh,
+	}
+}
+
+// Only the receive pump reserves bytes. The reader releases an entire slab
+// when it hands off the last packet, so partially read batches stay charged.
+func (h *winDivertBatchQueue) queueBatch(packets []winDivertBatchPacket) bool {
+	batch := winDivertQueuedBatch{packets: packets}
+	for _, p := range packets {
+		batch.bytes += int64(len(p.data))
+	}
+	for h.batchBytes.Load()+batch.bytes > winDivertBatchBudgetBytes {
+		select {
+		case <-h.batchSpace:
+		case <-h.abortCh:
+			return false
+		}
+	}
+	h.batchBytes.Add(batch.bytes)
+	select {
+	case h.batches <- batch:
+		return true
+	case <-h.abortCh:
+		h.batchBytes.Add(-batch.bytes)
+		return false
+	}
+}
+
+func (h *winDivertBatchQueue) nextBatchPacket() ([]byte, gopacket.CaptureInfo, error) {
+	pkt := h.current.packets[0]
+	h.current.packets = h.current.packets[1:]
+	if len(h.current.packets) == 0 {
+		if h.current.bytes > 0 {
+			h.batchBytes.Add(-h.current.bytes)
+			select {
+			case h.batchSpace <- struct{}{}:
+			default:
+			}
+		}
+		h.current = winDivertQueuedBatch{}
+	}
+	return pkt.data, pkt.ci, nil
+}
+
+func (h *winDivertBatchQueue) acceptBatch(batch winDivertQueuedBatch, ok bool) ([]byte, gopacket.CaptureInfo, error) {
+	if !ok {
+		return nil, gopacket.CaptureInfo{}, io.EOF
+	}
+	if len(batch.packets) == 0 {
+		return nil, gopacket.CaptureInfo{}, pcap.NextErrorTimeoutExpired
+	}
+	h.current = batch
+	return h.nextBatchPacket()
+}
+
+func (h *winDivertBatchQueue) readPacket() ([]byte, gopacket.CaptureInfo, error) {
+	if len(h.current.packets) > 0 {
+		return h.nextBatchPacket()
+	}
+	select {
+	case batch, ok := <-h.batches:
+		return h.acceptBatch(batch, ok)
+	default:
+	}
+	const wait = 100 * time.Millisecond
+	if h.readTimer == nil {
+		h.readTimer = time.NewTimer(wait)
+	} else {
+		h.readTimer.Reset(wait)
+	}
+	select {
+	case batch, ok := <-h.batches:
+		if !h.readTimer.Stop() {
+			<-h.readTimer.C
+		}
+		return h.acceptBatch(batch, ok)
+	case <-h.readTimer.C:
+		// Report terminal errors only after all completed batches are consumed.
+		return nil, gopacket.CaptureInfo{}, pcap.NextErrorTimeoutExpired
+	}
 }
