@@ -389,3 +389,82 @@ func TestGzipThresholdAndPoolReuse(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestStoreCacheIdempotentReleaseAndClosedAcquire(t *testing.T) {
+	w := tuiTestStore(t)
+	putTUITransaction(t, w, Transaction{ID: "1", Time: time.Now().UTC(), Client: "192.0.2.1:1", Method: "GET", URL: "/"})
+	if err := os.WriteFile(filepath.Join(w.dir, "status.json"), []byte(`{"state":"stopped","transactions":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	dir := w.dir
+	cache := newStoreCache(2)
+
+	s1, rel1, err := cache.acquire(dir)
+	if err != nil {
+		t.Fatalf("acquire 1: %v", err)
+	}
+	s2, rel2, err := cache.acquire(dir)
+	if err != nil {
+		t.Fatalf("acquire 2: %v", err)
+	}
+	if s1.db != s2.db {
+		t.Fatalf("expected shared cached db")
+	}
+	cache.close()
+	// Calling rel1 twice must not decrement refs below 1 or close s2's live db.
+	rel1()
+	rel1()
+	var count int
+	if err := s2.db.QueryRow(`SELECT count(*) FROM entries`).Scan(&count); err != nil {
+		t.Fatalf("double release closed db while another lease was active: %v", err)
+	}
+	rel2()
+	rel2()
+
+	if _, _, err := cache.acquire(dir); err == nil {
+		t.Fatalf("expected error acquiring from closed cache")
+	}
+}
+
+func TestGzipResponseWriterFlush(t *testing.T) {
+	rec := httptest.NewRecorder()
+	gw := &gzipResponseWriter{ResponseWriter: rec}
+	gw.WriteHeader(http.StatusAccepted)
+	if _, err := gw.Write([]byte("chunk")); err != nil {
+		t.Fatal(err)
+	}
+	if err := http.NewResponseController(gw).Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if !rec.Flushed {
+		t.Fatalf("expected underlying ResponseRecorder to be flushed")
+	}
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("got status %d, want %d", rec.Code, http.StatusAccepted)
+	}
+	if rec.Header().Get("Content-Encoding") != "" {
+		t.Fatalf("flushed small response should not be gzipped, got %q", rec.Header().Get("Content-Encoding"))
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Body.String() != "chunk" {
+		t.Fatalf("got body %q, want %q", rec.Body.String(), "chunk")
+	}
+}
+
+func TestTUILoadersRejectNilStore(t *testing.T) {
+	ctx := context.Background()
+	if _, err := loadTUIOverview(ctx, nil); err == nil {
+		t.Fatalf("loadTUIOverview(nil) should return error")
+	}
+	if _, err := loadTUITimeline(ctx, nil, tuiFilter{}, false); err == nil {
+		t.Fatalf("loadTUITimeline(nil) should return error")
+	}
+	if _, err := loadTUISnapshot(ctx, nil, tuiFilter{}, false, 0, "", nil); err == nil {
+		t.Fatalf("loadTUISnapshot(nil) should return error")
+	}
+	if _, err := loadTUISummary(ctx, nil, tuiFilter{}); err == nil {
+		t.Fatalf("loadTUISummary(nil) should return error")
+	}
+}

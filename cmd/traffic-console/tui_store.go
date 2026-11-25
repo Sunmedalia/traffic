@@ -200,7 +200,10 @@ func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly
 	if len(limits) > 0 && limits[0] > 0 {
 		pageSize = min(limits[0], 500)
 	}
-	if s == nil || !s.reader || s.db == nil {
+	if s == nil {
+		return tuiSnapshot{}, fmt.Errorf("会话未打开")
+	}
+	if !s.reader || s.db == nil {
 		fresh, openErr := openStore(s.dir)
 		if openErr != nil {
 			return tuiSnapshot{}, openErr
@@ -321,7 +324,10 @@ const tuiSourceLimit = 200
 // loadTUISummary aggregates the alerts of matching requests in one scan. Rule and
 // severity conditions also restrict which alerts of a request are counted.
 func loadTUISummary(ctx context.Context, s *Store, filter tuiFilter) (*tuiSummary, error) {
-	if s == nil || !s.reader || s.db == nil {
+	if s == nil {
+		return nil, fmt.Errorf("会话未打开")
+	}
+	if !s.reader || s.db == nil {
 		fresh, openErr := openStore(s.dir)
 		if openErr != nil {
 			return nil, openErr

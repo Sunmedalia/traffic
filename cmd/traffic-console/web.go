@@ -130,6 +130,27 @@ func (w *gzipResponseWriter) Write(p []byte) (int, error) {
 	return w.gz.Write(p)
 }
 
+func (w *gzipResponseWriter) Flush() {
+	if !w.decided {
+		w.decided = true
+		if !w.wroteHeader {
+			w.wroteHeader = true
+			w.status = http.StatusOK
+		}
+		w.ResponseWriter.WriteHeader(w.status)
+		if len(w.buf) > 0 {
+			_, _ = w.ResponseWriter.Write(w.buf)
+			w.buf = nil
+		}
+	}
+	if w.gz != nil {
+		_ = w.gz.Flush()
+	}
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 func (w *gzipResponseWriter) Close() error {
 	if w.gz != nil {
 		err := w.gz.Close()
@@ -260,22 +281,31 @@ func storeRevision(dir string) string {
 func (c *storeCache) acquire(dir string) (*Store, func(), error) {
 	revision := storeRevision(dir)
 	if revision == "" {
+		c.mu.Lock()
+		closed := c.closed
+		c.mu.Unlock()
+		if closed {
+			return nil, nil, errors.New("服务正在停止")
+		}
 		s, err := openStore(dir)
 		if err != nil {
 			return nil, nil, err
 		}
-		return s, func() { s.db.Close() }, nil
+		var once sync.Once
+		return s, func() { once.Do(func() { s.db.Close() }) }, nil
 	}
 	key := storeCacheKey{dir: dir, revision: revision}
 
 	c.mu.Lock()
-	if !c.closed {
-		if entry, ok := c.entries[key]; ok {
-			c.lru.MoveToFront(entry.elem)
-			entry.refs++
-			c.mu.Unlock()
-			return entry.store, func() { c.release(entry) }, nil
-		}
+	if c.closed {
+		c.mu.Unlock()
+		return nil, nil, errors.New("服务正在停止")
+	}
+	if entry, ok := c.entries[key]; ok {
+		c.lru.MoveToFront(entry.elem)
+		entry.refs++
+		c.mu.Unlock()
+		return entry.store, c.releaseOnce(entry), nil
 	}
 	c.mu.Unlock()
 
@@ -296,7 +326,7 @@ func (c *storeCache) acquire(dir string) (*Store, func(), error) {
 		existing.refs++
 		c.mu.Unlock()
 		s.db.Close()
-		return existing.store, func() { c.release(existing) }, nil
+		return existing.store, c.releaseOnce(existing), nil
 	}
 	for existingKey, existing := range c.entries {
 		if existingKey.dir == dir {
@@ -325,7 +355,16 @@ func (c *storeCache) acquire(dir string) (*Store, func(), error) {
 	for _, db := range toClose {
 		db.Close()
 	}
-	return entry.store, func() { c.release(entry) }, nil
+	return entry.store, c.releaseOnce(entry), nil
+}
+
+func (c *storeCache) releaseOnce(entry *cachedStore) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.release(entry)
+		})
+	}
 }
 
 func (c *storeCache) release(entry *cachedStore) {

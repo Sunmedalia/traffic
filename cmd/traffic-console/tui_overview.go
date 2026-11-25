@@ -40,7 +40,10 @@ type tuiOverview struct {
 }
 
 func loadTUIOverview(ctx context.Context, s *Store) (*tuiOverview, error) {
-	if s == nil || !s.reader || s.db == nil {
+	if s == nil {
+		return nil, fmt.Errorf("会话未打开")
+	}
+	if !s.reader || s.db == nil {
 		fresh, err := openStore(s.dir)
 		if err != nil {
 			return nil, err
@@ -65,7 +68,10 @@ func loadTUIOverview(ctx context.Context, s *Store) (*tuiOverview, error) {
 }
 
 func loadTUITimeline(ctx context.Context, s *Store, filter tuiFilter, alertsOnly bool) (*sessionTimeline, error) {
-	if s == nil || !s.reader || s.db == nil {
+	if s == nil {
+		return nil, fmt.Errorf("会话未打开")
+	}
+	if !s.reader || s.db == nil {
 		fresh, err := openStore(s.dir)
 		if err != nil {
 			return nil, err
