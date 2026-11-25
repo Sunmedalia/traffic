@@ -788,15 +788,21 @@ func (w *webServer) handleExport(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	dir, err := os.MkdirTemp("", "traffic-export-*")
+	name := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			return r
+		}
+		return -1
+	}, t.ID)
+	headersSent := false
+	err := exportEvidenceStream(r.Context(), s, t, b, func() {
+		headersSent = true
+		rw.Header().Set("Content-Type", "application/zip")
+		rw.Header().Set("Content-Disposition", `attachment; filename="evidence-`+name+`.zip"`)
+		rw.WriteHeader(http.StatusOK)
+	}, rw)
 	if err != nil {
-		webError(rw, http.StatusInternalServerError, err)
-		return
-	}
-	defer os.RemoveAll(dir)
-	path := filepath.Join(dir, "evidence.zip")
-	if err = exportEvidenceContext(r.Context(), s, t, b, path); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if headersSent || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return
 		}
 		status := http.StatusInternalServerError
@@ -804,26 +810,7 @@ func (w *webServer) handleExport(rw http.ResponseWriter, r *http.Request) {
 			status, err = http.StatusConflict, errors.New("采集仍在进行，请停止采集后再导出证据")
 		}
 		webError(rw, status, err)
-		return
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		webError(rw, http.StatusInternalServerError, err)
-		return
-	}
-	defer file.Close()
-	name := strings.Map(func(r rune) rune {
-		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
-			return r
-		}
-		return -1
-	}, t.ID)
-	if info, err := file.Stat(); err == nil {
-		rw.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
-	}
-	rw.Header().Set("Content-Type", "application/zip")
-	rw.Header().Set("Content-Disposition", `attachment; filename="evidence-`+name+`.zip"`)
-	io.Copy(rw, file)
 }
 
 func webLoopback(listen string) bool {

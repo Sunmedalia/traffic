@@ -124,6 +124,7 @@ type tuiModel struct {
 	splitDrag                            bool // the divider between list and detail is held
 	paramSelected                        int
 	detailID, errorText, flash           string
+	detailMeta                           *tuiDetailMeta
 	alertView                            int
 	aggSelected                          [viewList]int
 	block                                int
@@ -217,6 +218,11 @@ func (m *tuiModel) load() tea.Cmd {
 	m.busy = true
 	m.pending = false
 	version, filter, page, alertsOnly, detailID := m.version, m.filter, m.page, m.tab == tabAlerts, m.detailID
+	var prevDetailMeta *tuiDetailMeta
+	if m.details && detailID != "" && m.snapshot.Detail != nil && m.snapshot.Detail.ID == detailID && m.detailMeta != nil && m.detailMeta.ID == detailID {
+		meta := *m.detailMeta
+		prevDetailMeta = &meta
+	}
 	var anchor *tuiRow
 	// Once the cursor leaves the newest row, anchor the page so rows stop moving.
 	if !m.following() && !m.stale && m.snapshot.Page == page && len(m.snapshot.Rows) > 0 {
@@ -238,7 +244,7 @@ func (m *tuiModel) load() tea.Cmd {
 			return tuiLoaded{Version: version, Err: err}
 		}
 		defer fresh.db.Close()
-		snapshot, err := loadTUISnapshot(ctx, fresh, filter, alertsOnly, page, detailID, anchor)
+		snapshot, err := loadTUISnapshotWithMeta(ctx, fresh, filter, alertsOnly, page, detailID, prevDetailMeta, anchor)
 		result := tuiLoaded{Version: version, Snapshot: snapshot, Err: err}
 		if err == nil && wantSummary {
 			result.Summary, result.Err = loadTUISummary(ctx, fresh, summaryFilter)
@@ -336,9 +342,12 @@ func (m *tuiModel) closeDetail() {
 	m.searchTerm, m.searchInput, m.searchLines = "", nil, nil
 	m.details = false
 	m.detailID = ""
+	m.detailMeta = nil
 	m.pickDetail = false
 	m.decoder = nil
 	m.snapshot.Detail = nil
+	m.snapshot.DetailMeta = nil
+	m.snapshot.DetailUnchanged = false
 	m.snapshot.DetailMissing = false
 }
 
@@ -364,7 +373,10 @@ func (m *tuiModel) applyFilter(filter tuiFilter) tea.Cmd {
 func (m *tuiModel) openDetail(row tuiRow) tea.Cmd {
 	m.details = true
 	m.detailID = row.ID
+	m.detailMeta = nil
 	m.snapshot.Detail = nil
+	m.snapshot.DetailMeta = nil
+	m.snapshot.DetailUnchanged = false
 	m.snapshot.DetailMissing = false
 	m.detailTab = detailRequest
 	m.decoder = nil
@@ -417,6 +429,7 @@ func (m *tuiModel) gotoPage(page int) tea.Cmd {
 // refreshNow drops cached aggregates so the next load rebuilds them, like r on the web.
 func (m *tuiModel) refreshNow() tea.Cmd {
 	m.summaryAt, m.overviewAt, m.timelineAt = time.Time{}, time.Time{}, time.Time{}
+	m.detailMeta = nil
 	return m.load()
 }
 
@@ -512,12 +525,17 @@ func (m *tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *tuiModel) applySnapshot(snapshot tuiSnapshot) {
 	before, wasMissing := m.snapshot.Detail, m.snapshot.DetailMissing
+	unchanged := snapshot.DetailUnchanged && before != nil && before.ID == m.detailID
+	if unchanged {
+		snapshot.Detail = before
+	}
 	wasFollowing := m.following()
 	selectedID := ""
 	if !m.stale && len(m.snapshot.Rows) > m.selected {
 		selectedID = m.snapshot.Rows[m.selected].ID
 	}
 	m.snapshot, m.page, m.stale = snapshot, snapshot.Page, false
+	m.detailMeta = snapshot.DetailMeta
 	m.selected = min(m.selected, max(0, len(m.snapshot.Rows)-1))
 	if !wasFollowing && !m.pickDetail {
 		for i, row := range m.snapshot.Rows {
@@ -538,7 +556,7 @@ func (m *tuiModel) applySnapshot(snapshot tuiSnapshot) {
 	m.errorText = ""
 	// Keys that change the detail rebuild it themselves; a refresh returning
 	// the same record leaves it alone, since a large body takes long to lay out.
-	if m.details && m.snapshot.DetailMissing == wasMissing && sameTransaction(before, m.snapshot.Detail) {
+	if m.details && m.snapshot.DetailMissing == wasMissing && (unchanged || sameTransaction(before, m.snapshot.Detail)) {
 		return
 	}
 	m.updateContent()

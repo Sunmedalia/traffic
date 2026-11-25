@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -46,14 +47,27 @@ type tuiRow struct {
 	Incomplete, Truncated                               bool
 }
 
+// tuiDetailMeta is a lightweight fingerprint of an open detail row queried from
+// entries before fetching and decoding the full transaction body from records.
+type tuiDetailMeta struct {
+	ID         string
+	Status     int
+	Incomplete bool
+	Truncated  bool
+	AlertCount int
+	Alerts     string
+}
+
 type tuiSnapshot struct {
-	Rows          []tuiRow
-	Count         int
-	Page          int
-	Stats         Stats
-	StatusWarning string
-	Detail        *Transaction
-	DetailMissing bool
+	Rows            []tuiRow
+	Count           int
+	Page            int
+	Stats           Stats
+	StatusWarning   string
+	Detail          *Transaction
+	DetailMeta      *tuiDetailMeta
+	DetailUnchanged bool
+	DetailMissing   bool
 	// Newer counts matching records above an anchored first row.
 	Newer int
 }
@@ -196,6 +210,10 @@ func readTUIStatus(dir string) (Stats, string) {
 
 // loadTUISnapshot queries summaries in SQLite so bodies are only transferred for an opened detail.
 func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly bool, page int, detailID string, anchor *tuiRow, limits ...int) (tuiSnapshot, error) {
+	return loadTUISnapshotWithMeta(ctx, s, filter, alertsOnly, page, detailID, nil, anchor, limits...)
+}
+
+func loadTUISnapshotWithMeta(ctx context.Context, s *Store, filter tuiFilter, alertsOnly bool, page int, detailID string, prevMeta *tuiDetailMeta, anchor *tuiRow, limits ...int) (tuiSnapshot, error) {
 	pageSize := 100
 	if len(limits) > 0 && limits[0] > 0 {
 		pageSize = min(limits[0], 500)
@@ -279,21 +297,35 @@ func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly
 		if err := tx.Rollback(); err != nil {
 			return result, err
 		}
-		return loadTUISnapshot(ctx, s, filter, alertsOnly, result.Page, detailID, nil, limits...)
+		return loadTUISnapshotWithMeta(ctx, s, filter, alertsOnly, result.Page, detailID, prevMeta, nil, limits...)
 	}
 	if detailID != "" {
-		var b []byte
-		err = tx.QueryRowContext(ctx, "SELECT data FROM records WHERE id=?", detailID).Scan(&b)
+		var meta tuiDetailMeta
+		meta.ID = detailID
+		err = tx.QueryRowContext(ctx, `SELECT status,incomplete,truncated,alert,alerts FROM entries WHERE id=?`, detailID).Scan(&meta.Status, &meta.Incomplete, &meta.Truncated, &meta.AlertCount, &meta.Alerts)
 		if err == sql.ErrNoRows {
 			result.DetailMissing = true
 		} else if err != nil {
 			return result, err
 		} else {
-			var t Transaction
-			if err = json.Unmarshal(b, &t); err != nil {
-				return result, fmt.Errorf("读取请求详情: %w", err)
+			result.DetailMeta = &meta
+			if prevMeta != nil && *prevMeta == meta {
+				result.DetailUnchanged = true
+			} else {
+				var b []byte
+				err = tx.QueryRowContext(ctx, "SELECT data FROM records WHERE id=?", detailID).Scan(&b)
+				if err == sql.ErrNoRows {
+					result.DetailMissing = true
+				} else if err != nil {
+					return result, err
+				} else {
+					var t Transaction
+					if err = json.Unmarshal(b, &t); err != nil {
+						return result, fmt.Errorf("读取请求详情: %w", err)
+					}
+					result.Detail = &t
+				}
 			}
-			result.Detail = &t
 		}
 	}
 	return result, tx.Commit()
@@ -319,10 +351,29 @@ type tuiSummary struct {
 	Recent        []tuiRow
 }
 
-const tuiSourceLimit = 200
+const (
+	tuiSourceLimit = 200
+	tuiRuleLimit   = 500
+	tuiRecentLimit = 20
+)
 
-// loadTUISummary aggregates the alerts of matching requests in one scan. Rule and
-// severity conditions also restrict which alerts of a request are counted.
+type tuiSummaryCacheKey struct {
+	dir    string
+	filter tuiFilter
+}
+
+type tuiSummaryCacheEntry struct {
+	revision string
+	data     *tuiSummary
+}
+
+var (
+	tuiSummaryCacheMu sync.Mutex
+	tuiSummaryCache   = map[tuiSummaryCacheKey]tuiSummaryCacheEntry{}
+)
+
+// loadTUISummary aggregates the alerts of matching requests inside SQLite. Rule
+// and severity conditions also restrict which alerts of a request are counted.
 func loadTUISummary(ctx context.Context, s *Store, filter tuiFilter) (*tuiSummary, error) {
 	if s == nil {
 		return nil, fmt.Errorf("会话未打开")
@@ -335,116 +386,190 @@ func loadTUISummary(ctx context.Context, s *Store, filter tuiFilter) (*tuiSummar
 		defer fresh.db.Close()
 		s = fresh
 	}
-	where, args := filter.where(true)
-	rows, err := s.db.QueryContext(ctx, `SELECT id,time,client,alerts,method,host,url
- FROM entries WHERE `+where+` ORDER BY time DESC, id DESC`, args...)
+	status, _ := readTUIStatus(s.dir)
+	finished := status.State != "" && status.State != "running" && status.State != "starting" && status.State != "stale"
+	var revision string
+	cacheKey := tuiSummaryCacheKey{dir: s.dir, filter: filter}
+	if finished {
+		revision = summaryRevision(s)
+		if revision != "" {
+			tuiSummaryCacheMu.Lock()
+			entry, ok := tuiSummaryCache[cacheKey]
+			tuiSummaryCacheMu.Unlock()
+			if ok && entry.revision == revision {
+				return entry.data, nil
+			}
+		}
+	}
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	type ruleState struct {
-		agg     tuiRuleAgg
-		sources map[string]bool
-	}
-	type sourceState struct {
-		agg   tuiSourceAgg
-		rules map[string]bool
-	}
-	result := &tuiSummary{}
-	byRule := map[string]*ruleState{}
-	bySource := map[string]*sourceState{}
+	defer tx.Rollback()
+
+	where, args := filter.where(true)
 	minRank := severityRank(filter.Severity)
-	for rows.Next() {
-		var id, at, client, method, host, url string
-		var raw []byte
-		if err = rows.Scan(&id, &at, &client, &raw, &method, &host, &url); err != nil {
-			return nil, err
-		}
-		var alerts []Alert
-		if json.Unmarshal(raw, &alerts) != nil {
-			continue
-		}
-		best, highRule, seen := 0, "", map[string]bool{}
-		source := tuiClientHost(client)
-		for _, a := range alerts {
-			rank := severityRank(a.Severity)
-			if (filter.Rule != "" && a.Rule != filter.Rule) || rank < minRank {
-				continue
-			}
-			best = max(best, rank)
-			if rank == 3 && highRule == "" {
-				highRule = a.Rule
-			}
-			// Rows arrive newest first, so the first sighting holds the latest match.
-			r := byRule[a.Rule]
-			if r == nil {
-				r = &ruleState{agg: tuiRuleAgg{Rule: a.Rule, Last: at, Match: a.Match}, sources: map[string]bool{}}
-				byRule[a.Rule] = r
-			}
-			if rank > severityRank(r.agg.Severity) {
-				r.agg.Severity = a.Severity
-			}
-			if !seen[a.Rule] {
-				seen[a.Rule] = true
-				r.agg.Hits++
-				r.sources[source] = true
-			}
-		}
-		if len(seen) == 0 {
-			continue
-		}
-		result.Levels[best]++
-		result.AlertRequests++
-		src := bySource[source]
-		if src == nil {
-			src = &sourceState{agg: tuiSourceAgg{Client: source, Last: at}, rules: map[string]bool{}}
-			bySource[source] = src
-		}
-		src.agg.Hits++
-		src.agg.First = at
-		for rule := range seen {
-			src.rules[rule] = true
-		}
-		if highRule != "" && len(result.Recent) < 20 {
-			result.Recent = append(result.Recent, tuiRow{ID: id, Time: at, Client: client, Method: method, Host: host, URL: url, Rule: highRule, Severity: "high"})
-		}
+	alertCond := sqlSeverityRank + ">=?"
+	alertArgs := []any{minRank}
+	if filter.Rule != "" {
+		alertCond = "json_extract(a.value,'$.rule')=? AND " + alertCond
+		alertArgs = append([]any{filter.Rule}, alertArgs...)
 	}
-	if err = rows.Err(); err != nil {
+	joinedArgs := append(append([]any{}, args...), alertArgs...)
+
+	result := &tuiSummary{}
+
+	// 1. Levels & total alerting requests.
+	var low, medium, high, other int
+	if filter.Rule == "" {
+		err = tx.QueryRowContext(ctx, `SELECT count(*),
+ COALESCE(sum(CASE WHEN severity=1 THEN 1 ELSE 0 END),0),
+ COALESCE(sum(CASE WHEN severity=2 THEN 1 ELSE 0 END),0),
+ COALESCE(sum(CASE WHEN severity=3 THEN 1 ELSE 0 END),0),
+ COALESCE(sum(CASE WHEN severity<1 OR severity>3 THEN 1 ELSE 0 END),0)
+ FROM entries WHERE `+where, args...).Scan(&result.AlertRequests, &low, &medium, &high, &other)
+	} else {
+		err = tx.QueryRowContext(ctx, `SELECT count(*),
+ COALESCE(sum(CASE WHEN best=1 THEN 1 ELSE 0 END),0),
+ COALESCE(sum(CASE WHEN best=2 THEN 1 ELSE 0 END),0),
+ COALESCE(sum(CASE WHEN best=3 THEN 1 ELSE 0 END),0),
+ COALESCE(sum(CASE WHEN best<1 OR best>3 THEN 1 ELSE 0 END),0)
+ FROM (
+  SELECT max(`+sqlSeverityRank+`) AS best
+  FROM entries, json_each(entries.alerts) a
+  WHERE `+where+` AND `+alertCond+`
+  GROUP BY entries.id
+ )`, joinedArgs...).Scan(&result.AlertRequests, &low, &medium, &high, &other)
+	}
+	if err != nil {
 		return nil, err
 	}
-	for _, r := range byRule {
-		r.agg.Sources = len(r.sources)
-		result.Rules = append(result.Rules, r.agg)
+	result.Levels = [4]int{other, low, medium, high}
+
+	// 2. Per-rule aggregation with newest match (bounded by tuiRuleLimit).
+	severityNames := [...]string{"", "low", "medium", "high"}
+	ruleRows, err := tx.QueryContext(ctx, `SELECT rule, max(rank) AS max_rank, count(DISTINCT id) AS hits, count(DISTINCT src) AS sources, max(at) AS last_at,
+ COALESCE(max(CASE WHEN rn=1 THEN match_text END),'')
+ FROM (
+  SELECT
+   COALESCE(json_extract(a.value,'$.rule'),'') AS rule,
+   `+sqlSeverityRank+` AS rank,
+   COALESCE(json_extract(a.value,'$.match'),'') AS match_text,
+   entries.id AS id,
+   entries.time AS at,
+   `+sqlClientHost+` AS src,
+   ROW_NUMBER() OVER (PARTITION BY COALESCE(json_extract(a.value,'$.rule'),'') ORDER BY entries.time DESC, entries.id DESC, a.key ASC) AS rn
+  FROM entries, json_each(entries.alerts) a
+  WHERE `+where+` AND `+alertCond+`
+ )
+ GROUP BY rule
+ ORDER BY max_rank DESC, hits DESC, rule ASC
+ LIMIT ?`, append(append([]any{}, joinedArgs...), tuiRuleLimit)...)
+	if err != nil {
+		return nil, err
 	}
-	sort.Slice(result.Rules, func(i, j int) bool {
-		a, b := result.Rules[i], result.Rules[j]
-		if severityRank(a.Severity) != severityRank(b.Severity) {
-			return severityRank(a.Severity) > severityRank(b.Severity)
+	for ruleRows.Next() {
+		var agg tuiRuleAgg
+		var rank int
+		if err = ruleRows.Scan(&agg.Rule, &rank, &agg.Hits, &agg.Sources, &agg.Last, &agg.Match); err != nil {
+			ruleRows.Close()
+			return nil, err
 		}
-		if a.Hits != b.Hits {
-			return a.Hits > b.Hits
+		if rank >= 0 && rank < len(severityNames) {
+			agg.Severity = severityNames[rank]
 		}
-		return a.Rule < b.Rule
-	})
-	for _, src := range bySource {
-		for rule := range src.rules {
-			src.agg.Rules = append(src.agg.Rules, rule)
-		}
-		sort.Strings(src.agg.Rules)
-		result.Sources = append(result.Sources, src.agg)
+		result.Rules = append(result.Rules, agg)
 	}
-	sort.Slice(result.Sources, func(i, j int) bool {
-		a, b := result.Sources[i], result.Sources[j]
-		if a.Hits != b.Hits {
-			return a.Hits > b.Hits
+	err = ruleRows.Err()
+	ruleRows.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. Per-source aggregation (bounded by tuiSourceLimit+1 to detect capping).
+	srcRows, err := tx.QueryContext(ctx, `SELECT src, count(DISTINCT id) AS hits, min(at), max(at), json_group_array(DISTINCT rule)
+ FROM (
+  SELECT
+   `+sqlClientHost+` AS src,
+   entries.id AS id,
+   entries.time AS at,
+   COALESCE(json_extract(a.value,'$.rule'),'') AS rule
+  FROM entries, json_each(entries.alerts) a
+  WHERE `+where+` AND `+alertCond+`
+ )
+ GROUP BY src
+ ORDER BY hits DESC, max(at) DESC, src ASC
+ LIMIT ?`, append(append([]any{}, joinedArgs...), tuiSourceLimit+1)...)
+	if err != nil {
+		return nil, err
+	}
+	for srcRows.Next() {
+		var agg tuiSourceAgg
+		var rawRules []byte
+		if err = srcRows.Scan(&agg.Client, &agg.Hits, &agg.First, &agg.Last, &rawRules); err != nil {
+			srcRows.Close()
+			return nil, err
 		}
-		if a.Last != b.Last {
-			return a.Last > b.Last
+		if len(rawRules) > 0 {
+			_ = json.Unmarshal(rawRules, &agg.Rules)
+			sort.Strings(agg.Rules)
 		}
-		return a.Client < b.Client
-	})
+		result.Sources = append(result.Sources, agg)
+	}
+	err = srcRows.Err()
+	srcRows.Close()
+	if err != nil {
+		return nil, err
+	}
 	if len(result.Sources) > tuiSourceLimit {
 		result.Sources, result.SourcesCapped = result.Sources[:tuiSourceLimit], true
+	}
+
+	// 4. Recent high-severity alerting requests (bounded by tuiRecentLimit).
+	highCond := `json_extract(a.value,'$.severity')='high'`
+	var highArgs []any
+	if filter.Rule != "" {
+		highCond = `json_extract(a.value,'$.rule')=? AND ` + highCond
+		highArgs = append(highArgs, filter.Rule)
+	}
+	recentArgs := append(append([]any{}, highArgs...), args...)
+	recentArgs = append(recentArgs, highArgs...)
+	recentArgs = append(recentArgs, tuiRecentLimit)
+	recentRows, err := tx.QueryContext(ctx, `SELECT entries.id,entries.time,entries.client,entries.method,entries.host,entries.url,
+ COALESCE((SELECT json_extract(a.value,'$.rule') FROM json_each(entries.alerts) a WHERE `+highCond+` ORDER BY a.key LIMIT 1),'')
+ FROM entries
+ WHERE `+where+` AND EXISTS (SELECT 1 FROM json_each(entries.alerts) a WHERE `+highCond+`)
+ ORDER BY entries.time DESC, entries.id DESC
+ LIMIT ?`, recentArgs...)
+	if err != nil {
+		return nil, err
+	}
+	for recentRows.Next() {
+		var row tuiRow
+		if err = recentRows.Scan(&row.ID, &row.Time, &row.Client, &row.Method, &row.Host, &row.URL, &row.Rule); err != nil {
+			recentRows.Close()
+			return nil, err
+		}
+		row.Severity = "high"
+		result.Recent = append(result.Recent, row)
+	}
+	err = recentRows.Err()
+	recentRows.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	if finished && revision != "" {
+		tuiSummaryCacheMu.Lock()
+		if len(tuiSummaryCache) > 64 {
+			tuiSummaryCache = map[tuiSummaryCacheKey]tuiSummaryCacheEntry{}
+		}
+		tuiSummaryCache[cacheKey] = tuiSummaryCacheEntry{revision: revision, data: result}
+		tuiSummaryCacheMu.Unlock()
 	}
 	return result, nil
 }
