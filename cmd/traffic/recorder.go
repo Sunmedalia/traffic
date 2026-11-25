@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -19,15 +20,15 @@ type opensslEvent = session.OpenSSLEvent
 type iisEvent = session.IISEvent
 
 const evidenceShedLossReason = "evidence_queue_shed"
+const maxRawEventSources = 1024
 
 type sourceRecordState struct {
-	backend     string
-	target      session.Target
 	pendingLoss uint64
 }
 
 type eventRecorder struct {
 	mu         sync.Mutex
+	closeOnce  sync.Once
 	store      *Store
 	policy     evidenceBackpressurePolicy
 	writer     *evidenceWriter
@@ -105,168 +106,214 @@ func (r *eventRecorder) ensureWriterLocked() error {
 	return nil
 }
 
-func (r *eventRecorder) flushSourceLossLocked(source string, state *sourceRecordState, at time.Time) error {
-	if state == nil || state.pendingLoss == 0 {
-		return nil
-	}
-	if at.IsZero() {
-		at = time.Now().UTC()
-	}
-	lossBytes, err := marshalRawEventLine(session.RawEvent{
-		Version: 1,
-		Time:    at,
-		Source:  source,
-		Type:    "loss",
-		Reason:  evidenceShedLossReason,
-		Unit:    "events",
-		Count:   state.pendingLoss,
-	})
-	if err != nil {
-		return err
-	}
-	if err := r.writer.writeOwnedControl(lossBytes); err != nil {
-		return err
-	}
-	state.pendingLoss = 0
-	return nil
-}
-
 func (r *eventRecorder) record(source, backend string, target session.Target, event session.RawEvent) error {
 	_, err := r.recordOutcome(source, backend, target, event)
 	return err
 }
 
-func (r *eventRecorder) recordOutcome(source, backend string, target session.Target, event session.RawEvent) (bool, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.recordOutcomeLocked(source, backend, target, event)
+func marshalSourceLoss(source string, count uint64, at time.Time) ([]byte, error) {
+	return marshalRawEventLine(session.RawEvent{
+		Version: 1, Time: at, Source: source, Type: "loss",
+		Reason: evidenceShedLossReason, Unit: "events", Count: count,
+	})
 }
 
-func (r *eventRecorder) recordOutcomeLocked(source, backend string, target session.Target, event session.RawEvent) (bool, error) {
-	if r.closed {
-		return false, fmt.Errorf("raw event recorder closed")
-	}
-	if r.initErr != nil {
-		return false, r.initErr
-	}
-	if err := r.ensureWriterLocked(); err != nil {
-		r.initErr = err
-		return false, err
-	}
-	if err := r.writer.failure(); err != nil {
-		return false, err
-	}
-	now := time.Now().UTC()
+func rawEventForSource(event session.RawEvent, source string, now time.Time) session.RawEvent {
 	event.Version, event.Source = 1, source
 	if event.Time.IsZero() {
 		event.Time = now
 	} else {
 		event.Time = event.Time.UTC()
 	}
-	eventBytes, err := marshalRawEventLine(event)
-	if err != nil {
-		return false, err
+	return event
+}
+
+func (r *eventRecorder) recordOutcome(source, backend string, target session.Target, event session.RawEvent) (bool, error) {
+	control := isControlRawEvent(event)
+	policy := r.policy
+	if r.writerCfg != nil && r.writerCfg.policy != "" {
+		policy = r.writerCfg.policy
 	}
-	state := r.sources[source]
-	if state == nil {
-		if len(r.sources) >= 1024 {
-			return false, fmt.Errorf("too many active probe sources")
-		}
-		sourceBytes, err := marshalRawEventLine(session.RawEvent{
-			Version: 1,
-			Time:    now,
-			Source:  source,
-			Backend: backend,
-			Type:    "source",
-			Target:  &target,
-		})
+	preflight := policy == evidenceBackpressureDrop && !control
+
+	now := time.Now().UTC()
+	event = rawEventForSource(event, source, now)
+	var eventBytes, sourceBytes, lossBytes []byte
+	var err error
+	if !preflight {
+		eventBytes, err = marshalRawEventLine(event)
 		if err != nil {
 			return false, err
 		}
-		if err := r.writer.writeOwnedControl(sourceBytes); err != nil {
-			return false, err
-		}
-		state = &sourceRecordState{backend: backend, target: target}
-		r.sources[source] = state
-		if event.Type == "source" {
-			return true, nil
-		}
-	} else if event.Type == "source" {
-		return false, fmt.Errorf("duplicate raw TLS source generation %q", source)
 	}
-	if isControlRawEvent(event) {
-		if err := r.flushSourceLossLocked(source, state, event.Time); err != nil {
+	var lossState *sourceRecordState
+	var lossCount uint64
+	for {
+		r.mu.Lock()
+		if err := r.readyWriterLocked(); err != nil {
+			r.mu.Unlock()
 			return false, err
+		}
+		state := r.sources[source]
+		if state == nil && len(r.sources) >= maxRawEventSources {
+			r.mu.Unlock()
+			return false, fmt.Errorf("too many active probe sources")
+		}
+		if state == nil && sourceBytes == nil {
+			r.mu.Unlock()
+			sourceBytes, err = marshalRawEventLine(session.RawEvent{
+				Version: 1, Time: now, Source: source, Backend: backend, Type: "source", Target: &target,
+			})
+			if err != nil {
+				return false, err
+			}
+			continue
+		}
+		if preflight {
+			// Base64 bytes alone are a lower bound on the final JSON line.
+			minSize := 1 + base64.StdEncoding.EncodedLen(len(event.Data))
+			if event.IIS != nil {
+				minSize += base64.StdEncoding.EncodedLen(len(event.IIS.Data))
+			}
+			shed, err := r.writer.shedBeforeEncoding(minSize)
+			if shed && err == nil {
+				if state == nil {
+					state, err = r.addSourceLocked(source, sourceBytes)
+				}
+				if err == nil {
+					state.pendingLoss++
+				}
+			}
+			r.mu.Unlock()
+			if shed || err != nil {
+				return false, err
+			}
+			eventBytes, err = marshalRawEventLine(event)
+			if err != nil {
+				return false, err
+			}
+			preflight = false
+			continue
+		}
+		if state == nil {
+			state, err = r.addSourceLocked(source, sourceBytes)
+			if err != nil || event.Type == "source" {
+				r.mu.Unlock()
+				return err == nil, err
+			}
+		} else if event.Type == "source" {
+			r.mu.Unlock()
+			return false, fmt.Errorf("duplicate raw TLS source generation %q", source)
+		}
+		// A concurrent record can change the pending loss while it is being
+		// serialized. Commit only if the marker still describes this source.
+		if state.pendingLoss > 0 && (lossState != state || lossCount != state.pendingLoss) {
+			lossState, lossCount = state, state.pendingLoss
+			r.mu.Unlock()
+			lossBytes, err = marshalSourceLoss(source, lossCount, event.Time)
+			if err != nil {
+				return false, err
+			}
+			continue
+		}
+		accepted, err := r.recordPreparedLocked(state, event, control, eventBytes, lossBytes)
+		r.mu.Unlock()
+		return accepted, err
+	}
+}
+
+func (r *eventRecorder) readyWriterLocked() error {
+	if r.closed {
+		return fmt.Errorf("raw event recorder closed")
+	}
+	if r.initErr != nil {
+		return r.initErr
+	}
+	if err := r.ensureWriterLocked(); err != nil {
+		r.initErr = err
+		return err
+	}
+	return r.writer.failure()
+}
+
+func (r *eventRecorder) addSourceLocked(source string, encoded []byte) (*sourceRecordState, error) {
+	if len(r.sources) >= maxRawEventSources {
+		return nil, fmt.Errorf("too many active probe sources")
+	}
+	if err := r.writer.writeOwnedControl(encoded); err != nil {
+		return nil, err
+	}
+	state := &sourceRecordState{}
+	r.sources[source] = state
+	return state, nil
+}
+
+func (r *eventRecorder) recordPreparedLocked(state *sourceRecordState, event session.RawEvent, control bool, eventBytes, lossBytes []byte) (bool, error) {
+	if control {
+		if state.pendingLoss > 0 {
+			if err := r.writer.writeOwnedControl(lossBytes); err != nil {
+				return false, err
+			}
+			state.pendingLoss = 0
 		}
 		if err := r.writer.writeOwnedControl(eventBytes); err != nil {
 			return false, err
 		}
 		if event.Type == "end" {
-			delete(r.sources, source)
+			delete(r.sources, event.Source)
 		}
 		return true, nil
 	}
 	var accepted bool
+	var err error
 	if state.pendingLoss > 0 {
-		lossBytes, err := marshalRawEventLine(session.RawEvent{
-			Version: 1,
-			Time:    event.Time,
-			Source:  source,
-			Type:    "loss",
-			Reason:  evidenceShedLossReason,
-			Unit:    "events",
-			Count:   state.pendingLoss,
-		})
-		if err != nil {
-			return false, err
-		}
 		accepted, err = r.writer.writeOwnedRecoveryAndData(lossBytes, eventBytes)
-		if err != nil {
-			return false, err
-		}
-		if accepted {
-			state.pendingLoss = 0
-		} else {
-			state.pendingLoss++
-		}
 	} else {
 		accepted, err = r.writer.writeOwnedData(eventBytes)
-		if err != nil {
-			return false, err
-		}
-		if !accepted {
-			state.pendingLoss++
-		}
 	}
-	if accepted && r.store != nil && (event.Type == "data" || (event.Type == "iis" && event.IIS != nil && (event.IIS.Type == "request" || event.IIS.Type == "response"))) {
-		r.store.noteTLSEvent(event.Time)
+	if err != nil {
+		return false, err
+	}
+	if !accepted {
+		state.pendingLoss++
+	} else {
+		state.pendingLoss = 0
+		if r.store != nil && (event.Type == "data" || (event.Type == "iis" && event.IIS != nil && (event.IIS.Type == "request" || event.IIS.Type == "response"))) {
+			r.store.noteTLSEvent(event.Time)
+		}
 	}
 	return accepted, nil
 }
 
 func (r *eventRecorder) close() error {
-	r.mu.Lock()
-	if !r.closed {
+	r.closeOnce.Do(func() {
+		r.mu.Lock()
 		r.closed = true
-		if r.writer != nil && r.writer.failure() == nil {
-			sources := make([]string, 0, len(r.sources))
-			for source := range r.sources {
+		r.mu.Unlock()
+
+		// Closing freezes the source map. Complete its loss records before
+		// any caller closes the writer's queue.
+		if r.writer == nil || r.writer.failure() != nil {
+			return
+		}
+		sources := make([]string, 0, len(r.sources))
+		for source, state := range r.sources {
+			if state.pendingLoss > 0 {
 				sources = append(sources, source)
 			}
-			sort.Strings(sources)
-			now := time.Now().UTC()
-			for _, source := range sources {
-				_ = r.flushSourceLossLocked(source, r.sources[source], now)
+		}
+		sort.Strings(sources)
+		now := time.Now().UTC()
+		for _, source := range sources {
+			if encoded, err := marshalSourceLoss(source, r.sources[source].pendingLoss, now); err == nil {
+				_ = r.writer.writeOwnedControl(encoded)
 			}
 		}
+	})
+	if r.writer != nil {
+		return r.writer.Close()
 	}
-	writer := r.writer
-	initErr := r.initErr
-	r.mu.Unlock()
-	if writer != nil {
-		return writer.Close()
-	}
-	return initErr
+	return r.initErr
 }
 
 func (r *eventRecorder) target(pid int, id string) session.Target {
@@ -367,27 +414,83 @@ func captureAddresses() []string {
 }
 
 func (r *eventRecorder) boundary(generation string, event session.RawEvent) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	var sources []string
-	for source := range r.sources {
-		if strings.HasPrefix(source, generation+"/") {
-			sources = append(sources, source)
-		}
+	type boundaryRecord struct {
+		source string
+		state  *sourceRecordState
+		count  uint64
+		event  session.RawEvent
+		data   []byte
+		loss   []byte
 	}
-	sort.Strings(sources)
-	for _, source := range sources {
-		state := r.sources[source]
-		if state == nil {
-			continue
+
+	prefix := generation + "/"
+	control := isControlRawEvent(event)
+	for {
+		r.mu.Lock()
+		var records []boundaryRecord
+		for source, state := range r.sources {
+			if strings.HasPrefix(source, prefix) {
+				records = append(records, boundaryRecord{source: source, state: state, count: state.pendingLoss})
+			}
 		}
-		if _, err := r.recordOutcomeLocked(source, state.backend, state.target, event); err != nil {
+		r.mu.Unlock()
+		if len(records) == 0 {
+			return nil
+		}
+
+		sort.Slice(records, func(i, j int) bool { return records[i].source < records[j].source })
+		now := time.Now().UTC()
+		for i := range records {
+			record := &records[i]
+			record.event = rawEventForSource(event, record.source, now)
+			// A transport-wide count belongs to the boundary, not each PID.
+			if i > 0 {
+				record.event.Count = 0
+			}
+			var err error
+			record.data, err = marshalRawEventLine(record.event)
+			if err != nil {
+				return err
+			}
+			if record.count > 0 {
+				record.loss, err = marshalSourceLoss(record.source, record.count, record.event.Time)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		r.mu.Lock()
+		if err := r.readyWriterLocked(); err != nil {
+			r.mu.Unlock()
 			return err
 		}
-		// A transport-wide count belongs to the whole boundary, not each PID.
-		event.Count = 0
+		// Preserve the atomic boundary across all sources. Retry if the
+		// generation's membership or pending loss changed during encoding.
+		active := 0
+		for source := range r.sources {
+			if strings.HasPrefix(source, prefix) {
+				active++
+			}
+		}
+		current := active == len(records)
+		for _, record := range records {
+			state := r.sources[record.source]
+			current = current && state == record.state && state.pendingLoss == record.count
+		}
+		if !current {
+			r.mu.Unlock()
+			continue
+		}
+		for _, record := range records {
+			if _, err := r.recordPreparedLocked(record.state, record.event, control, record.data, record.loss); err != nil {
+				r.mu.Unlock()
+				return err
+			}
+		}
+		r.mu.Unlock()
+		return nil
 	}
-	return nil
 }
 
 // Observe only successfully queued raw requests. Shed requests during bounded

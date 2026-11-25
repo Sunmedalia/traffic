@@ -134,8 +134,44 @@ static void test_raw_event_boundary(int fd) {
     expect_message(fd, "next");
 }
 
+static void test_endpoints(void) {
+    struct sockaddr_in server4 = { .sin_family = AF_INET };
+    server4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    struct sockaddr_in6 server6 = { .sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+    for (int i = 0; i < 2; i++) {
+        int family = i ? AF_INET6 : AF_INET;
+        struct sockaddr *address = i ? (struct sockaddr *)&server6 : (struct sockaddr *)&server4;
+        socklen_t length = i ? sizeof(server6) : sizeof(server4);
+        int server = socket(family, SOCK_DGRAM, 0);
+        if (i && server < 0 && errno == EAFNOSUPPORT)
+            continue;
+        assert(server >= 0);
+        if (i && bind(server, address, length) < 0) {
+            assert(errno == EADDRNOTAVAIL);
+            close(server);
+            continue;
+        }
+        if (!i)
+            assert(bind(server, address, length) == 0);
+        assert(getsockname(server, address, &length) == 0);
+        int client = socket(family, SOCK_DGRAM, 0);
+        assert(client >= 0 && connect(client, address, length) == 0);
+        char local[128], peer[128], tiny[4];
+        size_t n = endpoint(server, 0, local, sizeof(local));
+        assert(n && n == strlen(local) + 1);
+        assert(endpoint(client, 1, peer, sizeof(peer)) == n && !strcmp(local, peer));
+        assert(!strncmp(local, i ? "[::1]:" : "127.0.0.1:", i ? 6 : 10));
+        unsigned port = ntohs(i ? server6.sin6_port : server4.sin_port);
+        assert(strtoul(strrchr(local, ':') + 1, NULL, 10) == port);
+        assert(!endpoint(client, 1, tiny, sizeof(tiny)));
+        close(client);
+        close(server);
+    }
+}
+
 int main(void) {
     test_connection_deletion();
+    test_endpoints();
     char directory[] = "/tmp/traffic-queue-XXXXXX";
     assert(mkdtemp(directory));
     assert(snprintf(destination, sizeof(destination), "%s/events", directory) > 0);
@@ -219,11 +255,14 @@ int main(void) {
     publish(bad, "bad");
     pthread_mutex_unlock(&connection_mutex[0]);
     uint64_t deadline = monotonic_milliseconds() + 2000;
+    uint64_t failed_retry = 0;
     int failed = 0;
     while (monotonic_milliseconds() < deadline) {
         pthread_mutex_lock(&connection_mutex[0]);
         failed = __atomic_load_n(&transport_lost, __ATOMIC_ACQUIRE) > 0;
         if (failed) {
+            failed_retry = atomic_load(&retry_after);
+            assert(failed_retry != 0 && atomic_load(&transport_errno) != 0);
             /* Failed transmission must not free an unpublished tail slot. */
             assert(queue_length() == 1);
             assert(&events[atomic_load(&queue_read) % EVENT_QUEUE] == pending);
@@ -240,6 +279,7 @@ int main(void) {
     publish(pending, "old");
     ssize_t loss_length = recv(fd, data, sizeof(data) - 1, 0);
     assert(loss_length > 0);
+    assert(monotonic_milliseconds() >= failed_retry);
     data[loss_length] = 0;
     assert(strstr(data, "\"type\":\"loss\""));
     assert(strstr(data, "\"count\":2"));
@@ -287,15 +327,12 @@ int main(void) {
     assert(strstr(data, "\"type\":\"loss\""));
     expect_message(fd, "rec");
 
-    pthread_mutex_lock(&connection_mutex[0]);
-    atomic_store(&stop_deadline, monotonic_milliseconds() + 500);
-    __atomic_store_n(&stopping, 1, __ATOMIC_RELEASE);
-    pthread_cond_signal(&event_ready);
-    pthread_mutex_unlock(&connection_mutex[0]);
-    assert(pthread_join(worker, NULL) == 0);
-    atomic_store(&worker_running, 0);
-    if (event_socket >= 0) close(event_socket);
-    event_socket = -1;
+    deadline = monotonic_milliseconds() + 1000;
+    while (!atomic_load(&worker_sleeping) && monotonic_milliseconds() < deadline)
+        usleep(1000);
+    assert(atomic_load(&worker_sleeping));
+    shutdown_events();
+    assert(!atomic_load(&worker_running) && event_socket == -1);
     close(fd);
     assert(unlink(destination) == 0);
     assert(rmdir(directory) == 0);

@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Sunmedalia/traffic/internal/session"
+	"github.com/google/gopacket/pcap"
 )
 
 func TestSplitWinDivertBatchIPv4AndIPv6WithQPCTimestampsAndSnaplen(t *testing.T) {
@@ -35,7 +37,7 @@ func TestSplitWinDivertBatchIPv4AndIPv6WithQPCTimestampsAndSnaplen(t *testing.T)
 	binary.LittleEndian.PutUint64(addrBuf[80:88], uint64(anchorTicks+25_000))       // +2.5ms
 	binary.LittleEndian.PutUint64(addrBuf[160:168], uint64(anchorTicks+10_000_000)) // +1s
 
-	got, err := splitWinDivertBatch(raw, uint32(len(raw)), addrBuf, uint32(len(addrBuf)), 80, func(ticks int64) time.Time {
+	got, err := splitWinDivertBatch(raw, uint32(len(raw)), addrBuf, uint32(len(addrBuf)), 80, anchor, func(ticks int64) time.Time {
 		return qpcTicksToUTC(ticks, anchorTicks, freq, anchor)
 	})
 	if err != nil {
@@ -53,6 +55,61 @@ func TestSplitWinDivertBatchIPv4AndIPv6WithQPCTimestampsAndSnaplen(t *testing.T)
 	if len(got[2].data) != 80 || got[2].ci.CaptureLength != 80 || got[2].ci.Length != 120 || !got[2].ci.Timestamp.Equal(anchor.Add(time.Second)) {
 		t.Fatalf("packet 2 snaplen mismatch: %+v", got[2].ci)
 	}
+	if &got[0].data[0] == &raw[0] || cap(got[0].data) != len(got[0].data) {
+		t.Fatal("packet data aliases the receive buffer or exposes another packet's bytes")
+	}
+	raw[0] = 0
+	if got[0].data[0] != p1[0] {
+		t.Fatal("reuse of the receive buffer corrupted a packet")
+	}
+	received, err := splitWinDivertBatch(append(p1, p2...), uint32(len(p1)+len(p2)), addrBuf, 2*winDivertAddrSize, 80, anchor, nil)
+	if err != nil || len(received) != 2 || received[0].ci.Timestamp != anchor || received[1].ci.Timestamp != anchor {
+		t.Fatalf("receive timestamp fallback: packets=%+v, err=%v", received, err)
+	}
+}
+
+func TestWinDivertBatchQueueRetainsSlabBudgetUntilLastPacket(t *testing.T) {
+	abort := make(chan struct{})
+	t.Cleanup(func() { close(abort) })
+	q := newWinDivertBatchQueue(abort)
+	slab := make([]byte, winDivertBatchBudgetBytes)
+	if !q.queueBatch([]winDivertBatchPacket{{data: slab[:1]}, {data: slab[1:]}}) {
+		t.Fatal("batch was rejected")
+	}
+	enqueued := make(chan bool, 1)
+	go func() { enqueued <- q.queueBatch([]winDivertBatchPacket{{data: []byte{9}}}) }()
+	if data, _, err := q.readPacket(); err != nil || len(data) != 1 || q.batchBytes.Load() != winDivertBatchBudgetBytes {
+		t.Fatalf("first packet: bytes=%d, charged=%d, err=%v", len(data), q.batchBytes.Load(), err)
+	}
+	if data, _, err := q.readPacket(); err != nil || len(data) != winDivertBatchBudgetBytes-1 {
+		t.Fatalf("last packet: bytes=%d, err=%v", len(data), err)
+	}
+	select {
+	case ok := <-enqueued:
+		if !ok {
+			t.Fatal("producer did not resume")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("producer did not wake after the slab was released")
+	}
+	close(q.batches)
+	if data, _, err := q.readPacket(); err != nil || !bytes.Equal(data, []byte{9}) || q.batchBytes.Load() != 0 {
+		t.Fatalf("queued packet after close: bytes=%v, charged=%d, err=%v", data, q.batchBytes.Load(), err)
+	}
+	if _, _, err := q.readPacket(); err != io.EOF || q.readTimer != nil {
+		t.Fatalf("closed queue allocated a timer or returned the wrong error: %v", err)
+	}
+}
+
+func TestWinDivertBatchQueueReusesTimeoutTimer(t *testing.T) {
+	q := newWinDivertBatchQueue(nil)
+	if _, _, err := q.readPacket(); err != pcap.NextErrorTimeoutExpired {
+		t.Fatal(err)
+	}
+	timer := q.readTimer
+	if _, _, err := q.readPacket(); err != pcap.NextErrorTimeoutExpired || q.readTimer != timer {
+		t.Fatalf("read did not reuse the timer: %v", err)
+	}
 }
 
 func TestSplitWinDivertBatchRejectsCorruptHeaders(t *testing.T) {
@@ -60,7 +117,7 @@ func TestSplitWinDivertBatchRejectsCorruptHeaders(t *testing.T) {
 	corrupt := make([]byte, 30)
 	corrupt[0] = 0x45
 	binary.BigEndian.PutUint16(corrupt[2:4], 100) // exceeds remaining batch length
-	if _, err := splitWinDivertBatch(corrupt, uint32(len(corrupt)), addrBuf, uint32(len(addrBuf)), 65535, nil); err == nil {
+	if _, err := splitWinDivertBatch(corrupt, uint32(len(corrupt)), addrBuf, uint32(len(addrBuf)), 65535, time.Time{}, nil); err == nil {
 		t.Fatal("accepted corrupt IPv4 total length in batch")
 	}
 }
@@ -90,7 +147,8 @@ func TestIISBindingPortScopeAndProbeExitAccounting(t *testing.T) {
 	s.stats.Started = time.Date(2026, 11, 18, 6, 0, 0, 0, time.UTC)
 	s.stats.Stopped = s.stats.Started.Add(30 * time.Second)
 	s.notePacketPoll(s.stats.Stopped)
-	s.notePacketCaptured(s.stats.Started.Add(100 * time.Millisecond))
+	stamp := s.stats.Started.Add(100 * time.Millisecond).UnixNano()
+	s.notePacketBatch(1, stamp, stamp)
 	recordWindowsProbeExit(s, "6092:1", true, true, false, false)
 	if err := finishCaptureStateReason(s, false, false, false, "duration"); err != nil {
 		t.Fatal(err)
@@ -145,7 +203,7 @@ func TestWinDivertBatchChecksEveryAddressAndAllPacketBytes(t *testing.T) {
 		{"packet missing despite address", nil, winDivertAddrSize},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := splitWinDivertBatch(tc.raw, uint32(len(tc.raw)), meta, tc.addressBytes, 65535, nil)
+			got, err := splitWinDivertBatch(tc.raw, uint32(len(tc.raw)), meta, tc.addressBytes, 65535, time.Time{}, nil)
 			if err == nil || len(got) != 0 {
 				t.Fatalf("exposed invalid batch: got %d packets, err=%v", len(got), err)
 			}

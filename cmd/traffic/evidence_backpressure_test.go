@@ -308,18 +308,16 @@ func TestRecorderDropPolicyInsertsLossBeforeRecoveredDataAndPreventsCrossGapSpli
 		t.Fatalf("oversized event failed recorder in drop mode: %v", err)
 	}
 
-	if s.stats.QueueDropped == 0 {
+	if s.rawEvidenceQueueDropped.Load() == 0 {
 		t.Fatal("expected shed events while sink was blocked")
 	}
-	shedDuringBlock := s.stats.QueueDropped
+	shedDuringBlock := s.rawEvidenceQueueDropped.Load()
 
 	// 3. Unblock sink and wait for buffered data to drain to 0.
 	sink.resume()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		s.mu.Lock()
-		pending := s.stats.RawEvidencePendingBytes
-		s.mu.Unlock()
+		pending := s.rawEvidencePendingBytes()
 		if pending == 0 {
 			break
 		}
@@ -377,8 +375,8 @@ func TestRecorderDropPolicyInsertsLossBeforeRecoveredDataAndPreventsCrossGapSpli
 	if lossIdx <= 1 || postRecoveryIdx <= lossIdx {
 		t.Fatalf("loss marker did not precede recovered data: lossIdx=%d postRecoveryIdx=%d events=%+v", lossIdx, postRecoveryIdx, events)
 	}
-	if recordedLoss != shedDuringBlock || s.stats.QueueDropped != shedDuringBlock || s.stats.GapCounts["raw-tls/evidence_queue_shed/events"] != shedDuringBlock {
-		t.Fatalf("loss count mismatch: stream=%d queue_dropped=%d gap_counts=%v", recordedLoss, s.stats.QueueDropped, s.stats.GapCounts)
+	if recordedLoss != shedDuringBlock || s.rawEvidenceQueueDropped.Load() != shedDuringBlock || s.stats.GapCounts["raw-tls/evidence_queue_shed/events"] != shedDuringBlock {
+		t.Fatalf("loss count mismatch: stream=%d queue_dropped=%d gap_counts=%v", recordedLoss, s.rawEvidenceQueueDropped.Load(), s.stats.GapCounts)
 	}
 	if journalSum := sumGapJournalReason(t, dir, "evidence_queue_shed"); journalSum != shedDuringBlock {
 		t.Fatalf("gaps.jsonl sum=%d != %d", journalSum, shedDuringBlock)
@@ -386,7 +384,7 @@ func TestRecorderDropPolicyInsertsLossBeforeRecoveredDataAndPreventsCrossGapSpli
 	if err := finishCaptureStateReason(s, false, false, false, "duration"); err != nil {
 		t.Fatalf("expected clean stop after bounded shedding, got %v", err)
 	}
-	if s.stats.State != "stopped" || s.stats.DrainState != "confirmed" || s.stats.RawEvidenceDrainUnconfirmed || s.stats.RawEvidencePendingBytes != 0 || s.stats.RawEvidenceWriters != 0 {
+	if s.stats.State != "stopped" || s.stats.DrainState != "confirmed" || s.stats.RawEvidenceDrainUnconfirmed || s.rawEvidencePendingBytes() != 0 || s.stats.RawEvidenceWriters != 0 {
 		t.Fatalf("unexpected session state after clean drain: %+v", s.stats)
 	}
 }
@@ -596,12 +594,12 @@ func TestRecorderMultiSourceConcurrencyAndExactLossAccounting(t *testing.T) {
 		}
 	}
 
-	if totalShedInStream != s.stats.QueueDropped || s.stats.GapCounts["raw-tls/evidence_queue_shed/events"] != s.stats.QueueDropped {
+	if totalShedInStream != s.rawEvidenceQueueDropped.Load() || s.stats.GapCounts["raw-tls/evidence_queue_shed/events"] != s.rawEvidenceQueueDropped.Load() {
 		t.Fatalf("global shed mismatch: stream=%d queue_dropped=%d gap_counts=%+v",
-			totalShedInStream, s.stats.QueueDropped, s.stats.GapCounts)
+			totalShedInStream, s.rawEvidenceQueueDropped.Load(), s.stats.GapCounts)
 	}
-	if journalSum := sumGapJournalReason(t, dir, "evidence_queue_shed"); journalSum != s.stats.QueueDropped {
-		t.Fatalf("gaps.jsonl sum=%d != queue_dropped=%d", journalSum, s.stats.QueueDropped)
+	if journalSum := sumGapJournalReason(t, dir, "evidence_queue_shed"); journalSum != s.rawEvidenceQueueDropped.Load() {
+		t.Fatalf("gaps.jsonl sum=%d != queue_dropped=%d", journalSum, s.rawEvidenceQueueDropped.Load())
 	}
 }
 
@@ -666,7 +664,7 @@ func TestRecorderSustainedCongestionStopDeadlineAndHardWriteFailure(t *testing.T
 				t.Fatal(err)
 			}
 		}
-		if s.stats.QueueDropped == 0 {
+		if s.rawEvidenceQueueDropped.Load() == 0 {
 			t.Fatal("expected shedding under sustained congestion")
 		}
 		// Wait for ticker flush to enter blocked sink.Write.
@@ -686,8 +684,8 @@ func TestRecorderSustainedCongestionStopDeadlineAndHardWriteFailure(t *testing.T
 		if fatal == nil || s.stats.State != "failed" || s.stats.DrainState != "unverified" || !s.stats.RawEvidenceDrainUnconfirmed {
 			t.Fatalf("unconfirmed drain was not surfaced in session status: fatal=%v stats=%+v", fatal, s.stats)
 		}
-		if s.stats.GapCounts["raw-tls/evidence_queue_shed/events"] != s.stats.QueueDropped {
-			t.Fatalf("shed gap count not flushed on drain timeout: queue_dropped=%d gaps=%+v", s.stats.QueueDropped, s.stats.GapCounts)
+		if s.stats.GapCounts["raw-tls/evidence_queue_shed/events"] != s.rawEvidenceQueueDropped.Load() {
+			t.Fatalf("shed gap count not flushed on drain timeout: queue_dropped=%d gaps=%+v", s.rawEvidenceQueueDropped.Load(), s.stats.GapCounts)
 		}
 
 		// Cleanup blocked goroutine.
@@ -822,8 +820,8 @@ func TestDropWritersShareIndependentGlobalControlAndDataBudgets(t *testing.T) {
 		_ = data.Close()
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		if s.rawEvidenceControlPending != 0 || s.stats.RawEvidencePendingBytes != 0 {
-			t.Fatalf("pending evidence leaked: control=%d total=%d", s.rawEvidenceControlPending, s.stats.RawEvidencePendingBytes)
+		if evidencePending(s.rawEvidencePending.Load()).control() != 0 || s.rawEvidencePendingBytes() != 0 {
+			t.Fatalf("pending evidence leaked: control=%d total=%d", evidencePending(s.rawEvidencePending.Load()).control(), s.rawEvidencePendingBytes())
 		}
 	}()
 	if err := control.writeControl(make([]byte, 64)); err != nil {
@@ -834,6 +832,28 @@ func TestDropWritersShareIndependentGlobalControlAndDataBudgets(t *testing.T) {
 	}
 	if err := data.writeControl([]byte{1}); !errors.Is(err, errEvidenceControlOverflow) {
 		t.Fatalf("expected exhausted global control budget, got %v", err)
+	}
+}
+
+func TestDropRecorderSkipsEncodingWhenBudgetCannotFitPayload(t *testing.T) {
+	s := &Store{dir: t.TempDir()}
+	w := newRecorderWithPolicy(s, evidenceBackpressureDrop)
+	w.writerCfg = &evidenceWriterConfig{dataBudget: 256}
+	t.Cleanup(func() { _ = w.close() })
+	// An out-of-range timestamp would fail json.Marshal if the event reached it.
+	accepted, err := w.recordOutcome("source", "ecapture", session.Target{}, session.RawEvent{
+		Type: "data", Data: make([]byte, 256), Time: time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil || accepted {
+		t.Fatalf("oversized event accepted=%v, err=%v", accepted, err)
+	}
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+	events := readRawEventsFromStream(t, filepath.Join(s.dir, "tls", "stream.jsonl"))
+	if len(events) != 2 || events[0].Type != "source" || events[1].Type != "loss" ||
+		events[1].Count != 1 || events[1].Reason != evidenceShedLossReason {
+		t.Fatalf("missing source or shed marker: %+v", events)
 	}
 }
 

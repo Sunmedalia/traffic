@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"runtime"
 	"strings"
 	"sync"
@@ -175,8 +176,8 @@ type evidenceWriter struct {
 	controlQueued        int
 	shedding             bool
 	congested            atomic.Bool
+	failed               atomic.Bool
 	shedEvents           uint64
-	shedBytes            uint64
 	reportedShed         uint64
 	err                  error
 	timeout              time.Duration
@@ -246,6 +247,9 @@ func newEvidenceWriterWithConfig(s *Store, sink evidenceSink, backend string, cf
 }
 
 func (w *evidenceWriter) failure() error {
+	if !w.failed.Load() {
+		return nil
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.err
@@ -262,6 +266,29 @@ func (w *evidenceWriter) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
+type evidencePending uint64
+
+func packEvidencePending(data, control uint64) evidencePending {
+	return evidencePending(data<<32 | control)
+}
+
+func (p evidencePending) data() uint64    { return uint64(p >> 32) }
+func (p evidencePending) control() uint64 { return uint64(uint32(p)) }
+func (p evidencePending) total() uint64   { return p.data() + p.control() }
+
+func (s *Store) reserveEvidence(previous evidencePending, data, control uint64) bool {
+	next := packEvidencePending(data, control)
+	if !s.rawEvidencePending.CompareAndSwap(uint64(previous), uint64(next)) {
+		return false
+	}
+	for total, high := next.total(), s.rawEvidenceHighWater.Load(); total > high; high = s.rawEvidenceHighWater.Load() {
+		if s.rawEvidenceHighWater.CompareAndSwap(high, total) {
+			break
+		}
+	}
+	return true
+}
+
 func (w *evidenceWriter) dataDrainedLocked(globalDataPending uint64) bool {
 	return w.dataPending <= w.dataBudget/2 && w.dataQueued <= w.dataSlots/2 && globalDataPending <= w.globalDataBudget/2
 }
@@ -269,12 +296,9 @@ func (w *evidenceWriter) dataDrainedLocked(globalDataPending uint64) bool {
 // noteShedLocked accounts for one complete shed data event under w.mu and
 // returns an immediate gap delta on episode start so GapCounts reflects active
 // congestion right away without writing one gaps.jsonl line per dropped event.
-func (w *evidenceWriter) noteShedLocked(size int, episodeStart bool) uint64 {
+func (w *evidenceWriter) noteShedLocked(episodeStart bool) uint64 {
 	w.shedEvents++
-	w.shedBytes += uint64(size)
-	w.store.mu.Lock()
-	w.store.stats.QueueDropped++
-	w.store.mu.Unlock()
+	w.store.rawEvidenceQueueDropped.Add(1)
 	if episodeStart && w.shedEvents > w.reportedShed {
 		delta := w.shedEvents - w.reportedShed
 		w.reportedShed = w.shedEvents
@@ -319,23 +343,25 @@ func (w *evidenceWriter) enqueueStrictLocked(data []byte, control, owned bool) (
 	totalPending := w.dataPending + w.controlPending
 	totalQueued := w.dataQueued + w.controlQueued
 	if len(data) > evidenceMaxRecordBytes || len(data) > w.dataBudget || totalPending+len(data) > w.dataBudget || totalQueued >= w.dataSlots {
-		w.err = errEvidenceBackpressure
+		w.setFailureLocked(errEvidenceBackpressure)
 		return "evidence_queue_overflow", errEvidenceBackpressure
 	}
-	w.store.mu.Lock()
-	if w.store.stats.RawEvidencePendingBytes+uint64(len(data)) > w.globalDataBudget {
-		w.store.mu.Unlock()
-		w.err = errEvidenceBackpressure
-		return "evidence_global_budget", errEvidenceBackpressure
+	for {
+		pending := evidencePending(w.store.rawEvidencePending.Load())
+		dataBytes, controlBytes := pending.data(), pending.control()
+		if control {
+			controlBytes += uint64(len(data))
+		} else {
+			dataBytes += uint64(len(data))
+		}
+		if dataBytes+controlBytes > w.globalDataBudget || dataBytes > math.MaxUint32 || controlBytes > math.MaxUint32 {
+			w.setFailureLocked(errEvidenceBackpressure)
+			return "evidence_global_budget", errEvidenceBackpressure
+		}
+		if w.store.reserveEvidence(pending, dataBytes, controlBytes) {
+			break
+		}
 	}
-	w.store.stats.RawEvidencePendingBytes += uint64(len(data))
-	if control {
-		w.store.rawEvidenceControlPending += uint64(len(data))
-	}
-	if w.store.stats.RawEvidencePendingBytes > w.store.stats.RawEvidenceHighWaterBytes {
-		w.store.stats.RawEvidenceHighWaterBytes = w.store.stats.RawEvidencePendingBytes
-	}
-	w.store.mu.Unlock()
 	w.enqueueLocked(data, control, owned)
 	return "", nil
 }
@@ -370,78 +396,99 @@ func (w *evidenceWriter) writeControlWithOwnership(data []byte, owned bool) erro
 		return err
 	}
 	if len(data) > evidenceMaxRecordBytes || len(data) > w.controlBudget || w.controlPending+len(data) > w.controlBudget || w.controlQueued >= w.controlSlots {
-		w.err = errEvidenceControlOverflow
+		w.setFailureLocked(errEvidenceControlOverflow)
 		w.mu.Unlock()
 		w.store.gap(w.backend, "", "evidence_control_overflow", "writes", 1)
 		w.store.fail(errEvidenceControlOverflow)
 		return errEvidenceControlOverflow
 	}
-	w.store.mu.Lock()
-	if w.store.rawEvidenceControlPending+uint64(len(data)) > w.globalControlReserve ||
-		w.store.stats.RawEvidencePendingBytes+uint64(len(data)) > w.globalDataBudget+w.globalControlReserve {
-		w.store.mu.Unlock()
-		w.err = errEvidenceControlOverflow
-		w.mu.Unlock()
-		w.store.gap(w.backend, "", "evidence_control_overflow", "writes", 1)
-		w.store.fail(errEvidenceControlOverflow)
-		return errEvidenceControlOverflow
+	for {
+		pending := evidencePending(w.store.rawEvidencePending.Load())
+		control := pending.control() + uint64(len(data))
+		if control > min(w.globalControlReserve, math.MaxUint32) ||
+			pending.data()+control > w.globalDataBudget+w.globalControlReserve {
+			w.setFailureLocked(errEvidenceControlOverflow)
+			w.mu.Unlock()
+			w.store.gap(w.backend, "", "evidence_control_overflow", "writes", 1)
+			w.store.fail(errEvidenceControlOverflow)
+			return errEvidenceControlOverflow
+		}
+		if w.store.reserveEvidence(pending, pending.data(), control) {
+			break
+		}
 	}
-	w.store.stats.RawEvidencePendingBytes += uint64(len(data))
-	w.store.rawEvidenceControlPending += uint64(len(data))
-	if w.store.stats.RawEvidencePendingBytes > w.store.stats.RawEvidenceHighWaterBytes {
-		w.store.stats.RawEvidenceHighWaterBytes = w.store.stats.RawEvidencePendingBytes
-	}
-	w.store.mu.Unlock()
 	w.enqueueLocked(data, true, owned)
 	w.mu.Unlock()
 	return nil
 }
 
-func (w *evidenceWriter) checkAndReserveDataDropLocked(lossData, eventData []byte, owned bool) (accepted bool, gapDelta uint64, controlErr error) {
-	if len(eventData) > evidenceMaxRecordBytes || len(eventData) > w.dataBudget {
-		// An oversized event cannot fit even in an empty data queue; drop it as a
-		// complete event without wedging subsequent normal-sized events unless the
-		// queue is already above its recovery threshold.
-		wasShedding := w.shedding
+// dataDropLocked checks the data budget without reserving any bytes. An
+// oversized event does not start persistent shedding in a drained queue.
+func (w *evidenceWriter) dataDropLocked(size int, pending evidencePending) (shed bool, gapDelta uint64) {
+	if size > evidenceMaxRecordBytes || size > w.dataBudget {
+		started := !w.shedding
 		if w.dataPending > w.dataBudget/2 || w.dataQueued > w.dataSlots/2 {
 			w.shedding = true
 			w.congested.Store(true)
 		}
-		return false, w.noteShedLocked(len(eventData), !wasShedding), nil
+		return true, w.noteShedLocked(started)
 	}
-	w.store.mu.Lock()
-	globalPending := w.store.stats.RawEvidencePendingBytes
-	globalControlPending := w.store.rawEvidenceControlPending
-	globalDataPending := globalPending - min(globalPending, globalControlPending)
-	if w.shedding && !w.dataDrainedLocked(globalDataPending) {
-		w.store.mu.Unlock()
-		return false, w.noteShedLocked(len(eventData), false), nil
+	if w.shedding && !w.dataDrainedLocked(pending.data()) {
+		return true, w.noteShedLocked(false)
 	}
-	if w.dataPending+len(eventData) > w.dataBudget || w.dataQueued >= w.dataSlots || globalDataPending+uint64(len(eventData)) > w.globalDataBudget ||
-		globalPending+uint64(len(eventData)) > w.globalDataBudget+w.globalControlReserve {
-		w.store.mu.Unlock()
-		wasShedding := w.shedding
+	if w.dataPending+size > w.dataBudget || w.dataQueued >= w.dataSlots ||
+		pending.data()+uint64(size) > min(w.globalDataBudget, math.MaxUint32) ||
+		pending.total()+uint64(size) > w.globalDataBudget+w.globalControlReserve {
+		started := !w.shedding
 		w.shedding = true
 		w.congested.Store(true)
-		return false, w.noteShedLocked(len(eventData), !wasShedding), nil
+		return true, w.noteShedLocked(started)
 	}
-	if len(lossData) > 0 {
-		if len(lossData) > evidenceMaxRecordBytes || len(lossData) > w.controlBudget || w.controlPending+len(lossData) > w.controlBudget || w.controlQueued >= w.controlSlots ||
-			globalControlPending+uint64(len(lossData)) > w.globalControlReserve ||
-			globalPending+uint64(len(lossData)+len(eventData)) > w.globalDataBudget+w.globalControlReserve {
-			w.store.mu.Unlock()
-			w.err = errEvidenceControlOverflow
+	return false, 0
+}
+
+// shedBeforeEncoding checks a lower bound. Exact encoded sizes are still
+// checked at commit, when other writers may have changed the global budget.
+func (w *evidenceWriter) shedBeforeEncoding(minSize int) (bool, error) {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return false, io.ErrClosedPipe
+	}
+	if w.err != nil || w.policy != evidenceBackpressureDrop {
+		err := w.err
+		w.mu.Unlock()
+		return false, err
+	}
+	shed, delta := w.dataDropLocked(minSize, evidencePending(w.store.rawEvidencePending.Load()))
+	w.mu.Unlock()
+	if delta > 0 {
+		w.store.gap(w.backend, "", "evidence_queue_shed", "events", delta)
+	}
+	return shed, nil
+}
+
+func (w *evidenceWriter) checkAndReserveDataDropLocked(lossData, eventData []byte, owned bool) (accepted bool, gapDelta uint64, controlErr error) {
+	for {
+		pending := evidencePending(w.store.rawEvidencePending.Load())
+		if shed, delta := w.dataDropLocked(len(eventData), pending); shed {
+			return false, delta, nil
+		}
+		data := pending.data() + uint64(len(eventData))
+		control := pending.control() + uint64(len(lossData))
+		if len(lossData) > 0 &&
+			(len(lossData) > evidenceMaxRecordBytes || len(lossData) > w.controlBudget ||
+				w.controlPending+len(lossData) > w.controlBudget || w.controlQueued >= w.controlSlots ||
+				control > min(w.globalControlReserve, math.MaxUint32) || data+control > w.globalDataBudget+w.globalControlReserve) {
+			w.setFailureLocked(errEvidenceControlOverflow)
 			return false, 0, errEvidenceControlOverflow
+		}
+		if w.store.reserveEvidence(pending, data, control) {
+			break
 		}
 	}
 	w.shedding = false
 	w.congested.Store(false)
-	w.store.stats.RawEvidencePendingBytes += uint64(len(lossData) + len(eventData))
-	w.store.rawEvidenceControlPending += uint64(len(lossData))
-	if w.store.stats.RawEvidencePendingBytes > w.store.stats.RawEvidenceHighWaterBytes {
-		w.store.stats.RawEvidenceHighWaterBytes = w.store.stats.RawEvidencePendingBytes
-	}
-	w.store.mu.Unlock()
 	if len(lossData) > 0 {
 		w.enqueueLocked(lossData, true, owned)
 	}
@@ -541,19 +588,27 @@ func (w *evidenceWriter) release(dataBytes, controlBytes, dataItems, controlItem
 	w.controlPending -= controlBytes
 	w.dataQueued -= dataItems
 	w.controlQueued -= controlItems
-	released := uint64(dataBytes + controlBytes)
-	w.store.mu.Lock()
-	w.store.rawEvidenceControlPending -= min(w.store.rawEvidenceControlPending, uint64(controlBytes))
-	w.store.stats.RawEvidencePendingBytes -= min(w.store.stats.RawEvidencePendingBytes, released)
-	w.store.mu.Unlock()
+	for {
+		pending := evidencePending(w.store.rawEvidencePending.Load())
+		data := pending.data() - min(pending.data(), uint64(dataBytes))
+		control := pending.control() - min(pending.control(), uint64(controlBytes))
+		if w.store.rawEvidencePending.CompareAndSwap(uint64(pending), uint64(packEvidencePending(data, control))) {
+			break
+		}
+	}
 	w.mu.Unlock()
+}
+
+func (w *evidenceWriter) setFailureLocked(err error) {
+	w.err = err
+	w.failed.Store(true)
 }
 
 func (w *evidenceWriter) recordHardFailure(err error) (error, string) {
 	classified, reason := classifyEvidenceSinkError(w.backend, err)
 	w.mu.Lock()
 	if w.err == nil || isEvidenceCongestion(w.err) {
-		w.err = classified
+		w.setFailureLocked(classified)
 	}
 	w.mu.Unlock()
 	return classified, reason
@@ -673,7 +728,7 @@ func (w *evidenceWriter) Close() error {
 			err := fmt.Errorf("%s raw evidence drain exceeded %s: %w", w.backend, w.timeout, errEvidenceDrainTimeout)
 			w.mu.Lock()
 			if w.err == nil {
-				w.err = err
+				w.setFailureLocked(err)
 			}
 			w.mu.Unlock()
 			w.store.mu.Lock()

@@ -1,8 +1,10 @@
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <netdb.h>
 #include <pthread.h>
 #include <poll.h>
@@ -76,15 +78,17 @@ static pthread_mutex_t transport_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t worker_once = PTHREAD_ONCE_INIT;
 static pthread_cond_t event_ready = PTHREAD_COND_INITIALIZER;
 static pthread_t worker;
-static int worker_running, stopping;
+static int worker_running, worker_sleeping, stopping;
 static uint64_t stop_deadline;
 static uint64_t sequence, lost, metadata_epoch;
 static pid_t identity_pid;
 static char identity[96];
+static size_t identity_len = 1;
 static struct connection {
     void *ssl;
     uint64_t generation, epoch;
     int fd;
+    uint8_t local_len, peer_len;
     char local[128], peer[128];
 } connections[CONNECTION_STRIPES][CONNECTION_WIDTH];
 static int (*next_read)(void *, void *, int);
@@ -118,7 +122,7 @@ static void child_after_fork(void) {
     }
     worker_once = (pthread_once_t)PTHREAD_ONCE_INIT;
     wait_mutex = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
-    worker_running = stopping = 0;
+    worker_running = worker_sleeping = stopping = 0;
     atomic_store(&retry_after, 0);
     atomic_store(&contention_lost, 0);
     atomic_store(&cooldown_lost, 0);
@@ -276,32 +280,33 @@ static int transmit_event(const char *message, size_t length) {
     struct sockaddr_un address;
     ssize_t result;
     if (!destination[0])
-        return 0;
+        return EDESTADDRREQ;
     if (event_socket < 0) {
         event_socket =
             socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (event_socket < 0)
-            return 0;
+            return errno;
         memset(&address, 0, sizeof(address));
         address.sun_family = AF_UNIX;
         strcpy(address.sun_path, destination);
         if (connect(event_socket, (struct sockaddr *)&address,
                     sizeof(address)) != 0) {
+            int error = errno;
             close(event_socket);
             event_socket = -1;
-            return 0;
+            return error;
         }
     }
     result = send(event_socket, message, length, MSG_DONTWAIT | MSG_NOSIGNAL);
     if (result == (ssize_t)length)
-        return 1;
-    if (result < 0 && (errno == ECONNREFUSED || errno == ENOENT ||
-                       errno == EPIPE || errno == ENOTCONN ||
-                       errno == EDESTADDRREQ)) {
+        return 0;
+    int error = result < 0 ? errno : EIO;
+    if (error == ECONNREFUSED || error == ENOENT || error == EPIPE ||
+        error == ENOTCONN || error == EDESTADDRREQ) {
         close(event_socket);
         event_socket = -1;
     }
-    return 0;
+    return error;
 }
 
 static uint64_t monotonic_milliseconds(void) {
@@ -369,12 +374,42 @@ static int event_published(struct queued_event *event, uint64_t position) {
 }
 static void publish_event(struct queued_event *event) {
     __atomic_store_n(&event->published, event->position + 1, __ATOMIC_RELEASE);
-    pthread_cond_signal(&event_ready);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&worker_sleeping, __ATOMIC_ACQUIRE))
+        pthread_cond_signal(&event_ready);
 }
 static void release_event(struct queued_event *event, uint64_t position) {
     __atomic_store_n(&event->available, position + EVENT_QUEUE, __ATOMIC_RELEASE);
     __atomic_store_n(&queue_read, position + 1, __ATOMIC_RELEASE);
 }
+static void wait_for_worker(uint64_t deadline) {
+    uint64_t now = monotonic_milliseconds();
+    if (deadline <= now)
+        return;
+    uint64_t delay = deadline - now;
+    struct timespec wake;
+    clock_gettime(CLOCK_REALTIME, &wake);
+    wake.tv_sec += (time_t)(delay / 1000);
+    wake.tv_nsec += (long)(delay % 1000) * 1000000;
+    if (wake.tv_nsec >= 1000000000) {
+        wake.tv_sec++;
+        wake.tv_nsec -= 1000000000;
+    }
+    pthread_cond_timedwait(&event_ready, &wait_mutex, &wake);
+}
+
+static void wait_for_retry(void) {
+    pthread_mutex_lock(&wait_mutex);
+    uint64_t until = atomic_load(&retry_after);
+    if (__atomic_load_n(&stopping, __ATOMIC_ACQUIRE)) {
+        uint64_t stop = atomic_load(&stop_deadline);
+        if (stop < until)
+            until = stop;
+    }
+    wait_for_worker(until);
+    pthread_mutex_unlock(&wait_mutex);
+}
+
 static int report_loss(void);
 static void *send_worker(void *unused) {
     char message[EVENT_SIZE];
@@ -384,26 +419,22 @@ static void *send_worker(void *unused) {
         uint64_t position = atomic_load(&queue_read);
         uint64_t end = __atomic_load_n(&queue_write, __ATOMIC_ACQUIRE);
         struct queued_event *event = &events[position % EVENT_QUEUE];
-        if (position == end)
-            (void)report_loss();
+        if (position == end && !report_loss() &&
+            !__atomic_load_n(&stopping, __ATOMIC_ACQUIRE)) {
+            wait_for_retry();
+            continue;
+        }
         if ((position == end || !event_published(event, position)) &&
             !__atomic_load_n(&stopping, __ATOMIC_ACQUIRE)) {
-            /* Producers signal without this mutex. The bounded timeout covers
-             * a publication racing the transition into pthread_cond_timedwait. */
-            struct timespec wake;
-            clock_gettime(CLOCK_REALTIME, &wake);
-            wake.tv_nsec += 10000000;
-            if (wake.tv_nsec >= 1000000000) {
-                wake.tv_sec++;
-                wake.tv_nsec -= 1000000000;
-            }
             pthread_mutex_lock(&wait_mutex);
-            position = atomic_load(&queue_read);
-            end = __atomic_load_n(&queue_write, __ATOMIC_ACQUIRE);
-            event = &events[position % EVENT_QUEUE];
-            if ((position == end || !event_published(event, position)) &&
+            __atomic_store_n(&worker_sleeping, 1, __ATOMIC_RELEASE);
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            /* Recheck after advertising sleep. Producers never need this
+             * mutex; the timeout bounds a publication racing the wait. */
+            if (!event_published(event, position) &&
                 !__atomic_load_n(&stopping, __ATOMIC_ACQUIRE))
-                pthread_cond_timedwait(&event_ready, &wait_mutex, &wake);
+                wait_for_worker(monotonic_milliseconds() + 10);
+            __atomic_store_n(&worker_sleeping, 0, __ATOMIC_RELAXED);
             pthread_mutex_unlock(&wait_mutex);
             continue;
         }
@@ -425,8 +456,7 @@ static void *send_worker(void *unused) {
             continue;
         }
         if (!report_loss()) {
-            struct timespec pause = {0, 5000000};
-            nanosleep(&pause, NULL);
+            wait_for_retry();
             continue;
         }
         size_t length = event->length;
@@ -456,19 +486,24 @@ static void *send_worker(void *unused) {
         }
         release_event(event, position);
         uint64_t deadline = monotonic_milliseconds() + 1000;
-        int sent;
+        int error;
         do {
             pthread_mutex_lock(&transport_mutex);
-            sent = transmit_event(message, length);
+            error = transmit_event(message, length);
             pthread_mutex_unlock(&transport_mutex);
-            if (sent || event_socket < 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+            if (event_socket < 0 || (error != EAGAIN && error != EWOULDBLOCK))
                 break;
             struct pollfd writable = {event_socket, POLLOUT, 0};
             poll(&writable, 1, 5);
+            if (__atomic_load_n(&stopping, __ATOMIC_ACQUIRE)) {
+                uint64_t stop = atomic_load(&stop_deadline);
+                if (stop < deadline)
+                    deadline = stop;
+            }
         } while (monotonic_milliseconds() < deadline);
-        if (!sent) {
+        if (error) {
             atomic_store(&retry_after, monotonic_milliseconds() + 1000);
-            atomic_store(&transport_errno, errno);
+            atomic_store(&transport_errno, error);
             atomic_fetch_add(&lost, loss_count);
             /* Snapshot the queued tail. Retire each slot only after its
              * producer publishes it; later reservations stay in the queue. */
@@ -483,8 +518,11 @@ static void start_worker(void) {
     refresh_identity();
     for (size_t i = 0; i < EVENT_QUEUE; i++)
         events[i].available = i;
-    if (!pthread_create(&worker, NULL, send_worker, NULL))
+    pthread_mutex_lock(&wait_mutex);
+    if (!__atomic_load_n(&stopping, __ATOMIC_ACQUIRE) &&
+        !pthread_create(&worker, NULL, send_worker, NULL))
         atomic_store(&worker_running, 1);
+    pthread_mutex_unlock(&wait_mutex);
 }
 static int ensure_worker(void) {
     /* Creation happens before taking a connection mutex. A scheduling pause
@@ -509,9 +547,9 @@ static void refresh_identity(void) {
     char stat[4096], *end, *token, *saved;
     unsigned int i;
     pid_t pid = getpid();
-    if (identity_pid == pid)
-        return;
+    identity_pid = pid;
     identity[0] = 0;
+    identity_len = 1;
     file = fopen("/proc/self/stat", "r");
     if (!file)
         return;
@@ -524,14 +562,18 @@ static void refresh_identity(void) {
         token = strtok_r(NULL, " ", &saved);
     if (!token)
         return;
-    snprintf(identity, sizeof(identity), "%ld:%s", (long)pid, token);
-    identity_pid = pid;
+    int length = snprintf(identity, sizeof(identity), "%ld:%s", (long)pid, token);
+    if (length >= 0 && (size_t)length < sizeof(identity))
+        identity_len = (size_t)length + 1;
+    else
+        identity[0] = 0;
 }
 
 /* The worker owns loss formatting and transmission. A failed marker remains
  * pending, so later plaintext can never overtake an unreported gap. */
 static int report_loss(void) {
-    if (monotonic_milliseconds() < atomic_load(&retry_after))
+    uint64_t retry = atomic_load(&retry_after);
+    if (retry && monotonic_milliseconds() < retry)
         return atomic_load(&lost) == 0 && atomic_load(&contention_lost) == 0 &&
             atomic_load(&cooldown_lost) == 0 && atomic_load(&metadata_pending) == 0;
     uint64_t contention = atomic_exchange(&contention_lost, 0);
@@ -552,18 +594,19 @@ static int report_loss(void) {
         (unsigned long long)atomic_load(&metadata_lost),
         (unsigned long long)atomic_load(&transport_lost),
         (unsigned long long)queue_length(), atomic_load(&transport_errno));
-    int sent = 0;
+    int error = EOVERFLOW;
     if (length >= 0 && (size_t)length < sizeof(message)) {
         pthread_mutex_lock(&transport_mutex);
-        sent = transmit_event(message, (size_t)length);
+        error = transmit_event(message, (size_t)length);
         pthread_mutex_unlock(&transport_mutex);
     }
-    if (sent) {
+    if (!error) {
         atomic_fetch_add(&metadata_epoch, 1);
         atomic_store(&retry_after, 0);
         return 1;
     }
     atomic_fetch_add(&lost, count);
+    atomic_store(&transport_errno, error);
     atomic_store(&retry_after, monotonic_milliseconds() + 1000);
     return 0;
 }
@@ -610,22 +653,41 @@ static void remove_connection(struct connection *entry) {
     stripe[hole].ssl = NULL;
 }
 
-static int endpoint(int fd, int peer, char *output, size_t capacity) {
+/* Return the formatted length including the terminator. */
+static size_t endpoint(int fd, int peer, char *output, size_t capacity) {
     struct sockaddr_storage address;
     socklen_t length = sizeof(address);
-    char host[NI_MAXHOST], port[NI_MAXSERV];
+    char host[INET6_ADDRSTRLEN];
     int result = peer ? getpeername(fd, (struct sockaddr *)&address, &length)
                       : getsockname(fd, (struct sockaddr *)&address, &length);
-    if (result ||
-        (address.ss_family != AF_INET && address.ss_family != AF_INET6))
+    if (result)
         return 0;
-    if (getnameinfo((struct sockaddr *)&address, length, host, sizeof(host),
-                    port, sizeof(port), NI_NUMERICHOST | NI_NUMERICSERV))
+    int written;
+    if (address.ss_family == AF_INET && length >= sizeof(struct sockaddr_in)) {
+        const struct sockaddr_in *inet = (const struct sockaddr_in *)&address;
+        if (!inet_ntop(AF_INET, &inet->sin_addr, host, sizeof(host)))
+            return 0;
+        written = snprintf(output, capacity, "%s:%u", host,
+                           (unsigned)ntohs(inet->sin_port));
+    } else if (address.ss_family == AF_INET6 && length >= sizeof(struct sockaddr_in6)) {
+        const struct sockaddr_in6 *inet = (const struct sockaddr_in6 *)&address;
+        if (!inet_ntop(AF_INET6, &inet->sin6_addr, host, sizeof(host)))
+            return 0;
+        unsigned port = ntohs(inet->sin6_port);
+        unsigned scope = inet->sin6_scope_id;
+        char zone[IF_NAMESIZE];
+        if (!scope)
+            written = snprintf(output, capacity, "[%s]:%u", host, port);
+        else if ((IN6_IS_ADDR_LINKLOCAL(&inet->sin6_addr) ||
+                  IN6_IS_ADDR_MC_LINKLOCAL(&inet->sin6_addr)) &&
+                 if_indextoname(scope, zone))
+            written = snprintf(output, capacity, "[%s%%%s]:%u", host, zone, port);
+        else
+            written = snprintf(output, capacity, "[%s%%%u]:%u", host, scope, port);
+    } else {
         return 0;
-    int written = snprintf(output, capacity,
-                           address.ss_family == AF_INET6 ? "[%s]:%s" : "%s:%s",
-                           host, port);
-    return written >= 0 && (size_t)written < capacity;
+    }
+    return written >= 0 && (size_t)written < capacity ? (size_t)written + 1 : 0;
 }
 
 static size_t encode_base64(char *output, const unsigned char *input,
@@ -648,10 +710,9 @@ static size_t encode_base64(char *output, const unsigned char *input,
 }
 
 static void emit_data(void *ssl, const void *buffer, size_t length,
-                      const char *direction) {
+                      const char *direction, size_t direction_len) {
     const unsigned char *bytes = buffer;
     struct connection *connection;
-    pthread_mutex_t *mutex = connection_lock(ssl);
     int fd;
     if (!destination[0] || !length)
         return;
@@ -659,11 +720,13 @@ static void emit_data(void *ssl, const void *buffer, size_t length,
         atomic_fetch_add(&lost, 1);
         return;
     }
-    fd = next_get_fd ? next_get_fd(ssl) : -1;
-    if (monotonic_milliseconds() < atomic_load(&retry_after)) {
+    uint64_t retry = atomic_load(&retry_after);
+    if (retry && monotonic_milliseconds() < retry) {
         atomic_fetch_add(&cooldown_lost, 1);
         return;
     }
+    fd = next_get_fd ? next_get_fd(ssl) : -1;
+    pthread_mutex_t *mutex = connection_lock(ssl);
     if (!acquire_event_lock(mutex)) {
         atomic_fetch_add(&contention_lost, 1);
         return;
@@ -688,8 +751,9 @@ static void emit_data(void *ssl, const void *buffer, size_t length,
          * outside the connection mutex so a new connection cannot exclude other
          * application threads for the whole syscall or a scheduling pause. */
         pthread_mutex_unlock(mutex);
-        if (!endpoint(fd, 0, local, sizeof(local)) ||
-            !endpoint(fd, 1, peer, sizeof(peer))) {
+        size_t local_len = endpoint(fd, 0, local, sizeof(local));
+        size_t peer_len = local_len ? endpoint(fd, 1, peer, sizeof(peer)) : 0;
+        if (!peer_len) {
             atomic_fetch_add(&metadata_pending, 1);
             return;
         }
@@ -709,14 +773,14 @@ static void emit_data(void *ssl, const void *buffer, size_t length,
              strcmp(connection->local, local) ||
              strcmp(connection->peer, peer)))
             connection->generation = atomic_fetch_add(&sequence, 1) + 1;
-        snprintf(connection->local, sizeof(connection->local), "%s", local);
-        snprintf(connection->peer, sizeof(connection->peer), "%s", peer);
+        memcpy(connection->local, local, local_len);
+        memcpy(connection->peer, peer, peer_len);
+        connection->local_len = (uint8_t)local_len;
+        connection->peer_len = (uint8_t)peer_len;
         connection->fd = fd;
         connection->epoch = epoch;
     }
     struct connection snapshot = *connection;
-    char process_id[sizeof(identity)];
-    snprintf(process_id, sizeof(process_id), "%s", identity);
     pthread_mutex_unlock(mutex);
     while (length) {
         size_t chunk = length < CHUNK_SIZE ? length : CHUNK_SIZE;
@@ -730,12 +794,12 @@ static void emit_data(void *ssl, const void *buffer, size_t length,
         /* The connection snapshot and reserved slot have independent lifetimes;
          * copying a large TLS call never holds a metadata mutex. */
         memcpy(body->bytes, bytes, chunk);
-        snprintf(body->local, sizeof(body->local), "%s", snapshot.local);
-        snprintf(body->peer, sizeof(body->peer), "%s", snapshot.peer);
-        snprintf(body->identity, sizeof(body->identity), "%s", process_id);
-        snprintf(body->direction, sizeof(body->direction), "%s", direction);
+        memcpy(body->local, snapshot.local, snapshot.local_len);
+        memcpy(body->peer, snapshot.peer, snapshot.peer_len);
+        memcpy(body->identity, identity, identity_len);
+        memcpy(body->direction, direction, direction_len);
         body->ssl = ssl;
-        body->pid = getpid();
+        body->pid = identity_pid;
         body->generation = snapshot.generation;
         publish_event(event);
         bytes += chunk;
@@ -785,7 +849,7 @@ void SSL_free(void *ssl) {
                 message, sizeof(message),
                 "{\"protocol\":\"traffic-openssl-v1\",\"type\":\"close\","
                 "\"process_id\":\"%s\",\"connection\":\"%ld-%p-%llu\"}",
-                identity, (long)getpid(), ssl,
+                identity, (long)identity_pid, ssl,
                 (unsigned long long)generation);
             if (length < 0 || (size_t)length >= sizeof(message) ||
                 !send_event(message, (size_t)length))
@@ -833,7 +897,7 @@ int SSL_read(void *ssl, void *buffer, int length) {
     result = next_read(ssl, buffer, length);
     saved_errno = errno;
     if (--call_depth == 0 && result > 0)
-        emit_data(ssl, buffer, (size_t)result, "read");
+        emit_data(ssl, buffer, (size_t)result, "read", sizeof("read"));
     errno = saved_errno;
     return result;
 }
@@ -849,7 +913,7 @@ int SSL_write(void *ssl, const void *buffer, int length) {
     result = next_write(ssl, buffer, length);
     saved_errno = errno;
     if (--call_depth == 0 && result > 0)
-        emit_data(ssl, buffer, (size_t)result, "write");
+        emit_data(ssl, buffer, (size_t)result, "write", sizeof("write"));
     errno = saved_errno;
     return result;
 }
@@ -865,7 +929,7 @@ int SSL_read_ex(void *ssl, void *buffer, size_t length, size_t *read_bytes) {
     result = next_read_ex(ssl, buffer, length, read_bytes);
     saved_errno = errno;
     if (--call_depth == 0 && result == 1 && read_bytes)
-        emit_data(ssl, buffer, *read_bytes, "read");
+        emit_data(ssl, buffer, *read_bytes, "read", sizeof("read"));
     errno = saved_errno;
     return result;
 }
@@ -882,19 +946,23 @@ int SSL_write_ex(void *ssl, const void *buffer, size_t length,
     result = next_write_ex(ssl, buffer, length, written_bytes);
     saved_errno = errno;
     if (--call_depth == 0 && result == 1 && written_bytes)
-        emit_data(ssl, buffer, *written_bytes, "write");
+        emit_data(ssl, buffer, *written_bytes, "write", sizeof("write"));
     errno = saved_errno;
     return result;
 }
 
 __attribute__((destructor)) static void shutdown_events(void) {
-    int join;
+    pthread_mutex_lock(&wait_mutex);
     atomic_store(&stop_deadline, monotonic_milliseconds() + 500);
     __atomic_store_n(&stopping, 1, __ATOMIC_RELEASE);
-    join = atomic_load(&worker_running);
     pthread_cond_signal(&event_ready);
-    if (join)
+    pthread_mutex_unlock(&wait_mutex);
+    if (atomic_load(&worker_running)) {
         pthread_join(worker, NULL);
-    if (event_socket >= 0)
+        atomic_store(&worker_running, 0);
+    }
+    if (event_socket >= 0) {
         close(event_socket);
+        event_socket = -1;
+    }
 }
