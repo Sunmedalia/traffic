@@ -20,6 +20,7 @@ const indexTimeFormat = session.IndexTimeFormat
 type Store struct {
 	db           *sql.DB
 	dir          string
+	reader       bool
 	analysis     *analysisReport
 	analysisNote string
 }
@@ -44,7 +45,7 @@ func openStoreOnce(dir string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir}
+	s := &Store{dir: dir, reader: true}
 	var setup []index.Statement
 	if analysisExists(dir) {
 		if err := validateAnalysisDestination(dir); err != nil {

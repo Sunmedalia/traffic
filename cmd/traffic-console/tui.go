@@ -233,17 +233,22 @@ func (m *tuiModel) load() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(rootCtx, 3*time.Second)
 		defer cancel()
-		snapshot, err := loadTUISnapshot(ctx, store, filter, alertsOnly, page, detailID, anchor)
+		fresh, err := openStore(store.dir)
+		if err != nil {
+			return tuiLoaded{Version: version, Err: err}
+		}
+		defer fresh.db.Close()
+		snapshot, err := loadTUISnapshot(ctx, fresh, filter, alertsOnly, page, detailID, anchor)
 		result := tuiLoaded{Version: version, Snapshot: snapshot, Err: err}
 		if err == nil && wantSummary {
-			result.Summary, result.Err = loadTUISummary(ctx, store, summaryFilter)
+			result.Summary, result.Err = loadTUISummary(ctx, fresh, summaryFilter)
 			result.SummaryKey = summaryKey
 		}
 		if result.Err == nil && wantOverview {
-			result.Overview, result.Err = loadTUIOverview(ctx, store)
+			result.Overview, result.Err = loadTUIOverview(ctx, fresh)
 		}
 		if result.Err == nil && wantTimeline {
-			result.Timeline, result.Err = loadTUITimeline(ctx, store, timelineFilter, alertsOnly)
+			result.Timeline, result.Err = loadTUITimeline(ctx, fresh, timelineFilter, alertsOnly)
 			result.TimelineKey = timelineKey
 		}
 		return result

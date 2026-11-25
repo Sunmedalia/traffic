@@ -84,7 +84,7 @@ func (f tuiFilter) where(alertsOnly bool) (string, []any) {
 		clauses = append(clauses, operator)
 		args = append(args, f.Until)
 	}
-	if alertsOnly {
+	if alertsOnly || f.Rule != "" || f.Severity != "" {
 		clauses = append(clauses, "alert>0")
 	}
 	if f.Client != "" {
@@ -200,12 +200,14 @@ func loadTUISnapshot(ctx context.Context, s *Store, filter tuiFilter, alertsOnly
 	if len(limits) > 0 && limits[0] > 0 {
 		pageSize = min(limits[0], 500)
 	}
-	fresh, openErr := openStore(s.dir)
-	if openErr != nil {
-		return tuiSnapshot{}, openErr
+	if s == nil || !s.reader || s.db == nil {
+		fresh, openErr := openStore(s.dir)
+		if openErr != nil {
+			return tuiSnapshot{}, openErr
+		}
+		defer fresh.db.Close()
+		s = fresh
 	}
-	defer fresh.db.Close()
-	s = fresh
 	result := tuiSnapshot{Page: page}
 	result.Stats, result.StatusWarning = readTUIStatus(s.dir)
 	var reconstructed *Stats
@@ -319,12 +321,14 @@ const tuiSourceLimit = 200
 // loadTUISummary aggregates the alerts of matching requests in one scan. Rule and
 // severity conditions also restrict which alerts of a request are counted.
 func loadTUISummary(ctx context.Context, s *Store, filter tuiFilter) (*tuiSummary, error) {
-	fresh, openErr := openStore(s.dir)
-	if openErr != nil {
-		return nil, openErr
+	if s == nil || !s.reader || s.db == nil {
+		fresh, openErr := openStore(s.dir)
+		if openErr != nil {
+			return nil, openErr
+		}
+		defer fresh.db.Close()
+		s = fresh
 	}
-	defer fresh.db.Close()
-	s = fresh
 	where, args := filter.where(true)
 	rows, err := s.db.QueryContext(ctx, `SELECT id,time,client,alerts,method,host,url
  FROM entries WHERE `+where+` ORDER BY time DESC, id DESC`, args...)

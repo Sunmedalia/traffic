@@ -29,11 +29,11 @@ type webRuleHit struct {
 // It also returns the rule set that produced those results, so the editor can
 // tell a rule that never matched from one the session was never analyzed with.
 func (w *webServer) handleRuleHits(rw http.ResponseWriter, r *http.Request) {
-	s := w.sessionStore(rw, r)
+	s, release := w.sessionStore(rw, r)
 	if s == nil {
 		return
 	}
-	defer s.db.Close()
+	defer release()
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	rows, err := s.db.QueryContext(ctx, `SELECT COALESCE(json_extract(hit.value,'$.rule'),''),COALESCE(max(json_extract(hit.value,'$.severity')),''),count(DISTINCT entries.id),min(entries.time),max(entries.time) FROM entries, json_each(entries.alerts) hit WHERE entries.alert>0 GROUP BY 1 ORDER BY 3 DESC,1`)
@@ -150,7 +150,7 @@ func (w *webServer) ruleTestTransaction(rw http.ResponseWriter, ctx context.Cont
 		webError(rw, http.StatusBadRequest, errors.New("请同时选择会话和请求"))
 		return t, false
 	}
-	s, err := w.store(ctx, sid)
+	s, release, err := w.store(ctx, sid)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, errWebSessionNotFound) {
@@ -159,7 +159,7 @@ func (w *webServer) ruleTestTransaction(rw http.ResponseWriter, ctx context.Cont
 		webError(rw, status, err)
 		return t, false
 	}
-	defer s.db.Close()
+	defer release()
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	var b []byte

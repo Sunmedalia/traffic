@@ -94,11 +94,11 @@ func (w *webServer) handleTimeline(rw http.ResponseWriter, r *http.Request) {
 		webError(rw, http.StatusBadRequest, err)
 		return
 	}
-	s := w.sessionStore(rw, r)
+	s, release := w.sessionStore(rw, r)
 	if s == nil {
 		return
 	}
-	defer s.db.Close()
+	defer release()
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	result, err := querySessionTimeline(ctx, s.db, filter, get("alerts") == "1")
@@ -146,11 +146,11 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 		webError(rw, http.StatusBadRequest, err)
 		return
 	}
-	s := w.sessionStore(rw, r)
+	s, release := w.sessionStore(rw, r)
 	if s == nil {
 		return
 	}
-	defer s.db.Close()
+	defer release()
 	// Finished sessions cannot change until their index or analysis file does.
 	// Cache those summaries; running captures are re-scanned on every request.
 	status, _ := readTUIStatus(s.dir)
@@ -202,8 +202,10 @@ func querySessionSummary(ctx context.Context, db *sql.DB, filter tuiFilter) (ses
 		return result, err
 	}
 	var err error
-	// The port is stripped so one source address aggregates across connections.
-	result.Clients, err = webCounts(ctx, db, `SELECT rtrim(rtrim(client,'0123456789'),':'),count(*),COALESCE(sum(alert>0),0) FROM entries WHERE `+where+` GROUP BY 1 ORDER BY 3 DESC,2 DESC,1 LIMIT 10`, args,
+	// The port is stripped so one source address aggregates across connections,
+	// without mangling portless IPv4/IPv6 addresses.
+	const clientHostExpr = `CASE WHEN substr(client,1,1)='[' AND instr(client,']:')>0 THEN substr(client,2,instr(client,']:')-2) WHEN instr(client,':')>0 AND instr(substr(client,instr(client,':')+1),':')=0 THEN substr(client,1,instr(client,':')-1) ELSE client END`
+	result.Clients, err = webCounts(ctx, db, `SELECT `+clientHostExpr+`,count(*),COALESCE(sum(alert>0),0) FROM entries WHERE `+where+` GROUP BY 1 ORDER BY 3 DESC,2 DESC,1 LIMIT 10`, args,
 		func(rows *sql.Rows, item *webCount) error { return rows.Scan(&item.Name, &item.Count, &item.Alerts) })
 	if err != nil {
 		return result, err
@@ -214,13 +216,16 @@ func querySessionSummary(ctx context.Context, db *sql.DB, filter tuiFilter) (ses
 	if err != nil {
 		return result, err
 	}
+	severityNames := [...]string{"", "low", "medium", "high"}
 	result.Severities, err = webCounts(ctx, db, `SELECT severity,count(*) FROM entries WHERE alert>0 AND `+where+` GROUP BY severity`, args,
 		func(rows *sql.Rows, item *webCount) error {
 			var level int
 			if err := rows.Scan(&level, &item.Count); err != nil {
 				return err
 			}
-			item.Name = []string{"", "low", "medium", "high"}[level]
+			if level >= 0 && level < len(severityNames) {
+				item.Name = severityNames[level]
+			}
 			return nil
 		})
 	if err != nil {
