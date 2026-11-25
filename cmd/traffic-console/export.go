@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -24,6 +25,13 @@ import (
 var errCaptureRunning = errors.New("stop capture before exporting evidence")
 
 func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
+	return exportEvidenceContext(context.Background(), s, t, b, path)
+}
+
+func exportEvidenceContext(ctx context.Context, s *Store, t Transaction, b []byte, path string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if analysisExists(s.dir) {
 		fresh, err := openStore(s.dir)
 		if err != nil {
@@ -31,7 +39,7 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 		}
 		defer fresh.db.Close()
 		s = fresh
-		if err = s.db.QueryRow("SELECT data FROM records WHERE id=?", t.ID).Scan(&b); err != nil {
+		if err = s.db.QueryRowContext(ctx, "SELECT data FROM records WHERE id=?", t.ID).Scan(&b); err != nil {
 			return err
 		}
 		t = Transaction{}
@@ -117,7 +125,7 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 			return err
 		}
 		var original []byte
-		if err = s.db.QueryRow("SELECT data FROM main.requests WHERE id=?", t.ID).Scan(&original); err != nil {
+		if err = s.db.QueryRowContext(ctx, "SELECT data FROM main.requests WHERE id=?", t.ID).Scan(&original); err != nil {
 			return err
 		}
 		name := "captured-event.json"
@@ -141,6 +149,10 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 		var selected bytes.Buffer
 		lines := session.NewJSONLines(file, 1<<20)
 		for {
+			if err := ctx.Err(); err != nil {
+				file.Close()
+				return err
+			}
 			var gap session.GapEvent
 			err := lines.Next(&gap)
 			if err == io.EOF {
@@ -172,10 +184,13 @@ func exportEvidence(s *Store, t Transaction, b []byte, path string) error {
 			return err
 		}
 		for i, name := range files {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if hasPacketSource && filepath.Base(session.PacketSegmentGroup(name)) != packetSource {
 				continue
 			}
-			entry, digest, truncated, err := exportPacketSegment(z, s.dir, name, remote, local, first, last, lastPacketSegment(files, i))
+			entry, digest, truncated, err := exportPacketSegment(ctx, z, s.dir, name, remote, local, first, last, lastPacketSegment(files, i))
 			if err != nil {
 				return err
 			}
@@ -212,7 +227,10 @@ func lastPacketSegment(files []string, index int) bool {
 	return index+1 == len(files) || session.PacketSegmentGroup(files[index]) != session.PacketSegmentGroup(files[index+1])
 }
 
-func exportPacketSegment(z *evidenceZip, dir, path string, remote, local netip.AddrPort, first, last time.Time, allowTornTail bool) (entry, digest string, truncated bool, err error) {
+func exportPacketSegment(ctx context.Context, z *evidenceZip, dir, path string, remote, local netip.AddrPort, first, last time.Time, allowTornTail bool) (entry, digest string, truncated bool, err error) {
+	if err = ctx.Err(); err != nil {
+		return
+	}
 	entry, err = filepath.Rel(dir, path)
 	if err != nil {
 		return
@@ -230,7 +248,12 @@ func exportPacketSegment(z *evidenceZip, dir, path string, remote, local netip.A
 	hash := sha256.New()
 	var writer *pcapgo.Writer
 	interfaceIndex := -1
-	for {
+	for packets := 0; ; packets++ {
+		if packets&255 == 0 {
+			if err = ctx.Err(); err != nil {
+				return entry, "", false, err
+			}
+		}
 		data, ci, readErr := reader.ReadPacketData()
 		if readErr == io.EOF {
 			break

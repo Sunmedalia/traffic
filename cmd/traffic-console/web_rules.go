@@ -165,15 +165,40 @@ func (l *ruleLibrary) read(name string) (ruleFile, error) {
 	return result, nil
 }
 
+func (l *ruleLibrary) readRevision(name string) (string, error) {
+	info, err := l.root.Lstat(name)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", errors.New("只能操作规则目录中的普通文件")
+	}
+	file, err := l.root.Open(name)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	n, err := io.Copy(hash, io.LimitReader(file, maxRuleBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if n > maxRuleBytes {
+		return "", errors.New("规则文件不能超过 1 MiB")
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
 func (l *ruleLibrary) write(name, content, revision string) (ruleFile, int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if _, err := validateRuleContent(content); err != nil {
+	rs, err := validateRuleContent(content)
+	if err != nil {
 		return ruleFile{}, http.StatusUnprocessableEntity, err
 	}
-	previous, err := l.read(name)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	previousRev, err := l.readRevision(name)
 	if err == nil {
-		if revision == "" || revision != previous.Revision {
+		if revision == "" || revision != previousRev {
 			return ruleFile{}, http.StatusConflict, errors.New("文件已存在或已被修改，请重新打开后保存")
 		}
 	} else if !os.IsNotExist(err) {
@@ -214,8 +239,22 @@ func (l *ruleLibrary) write(name, content, revision string) (ruleFile, int, erro
 	if err != nil {
 		return ruleFile{}, 500, err
 	}
-	result, err := l.read(name)
-	return result, http.StatusOK, err
+	var modified time.Time
+	if info, statErr := l.root.Lstat(name); statErr == nil {
+		modified = info.ModTime()
+	}
+	custom := rs[len(builtinRules):]
+	result := ruleFile{
+		Name:     name,
+		Size:     int64(len(content)),
+		Modified: modified,
+		Content:  content,
+		Revision: ruleRevision([]byte(content)),
+		Count:    len(custom),
+		Valid:    true,
+		Rules:    custom,
+	}
+	return result, http.StatusOK, nil
 }
 
 func decodeWebJSON(rw http.ResponseWriter, r *http.Request, target any) error {
@@ -302,7 +341,7 @@ func (w *webServer) handleRuleFile(rw http.ResponseWriter, r *http.Request) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	previous, err := l.read(name)
+	previousRev, err := l.readRevision(name)
 	if err != nil {
 		status := 400
 		if os.IsNotExist(err) {
@@ -311,7 +350,7 @@ func (w *webServer) handleRuleFile(rw http.ResponseWriter, r *http.Request) {
 		webError(rw, status, err)
 		return
 	}
-	if input.Revision == "" || input.Revision != previous.Revision {
+	if input.Revision == "" || input.Revision != previousRev {
 		webError(rw, 409, errors.New("文件已被修改，请重新打开后删除"))
 		return
 	}

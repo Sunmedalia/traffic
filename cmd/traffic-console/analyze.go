@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -150,7 +151,7 @@ func openAnalysisBuild(path string) (*sql.DB, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	if _, err = db.Exec(`PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF;
+	if _, err = db.Exec(`PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF; PRAGMA cache_size=-65536; PRAGMA temp_store=MEMORY; PRAGMA locking_mode=EXCLUSIVE;
 CREATE TABLE results(id TEXT PRIMARY KEY, alerts TEXT NOT NULL);
 CREATE TABLE metadata(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
 ` + entriesTable); err != nil {
@@ -275,15 +276,17 @@ func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, wi
 	defer rows.Close()
 	// Decoding and rule matching run on every CPU; scan correlation and writes
 	// stay in source order on this goroutine, so results match a serial run.
+	fieldPlan := planRuleFields(rs)
 	work := make(chan *analysisJob)
 	var workers sync.WaitGroup
 	for range runtime.GOMAXPROCS(0) {
 		workers.Add(1)
 		go func(work <-chan *analysisJob) {
 			defer workers.Done()
+			br := bufio.NewReaderSize(nil, 4096)
 			for job := range work {
 				if job.record, job.err = session.DecodeTransaction(job.raw); job.err == nil {
-					job.record.Alerts = detectWithLimits(job.record, rs, limits.RequestLimit, limits.ResponseLimit)
+					job.record.Alerts = detectWithPlan(job.record, rs, fieldPlan, limits.RequestLimit, limits.ResponseLimit, br)
 				}
 				job.raw = nil
 				close(job.done)
@@ -431,22 +434,27 @@ func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, wi
 			return report, err
 		}
 		defer view.db.Close()
-		rows, err := view.db.QueryContext(ctx, "SELECT data FROM records WHERE alert>0 ORDER BY time,id")
+		rows, err := view.db.QueryContext(ctx, "SELECT id,time,client,url,alerts FROM entries WHERE alert>0 ORDER BY time,id")
 		if err != nil {
 			return report, err
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var raw []byte
-			var record Transaction
-			if err = rows.Scan(&raw); err != nil {
+			var id, at, client, reqURL string
+			var rawAlerts []byte
+			if err = rows.Scan(&id, &at, &client, &reqURL, &rawAlerts); err != nil {
 				return report, err
 			}
-			if err = json.Unmarshal(raw, &record); err != nil {
+			var alerts []Alert
+			if err = json.Unmarshal(rawAlerts, &alerts); err != nil {
 				return report, err
 			}
-			for _, alert := range record.Alerts {
-				payload, _ := json.Marshal(map[string]any{"id": record.ID, "url": record.URL, "client": record.Client, "peer_client": record.PeerClient, "client_source": record.ClientSource, "time": record.Time, "alert": alert})
+			var stamp any = at
+			if parsed, parseErr := time.Parse(indexTimeFormat, at); parseErr == nil {
+				stamp = parsed
+			}
+			for _, alert := range alerts {
+				payload, _ := json.Marshal(map[string]any{"id": id, "url": reqURL, "client": client, "time": stamp, "alert": alert})
 				webhook.enqueue(payload)
 			}
 		}

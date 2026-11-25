@@ -154,20 +154,29 @@ function bind() {
   const splitter = $('splitter');
   const width = Number(saved('detail-width', 0));
   if (width) split.style.setProperty('--detail-w', width + 'px');
+  let dragWidth = 0;
+  let splitBox = null;
   splitter.addEventListener('pointerdown', (event) => {
     splitter.setPointerCapture(event.pointerId);
     splitter.classList.add('dragging');
+    splitBox = split.getBoundingClientRect();
+    dragWidth = 0;
   });
   splitter.addEventListener('pointermove', (event) => {
     if (!splitter.classList.contains('dragging')) return;
-    const box = split.getBoundingClientRect();
+    const box = splitBox || split.getBoundingClientRect();
     const next = Math.round(Math.max(360, Math.min(box.width - 360, box.right - event.clientX - 14)));
     split.style.setProperty('--detail-w', next + 'px');
-    save('detail-width', String(next));
+    dragWidth = next;
   });
-  const release = () => splitter.classList.remove('dragging');
-  splitter.addEventListener('pointerup', release);
-  splitter.addEventListener('pointercancel', release);
+  const finishDrag = (persist) => {
+    splitter.classList.remove('dragging');
+    splitBox = null;
+    if (persist && dragWidth > 0) save('detail-width', String(dragWidth));
+    dragWidth = 0;
+  };
+  splitter.addEventListener('pointerup', () => finishDrag(true));
+  splitter.addEventListener('pointercancel', () => finishDrag(false));
   splitter.addEventListener('dblclick', () => {
     split.style.removeProperty('--detail-w');
     save('detail-width', '');
