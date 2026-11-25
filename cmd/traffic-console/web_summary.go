@@ -102,7 +102,7 @@ func (w *webServer) handleTimeline(rw http.ResponseWriter, r *http.Request) {
 	status, _ := readTUIStatus(s.dir)
 	finished := status.State != "" && status.State != "running" && status.State != "starting" && status.State != "stale"
 	revision := summaryRevision(s)
-	key := s.dir + "|" + r.URL.RawQuery
+	key := s.dir + "|" + r.URL.Query().Encode()
 	if finished && revision != "" {
 		w.timelineMu.Lock()
 		entry, ok := w.timelines[key]
@@ -177,7 +177,7 @@ func (w *webServer) handleSummary(rw http.ResponseWriter, r *http.Request) {
 	status, _ := readTUIStatus(s.dir)
 	finished := status.State != "" && status.State != "running" && status.State != "starting" && status.State != "stale"
 	revision := summaryRevision(s)
-	key := s.dir + "|" + r.URL.RawQuery
+	key := s.dir + "|" + r.URL.Query().Encode()
 	if finished && revision != "" {
 		w.summaryMu.Lock()
 		entry, ok := w.summaries[key]
@@ -224,7 +224,7 @@ func querySessionSummary(ctx context.Context, db *sql.DB, filter tuiFilter) (ses
  COALESCE(sum(CASE WHEN alert>0 AND severity=1 THEN 1 ELSE 0 END),0),
  COALESCE(sum(CASE WHEN alert>0 AND severity=2 THEN 1 ELSE 0 END),0),
  COALESCE(sum(CASE WHEN alert>0 AND severity=3 THEN 1 ELSE 0 END),0),
- COALESCE(sum(CASE WHEN alert>0 AND (severity<1 OR severity>3) THEN 1 ELSE 0 END),0)
+ COALESCE(sum(CASE WHEN alert>0 AND (severity IS NULL OR severity<1 OR severity>3) THEN 1 ELSE 0 END),0)
  FROM entries WHERE `+where, args...).Scan(&result.Total, &result.Alerted, &low, &medium, &high, &other); err != nil {
 		return result, err
 	}

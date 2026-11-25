@@ -434,15 +434,18 @@ func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, wi
 			return report, err
 		}
 		defer view.db.Close()
-		rows, err := view.db.QueryContext(ctx, "SELECT id,time,client,url,alerts FROM entries WHERE alert>0 ORDER BY time,id")
+		rows, err := view.db.QueryContext(ctx, `SELECT e.id,e.time,e.client,e.url,e.alerts,
+ COALESCE(json_extract(CAST(r.data AS TEXT),'$.peer_client'),''),
+ COALESCE(json_extract(CAST(r.data AS TEXT),'$.client_source'),'')
+ FROM entries e JOIN requests r ON r.id=e.id WHERE e.alert>0 ORDER BY e.time,e.id`)
 		if err != nil {
 			return report, err
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var id, at, client, reqURL string
+			var id, at, client, reqURL, peerClient, clientSource string
 			var rawAlerts []byte
-			if err = rows.Scan(&id, &at, &client, &reqURL, &rawAlerts); err != nil {
+			if err = rows.Scan(&id, &at, &client, &reqURL, &rawAlerts, &peerClient, &clientSource); err != nil {
 				return report, err
 			}
 			var alerts []Alert
@@ -454,7 +457,15 @@ func analyzeInSession(ctx context.Context, dir, webhookURL string, rs []Rule, wi
 				stamp = parsed
 			}
 			for _, alert := range alerts {
-				payload, _ := json.Marshal(map[string]any{"id": id, "url": reqURL, "client": client, "time": stamp, "alert": alert})
+				payload, _ := json.Marshal(map[string]any{
+					"id":            id,
+					"url":           reqURL,
+					"client":        client,
+					"peer_client":   peerClient,
+					"client_source": clientSource,
+					"time":          stamp,
+					"alert":         alert,
+				})
 				webhook.enqueue(payload)
 			}
 		}

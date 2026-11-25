@@ -92,14 +92,16 @@ func TestAnalyzeWebhookReadsFromEntries(t *testing.T) {
 	writer := tuiTestStore(t)
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	putTUITransaction(t, writer, Transaction{
-		ID:      "atk-1",
-		Time:    now,
-		Client:  "198.51.100.7:54321",
-		Method:  "GET",
-		Host:    "demo",
-		URL:     "/search?q=1%20union%20select%202",
-		Status:  200,
-		Request: []byte("GET /search?q=1%20union%20select%202 HTTP/1.1\r\nHost: demo\r\n\r\n"),
+		ID:           "atk-1",
+		Time:         now,
+		Client:       "198.51.100.7:54321",
+		PeerClient:   "10.0.0.2:443",
+		ClientSource: "x-forwarded-for",
+		Method:       "GET",
+		Host:         "demo",
+		URL:          "/search?q=1%20union%20select%202",
+		Status:       200,
+		Request:      []byte("GET /search?q=1%20union%20select%202 HTTP/1.1\r\nHost: demo\r\n\r\n"),
 	})
 	if err := os.WriteFile(filepath.Join(writer.dir, "status.json"), []byte(`{"state":"stopped","transactions":1}`), 0600); err != nil {
 		t.Fatal(err)
@@ -135,8 +137,33 @@ func TestAnalyzeWebhookReadsFromEntries(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(received) == 0 || received[0]["id"] != "atk-1" || received[0]["client"] != "198.51.100.7:54321" || received[0]["url"] != "/search?q=1%20union%20select%202" {
+	if len(received) == 0 || received[0]["id"] != "atk-1" || received[0]["client"] != "198.51.100.7:54321" || received[0]["peer_client"] != "10.0.0.2:443" || received[0]["client_source"] != "x-forwarded-for" || received[0]["url"] != "/search?q=1%20union%20select%202" {
 		t.Fatalf("unexpected webhook payload: %+v", received)
+	}
+}
+
+func TestPlanRuleFieldsMatchesDottedHeadersField(t *testing.T) {
+	rs := []Rule{{
+		ID:       "HDR-DOT",
+		Version:  1,
+		Severity: "low",
+		Field:    "request.header.x.headers",
+		Pattern:  "secret-marker",
+	}}
+	if err := compileRules(rs); err != nil {
+		t.Fatalf("compileRules: %v", err)
+	}
+	plan := planRuleFields(rs)
+	if !plan.request.fields {
+		t.Fatalf("expected request.fields=true for request.header.x.headers, got %+v", plan.request)
+	}
+	tx := Transaction{
+		ID:      "hdr-1",
+		Request: []byte("GET / HTTP/1.1\r\nHost: demo\r\nX.Headers: secret-marker\r\n\r\n"),
+	}
+	alerts := detectWithRules(tx, rs)
+	if len(alerts) != 1 || alerts[0].Rule != "HDR-DOT" {
+		t.Fatalf("expected HDR-DOT alert, got %+v", alerts)
 	}
 }
 

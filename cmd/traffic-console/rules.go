@@ -168,11 +168,11 @@ func planRuleFields(rs []Rule) ruleFieldPlan {
 		case r.Field == "request" || r.Field == "response":
 			dst.raw = true
 			dst.decoded = true
-		case strings.HasSuffix(r.Field, ".headers"):
-			dst.headers = true
 		case strings.Contains(r.Field, ".header."):
 			dst.fields = true
-		case strings.HasSuffix(r.Field, ".body"):
+		case r.Field == "request.headers" || r.Field == "response.headers":
+			dst.headers = true
+		case r.Field == "request.body" || r.Field == "response.body":
 			dst.body = true
 			dst.decoded = true
 		}

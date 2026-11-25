@@ -753,10 +753,8 @@ function drawTimeline(host, data, height) {
   if (data.granularity >= 86400) labels.forEach((text, i) => { labels[i] = text.slice(0, 10); });
   set(host, chart, tip, h('div', { class: 'axis' }, labels.map((text) => h('span', {}, text))));
 
-  let chartBox = null;
-  const getBox = () => chartBox || (chartBox = chart.getBoundingClientRect());
   const indexAt = (clientX) => {
-    const box = getBox();
+    const box = chart.getBoundingClientRect();
     return Math.max(0, Math.min(count - 1, Math.floor(((clientX - box.left) / (box.width || 1)) * count)));
   };
   let anchor = null;
@@ -789,7 +787,6 @@ function drawTimeline(host, data, height) {
     tip.style.left = `${Math.max(90, Math.min(width - 90, ((from + to + 1) / 2) * slot))}px`;
     return [from, to];
   };
-  chart.addEventListener('pointerenter', () => { chartBox = chart.getBoundingClientRect(); });
   chart.addEventListener('pointermove', (event) => {
     pendingX = event.clientX;
     if (moveRaf) return;
@@ -801,13 +798,11 @@ function drawTimeline(host, data, height) {
   chart.addEventListener('pointerleave', () => {
     if (moveRaf) { cancelAnimationFrame(moveRaf); moveRaf = 0; }
     if (anchor != null) return;
-    chartBox = null;
     hover.setAttribute('visibility', 'hidden');
     tip.hidden = true;
   });
   chart.addEventListener('pointerdown', (event) => {
     if (event.button !== 0) return;
-    chartBox = chart.getBoundingClientRect();
     anchor = indexAt(event.clientX);
     chart.setPointerCapture(event.pointerId);
     paint(event.clientX);
@@ -817,7 +812,6 @@ function drawTimeline(host, data, height) {
     if (anchor == null) return;
     const [from, to] = paint(event.clientX);
     anchor = null;
-    chartBox = null;
     // A plain click on a one-second bucket cannot zoom further.
     if (from === to && count === 1 && data.granularity === 1) return;
     const filter = state.tab === 'overview' ? {} : state.filter;
@@ -827,7 +821,6 @@ function drawTimeline(host, data, height) {
   chart.addEventListener('pointercancel', () => {
     if (moveRaf) { cancelAnimationFrame(moveRaf); moveRaf = 0; }
     anchor = null;
-    chartBox = null;
     brush.setAttribute('visibility', 'hidden');
   });
 }
