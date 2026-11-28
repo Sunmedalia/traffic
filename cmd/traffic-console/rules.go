@@ -390,22 +390,20 @@ func (m detectionHTTP) content(field string) (string, string) {
 }
 
 type decodedView struct {
-	text   string
-	round  int
+	text  string
+	round int
+	// folded is text as rule prefilters search it (foldForPrefilter).
 	folded string
-	ascii  bool
 }
 
 func decodeViews(text string) []decodedView {
-	folded, ascii := foldedASCII(text)
-	variants := []decodedView{{text: text, round: 0, folded: folded, ascii: ascii}}
+	variants := []decodedView{{text: text, round: 0, folded: foldForPrefilter(text)}}
 	for round := 1; round <= 2; round++ {
 		decoded := decodePercent(text)
 		if decoded == text {
 			break
 		}
-		folded, ascii := foldedASCII(decoded)
-		variants = append(variants, decodedView{text: decoded, round: round, folded: folded, ascii: ascii})
+		variants = append(variants, decodedView{text: decoded, round: round, folded: foldForPrefilter(decoded)})
 		text = decoded
 	}
 	return variants
