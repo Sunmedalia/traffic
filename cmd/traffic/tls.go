@@ -107,6 +107,20 @@ func parseProbeDrainControl(message string) (probeDrainSummary, bool) {
 	return summary, hasSeq
 }
 
+// parseAttachModeControl reads the probe's uprobe attach mode. The reason is
+// empty when hooks are installed per process and explains a system-wide
+// attach otherwise.
+func parseAttachModeControl(message string) (reason string, ok bool) {
+	if message == "traffic-control-v1:attach-mode:pid" {
+		return "", true
+	}
+	reason, ok = strings.CutPrefix(message, "traffic-control-v1:attach-mode:system:")
+	if ok && reason == "" {
+		reason = "unspecified"
+	}
+	return reason, ok
+}
+
 type probeProcess struct {
 	cmd           *exec.Cmd
 	exited        chan struct{}
@@ -199,6 +213,11 @@ func captureTLS(ctx context.Context, s *Store, p *eventRecorder, bin, lib string
 		}
 		defer os.Remove(scope.path)
 		args = append(args, "--traffic-scope-file", scope.path)
+		// Breakpoints only in the scope's processes instead of every process
+		// mapping the library; the probe reports when it had to fall back.
+		if probeCapability(bin, "feature:pid_attach_v1") {
+			args = append(args, "--traffic-pid-attach")
+		}
 	}
 	if pid == 0 && uid == 0 && scope == nil {
 		return fmt.Errorf("%w: grouped root probe requires a verified kernel PID scope", errECaptureConfiguration)
@@ -474,6 +493,12 @@ func consumeTLSProbe(
 			controlMsg := string(outer[4])
 			if controlMsg == "traffic-control-v1:ready" {
 				markReady()
+				continue
+			}
+			if reason, ok := parseAttachModeControl(controlMsg); ok {
+				if reason != "" {
+					s.problem(fmt.Errorf("%s: OpenSSL uprobes attached system-wide, every process mapping %s takes the breakpoint: %s", probeKey, lib, reason))
+				}
 				continue
 			}
 			if controlMsg == "traffic-control-v1:scope-error" {

@@ -1,0 +1,1391 @@
+diff --git a/cli/cmd/tls.go b/cli/cmd/tls.go
+index 339fdeb..57175d0 100644
+--- a/cli/cmd/tls.go
++++ b/cli/cmd/tls.go
+@@ -49,6 +49,7 @@ docker run --rm --privileged=true --net=host -v /etc:/etc -v /usr:/usr -v ${PWD}
+ 
+ func init() {
+ 	opensslCmd.PersistentFlags().StringVar(&opensslConfig.TrafficScopeFile, "traffic-scope-file", "", "private JSON file with dynamic host PID/start-time and port scope (CO-RE only)")
++	opensslCmd.PersistentFlags().BoolVar(&opensslConfig.TrafficPIDAttach, "traffic-pid-attach", false, "install OpenSSL uprobes only in the scope's processes instead of every process mapping the library (requires --traffic-scope-file)")
+ 	opensslCmd.PersistentFlags().StringVar(&opensslConfig.OpensslPath, "libssl", "", "libssl.so file path, will automatically find it from curl default.")
+ 	opensslCmd.PersistentFlags().StringVar(&globalConf.CGroupPath, "cgroup_path", "", "cgroup v2 path for container/process filtering. Empty disables cgroup filtering.")
+ 	opensslCmd.PersistentFlags().StringVarP(&opensslConfig.CaptureMode, "model", "m", "text", "capture mode: text, pcap/pcapng, key/keylog")
+diff --git a/internal/probe/openssl/config.go b/internal/probe/openssl/config.go
+index b22e3aa..98c0d43 100644
+--- a/internal/probe/openssl/config.go
++++ b/internal/probe/openssl/config.go
+@@ -43,6 +43,7 @@ const (
+ type Config struct {
+ 	*config.BaseConfig
+ 	TrafficScopeFile string `json:"traffic_scope_file,omitempty"`
++	TrafficPIDAttach bool   `json:"traffic_pid_attach,omitempty"`
+ 	OpensslPath      string `json:"opensslpath"` // Path to libssl.so
+ 
+ 	// Capture mode configuration
+@@ -81,6 +82,9 @@ func (c *Config) Validate() error {
+ 	if c.TrafficScopeFile != "" && (c.CaptureMode != handlers.ModeText || (c.TextSource != "" && c.TextSource != handlers.TextSourceHook)) {
+ 		return fmt.Errorf("traffic scope supports hook text mode only")
+ 	}
++	if c.TrafficPIDAttach && c.TrafficScopeFile == "" {
++		return fmt.Errorf("traffic PID attach requires a traffic scope file")
++	}
+ 	if err := c.BaseConfig.Validate(); err != nil {
+ 		return errors.NewConfigurationError("openssl config validation failed", err)
+ 	}
+diff --git a/internal/probe/openssl/openssl_probe.go b/internal/probe/openssl/openssl_probe.go
+index a90da09..58857fd 100644
+--- a/internal/probe/openssl/openssl_probe.go
++++ b/internal/probe/openssl/openssl_probe.go
+@@ -24,6 +24,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/cilium/ebpf"
++	"github.com/cilium/ebpf/link"
+ 	manager "github.com/gojue/ebpfmanager"
+ 	"golang.org/x/sys/unix"
+ 
+@@ -59,6 +60,12 @@ type Probe struct {
+ 	sslBpfFile      string
+ 	isBoringSSL     bool
+ 	masterHookFuncs []string
++
++	// --traffic-pid-attach: uprobes kept out of the manager, and how they
++	// are attached (per process, or upstream-style system-wide links).
++	trafficUprobes []*manager.Probe
++	pidAttach      *trafficPIDAttacher
++	systemUprobes  []link.Link
+ }
+ 
+ // NewProbe creates a new OpenSSL probe instance.
+@@ -156,6 +163,11 @@ func (p *Probe) Start(ctx context.Context) error {
+ 	if err := p.bpfManager.Start(); err != nil {
+ 		return errors.NewEBPFAttachError("openssl manager start", err)
+ 	}
++	if len(p.trafficUprobes) > 0 {
++		if err := p.attachTrafficUprobes(ctx, scope); err != nil {
++			return errors.NewEBPFAttachError("openssl traffic uprobes", err)
++		}
++	}
+ 
+ 	// Retrieve eBPF maps and associate with decoders (configured in setupManager)
+ 	if err := p.retrieveEventMaps(); err != nil {
+@@ -224,6 +236,8 @@ func (p *Probe) stopBPFManager() {
+ 			_ = m.Put(uint32(0), uint32(2))
+ 		}
+ 	}
++	// Before the manager closes the programs these hooks hold.
++	p.detachTrafficUprobes()
+ 	p.Logger().Debug().Msg("Stopping eBPF manager")
+ 	if err := p.bpfManager.Stop(manager.CleanAll); err != nil {
+ 		p.Logger().Warn().Err(err).Msg("Failed to stop eBPF manager")
+@@ -391,6 +405,9 @@ func (p *Probe) setupManagerText() error {
+ 		},
+ 	}
+ 
++	if p.config.TrafficPIDAttach {
++		probes, p.trafficUprobes = trafficSplitUprobes(probes, opensslPath)
++	}
+ 	p.bpfManager = &manager.Manager{
+ 		Probes: probes,
+ 		Maps:   maps,
+diff --git a/internal/probe/openssl/traffic_pid_attach.go b/internal/probe/openssl/traffic_pid_attach.go
+new file mode 100644
+index 0000000..8da59d1
+--- /dev/null
++++ b/internal/probe/openssl/traffic_pid_attach.go
+@@ -0,0 +1,470 @@
++package openssl
++
++// Per-process OpenSSL uprobes (--traffic-pid-attach).
++//
++// Upstream attaches every OpenSSL uprobe system-wide. The kernel then writes a
++// breakpoint into every process that maps the library file, so unrelated
++// services sharing libssl (PHP-FPM workers calling out over HTTPS, database
++// clients, monitoring agents) trap on each SSL_read and SSL_write even though
++// the BPF scope drops their events afterwards.
++//
++// Here each hook is one tracefs uprobe event. The BPF program is attached once
++// per hook, to a carrier perf event on eCapture's own process, which never
++// maps libssl. Each target process gets one disabled, filter-only perf event
++// per hook. The kernel's trace_uprobe filter installs breakpoints only in the
++// address spaces of the events' tasks, and every hit still passes a single
++// consumer and runs the program once; adding or removing a process opens or
++// closes its filter events. Opening a pid -1 filter event on the same trace
++// events makes them system-wide without attaching the program a second time.
++//
++// Coverage never drops below upstream: if tracefs cannot be set up the probe
++// attaches upstream-style system-wide links, and if a target cannot be added
++// later the events become system-wide before any per-process event closes.
++
++import (
++	"debug/elf"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strconv"
++	"strings"
++	"sync"
++	"syscall"
++	"unsafe"
++
++	manager "github.com/gojue/ebpfmanager"
++	"golang.org/x/sys/unix"
++)
++
++// trafficProgram is the part of *ebpf.Program the attacher needs.
++type trafficProgram interface{ FD() int }
++
++// trafficAttachKernel is the kernel interface of the attacher; tests replace it.
++type trafficAttachKernel interface {
++	defineEvent(group, name, path string, offset uint64, ret bool) (uint64, error)
++	removeEvent(group, name string) error
++	// openEvent opens a disabled filter-only event: pid > 0 targets that
++	// process, pid -1 makes the trace event system-wide.
++	openEvent(id uint64, pid int) (int, error)
++	// openCarrier opens an enabled event on pid with the program attached.
++	openCarrier(id uint64, pid int, program trafficProgram) (int, error)
++	closeEvent(fd int) error
++	startTicks(pid uint32) (uint64, error)
++}
++
++type trafficHook struct {
++	name    string
++	symbol  string
++	ret     bool
++	offset  uint64
++	program trafficProgram
++	id      uint64
++	carrier int
++}
++
++type trafficAttachedProcess struct {
++	ticks uint64
++	fds   []int
++}
++
++type trafficPIDAttacher struct {
++	mu       sync.Mutex
++	kernel   trafficAttachKernel
++	group    string
++	hooks    []*trafficHook
++	pids     map[uint32]trafficAttachedProcess
++	system   []int
++	fallback string
++	closed   bool
++}
++
++// trafficSplitUprobes moves the symbol-addressed uprobes on the OpenSSL
++// library out of the manager's probe list. Their programs stay in the loaded
++// collection; kprobes and anything addressed by raw offset stay with the
++// manager.
++func trafficSplitUprobes(probes []*manager.Probe, library string) (managed, uprobes []*manager.Probe) {
++	for _, probe := range probes {
++		isUprobe := strings.HasPrefix(probe.Section, "uprobe/") || strings.HasPrefix(probe.Section, "uretprobe/")
++		if isUprobe && probe.BinaryPath == library && probe.AttachToFuncName != "" && probe.UAddress == 0 && probe.UprobeOffset == 0 {
++			uprobes = append(uprobes, probe)
++			continue
++		}
++		managed = append(managed, probe)
++	}
++	return managed, uprobes
++}
++
++// trafficSymbolOffsets returns the file offset of each function symbol, like
++// cilium/ebpf's Executable: dynamic symbols override static ones, and the
++// address is translated through the executable PT_LOAD segment holding it.
++func trafficSymbolOffsets(path string) (map[string]uint64, error) {
++	file, err := elf.Open(path)
++	if err != nil {
++		return nil, err
++	}
++	defer file.Close()
++	if file.Type != elf.ET_EXEC && file.Type != elf.ET_DYN {
++		return nil, fmt.Errorf("%s is not an executable or shared object", path)
++	}
++	symbols, err := file.Symbols()
++	if err != nil && !errors.Is(err, elf.ErrNoSymbols) {
++		return nil, err
++	}
++	dynamic, err := file.DynamicSymbols()
++	if err != nil && !errors.Is(err, elf.ErrNoSymbols) {
++		return nil, err
++	}
++	offsets := map[string]uint64{}
++	for _, symbol := range append(symbols, dynamic...) {
++		if elf.ST_TYPE(symbol.Info) != elf.STT_FUNC || symbol.Value == 0 {
++			continue
++		}
++		address := symbol.Value
++		for _, segment := range file.Progs {
++			if segment.Type == elf.PT_LOAD && segment.Flags&elf.PF_X != 0 && segment.Vaddr <= symbol.Value && symbol.Value < segment.Vaddr+segment.Memsz {
++				address = symbol.Value - segment.Vaddr + segment.Off
++				break
++			}
++		}
++		offsets[symbol.Name] = address
++	}
++	return offsets, nil
++}
++
++var (
++	trafficTracefsIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
++	trafficTracefsInvalid    = regexp.MustCompile(`[^A-Za-z0-9_]`)
++)
++
++func trafficEventName(symbol string, ret bool) string {
++	prefix := "p_"
++	if ret {
++		prefix = "r_"
++	}
++	return prefix + trafficTracefsInvalid.ReplaceAllString(symbol, "_")
++}
++
++// newTrafficPIDAttacher defines one trace event and carrier per probe, as the
++// manager attaches each probe once. Symbols missing from the library are
++// skipped, as the manager skips ENOENT attach errors. Any other failure undoes
++// everything created so far.
++func newTrafficPIDAttacher(kernel trafficAttachKernel, group, library string, probes []*manager.Probe, offsets map[string]uint64, program func(name string) (trafficProgram, error), self int) (*trafficPIDAttacher, error) {
++	if !trafficTracefsIdentifier.MatchString(group) {
++		return nil, fmt.Errorf("invalid trace event group %q", group)
++	}
++	if strings.ContainsAny(library, " \t\n:") {
++		return nil, fmt.Errorf("library path %q cannot be used in a uprobe definition", library)
++	}
++	a := &trafficPIDAttacher{kernel: kernel, group: group, pids: map[uint32]trafficAttachedProcess{}}
++	for index, probe := range probes {
++		ret := strings.HasPrefix(probe.Section, "uretprobe/")
++		offset, ok := offsets[probe.AttachToFuncName]
++		if !ok {
++			continue
++		}
++		name := fmt.Sprintf("%s_%d", trafficEventName(probe.AttachToFuncName, ret), index)
++		prog, err := program(probe.EbpfFuncName)
++		if err != nil {
++			a.close()
++			return nil, fmt.Errorf("program %s: %w", probe.EbpfFuncName, err)
++		}
++		hook := &trafficHook{name: name, symbol: probe.AttachToFuncName, ret: ret, offset: offset, program: prog, carrier: -1}
++		if hook.id, err = kernel.defineEvent(group, name, library, offset, ret); err != nil {
++			a.close()
++			return nil, fmt.Errorf("define %s: %w", name, err)
++		}
++		a.hooks = append(a.hooks, hook)
++		if hook.carrier, err = kernel.openCarrier(hook.id, self, prog); err != nil {
++			hook.carrier = -1
++			a.close()
++			return nil, fmt.Errorf("attach %s: %w", name, err)
++		}
++	}
++	if len(a.hooks) == 0 {
++		return nil, fmt.Errorf("no OpenSSL hook symbol found in %s", library)
++	}
++	return a, nil
++}
++
++// reconcile makes the per-process events match the scope. It returns a
++// reason when it had to switch to system-wide events, and an error only when
++// even that failed.
++func (a *trafficPIDAttacher) reconcile(scope []trafficScopePID) (string, error) {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.closed || a.fallback != "" {
++		return "", nil
++	}
++	wanted := make(map[uint32]uint64, len(scope))
++	for _, entry := range scope {
++		wanted[entry.PID] = entry.StartTicks
++	}
++	for pid, process := range a.pids {
++		if ticks, ok := wanted[pid]; !ok || ticks != process.ticks {
++			a.closeFDs(process.fds)
++			delete(a.pids, pid)
++		}
++	}
++	for pid, ticks := range wanted {
++		if _, ok := a.pids[pid]; ok {
++			continue
++		}
++		fds, err := a.addProcess(pid, ticks)
++		if err != nil {
++			return a.fallBackLocked(fmt.Sprintf("pid %d: %v", pid, err))
++		}
++		if fds != nil {
++			a.pids[pid] = trafficAttachedProcess{ticks: ticks, fds: fds}
++		}
++	}
++	return "", nil
++}
++
++// addProcess returns nil fds when the process exited or its PID now belongs
++// to another process; the BPF scope drops such a PID anyway.
++func (a *trafficPIDAttacher) addProcess(pid uint32, ticks uint64) ([]int, error) {
++	fds := make([]int, 0, len(a.hooks))
++	for _, hook := range a.hooks {
++		fd, err := a.kernel.openEvent(hook.id, int(pid))
++		if errors.Is(err, syscall.ESRCH) {
++			a.closeFDs(fds)
++			return nil, nil
++		}
++		if err != nil {
++			a.closeFDs(fds)
++			return nil, err
++		}
++		fds = append(fds, fd)
++	}
++	// Checked after opening: an event that holds a reused PID's task shows a
++	// different start time here, so it is never kept.
++	live, err := a.kernel.startTicks(pid)
++	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) || (err == nil && live != ticks) {
++		a.closeFDs(fds)
++		return nil, nil
++	}
++	if err != nil {
++		a.closeFDs(fds)
++		return nil, fmt.Errorf("verify start time: %w", err)
++	}
++	return fds, nil
++}
++
++// fallBackLocked opens the system-wide events first, so the website's
++// processes stay covered, then drops the per-process events.
++func (a *trafficPIDAttacher) fallBackLocked(reason string) (string, error) {
++	opened := make([]int, 0, len(a.hooks))
++	for _, hook := range a.hooks {
++		fd, err := a.kernel.openEvent(hook.id, -1)
++		if err != nil {
++			a.closeFDs(opened)
++			return "", fmt.Errorf("%s; system-wide fallback for %s failed: %w", reason, hook.name, err)
++		}
++		opened = append(opened, fd)
++	}
++	a.system = opened
++	for pid, process := range a.pids {
++		a.closeFDs(process.fds)
++		delete(a.pids, pid)
++	}
++	a.fallback = reason
++	return reason, nil
++}
++
++func (a *trafficPIDAttacher) attachedProcesses() int {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	return len(a.pids)
++}
++
++func (a *trafficPIDAttacher) closeFDs(fds []int) {
++	for _, fd := range fds {
++		_ = a.kernel.closeEvent(fd)
++	}
++}
++
++// close detaches every hook: per-process and system-wide filter events,
++// then the carriers holding the programs, then the trace events.
++func (a *trafficPIDAttacher) close() {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.closed {
++		return
++	}
++	a.closed = true
++	for pid, process := range a.pids {
++		a.closeFDs(process.fds)
++		delete(a.pids, pid)
++	}
++	a.closeFDs(a.system)
++	a.system = nil
++	for _, hook := range a.hooks {
++		if hook.carrier >= 0 {
++			_ = a.kernel.closeEvent(hook.carrier)
++			hook.carrier = -1
++		}
++		_ = a.kernel.removeEvent(a.group, hook.name)
++	}
++}
++
++// trafficTracefs is the Linux implementation over tracefs and perf_event_open.
++type trafficTracefs struct{ root string }
++
++func newTrafficTracefs() (*trafficTracefs, error) {
++	for _, root := range []string{"/sys/kernel/tracing", "/sys/kernel/debug/tracing"} {
++		if info, err := os.Stat(filepath.Join(root, "uprobe_events")); err == nil && info.Mode().IsRegular() {
++			return &trafficTracefs{root: root}, nil
++		}
++	}
++	return nil, errors.New("tracefs uprobe_events not found")
++}
++
++func (t *trafficTracefs) write(line string) error {
++	file, err := os.OpenFile(filepath.Join(t.root, "uprobe_events"), os.O_WRONLY|os.O_APPEND, 0)
++	if err != nil {
++		return err
++	}
++	_, err = file.WriteString(line)
++	return errors.Join(err, file.Close())
++}
++
++func (t *trafficTracefs) eventID(group, name string) (uint64, error) {
++	data, err := os.ReadFile(filepath.Join(t.root, "events", group, name, "id"))
++	if err != nil {
++		return 0, err
++	}
++	return strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
++}
++
++func (t *trafficTracefs) defineEvent(group, name, path string, offset uint64, ret bool) (uint64, error) {
++	if !trafficTracefsIdentifier.MatchString(name) {
++		return 0, fmt.Errorf("invalid trace event name %q", name)
++	}
++	if _, err := t.eventID(group, name); err == nil {
++		return 0, fmt.Errorf("trace event %s/%s: %w", group, name, os.ErrExist)
++	}
++	if err := t.write(trafficUprobeDefinition(group, name, path, offset, ret)); err != nil {
++		return 0, err
++	}
++	id, err := t.eventID(group, name)
++	if err != nil {
++		_ = t.removeEvent(group, name)
++		return 0, err
++	}
++	return id, nil
++}
++
++func trafficUprobeDefinition(group, name, path string, offset uint64, ret bool) string {
++	kind := "p"
++	if ret {
++		kind = "r"
++	}
++	return fmt.Sprintf("%s:%s/%s %s:%#x", kind, group, name, path, offset)
++}
++
++func (t *trafficTracefs) removeEvent(group, name string) error {
++	return t.write("-:" + group + "/" + name)
++}
++
++func trafficPerfAttr(id uint64, disabled bool) unix.PerfEventAttr {
++	attr := unix.PerfEventAttr{
++		Type:        unix.PERF_TYPE_TRACEPOINT,
++		Config:      id,
++		Sample_type: unix.PERF_SAMPLE_RAW,
++		Sample:      1,
++		Wakeup:      1,
++	}
++	attr.Size = uint32(unsafe.Sizeof(attr))
++	if disabled {
++		attr.Bits |= unix.PerfBitDisabled
++	}
++	return attr
++}
++
++func trafficPerfOpen(attr *unix.PerfEventAttr, pid int) (int, error) {
++	cpu := -1
++	if pid == -1 {
++		cpu = 0 // a pid -1 event must name a CPU; the filter is per trace event
++	}
++	return unix.PerfEventOpen(attr, pid, cpu, -1, unix.PERF_FLAG_FD_CLOEXEC)
++}
++
++// A disabled event never joins the per-CPU active list, so a hit in the
++// target does not format a sample for it; it only extends the filter.
++func (t *trafficTracefs) openEvent(id uint64, pid int) (int, error) {
++	attr := trafficPerfAttr(id, true)
++	return trafficPerfOpen(&attr, pid)
++}
++
++func (t *trafficTracefs) openCarrier(id uint64, pid int, program trafficProgram) (int, error) {
++	attr := trafficPerfAttr(id, false)
++	fd, err := trafficPerfOpen(&attr, pid)
++	if err != nil {
++		return -1, err
++	}
++	if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_SET_BPF, program.FD()); err != nil {
++		unix.Close(fd)
++		return -1, fmt.Errorf("attach program: %w", err)
++	}
++	if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_ENABLE, 0); err != nil {
++		unix.Close(fd)
++		return -1, fmt.Errorf("enable carrier: %w", err)
++	}
++	return fd, nil
++}
++
++func (t *trafficTracefs) closeEvent(fd int) error { return unix.Close(fd) }
++
++func (t *trafficTracefs) startTicks(pid uint32) (uint64, error) {
++	return trafficProcessStartTicks("/proc", pid)
++}
++
++// trafficProcessStartTicks reads field 22 of /proc/PID/stat, the start time
++// the collector writes into the scope file.
++func trafficProcessStartTicks(root string, pid uint32) (uint64, error) {
++	data, err := os.ReadFile(filepath.Join(root, strconv.FormatUint(uint64(pid), 10), "stat"))
++	if err != nil {
++		return 0, err
++	}
++	end := strings.LastIndexByte(string(data), ')')
++	if end < 0 {
++		return 0, errors.New("malformed process stat")
++	}
++	fields := strings.Fields(string(data)[end+1:])
++	if len(fields) < 20 {
++		return 0, errors.New("short process stat")
++	}
++	return strconv.ParseUint(fields[19], 10, 64)
++}
++
++// removeStale drops trace events left by a traffic eCapture that died without
++// closing them. Defined events without perf events install no breakpoints;
++// this only keeps tracefs tidy. The kernel refuses events still in use.
++func (t *trafficTracefs) removeStale() {
++	entries, err := os.ReadDir(filepath.Join(t.root, "events"))
++	if err != nil {
++		return
++	}
++	for _, entry := range entries {
++		owner, ok := strings.CutPrefix(entry.Name(), "traffic_")
++		if !ok || !entry.IsDir() {
++			continue
++		}
++		if pid, err := strconv.Atoi(owner); err != nil || pid <= 0 {
++			continue
++		} else if _, err := os.Stat(filepath.Join("/proc", owner)); err == nil {
++			continue
++		}
++		events, err := os.ReadDir(filepath.Join(t.root, "events", entry.Name()))
++		if err != nil {
++			continue
++		}
++		for _, event := range events {
++			if event.IsDir() && trafficTracefsIdentifier.MatchString(event.Name()) {
++				_ = t.removeEvent(entry.Name(), event.Name())
++			}
++		}
++	}
++}
+diff --git a/internal/probe/openssl/traffic_pid_attach_kernel_test.go b/internal/probe/openssl/traffic_pid_attach_kernel_test.go
+new file mode 100644
+index 0000000..1fa0a65
+--- /dev/null
++++ b/internal/probe/openssl/traffic_pid_attach_kernel_test.go
+@@ -0,0 +1,238 @@
++package openssl
++
++import (
++	"bytes"
++	"fmt"
++	"os"
++	"os/exec"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/cilium/ebpf"
++	"github.com/cilium/ebpf/asm"
++	manager "github.com/gojue/ebpfmanager"
++)
++
++// trafficMappedCode returns the bytes process pid executes at a file offset
++// of library, or nil when the library is not mapped there.
++func trafficMappedCode(t *testing.T, pid int, library string, offset uint64) []byte {
++	t.Helper()
++	maps, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", pid))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, line := range strings.Split(string(maps), "\n") {
++		fields := strings.Fields(line)
++		if len(fields) < 6 || fields[5] != library || !strings.Contains(fields[1], "x") {
++			continue
++		}
++		var start, end, fileOffset uint64
++		if _, err := fmt.Sscanf(fields[0]+" "+fields[2], "%x-%x %x", &start, &end, &fileOffset); err != nil || offset < fileOffset || offset+8 > fileOffset+end-start {
++			continue
++		}
++		memory, err := os.Open(fmt.Sprintf("/proc/%d/mem", pid))
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer memory.Close()
++		code := make([]byte, 8)
++		if _, err := memory.ReadAt(code, int64(start+offset-fileOffset)); err != nil {
++			t.Fatal(err)
++		}
++		return code
++	}
++	return nil
++}
++
++// trafficStartProcess starts a helper and waits until the dynamic loader has
++// mapped libc into it.
++func trafficStartProcess(t *testing.T, name string, args ...string) (int, string) {
++	t.Helper()
++	process := exec.Command(name, args...)
++	if err := process.Start(); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = process.Process.Kill(); _ = process.Wait() })
++	pid := process.Process.Pid
++	for attempt := 0; attempt < 200; attempt++ {
++		maps, _ := os.ReadFile(fmt.Sprintf("/proc/%d/maps", pid))
++		for _, line := range strings.Split(string(maps), "\n") {
++			if fields := strings.Fields(line); len(fields) >= 6 && strings.Contains(fields[5], "/libc.so") && strings.Contains(fields[1], "x") {
++				return pid, fields[5]
++			}
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Skipf("%s does not map a shared libc", name)
++	return 0, ""
++}
++
++func trafficKernelAttacher(t *testing.T, library, symbol string, offsets map[string]uint64, program *ebpf.Program, carrier int) *trafficPIDAttacher {
++	t.Helper()
++	kernel, err := newTrafficTracefs()
++	if err != nil {
++		t.Skip(err)
++	}
++	probes := []*manager.Probe{{Section: "uprobe/" + symbol, EbpfFuncName: "test", AttachToFuncName: symbol, BinaryPath: library}}
++	attacher, err := newTrafficPIDAttacher(kernel, fmt.Sprintf("traffic_%d", os.Getpid()), library, probes, offsets,
++		func(string) (trafficProgram, error) { return program, nil }, carrier)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(attacher.close)
++	return attacher
++}
++
++func trafficAttach(t *testing.T, attacher *trafficPIDAttacher, pid int) {
++	t.Helper()
++	ticks, err := trafficProcessStartTicks("/proc", uint32(pid))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if reason, err := attacher.reconcile([]trafficScopePID{{uint32(pid), ticks}}); err != nil || reason != "" {
++		t.Fatalf("reconcile: %q %v", reason, err)
++	}
++}
++
++// TestTrafficPIDAttachKernel checks the kernel behaviour the attacher relies
++// on, with uprobes on libc in helper processes it starts:
++//
++//   - breakpoints are written only into the listed process, into every
++//     process after the system-wide fallback, and removed on close;
++//   - the program attached to the carrier event runs for hits in the listed
++//     process, and only there.
++//
++// The carrier is a separate sleep process so this test process, which also
++// maps libc, is never instrumented. It needs root and tracefs and only runs on
++// request:
++//
++//	TRAFFIC_PID_ATTACH_KERNEL_TEST=1 go test -run TestTrafficPIDAttachKernel ./internal/probe/openssl
++func TestTrafficPIDAttachKernel(t *testing.T) {
++	if os.Getenv("TRAFFIC_PID_ATTACH_KERNEL_TEST") != "1" || os.Geteuid() != 0 {
++		t.Skip("set TRAFFIC_PID_ATTACH_KERNEL_TEST=1 and run as root")
++	}
++	carrier, library := trafficStartProcess(t, "sleep", "60")
++	offsets, err := trafficSymbolOffsets(library)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	t.Run("breakpoints", func(t *testing.T) {
++		target, targetLibrary := trafficStartProcess(t, "sleep", "60")
++		other, otherLibrary := trafficStartProcess(t, "sleep", "60")
++		if targetLibrary != library || otherLibrary != library {
++			t.Skip("helpers map different libc files")
++		}
++		const symbol = "swab" // exported by glibc and musl, rarely called
++		offset, ok := offsets[symbol]
++		if !ok {
++			t.Skipf("%s has no %s", library, symbol)
++		}
++		file, err := os.Open(library)
++		if err != nil {
++			t.Fatal(err)
++		}
++		onDisk := make([]byte, 8)
++		_, err = file.ReadAt(onDisk, int64(offset))
++		file.Close()
++		if err != nil {
++			t.Fatal(err)
++		}
++		instrumented := func(pid int) bool { return !bytes.Equal(trafficMappedCode(t, pid, library, offset), onDisk) }
++		if instrumented(target) || instrumented(other) {
++			t.Skipf("%s is already instrumented", symbol)
++		}
++		program, err := ebpf.NewProgram(&ebpf.ProgramSpec{
++			Type:         ebpf.Kprobe,
++			License:      "GPL",
++			Instructions: asm.Instructions{asm.Mov.Imm(asm.R0, 0), asm.Return()},
++		})
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer program.Close()
++		attacher := trafficKernelAttacher(t, library, symbol, offsets, program, carrier)
++		trafficAttach(t, attacher, target)
++		if !instrumented(target) || instrumented(other) {
++			t.Fatalf("per-process attach: target %v, other %v", instrumented(target), instrumented(other))
++		}
++		attacher.mu.Lock()
++		_, err = attacher.fallBackLocked("kernel test")
++		attacher.mu.Unlock()
++		if err != nil {
++			t.Fatal(err)
++		}
++		if !instrumented(target) || !instrumented(other) {
++			t.Fatalf("system-wide fallback: target %v, other %v", instrumented(target), instrumented(other))
++		}
++		event := attacher.hooks[0].name
++		attacher.close()
++		if instrumented(target) || instrumented(other) {
++			t.Fatalf("after close: target %v, other %v", instrumented(target), instrumented(other))
++		}
++		if _, err := attacher.kernel.(*trafficTracefs).eventID(attacher.group, event); err == nil {
++			t.Fatal("trace event left in tracefs")
++		}
++	})
++
++	t.Run("program runs for listed process", func(t *testing.T) {
++		const symbol = "write"
++		if _, ok := offsets[symbol]; !ok {
++			t.Skipf("%s has no %s", library, symbol)
++		}
++		// Each hit records the caller's process ID.
++		hits, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 4, ValueSize: 8, MaxEntries: 64})
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer hits.Close()
++		program, err := ebpf.NewProgram(&ebpf.ProgramSpec{
++			Type:    ebpf.Kprobe,
++			License: "GPL",
++			Instructions: asm.Instructions{
++				asm.FnGetCurrentPidTgid.Call(),
++				asm.RSh.Imm(asm.R0, 32),
++				asm.StoreMem(asm.RFP, -4, asm.R0, asm.Word),
++				asm.Mov.Imm(asm.R1, 1),
++				asm.StoreMem(asm.RFP, -16, asm.R1, asm.DWord),
++				asm.LoadMapPtr(asm.R1, hits.FD()),
++				asm.Mov.Reg(asm.R2, asm.RFP),
++				asm.Add.Imm(asm.R2, -4),
++				asm.Mov.Reg(asm.R3, asm.RFP),
++				asm.Add.Imm(asm.R3, -16),
++				asm.Mov.Imm(asm.R4, 0),
++				asm.FnMapUpdateElem.Call(),
++				asm.Mov.Imm(asm.R0, 0),
++				asm.Return(),
++			},
++		})
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer program.Close()
++		attacher := trafficKernelAttacher(t, library, symbol, offsets, program, carrier)
++		// coreutils yes writes in a loop; exec leaves stdout on /dev/null.
++		target, targetLibrary := trafficStartProcess(t, "yes")
++		other, otherLibrary := trafficStartProcess(t, "yes")
++		if targetLibrary != library || otherLibrary != library {
++			t.Skip("helpers map different libc files")
++		}
++		trafficAttach(t, attacher, target)
++		var marker uint64
++		deadline := time.Now().Add(2 * time.Second)
++		for hits.Lookup(uint32(target), &marker) != nil {
++			if time.Now().After(deadline) {
++				t.Fatal("program attached to the carrier never ran for the listed process")
++			}
++			time.Sleep(10 * time.Millisecond)
++		}
++		time.Sleep(100 * time.Millisecond)
++		if hits.Lookup(uint32(other), &marker) == nil {
++			t.Fatal("program ran for a process outside the scope")
++		}
++		if hits.Lookup(uint32(os.Getpid()), &marker) == nil {
++			t.Fatal("program ran for the test process")
++		}
++	})
++}
+diff --git a/internal/probe/openssl/traffic_pid_attach_probe.go b/internal/probe/openssl/traffic_pid_attach_probe.go
+new file mode 100644
+index 0000000..cb0c500
+--- /dev/null
++++ b/internal/probe/openssl/traffic_pid_attach_probe.go
+@@ -0,0 +1,165 @@
++package openssl
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"strings"
++	"syscall"
++
++	"github.com/cilium/ebpf"
++	"github.com/cilium/ebpf/link"
++	manager "github.com/gojue/ebpfmanager"
++
++	"github.com/gojue/ecapture/v2/internal/domain"
++)
++
++const (
++	trafficAttachModePID    = "traffic-control-v1:attach-mode:pid"
++	trafficAttachModeSystem = "traffic-control-v1:attach-mode:system:"
++)
++
++func (p *Probe) trafficProgram(name string) (*ebpf.Program, error) {
++	programs, ok, err := p.bpfManager.GetProgram(manager.ProbeIdentificationPair{EbpfFuncName: name})
++	if err != nil {
++		return nil, err
++	}
++	if !ok || len(programs) == 0 || programs[0] == nil {
++		return nil, fmt.Errorf("program %s is not loaded", name)
++	}
++	return programs[0], nil
++}
++
++// attachTrafficUprobes runs after the manager attached the kprobes and the
++// scope maps hold the first PID set, and before the probe reports ready.
++func (p *Probe) attachTrafficUprobes(ctx context.Context, scope *trafficScopeMaps) error {
++	attacher, err := p.newTrafficKernelAttacher()
++	if err != nil {
++		p.Logger().Warn().Err(err).Msg("per-process OpenSSL uprobes unavailable; attaching system-wide")
++		if err := p.attachSystemUprobes(); err != nil {
++			return err
++		}
++		p.publishTrafficControl(ctx, trafficAttachModeSystem+trafficControlReason(err))
++		return nil
++	}
++	reason, err := attacher.reconcile(scope.current.PIDs)
++	if err != nil {
++		attacher.close()
++		return err
++	}
++	p.pidAttach = attacher
++	if reason != "" {
++		p.publishTrafficControl(ctx, trafficAttachModeSystem+trafficControlReason(errors.New(reason)))
++		return nil
++	}
++	p.Logger().Info().Int("processes", attacher.attachedProcesses()).Msg("OpenSSL uprobes attached per process")
++	p.publishTrafficControl(ctx, trafficAttachModePID)
++	return nil
++}
++
++func (p *Probe) newTrafficKernelAttacher() (*trafficPIDAttacher, error) {
++	kernel, err := newTrafficTracefs()
++	if err != nil {
++		return nil, err
++	}
++	kernel.removeStale()
++	offsets, err := trafficSymbolOffsets(p.config.OpensslPath)
++	if err != nil {
++		return nil, err
++	}
++	program := func(name string) (trafficProgram, error) { return p.trafficProgram(name) }
++	self := os.Getpid()
++	return newTrafficPIDAttacher(kernel, fmt.Sprintf("traffic_%d", self), p.config.OpensslPath, p.trafficUprobes, offsets, program, self)
++}
++
++// attachSystemUprobes attaches the hooks as upstream's manager does: system
++// wide, skipping symbols the library does not export.
++func (p *Probe) attachSystemUprobes() error {
++	executable, err := link.OpenExecutable(p.config.OpensslPath)
++	if err != nil {
++		return err
++	}
++	for _, probe := range p.trafficUprobes {
++		program, err := p.trafficProgram(probe.EbpfFuncName)
++		if err != nil {
++			p.closeSystemUprobes()
++			return err
++		}
++		var attached link.Link
++		if strings.HasPrefix(probe.Section, "uretprobe/") {
++			attached, err = executable.Uretprobe(probe.AttachToFuncName, program, nil)
++		} else {
++			attached, err = executable.Uprobe(probe.AttachToFuncName, program, nil)
++		}
++		if errors.Is(err, link.ErrNoSymbol) || errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.EINVAL) {
++			continue
++		}
++		if err != nil {
++			p.closeSystemUprobes()
++			return fmt.Errorf("attach %s: %w", probe.Section, err)
++		}
++		p.systemUprobes = append(p.systemUprobes, attached)
++	}
++	return nil
++}
++
++func (p *Probe) closeSystemUprobes() {
++	for _, attached := range p.systemUprobes {
++		_ = attached.Close()
++	}
++	p.systemUprobes = nil
++}
++
++// reconcileTrafficUprobes follows a scope update. An error means even the
++// system-wide fallback failed; the caller then clears the scope.
++func (p *Probe) reconcileTrafficUprobes(ctx context.Context, pids []trafficScopePID) error {
++	if p.pidAttach == nil {
++		return nil
++	}
++	reason, err := p.pidAttach.reconcile(pids)
++	if err != nil {
++		return err
++	}
++	if reason != "" {
++		p.Logger().Warn().Str("reason", reason).Msg("per-process OpenSSL uprobes switched to system-wide")
++		p.publishTrafficControl(ctx, trafficAttachModeSystem+trafficControlReason(errors.New(reason)))
++	}
++	return nil
++}
++
++// detachTrafficUprobes may run while the scope watcher is still reconciling.
++// pidAttach is written once in Start, before the watcher starts, and close
++// turns later reconciles into no-ops under the attacher's lock.
++func (p *Probe) detachTrafficUprobes() {
++	if p.pidAttach != nil {
++		p.pidAttach.close()
++	}
++	p.closeSystemUprobes()
++}
++
++func (p *Probe) publishTrafficControl(ctx context.Context, message string) {
++	output := p.config.GetRuntimeOutput()
++	if output == nil {
++		return
++	}
++	for _, sink := range output.EventSinks {
++		if logs, ok := sink.(domain.OperationalLogSink); ok {
++			_ = logs.PublishLog(ctx, domain.OperationalLogRecord{Message: message})
++		}
++	}
++}
++
++// trafficControlReason keeps a control message on one bounded line.
++func trafficControlReason(err error) string {
++	reason := strings.Map(func(r rune) rune {
++		if r < 0x20 || r == 0x7f {
++			return ' '
++		}
++		return r
++	}, err.Error())
++	if len(reason) > 200 {
++		reason = reason[:200]
++	}
++	return reason
++}
+diff --git a/internal/probe/openssl/traffic_pid_attach_test.go b/internal/probe/openssl/traffic_pid_attach_test.go
+new file mode 100644
+index 0000000..709ef7f
+--- /dev/null
++++ b/internal/probe/openssl/traffic_pid_attach_test.go
+@@ -0,0 +1,390 @@
++package openssl
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++	"syscall"
++	"testing"
++
++	manager "github.com/gojue/ebpfmanager"
++)
++
++type fakeProgram int
++
++func (p fakeProgram) FD() int { return int(p) }
++
++type fakeAttachEvent struct {
++	id      uint64
++	pid     int
++	program int // carrier program FD, 0 for filter-only events
++}
++
++type fakeAttachKernel struct {
++	nextFD, nextID int
++	defined        map[string]uint64
++	events         map[int]fakeAttachEvent
++	ticks          map[uint32]uint64
++	openErr        map[int]error // by pid
++	carrierErr     map[uint64]error
++	log            []string
++}
++
++func newFakeAttachKernel() *fakeAttachKernel {
++	return &fakeAttachKernel{nextFD: 100, defined: map[string]uint64{}, events: map[int]fakeAttachEvent{}, ticks: map[uint32]uint64{}, openErr: map[int]error{}, carrierErr: map[uint64]error{}}
++}
++
++func (k *fakeAttachKernel) defineEvent(group, name, path string, offset uint64, ret bool) (uint64, error) {
++	key := group + "/" + name
++	if _, ok := k.defined[key]; ok {
++		return 0, os.ErrExist
++	}
++	k.nextID++
++	k.defined[key] = uint64(k.nextID)
++	k.log = append(k.log, "define "+trafficUprobeDefinition(group, name, path, offset, ret))
++	return uint64(k.nextID), nil
++}
++
++func (k *fakeAttachKernel) removeEvent(group, name string) error {
++	delete(k.defined, group+"/"+name)
++	k.log = append(k.log, "remove "+name)
++	return nil
++}
++
++func (k *fakeAttachKernel) open(id uint64, pid, program int) int {
++	k.nextFD++
++	k.events[k.nextFD] = fakeAttachEvent{id: id, pid: pid, program: program}
++	k.log = append(k.log, fmt.Sprintf("open %d pid %d", id, pid))
++	return k.nextFD
++}
++
++func (k *fakeAttachKernel) openEvent(id uint64, pid int) (int, error) {
++	if err := k.openErr[pid]; err != nil {
++		return -1, err
++	}
++	return k.open(id, pid, 0), nil
++}
++
++func (k *fakeAttachKernel) openCarrier(id uint64, pid int, program trafficProgram) (int, error) {
++	if err := k.carrierErr[id]; err != nil {
++		return -1, err
++	}
++	return k.open(id, pid, program.FD()), nil
++}
++
++func (k *fakeAttachKernel) closeEvent(fd int) error {
++	event, ok := k.events[fd]
++	if !ok {
++		panic(fmt.Sprintf("closing unknown fd %d", fd))
++	}
++	delete(k.events, fd)
++	k.log = append(k.log, fmt.Sprintf("close %d pid %d", event.id, event.pid))
++	return nil
++}
++
++func (k *fakeAttachKernel) startTicks(pid uint32) (uint64, error) {
++	ticks, ok := k.ticks[pid]
++	if !ok {
++		return 0, os.ErrNotExist
++	}
++	return ticks, nil
++}
++
++// filterPIDs lists the filter-only events per pid.
++func (k *fakeAttachKernel) filterPIDs() map[int]int {
++	pids := map[int]int{}
++	for _, event := range k.events {
++		if event.program == 0 {
++			pids[event.pid]++
++		}
++	}
++	return pids
++}
++
++const trafficTestLibrary = "/proc/1/root/usr/lib/libssl.so.3"
++
++func trafficTestProbes() []*manager.Probe {
++	return []*manager.Probe{
++		{Section: "uprobe/SSL_read", EbpfFuncName: "probe_entry_SSL_read", AttachToFuncName: "SSL_read", BinaryPath: trafficTestLibrary},
++		{Section: "uretprobe/SSL_read", EbpfFuncName: "probe_ret_SSL_read", AttachToFuncName: "SSL_read", BinaryPath: trafficTestLibrary},
++		{Section: "uprobe/SSL_set_rfd", EbpfFuncName: "probe_SSL_set_fd", AttachToFuncName: "SSL_set_rfd", BinaryPath: trafficTestLibrary},
++	}
++}
++
++func newTestAttacher(t *testing.T, kernel *fakeAttachKernel) *trafficPIDAttacher {
++	t.Helper()
++	// SSL_set_rfd is missing from the library, like OpenSSL builds without it.
++	offsets := map[string]uint64{"SSL_read": 0x1a2b}
++	programs := map[string]int{"probe_entry_SSL_read": 7, "probe_ret_SSL_read": 8, "probe_SSL_set_fd": 9}
++	program := func(name string) (trafficProgram, error) { return fakeProgram(programs[name]), nil }
++	attacher, err := newTrafficPIDAttacher(kernel, "traffic_42", trafficTestLibrary, trafficTestProbes(), offsets, program, 42)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return attacher
++}
++
++func TestTrafficSplitUprobesKeepsKprobesAndOtherBinaries(t *testing.T) {
++	probes := append(trafficTestProbes(),
++		&manager.Probe{Section: "kprobe/tcp_recvmsg", EbpfFuncName: "traffic_tcp_recvmsg", AttachToFuncName: "tcp_recvmsg"},
++		&manager.Probe{Section: "uprobe/SSL_write", EbpfFuncName: "probe_entry_SSL_write", AttachToFuncName: "SSL_write", BinaryPath: "/other/libssl.so"},
++		&manager.Probe{Section: "uprobe/bssl_keylog", EbpfFuncName: "uprobe_bssl_keylog", AttachToFuncName: "ssl_log_secret", BinaryPath: trafficTestLibrary, UAddress: 0x10},
++	)
++	managed, uprobes := trafficSplitUprobes(probes, trafficTestLibrary)
++	if len(uprobes) != 3 || len(managed) != 3 {
++		t.Fatalf("managed %d, uprobes %d", len(managed), len(uprobes))
++	}
++	for _, probe := range managed {
++		if probe.BinaryPath == trafficTestLibrary && probe.UAddress == 0 {
++			t.Fatalf("library uprobe %s stayed with the manager", probe.Section)
++		}
++	}
++}
++
++func TestTrafficUprobeDefinitionSyntax(t *testing.T) {
++	if got := trafficUprobeDefinition("traffic_42", trafficEventName("SSL_read", false), "/lib/libssl.so.3", 0x1a2b, false); got != "p:traffic_42/p_SSL_read /lib/libssl.so.3:0x1a2b" {
++		t.Fatal(got)
++	}
++	if got := trafficUprobeDefinition("traffic_42", trafficEventName("SSL_read@v3", true), "/lib/libssl.so.3", 0x10, true); got != "r:traffic_42/r_SSL_read_v3 /lib/libssl.so.3:0x10" {
++		t.Fatal(got)
++	}
++}
++
++// The file offset computed for a function must address the bytes this
++// process executes for it, which is how the kernel places a uprobe. Shared
++// libraries mapped here (libc, the dynamic loader) keep their dynamic symbols
++// even though go test strips the test binary.
++func TestTrafficSymbolOffsetsMatchMappedCode(t *testing.T) {
++	maps, err := os.ReadFile("/proc/self/maps")
++	if err != nil {
++		t.Skip(err)
++	}
++	memory, err := os.Open("/proc/self/mem")
++	if err != nil {
++		t.Skip(err)
++	}
++	defer memory.Close()
++	checked := 0
++	seen := map[string]bool{}
++	for _, line := range strings.Split(string(maps), "\n") {
++		fields := strings.Fields(line)
++		if len(fields) < 6 || !strings.Contains(fields[1], "x") || !strings.HasPrefix(fields[5], "/") || seen[fields[5]] {
++			continue
++		}
++		var start, end, fileOffset uint64
++		if _, err := fmt.Sscanf(fields[0]+" "+fields[2], "%x-%x %x", &start, &end, &fileOffset); err != nil {
++			continue
++		}
++		seen[fields[5]] = true
++		offsets, err := trafficSymbolOffsets(fields[5])
++		if err != nil {
++			continue
++		}
++		names := make([]string, 0, len(offsets))
++		for name := range offsets {
++			names = append(names, name)
++		}
++		sort.Strings(names)
++		perFile := 0
++		for _, name := range names {
++			offset := offsets[name]
++			if offset < fileOffset || offset+16 > fileOffset+(end-start) {
++				continue
++			}
++			onDisk, inMemory := make([]byte, 16), make([]byte, 16)
++			file, err := os.Open(fields[5])
++			if err != nil {
++				break
++			}
++			_, readErr := file.ReadAt(onDisk, int64(offset))
++			file.Close()
++			if readErr != nil {
++				t.Fatalf("%s %s: %v", fields[5], name, readErr)
++			}
++			if _, err := memory.ReadAt(inMemory, int64(start+offset-fileOffset)); err != nil {
++				t.Fatalf("%s %s: %v", fields[5], name, err)
++			}
++			if string(onDisk) != string(inMemory) {
++				t.Fatalf("%s %s at file offset %#x: file % x, memory % x", fields[5], name, offset, onDisk, inMemory)
++			}
++			checked++
++			if perFile++; perFile == 8 {
++				break
++			}
++		}
++	}
++	if checked == 0 {
++		t.Skip("no mapped executable with function symbols")
++	}
++}
++
++func TestTrafficPIDAttacherFollowsScope(t *testing.T) {
++	kernel := newFakeAttachKernel()
++	attacher := newTestAttacher(t, kernel)
++	// SSL_read entry and return; the missing SSL_set_rfd is skipped.
++	if len(attacher.hooks) != 2 || len(kernel.defined) != 2 {
++		t.Fatalf("hooks %d, defined %v", len(attacher.hooks), kernel.defined)
++	}
++	for _, event := range kernel.events {
++		if event.pid != 42 || event.program == 0 {
++			t.Fatalf("carrier %+v must hold the program on eCapture's own process", event)
++		}
++	}
++	kernel.ticks = map[uint32]uint64{10: 100, 11: 110, 12: 120, 14: 1}
++	kernel.openErr[13] = syscall.ESRCH
++	reconcile := func(scope ...trafficScopePID) {
++		t.Helper()
++		if reason, err := attacher.reconcile(scope); err != nil || reason != "" {
++			t.Fatalf("reconcile: %q %v", reason, err)
++		}
++	}
++	reconcile(trafficScopePID{10, 100}, trafficScopePID{11, 110})
++	if got := kernel.filterPIDs(); len(got) != 2 || got[10] != 2 || got[11] != 2 {
++		t.Fatalf("filter events %v", got)
++	}
++	// 10 leaves, 12 arrives, 13 has exited, 14's PID now belongs to another
++	// process (start time 1, not 140).
++	reconcile(trafficScopePID{11, 110}, trafficScopePID{12, 120}, trafficScopePID{13, 130}, trafficScopePID{14, 140})
++	if got := kernel.filterPIDs(); len(got) != 2 || got[11] != 2 || got[12] != 2 {
++		t.Fatalf("filter events %v", got)
++	}
++	if attacher.attachedProcesses() != 2 {
++		t.Fatalf("attached %d", attacher.attachedProcesses())
++	}
++	// Same PID, new start time: the old events are replaced.
++	kernel.ticks[11] = 111
++	before := len(kernel.log)
++	reconcile(trafficScopePID{11, 111}, trafficScopePID{12, 120})
++	if got := strings.Join(kernel.log[before:], ";"); !strings.Contains(got, "close 1 pid 11") || !strings.Contains(got, "open 1 pid 11") {
++		t.Fatalf("PID 11 not reattached: %s", got)
++	}
++	attacher.close()
++	if len(kernel.events) != 0 || len(kernel.defined) != 0 {
++		t.Fatalf("left events %v, definitions %v", kernel.events, kernel.defined)
++	}
++	if reason, err := attacher.reconcile([]trafficScopePID{{12, 120}}); err != nil || reason != "" || len(kernel.events) != 0 {
++		t.Fatal("reconcile after close attached processes")
++	}
++}
++
++// A process that cannot be added makes the events system-wide before any
++// per-process event closes, so no target is uncovered in between.
++func TestTrafficPIDAttacherFallsBackBeforeDroppingProcesses(t *testing.T) {
++	kernel := newFakeAttachKernel()
++	attacher := newTestAttacher(t, kernel)
++	kernel.ticks = map[uint32]uint64{10: 100, 20: 200}
++	if _, err := attacher.reconcile([]trafficScopePID{{10, 100}}); err != nil {
++		t.Fatal(err)
++	}
++	kernel.openErr[20] = syscall.EMFILE
++	before := len(kernel.log)
++	reason, err := attacher.reconcile([]trafficScopePID{{10, 100}, {20, 200}})
++	if err != nil || !strings.Contains(reason, "pid 20") {
++		t.Fatalf("reason %q, err %v", reason, err)
++	}
++	log := kernel.log[before:]
++	lastSystemOpen, firstClose := -1, len(log)
++	for i, line := range log {
++		if strings.HasSuffix(line, "pid -1") && strings.HasPrefix(line, "open") {
++			lastSystemOpen = i
++		}
++		if strings.HasPrefix(line, "close") && i < firstClose {
++			firstClose = i
++		}
++	}
++	if lastSystemOpen < 0 || lastSystemOpen > firstClose {
++		t.Fatalf("system-wide events must open before per-process events close: %v", log)
++	}
++	if got := kernel.filterPIDs(); len(got) != 1 || got[-1] != 2 {
++		t.Fatalf("after fallback %v", got)
++	}
++	// Later scopes no longer touch per-process events.
++	if reason, err := attacher.reconcile([]trafficScopePID{{10, 100}}); err != nil || reason != "" || kernel.filterPIDs()[10] != 0 {
++		t.Fatal("reconcile after fallback reattached a process")
++	}
++	attacher.close()
++	if len(kernel.events) != 0 || len(kernel.defined) != 0 {
++		t.Fatalf("left events %v, definitions %v", kernel.events, kernel.defined)
++	}
++}
++
++// If even the system-wide events fail, the per-process events stay and the
++// caller gets an error (it then clears the scope and the collector restarts).
++func TestTrafficPIDAttacherFailedFallbackKeepsProcesses(t *testing.T) {
++	kernel := newFakeAttachKernel()
++	attacher := newTestAttacher(t, kernel)
++	kernel.ticks = map[uint32]uint64{10: 100, 20: 200}
++	if _, err := attacher.reconcile([]trafficScopePID{{10, 100}}); err != nil {
++		t.Fatal(err)
++	}
++	kernel.openErr[20] = syscall.EMFILE
++	kernel.openErr[-1] = syscall.EMFILE
++	if _, err := attacher.reconcile([]trafficScopePID{{10, 100}, {20, 200}}); err == nil {
++		t.Fatal("failed fallback not reported")
++	}
++	if got := kernel.filterPIDs(); len(got) != 1 || got[10] != 2 {
++		t.Fatalf("process events changed: %v", got)
++	}
++	delete(kernel.openErr, 20)
++	if reason, err := attacher.reconcile([]trafficScopePID{{10, 100}, {20, 200}}); err != nil || reason != "" || kernel.filterPIDs()[20] != 2 {
++		t.Fatalf("retry: %q %v %v", reason, err, kernel.filterPIDs())
++	}
++	attacher.close()
++}
++
++func TestTrafficPIDAttacherSetupFailureCleansUp(t *testing.T) {
++	kernel := newFakeAttachKernel()
++	kernel.carrierErr[2] = errors.New("injected SET_BPF failure")
++	program := func(string) (trafficProgram, error) { return fakeProgram(7), nil }
++	_, err := newTrafficPIDAttacher(kernel, "traffic_42", trafficTestLibrary, trafficTestProbes(), map[string]uint64{"SSL_read": 0x10}, program, 42)
++	if err == nil {
++		t.Fatal("setup failure not reported")
++	}
++	if len(kernel.events) != 0 || len(kernel.defined) != 0 {
++		t.Fatalf("left events %v, definitions %v", kernel.events, kernel.defined)
++	}
++	if _, err := newTrafficPIDAttacher(kernel, "traffic_42", trafficTestLibrary, trafficTestProbes(), map[string]uint64{}, program, 42); err == nil {
++		t.Fatal("library without any hook symbol accepted")
++	}
++	if _, err := newTrafficPIDAttacher(kernel, "traffic-42", trafficTestLibrary, trafficTestProbes(), map[string]uint64{"SSL_read": 1}, program, 42); err == nil {
++		t.Fatal("invalid tracefs group accepted")
++	}
++	if _, err := newTrafficPIDAttacher(kernel, "traffic_42", "/lib/with space/libssl.so", trafficTestProbes(), map[string]uint64{"SSL_read": 1}, program, 42); err == nil {
++		t.Fatal("library path with a space accepted")
++	}
++}
++
++func TestTrafficProcessStartTicks(t *testing.T) {
++	root := t.TempDir()
++	if err := os.MkdirAll(filepath.Join(root, "123"), 0o700); err != nil {
++		t.Fatal(err)
++	}
++	stat := "123 (nginx: worker) process) S 1 123 123 0 -1 4194624 1 0 0 0 0 0 0 0 20 0 1 0 987654 1 1"
++	if err := os.WriteFile(filepath.Join(root, "123", "stat"), []byte(stat), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if ticks, err := trafficProcessStartTicks(root, 123); err != nil || ticks != 987654 {
++		t.Fatalf("ticks %d, err %v", ticks, err)
++	}
++	if _, err := trafficProcessStartTicks(root, 124); !errors.Is(err, os.ErrNotExist) {
++		t.Fatalf("missing process: %v", err)
++	}
++}
++
++func TestTrafficPIDAttachRequiresScope(t *testing.T) {
++	cfg := NewConfig()
++	cfg.TrafficPIDAttach = true
++	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "traffic PID attach") {
++		t.Fatalf("validate: %v", err)
++	}
++}
++
++func TestTrafficControlReasonIsOneBoundedLine(t *testing.T) {
++	reason := trafficControlReason(errors.New("a\nb\x00" + strings.Repeat("x", 300)))
++	if strings.ContainsAny(reason, "\n\x00") || len(reason) != 200 {
++		t.Fatalf("%q", reason)
++	}
++}
+diff --git a/internal/probe/openssl/traffic_scope.go b/internal/probe/openssl/traffic_scope.go
+index 224cf3e..a686a15 100644
+--- a/internal/probe/openssl/traffic_scope.go
++++ b/internal/probe/openssl/traffic_scope.go
+@@ -202,6 +202,9 @@ func (p *Probe) watchTrafficScope(ctx context.Context, scope *trafficScopeMaps)
+ 			if err == nil {
+ 				err = scope.apply(cfg)
+ 			}
++			if err == nil {
++				err = p.reconcileTrafficUprobes(ctx, cfg.PIDs)
++			}
+ 			if err != nil {
+ 				scope.clear(cfg)
+ 				if !failed {

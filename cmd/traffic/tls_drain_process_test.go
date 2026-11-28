@@ -69,6 +69,9 @@ func TestHelperECaptureProbeProcess(t *testing.T) {
 	ws := <-connCh
 	defer ws.Close()
 	_ = ws.WriteMessage(websocket.BinaryMessage, encodeFakeProcessLog("traffic-control-v1:ready"))
+	if extra := os.Getenv("TRAFFIC_FAKE_ECAPTURE_EXTRA_LOG"); extra != "" {
+		_ = ws.WriteMessage(websocket.BinaryMessage, encodeFakeProcessLog(extra))
+	}
 	_ = ws.WriteMessage(websocket.BinaryMessage, encodeFakeTLSEvent(1, targetPID, fmt.Sprintf("%d_inode_1", targetPID), "read", []byte("GET /subproc/1 HTTP/1.1\r\n\r\n")))
 	<-sigCh
 	_ = ws.WriteMessage(websocket.BinaryMessage, encodeFakeTLSEvent(2, targetPID, fmt.Sprintf("%d_inode_1", targetPID), "read", []byte("GET /subproc/2 HTTP/1.1\r\n\r\n")))
@@ -88,7 +91,7 @@ func TestCaptureTLSSubprocessEndToEndDrain(t *testing.T) {
 		t.Skipf("loopback tcp dial unavailable in current sandbox: %v", dialErr)
 	}
 	dialCheck.Close()
-	runCaptureTLSSubprocessDrain(t, false)
+	runCaptureTLSSubprocessDrain(t, false, "")
 }
 
 // A private_eventq_v1 build must be read over its private Unix socket.
@@ -96,7 +99,7 @@ func TestCaptureTLSSubprocessPrivateQueueDrain(t *testing.T) {
 	if !privateECaptureQueueSupported {
 		t.Skip("private eCapture queue requires Linux")
 	}
-	if url := runCaptureTLSSubprocessDrain(t, true); !strings.HasPrefix(url, "unix:///") {
+	if url, _ := runCaptureTLSSubprocessDrain(t, true, ""); !strings.HasPrefix(url, "unix:///") {
 		t.Fatalf("probe was given %q", url)
 	}
 }
@@ -114,7 +117,39 @@ func writeQueueFeature(t *testing.T, bin string) {
 	}
 }
 
-func runCaptureTLSSubprocessDrain(t *testing.T, privateQueue bool) string {
+// A probe that could not install uprobes per process says so; the capture
+// must report it instead of silently trapping every process using libssl.
+func TestCaptureTLSReportsSystemWideUprobeFallback(t *testing.T) {
+	if !privateECaptureQueueSupported {
+		t.Skip("private eCapture queue requires Linux")
+	}
+	_, s := runCaptureTLSSubprocessDrain(t, true, "traffic-control-v1:attach-mode:system:tracefs uprobe_events not found")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, problem := range s.stats.Errors {
+		if strings.Contains(problem, "attached system-wide") && strings.Contains(problem, "tracefs uprobe_events not found") {
+			return
+		}
+	}
+	t.Fatalf("fallback not reported: %v", s.stats.Errors)
+}
+
+func TestParseAttachModeControl(t *testing.T) {
+	for message, want := range map[string]string{
+		"traffic-control-v1:attach-mode:pid":                   "",
+		"traffic-control-v1:attach-mode:system:pid 20: EMFILE": "pid 20: EMFILE",
+		"traffic-control-v1:attach-mode:system:":               "unspecified",
+	} {
+		if reason, ok := parseAttachModeControl(message); !ok || reason != want {
+			t.Fatalf("%q: %q %v", message, reason, ok)
+		}
+	}
+	if _, ok := parseAttachModeControl("traffic-control-v1:attach-mode:future"); ok {
+		t.Fatal("unknown attach mode accepted")
+	}
+}
+
+func runCaptureTLSSubprocessDrain(t *testing.T, privateQueue bool, extraLog string) (string, *Store) {
 	oldPorts, oldDrain, oldStop := capturePorts, drainTimeout, stopTimeout
 	capturePorts = map[int]bool{443: true}
 	drainTimeout = 3 * time.Second
@@ -138,8 +173,8 @@ func runCaptureTLSSubprocessDrain(t *testing.T, privateQueue bool) string {
 	}
 	scriptPath := filepath.Join(t.TempDir(), "fake-ecapture.sh")
 	urlFile := filepath.Join(t.TempDir(), "queue.url")
-	script := fmt.Sprintf("#!/bin/sh\nexport TRAFFIC_FAKE_ECAPTURE_SUBPROCESS=1\nexport TRAFFIC_FAKE_ECAPTURE_PID_FILE=%q\nexport TRAFFIC_FAKE_ECAPTURE_TARGET_PID=%d\nexport TRAFFIC_FAKE_ECAPTURE_URL_FILE=%q\nexec %q -test.run=^TestHelperECaptureProbeProcess$ -- \"$@\"\n",
-		pidFile, targetPID, urlFile, exe)
+	script := fmt.Sprintf("#!/bin/sh\nexport TRAFFIC_FAKE_ECAPTURE_SUBPROCESS=1\nexport TRAFFIC_FAKE_ECAPTURE_PID_FILE=%q\nexport TRAFFIC_FAKE_ECAPTURE_TARGET_PID=%d\nexport TRAFFIC_FAKE_ECAPTURE_URL_FILE=%q\nexport TRAFFIC_FAKE_ECAPTURE_EXTRA_LOG=%q\nexec %q -test.run=^TestHelperECaptureProbeProcess$ -- \"$@\"\n",
+		pidFile, targetPID, urlFile, extraLog, exe)
 	if err := os.WriteFile(scriptPath, []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -202,5 +237,5 @@ func runCaptureTLSSubprocessDrain(t *testing.T, privateQueue bool) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(url)
+	return string(url), s
 }
