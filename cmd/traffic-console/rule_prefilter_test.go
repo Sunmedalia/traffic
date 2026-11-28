@@ -179,13 +179,14 @@ func BenchmarkDetectionViews(b *testing.B) {
 	rand.New(rand.NewSource(1)).Read(binary)
 	for _, c := range []struct {
 		name, payload string
-		// mayAlert: random bytes can hold two backticks, which CMD-001 reports.
-		mayAlert bool
+		// allowed is the one rule the payload may set off: random bytes can
+		// hold two backticks, which CMD-001 reports.
+		allowed string
 	}{
-		{"1024", strings.Repeat("normal-x", 128), false},
-		{"990", strings.Repeat("normal%2520", 90), false},
-		{"utf8-json", strings.Repeat(`{"name":"张三","city":"北京","note":"普通订单备注内容"},`, 32), false},
-		{"binary-16k", string(binary), true},
+		{"1024", strings.Repeat("normal-x", 128), ""},
+		{"990", strings.Repeat("normal%2520", 90), ""},
+		{"utf8-json", strings.Repeat(`{"name":"张三","city":"北京","note":"普通订单备注内容"},`, 32), ""},
+		{"binary-16k", string(binary), "CMD-001"},
 	} {
 		payload := c.payload
 		record := Transaction{URL: "/api/echo", Request: []byte(fmt.Sprintf("POST /api/echo HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n%s", len(payload), payload)), Response: []byte(fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(payload), payload))}
@@ -193,8 +194,10 @@ func BenchmarkDetectionViews(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(len(record.Request) + len(record.Response)))
 			for i := 0; i < b.N; i++ {
-				if len(detect(record)) != 0 && !c.mayAlert {
-					b.Fatal("normal traffic alerted")
+				for _, alert := range detect(record) {
+					if alert.Rule != c.allowed {
+						b.Fatalf("normal traffic alerted: %s", alert.Rule)
+					}
 				}
 			}
 		})
