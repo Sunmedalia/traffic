@@ -7,9 +7,11 @@ import (
 )
 
 // A prefilter is a condition every match of a rule implies, tested with
-// substring searches on lowercase ASCII text before the regular expression
-// runs. A nil prefilter knows nothing and admits all text. Non-ASCII input
-// always uses RE2, preserving Unicode folding (e.g. K/K).
+// substring searches on folded text (foldForPrefilter) before the regular
+// expression runs. A nil prefilter knows nothing and admits all text. Every
+// literal it holds is lowercase ASCII, and folding also maps the only
+// non-ASCII runes that case-fold to ASCII letters (ſ, K), so the condition
+// holds on UTF-8 and binary text as well as on ASCII.
 //
 // Substrings are contiguous runs of the expression: `\bor\s+` requires "or"
 // followed by a space character, not "or" and a space anywhere. Requests and
@@ -68,18 +70,20 @@ func (s *stringSet) occursIn(text string) bool {
 			at += i + 1
 		}
 	case s.suffix != "":
-		for end := len(text); ; {
-			i := strings.LastIndex(text[:end], s.suffix)
+		// Only whether a value occurs matters, so search forward: unlike
+		// strings.LastIndex, strings.Index uses the vectorised byte search.
+		for at := 0; ; {
+			i := strings.Index(text[at:], s.suffix)
 			if i < 0 {
 				return false
 			}
-			head := text[:i+len(s.suffix)]
+			head := text[:at+i+len(s.suffix)]
 			for _, value := range s.values {
 				if strings.HasSuffix(head, value) {
 					return true
 				}
 			}
-			end = i + len(s.suffix) - 1
+			at += i + 1
 		}
 	}
 	for _, value := range s.values {
@@ -373,17 +377,62 @@ func repeatedExact(expression *syntax.Regexp) []string {
 	return exact
 }
 
-func foldedASCII(text string) (string, bool) {
-	for i := range text {
-		if text[i] >= 128 {
-			return "", false
+// prefilterFold lowercases A-Z and maps every other byte to itself.
+var prefilterFold = func() (table [256]byte) {
+	for i := range table {
+		table[i] = byte(i)
+	}
+	for c := byte('A'); c <= 'Z'; c++ {
+		table[c] = c + 'a' - 'A'
+	}
+	return table
+}()
+
+// foldForPrefilter returns text as prefilters search it: A-Z lowercased, and
+// ſ (U+017F) and K (U+212A), the only non-ASCII runes that case-fold to ASCII
+// letters, replaced by s and k. Every other byte is kept, and a byte above
+// 0x7F equals no literal byte.
+//
+// RE2 reads text as UTF-8 runes, an invalid byte being one rune. 0xC5 and 0xE2
+// are never continuation bytes, so these two sequences always decode as ſ and
+// K wherever they occur, and folding maps each rune on its own: the fold of a
+// matched substring is a substring of the folded text, with the same order
+// and adjacency.
+func foldForPrefilter(text string) string {
+	i := 0
+	for i < len(text) && !mayFold(text[i]) {
+		i++
+	}
+	if i == len(text) {
+		return text
+	}
+	var out strings.Builder
+	out.Grow(len(text))
+	out.WriteString(text[:i])
+	var chunk [4096]byte
+	n := 0
+	for ; i < len(text); i++ {
+		c := text[i]
+		switch {
+		case c == 0xE2 && i+2 < len(text) && text[i+1] == 0x84 && text[i+2] == 0xAA:
+			c, i = 'k', i+2
+		case c == 0xC5 && i+1 < len(text) && text[i+1] == 0xBF:
+			c, i = 's', i+1
+		}
+		chunk[n] = prefilterFold[c]
+		n++
+		if n == len(chunk) {
+			out.Write(chunk[:])
+			n = 0
 		}
 	}
-	return strings.ToLower(text), true
+	out.Write(chunk[:n])
+	return out.String()
 }
+
+// mayFold reports whether foldForPrefilter can rewrite a sequence starting at c.
+func mayFold(c byte) bool { return c-'A' < 26 || c == 0xC5 || c == 0xE2 }
+
 func (r Rule) mayMatch(view decodedView) bool {
-	if r.prefilter == nil || !view.ascii {
-		return true
-	}
 	return r.prefilter.admits(view.folded)
 }
