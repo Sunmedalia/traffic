@@ -124,6 +124,19 @@ python3 scripts/impact.py \
 
 尚未处理：分析库以 base64 JSON 保存正文，单代约为证据的 1.4 倍且保留两代；只改规则时仍重新还原 PCAP；配对前请求先写库、配对后再覆盖写一次。
 
+## eCapture 逐进程 uprobe（当前源码，未发布）
+
+本节只有代码与自动化回归，没有实机、高负载或长压验证，不宣称业务侧收益。
+
+- **断点只写入目标进程**。新补丁 `ecapture-v2.9.1-pid-attach.patch`（能力 `pid_attach_v1`，参数 `--traffic-pid-attach`，需配合 `--traffic-scope-file`）把 OpenSSL uprobe 移出 ebpfmanager。原先 uprobe 为系统级挂载，映射同一 libssl 文件的每个进程都会被写入断点：PID 白名单只在 BPF 程序里过滤，非目标进程每次 SSL_read/SSL_write 仍多一次陷入。现在每个钩子定义一个 tracefs uprobe 事件，BPF 程序只挂在 eCapture 自身进程的承载 perf 事件上；每个目标进程各开一个禁用的过滤事件，内核 trace_uprobe 过滤器只在这些进程的地址空间安装断点。所有进程共享同一个 consumer，每次命中只运行一次程序。没有采用 cilium/ebpf 的逐 PID PMU 挂载，因为那样每个 PID 都会在同一地址新增一个 consumer，目标进程的每次命中都要依次检查全部过滤器。
+- **随 PID 白名单增删，打开后再核对启动时间**。打开过滤事件后，再核对 `/proc/PID/stat` 的启动时间：PID 已被复用或进程已退出时关闭事件，避免把断点装进无关进程。
+- **退回不降低覆盖**。tracefs 不可用时按上游方式系统级挂载。之后某个进程无法加入时，先在同一组事件上打开 pid -1 过滤事件切换为系统级，再关闭逐进程事件，期间既无空窗也不会重复运行程序。连系统级也失败时才走原有的 `scope-error` 缺口与重启路径。采集器把退回原因写入 `status.json` 的 `errors`。
+- **未覆盖**：kprobe（connect、accept、`tcp_recvmsg`、`tcp_v4_destroy_sock`）只能系统级挂载，对主机上所有相应调用生效；过滤事件挂在目标进程主线程，主线程先于其他线程退出时断点会被移除。
+
+自动化：补丁树单测（偏移计算与映射代码比对、白名单增删、PID 复用、退回顺序、建立失败清理）在 CI 的 `ecapture-patches` 任务中运行；内核行为测试 `TestTrafficPIDAttachKernel` 需要 root，默认跳过。
+
+2026-11-28 在开发机（Debian 13，内核 6.12，x86_64）以 root 运行 `TestTrafficPIDAttachKernel` 通过。测试对象为 libc 上的 `swab` 与 `write`：只有列入的进程被写入断点；系统级退回后其他进程也被写入；关闭后两者都恢复原字节，tracefs 无残留事件；挂在承载事件上的程序只为列入的进程运行，其他进程和测试进程本身都没有命中记录。该样本只验证内核机制，未使用完整 eCapture 构建，也未接真实站点、nginx 或 OpenSSL，ARM64、旧内核与其他发行版仍待验证。
+
 ## 尚未完成的计划项
 
 1. eCapture 内核侧动态 PID/启动身份及端口过滤已实现；ARM64、Ubuntu x64 原始传输反向验证均通过，包括动态撤销、空 PID 白名单、损坏配置拒绝采集及合法配置恢复；仍需其他 ABI 和高负载验证。旧探针保留用户态过滤回退。

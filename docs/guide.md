@@ -485,6 +485,10 @@ sudo apt-get install -y clang llvm bpftool libelf-dev libssl-dev \
 
 构建目录必须不存在。脚本生成 `bin/ecapture`、许可证、校验文件及 `.traffic.json` 能力清单，部署时保留这些配套文件。补丁修复连接缓存崩溃与 FD 复用的元数据竞争，减少解码复制；TLS 事件使用 100 毫秒时间排序窗口，空闲时也会刷新末批事件。补丁扩展了内部 ABI，探针字节码与用户态解码器必须配套构建。其他 OpenSSL 版本需要单独验证。
 
+带 `pid_attach_v1` 能力的随包 eCapture 只在目标进程内安装 OpenSSL uprobe 断点。上游做法是在映射同一个 libssl 文件的所有进程里安装断点，例如对外发 HTTPS 的 PHP-FPM、数据库客户端、监控代理，即使事件随后被 PID 白名单丢弃，这些进程每次 SSL_read/SSL_write 仍要多陷入一次内核。现在每个钩子只定义一个 tracefs uprobe 事件；BPF 程序只挂在 eCapture 自身进程的承载事件上，每个目标进程各开一个只用于过滤的 perf 事件，内核只在这些进程的地址空间写入断点，每次命中仍只经过一个 consumer、只运行一次程序。目标进程变化时随 PID 白名单增删。tracefs 不可用时退回上游的系统级挂载；之后某个进程无法加入（如文件描述符耗尽）时，先把同一组事件切换为系统级再关闭逐进程事件，覆盖不低于上游。两种退回都会写入 `status.json` 的 `errors`。kprobe（connect、accept、`tcp_recvmsg` 等）只能系统级挂载，仍对主机上所有相应系统调用生效，由 BPF 程序按 PID 白名单过滤。逐进程事件挂在目标进程主线程上；主线程先于其他线程退出的进程会失去断点，此情形未处理。
+
+在 eCapture 补丁树中以 root 设置 `TRAFFIC_PID_ATTACH_KERNEL_TEST=1` 运行 `go test -run TestTrafficPIDAttachKernel ./internal/probe/openssl`，可在新内核或新发行版上检查这一机制。测试只对自己启动的 `sleep`/`yes` 进程在 libc 上挂载：断点只写入目标进程，系统级退回后两者都有，关闭后全部恢复；承载事件上的程序只在目标进程命中时运行。
+
 ## 各后端细节与边界
 
 ### 预加载（LD_PRELOAD / ld.so.preload）

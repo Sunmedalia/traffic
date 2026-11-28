@@ -22,6 +22,7 @@ git apply "$project_dir/patches/ecapture-v2.9.1-reorder-heap.patch"
 git apply "$project_dir/patches/ecapture-v2.9.1-drain.patch"
 git apply "$project_dir/patches/ecapture-v2.9.1-overload-recovery.patch"
 git apply "$project_dir/patches/ecapture-v2.9.1-private-eventq.patch"
+git apply "$project_dir/patches/ecapture-v2.9.1-pid-attach.patch"
 # Build all four upstream 1.1.1 ABI groups together with OpenSSL 3.0/3.5.
 make core TARGETS="openssl_1_1_1a openssl_1_1_1b openssl_1_1_1d openssl_1_1_1j openssl_3_0_0 openssl_3_0_12 openssl_3_5_0" PARALLEL=1
 mkdir -p "$project_dir/bin"
@@ -35,6 +36,6 @@ from pathlib import Path
 binary=Path(sys.argv[1])
 metadata={"schema_version":1,"source_commit":"143e771cf2b4919aedc27fd7b4b24ff87b8725b9","arch":platform.machine(),"sha256":hashlib.sha256(binary.read_bytes()).hexdigest(),"openssl_abis":["1.1.1","3.0","3.5"]}
 metadata["patch_sha256"]={patch.name:hashlib.sha256(patch.read_bytes()).hexdigest() for patch in sorted((Path(sys.argv[2])/"patches").glob("ecapture-v2.9.1-*.patch"))}
-metadata["features"]=["pid_scope_v1","ready_v1","compact_tls_v2","bounded_output_v1","drain_v1","overload_recovery_v1","private_eventq_v1"]
+metadata["features"]=["pid_scope_v1","ready_v1","compact_tls_v2","bounded_output_v1","drain_v1","overload_recovery_v1","private_eventq_v1","pid_attach_v1"]
 Path(str(binary)+".traffic.json").write_text(json.dumps(metadata,indent=2)+"\n",encoding="utf-8")
 PYMETA
