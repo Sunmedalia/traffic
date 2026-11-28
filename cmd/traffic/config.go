@@ -59,3 +59,38 @@ var drainTimeout = 5 * time.Second
 var stopTimeout = 30 * time.Second
 
 var networkNamespacePID int
+
+// collectorNice lowers the collector's scheduling priority (and, on Linux
+// schedulers that derive it from nice, its I/O priority) so the website wins
+// when CPU or disk is contended. It matters most where the cgroup limits are
+// unavailable and nothing else caps the collector. 0 keeps the inherited value.
+var collectorNice = 10
+
+const maxCollectorNice = 19
+
+// minFreeMiB is the free space a session always leaves on its filesystem;
+// 0 selects diskReserveBytes' automatic reserve.
+var minFreeMiB = 0
+
+// scaledDiskReserve is set for live capture, which runs on the website's own
+// host. Import keeps the fixed floor.
+var scaledDiskReserve = false
+
+const (
+	minDiskReserve = 512 << 20
+	maxAutoReserve = 10 << 30
+)
+
+// diskReserveBytes scales the automatic capture reserve with the filesystem:
+// 5% of its size, at least 512 MiB (the former fixed floor) and at most
+// 10 GiB. A session on a shared system disk then stops well before the
+// website's database or logs run out of space.
+func diskReserveBytes(total uint64) uint64 {
+	if minFreeMiB > 0 {
+		return uint64(minFreeMiB) << 20
+	}
+	if !scaledDiskReserve {
+		return minDiskReserve
+	}
+	return min(max(total/20, minDiskReserve), maxAutoReserve)
+}

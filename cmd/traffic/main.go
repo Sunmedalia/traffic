@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -103,6 +104,8 @@ func run(args []string) (runErr error) {
 	duration := fs.Duration("duration", 0, "optional capture duration")
 	fs.IntVar(&diskLimitMiB, "disk-limit-mib", diskLimitMiB, "session disk budget MiB")
 	fs.IntVar(&pcapBufferMiB, "pcap-buffer-mib", pcapBufferMiB, "kernel capture buffer MiB per libpcap interface")
+	fs.IntVar(&collectorNice, "collector-nice", 10, "collector scheduling niceness 0-19 so the website wins under contention; 0 keeps the inherited priority")
+	fs.IntVar(&minFreeMiB, "min-free-mib", 0, "free space MiB to leave on the session filesystem; 0 = capture keeps 5% of it (512 MiB to 10 GiB), import 512 MiB")
 	fs.Bool("no-detect", true, "deprecated compatibility flag; collection never runs detection")
 	jsonUsage := "JSON output (default)"
 	if cmd == "doctor" {
@@ -227,6 +230,13 @@ func run(args []string) (runErr error) {
 	}
 	if diskLimitMiB < 64 {
 		return errors.New("invalid resource or result limits")
+	}
+	scaledDiskReserve = cmd == "capture"
+	if collectorNice < 0 || collectorNice > maxCollectorNice {
+		return fmt.Errorf("--collector-nice must be between 0 and %d", maxCollectorNice)
+	}
+	if minFreeMiB != 0 && minFreeMiB < minDiskReserve>>20 {
+		return fmt.Errorf("--min-free-mib must be 0 (automatic) or at least %d", minDiskReserve>>20)
 	}
 	if cmd == "doctor" {
 		capturePorts = map[int]bool{}
@@ -359,7 +369,11 @@ func run(args []string) (runErr error) {
 		s.problem(errors.New(session.CoverageWarning))
 		fmt.Fprintf(os.Stderr, "会话目录 %s\n", s.dir)
 		s.report()
-		s.stats.Targets = discoverTargets("/proc", *service, *pid, *javaPID, *lib)
+		initialTargets := discoverTargets("/proc", *service, *pid, *javaPID, *lib)
+		s.stats.Targets = slices.Clone(initialTargets)
+		if *noTLS {
+			markHTTPOnly(s.stats.Targets)
+		}
 		p := newRecorderWithPolicy(s, backpressurePolicy)
 		recorderFinalized := false
 		defer func() {
@@ -367,6 +381,8 @@ func run(args []string) (runErr error) {
 				_ = p.close()
 			}
 		}()
+		// Before any helper starts, so eCapture and attach helpers inherit it.
+		priority := applyCollectorPriority(s)
 		if cmd == "capture" {
 			cleanup, e := limitResources()
 			if e != nil {
@@ -380,6 +396,7 @@ func run(args []string) (runErr error) {
 				}
 			}
 		}
+		s.stats.ResourceLimits = strings.TrimPrefix(s.stats.ResourceLimits+"; "+priority, "; ")
 		sigCtx, stopSig := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stopSig()
 		ctx, cancel := context.WithCancel(sigCtx)
@@ -413,7 +430,7 @@ func run(args []string) (runErr error) {
 			"interfaces":                       names,
 			"network_namespace_pid":            networkNamespacePID,
 			"service":                          *service,
-			"targets":                          discoverTargets("/proc", *service, *pid, *javaPID, *lib),
+			"targets":                          initialTargets,
 			"tls_enabled":                      cmd == "capture" && !*noTLS,
 			"detection_mode":                   "offline",
 			"trusted_proxies":                  trustedProxies,
@@ -426,6 +443,8 @@ func run(args []string) (runErr error) {
 			"preflight":                        checks,
 			"collector_memory_mib":             collectorMemoryMiB,
 			"pcap_buffer_mib":                  pcapBufferMiB,
+			"collector_nice":                   collectorNice,
+			"min_free_mib":                     minFreeMiB,
 			"collector_cpu_percent":            collectorCPUPercent,
 			"probe_drain_timeout_ms":           drainTimeout.Milliseconds(),
 			"stop_timeout_ms":                  stopTimeout.Milliseconds(),
@@ -450,6 +469,12 @@ func run(args []string) (runErr error) {
 			return err
 		}
 		s.report()
+		if cmd == "capture" {
+			// Refuse before any probe attaches to the website, not one tick later.
+			if err := checkDisk(s); err != nil {
+				return err
+			}
+		}
 		if cmd == "import" {
 			e = capturePackets(ctx, s, p, "offline", filter, id)
 			s.mu.Lock()
@@ -500,17 +525,20 @@ func run(args []string) (runErr error) {
 		}
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
+		ticks := 0
 	loop:
 		for {
 			select {
 			case <-ctx.Done():
 				break loop
 			case <-ticker.C:
-				if *noTLS {
+				ticks++
+				// Without probes the target list is informational only; a
+				// full /proc scan reads every candidate's maps, descriptors
+				// and socket tables, so it does not run every second.
+				if *noTLS && ticks%httpOnlyRefreshTicks == 0 {
 					targets := discoverTargets("/proc", *service, *pid, *javaPID, *lib)
-					for i := range targets {
-						targets[i].State = "http-only"
-					}
+					markHTTPOnly(targets)
 					s.mu.Lock()
 					s.stats.Targets = targets
 					s.mu.Unlock()
@@ -666,8 +694,35 @@ func waitWithin(fn func(), budget time.Duration) bool {
 	}
 }
 
+// httpOnlyRefreshTicks is the --no-tls target list refresh interval in
+// one-second status ticks.
+const httpOnlyRefreshTicks = 10
+
+func markHTTPOnly(targets []session.Target) {
+	for i := range targets {
+		targets[i].State = "http-only"
+	}
+}
+
 func maintain(s *Store) error {
 	return checkDisk(s)
+}
+
+// applyCollectorPriority lowers the collector's scheduling priority and
+// describes the outcome for resource_limits. A failure is reported, not fatal:
+// the cgroup or job limits still apply where available.
+func applyCollectorPriority(s *Store) string {
+	if collectorNice == 0 {
+		return "priority inherited"
+	}
+	if err := lowerCollectorPriority(collectorNice); err != nil {
+		s.problem(fmt.Errorf("collector priority: %w", err))
+		return "priority unavailable"
+	}
+	if runtime.GOOS == "windows" {
+		return "below-normal priority"
+	}
+	return fmt.Sprintf("nice %d", collectorNice)
 }
 
 func checkDisk(s *Store) error {
@@ -694,12 +749,12 @@ func checkDisk(s *Store) error {
 	if total > int64(diskLimitMiB)<<20 {
 		return errors.New("session exceeds disk budget; capture stopped")
 	}
-	free, err := session.FreeBytes(s.dir)
+	free, size, err := session.DiskSpace(s.dir)
 	if err != nil {
 		return err
 	}
-	if free < 512<<20 {
-		return errors.New("less than 512 MiB free; capture stopped")
+	if reserve := diskReserveBytes(size); free < reserve {
+		return fmt.Errorf("less than %d MiB free on the session filesystem (reserve kept for the host); capture stopped", reserve>>20)
 	}
 
 	return nil

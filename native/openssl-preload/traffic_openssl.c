@@ -124,6 +124,24 @@ static void after_fork(void) {
         pthread_mutex_unlock(&connection_mutex[i]);
 }
 static void child_after_fork(void) {
+    /* With a system-wide ld.so.preload every process on the host runs this
+     * handler on every fork. Until a hooked call selects a destination the
+     * queue, counters, socket and worker are untouched: SSL_* hooks, the
+     * worker and send_event all require destination first. Resetting them
+     * anyway writes to each of the 128 queue slots, which lie on separate
+     * pages, and faults in about 512 KiB per child of unrelated
+     * services (for example a database forking one backend per connection).
+     * The exit destructor may still hold wait_mutex or have set stopping in
+     * another thread; reset both so a child that becomes a target later can
+     * start its worker. */
+    if (!destination[0]) {
+        wait_mutex = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+        stopping = 0;
+        pthread_mutex_unlock(&transport_mutex);
+        for (int i = CONNECTION_STRIPES - 1; i >= 0; i--)
+            pthread_mutex_unlock(&connection_mutex[i]);
+        return;
+    }
     if (event_socket >= 0)
         close(event_socket);
     event_socket = -1;

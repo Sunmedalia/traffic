@@ -40,11 +40,17 @@ func UnlockFile(file *os.File) error {
 func lockContended(err error) bool { return err == windows.ERROR_LOCK_VIOLATION }
 
 func FreeBytes(path string) (uint64, error) {
+	available, _, err := DiskSpace(path)
+	return available, err
+}
+
+// DiskSpace reports the bytes available to the caller and the size of the
+// volume holding path.
+func DiskSpace(path string) (available, total uint64, err error) {
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	var available uint64
-	err = windows.GetDiskFreeSpaceEx(name, &available, nil, nil)
-	return available, err
+	err = windows.GetDiskFreeSpaceEx(name, &available, &total, nil)
+	return available, total, err
 }

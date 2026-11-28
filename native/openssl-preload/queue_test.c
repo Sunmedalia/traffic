@@ -2,6 +2,7 @@
  * OpenSSL, root, packet capture or changes to any system service. */
 #include "traffic_openssl.c"
 #include <assert.h>
+#include <sys/resource.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 
@@ -169,6 +170,33 @@ static void test_endpoints(void) {
     }
 }
 
+/* A fork in a process that never selected a destination must not fault in
+ * the event queue: one page per slot with the full reset. The child must still
+ * be able to become a target afterwards. */
+static void test_inert_fork(int fd) {
+    char selected[sizeof(destination)];
+    assert(!atomic_load(&worker_running) && queue_write == 0);
+    strcpy(selected, destination);
+    destination[0] = 0;
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        struct rusage usage;
+        assert(getrusage(RUSAGE_SELF, &usage) == 0);
+        if (usage.ru_minflt >= EVENT_QUEUE / 2)
+            _exit(2);
+        strcpy(destination, selected);
+        assert(ensure_worker());
+        assert(send_event("idle", 4));
+        exit(0);
+    }
+    strcpy(destination, selected);
+    int status;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status));
+    assert(WEXITSTATUS(status) == 0);
+    expect_message(fd, "idle");
+}
+
 static void test_monotonic_wait(void) {
     assert(event_ready_initialized);
     pthread_mutex_lock(&wait_mutex);
@@ -186,6 +214,8 @@ int main(void) {
     assert(mkdtemp(directory));
     assert(snprintf(destination, sizeof(destination), "%s/events", directory) > 0);
     int fd = receiver(destination);
+    if (!getenv("TRAFFIC_TEST_SKIP_FORK"))
+        test_inert_fork(fd);
 
     assert(ensure_worker());
     pthread_mutex_lock(&connection_mutex[0]);
