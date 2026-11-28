@@ -444,25 +444,18 @@ func listeningPortsSnapshot(root, dir string, tables map[string]map[string]int) 
 		tableDir = filepath.Join(root, "net")
 	}
 	listeners, ok := tables[namespace]
-	if !ok {
-		listeners = map[string]int{}
-		for _, name := range []string{"tcp", "tcp6"} {
-			b, _ := os.ReadFile(filepath.Join(tableDir, name))
-			for _, line := range strings.Split(string(b), "\n") {
-				fields := strings.Fields(line)
-				if len(fields) < 10 || fields[3] != "0A" {
-					continue
-				}
-				_, portText, found := strings.Cut(fields[1], ":")
-				if !found {
-					continue
-				}
-				port, err := strconv.ParseInt(portText, 16, 32)
-				if err == nil {
-					listeners[fields[9]] = int(port)
-				}
+	if !ok && namespaceErr == nil && root == "/proc" {
+		// Listening sockets only; see kernelListeners. Test roots and
+		// kernels without sock_diag read the /proc tables below.
+		if kernel, err := kernelListeners(dir); err == nil {
+			listeners, ok = kernel, true
+			if tables != nil {
+				tables[namespace] = listeners
 			}
 		}
+	}
+	if !ok {
+		listeners = procListeners(tableDir)
 		if tables != nil {
 			tables[namespace] = listeners
 		}
@@ -483,6 +476,30 @@ func listeningPortsSnapshot(root, dir string, tables map[string]map[string]int) 
 	}
 	sort.Ints(ports)
 	return ports
+}
+
+// procListeners parses the LISTEN rows (state 0A) of the tcp and tcp6 tables
+// in tableDir into socket inode -> port.
+func procListeners(tableDir string) map[string]int {
+	listeners := map[string]int{}
+	for _, name := range []string{"tcp", "tcp6"} {
+		b, _ := os.ReadFile(filepath.Join(tableDir, name))
+		for _, line := range strings.Split(string(b), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 10 || fields[3] != "0A" {
+				continue
+			}
+			_, portText, found := strings.Cut(fields[1], ":")
+			if !found {
+				continue
+			}
+			port, err := strconv.ParseInt(portText, 16, 32)
+			if err == nil {
+				listeners[fields[9]] = int(port)
+			}
+		}
+	}
+	return listeners
 }
 
 func processIdentity(root string, pid int) (string, error) {

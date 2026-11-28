@@ -24,9 +24,16 @@ func UnlockFile(file *os.File) error { return syscall.Flock(int(file.Fd()), sysc
 func lockContended(err error) bool { return err == syscall.EWOULDBLOCK }
 
 func FreeBytes(path string) (uint64, error) {
+	available, _, err := DiskSpace(path)
+	return available, err
+}
+
+// DiskSpace reports the bytes available to unprivileged writers and the size
+// of the filesystem holding path.
+func DiskSpace(path string) (available, total uint64, err error) {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(path, &stat); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return stat.Bavail * uint64(stat.Bsize), nil
+	return stat.Bavail * uint64(stat.Bsize), stat.Blocks * uint64(stat.Bsize), nil
 }

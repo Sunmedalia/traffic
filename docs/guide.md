@@ -117,7 +117,7 @@ printf '%s\n' /opt/traffic/bin/libtraffic-openssl.so | sudo tee -a /etc/ld.so.pr
 sudo systemctl restart nginx
 ```
 
-非 root worker 需要 `--openssl-preload-allow-uid`：socket 会变成 `0660` 并归属该 UID 的主组。未匹配 `targets` 的进程不启动采集队列；预加载库仍会被动态链接器载入。完整说明、回滚和边界见 [系统级 ld.so.preload](#系统级-ldsopreload-与不同-uid-的服务)。
+非 root worker 需要 `--openssl-preload-allow-uid`：socket 会变成 `0660` 并归属该 UID 的主组。未匹配 `targets` 的进程不启动采集队列，fork 时也不重置队列；预加载库仍会被动态链接器载入。完整说明、回滚和边界见 [系统级 ld.so.preload](#系统级-ldsopreload-与不同-uid-的服务)。
 
 ### Tomcat / JVM HTTPS
 
@@ -353,6 +353,8 @@ TUI 支持鼠标，操作与网页点击一致：
 | `--duration` | 0 | 到时自动停止 |
 | `--disk-limit-mib` | 2048 | 会话磁盘预算 |
 | `--pcap-buffer-mib` | 32 | 每个 libpcap 接口的内核抓包缓冲，范围 2–1024；内核拒绝时回退 libpcap 默认值并记录 `pcap/capture_buffer_fallback` 缺口。WinDivert 不使用 |
+| `--collector-nice` | 10 | 采集器及其子进程（eCapture、Java 附加辅助进程）的调度优先级，范围 0–19；CPU 或磁盘争用时让业务进程优先，CFQ/BFQ 调度器下 I/O 优先级随之降低。只降低、不提高已有优先级，0 表示沿用继承值。cgroup 限制不可用时这是采集器唯一的 CPU 让步手段。Windows 为“低于正常”优先级。结果写入 `status.json` 的 `resource_limits` |
+| `--min-free-mib` | 0（自动） | 会话所在文件系统必须保留的空闲空间：采集默认保留文件系统容量的 5%（至少 512 MiB、至多 10 GiB），导入保留 512 MiB；显式值不小于 512。采集开始前先检查一次，不足时在附加探针前拒绝 |
 | `--no-detect` | 兼容参数 | 采集始终不执行检测 |
 | `--require-tls` | 关 | 所选目标未通过 HTTPS 预检时拒绝开始 |
 | `--collector-memory-mib` / `--collector-cpu-percent` | 256 / 50 | 限制采集器及子进程，不含目标内探针。会话目录若在 tmpfs/ramfs（如多数发行版的 `/tmp`、`/dev/shm`），证据计入该内存预算且无法回收；此时 `--disk-limit-mib` 超过内存预算一半会在开始前拒绝采集，请改用磁盘目录 |
@@ -377,7 +379,7 @@ sessions/web-01/2026-11-11/15-04-05-nginx/
 └── logs/             # 探针诊断
 ```
 
-采集器只保存原始数据，不执行还原、配对和索引。PCAP 每段约 64 MiB，顺序保留，不循环覆盖；达到磁盘预算或剩余空间低于 512 MiB 时停止。磁盘检查存在间隔，可能略超预算。探针仍有单事件及队列上限，零丢弃不证明采全。停止采集后复制整个目录；旧会话还需保留 `index.sqlite-wal`/`-shm`。判断完整性看 `status.json`：
+采集器只保存原始数据，不执行还原、配对和索引。PCAP 每段约 64 MiB，顺序保留，不循环覆盖；达到磁盘预算或剩余空间低于保留值（采集默认为文件系统容量的 5%，512 MiB–10 GiB，见 `--min-free-mib`）时停止。磁盘检查存在间隔，可能略超预算。探针仍有单事件及队列上限，零丢弃不证明采全。停止采集后复制整个目录；旧会话还需保留 `index.sqlite-wal`/`-shm`。判断完整性看 `status.json`：
 
 - `gap_counts` / `gaps.jsonl`：按后端、原因和计量单位保存已知缺口；`drain_state` 和 `probe_exits` 分别报告排空及退出确认。常见原因：`ecapture/receive_queue_shed`（接收队列过载时丢弃的探针消息，传输继续）、`pcap/write_queue_overflow`（磁盘跟不上时丢弃的网络包）、`collector/stop_budget_exceeded`（停止超过 `--stop-timeout`）。
 - `tls`：`attached` / `active-preload` / `partial` / `unavailable` / `disabled`。
@@ -467,9 +469,9 @@ TUI、Web、JSON 查询及导出读取同一代分析结果；Web 和 TUI 每次
 | HTTP 头部 | 32 KiB |
 | PCAP | 每接口 64 MiB 分段、16 段循环 |
 | 会话磁盘预算 | 2 GiB，达到后停止采集 |
-| 低磁盘保护 | 可用空间不足 512 MiB 时停止 |
+| 低磁盘保护 | 采集保留文件系统容量的 5%（512 MiB–10 GiB），导入保留 512 MiB；不足时停止 |
 | 索引保留期 | 24 小时 |
-| 进程资源 | Linux cgroup v1/v2 / Windows Job Object，256 MiB、单核 50% |
+| 进程资源 | Linux cgroup v1/v2 / Windows Job Object，256 MiB、单核 50%；nice 10（Windows 低于正常） |
 
 证据 ZIP 含请求、响应和 SHA-256 清单。有完整传输端点的请求还包含按双端 TCP 地址、端口及请求前后各 60 秒筛选的 PCAP。通过 PCAP 还原的响应晚于默认窗口时，窗口延长至已观测的响应时间。`evidence.json` 记录筛选窗口的起止时间。窗口可能包含同连接上的其他请求或重用同一对端点的流量。最后一段 PCAP 或缺口日志存在残缺记录时，ZIP 保留完整记录并在 `evidence.json` 中列出受影响的源文件。HTTPS 明文来自进程探针，PCAP 保留原始报文字节。明文事件、Cookie 和认证信息可能出现在会话里，分享前先检查。
 
